@@ -20,6 +20,10 @@ grep -Fq 'omarchy-hw-t2' "$leaf" ||
   fail "leaf gates on the T2 detector"
 grep -Fq 'omarchy-hw-t2' "$migration" ||
   fail "migration gates on the T2 detector"
+grep -Fq 'systemd-hwdb query' "$leaf" ||
+  fail "installer checks for the upstream systemd hwdb fix"
+grep -Fq 'systemd-hwdb query' "$migration" ||
+  fail "migration checks for the upstream systemd hwdb fix"
 if [[ -f $hardware_all ]]; then
   grep -q 'apple/fix-t2-touchpad.sh' "$hardware_all" ||
     fail "the T2 touchpad leaf runs during hardware setup"
@@ -93,6 +97,14 @@ printf '\t%s' "$@" >>"$TEST_LOG"
 printf '\n' >>"$TEST_LOG"
 SH
 
+cat >"$stub_bin/systemd-hwdb" <<'SH'
+#!/bin/bash
+
+if (( ${UPSTREAM_HWDB:-0} == 1 )); then
+  echo 'ID_INPUT_TOUCHPAD_INTEGRATION=internal'
+fi
+SH
+
 chmod +x "$stub_bin"/*
 
 run_detector() {
@@ -120,6 +132,7 @@ run_migration() {
   PATH="$stub_bin:$PATH" \
     TEST_LOG="$calls" \
     T2_HARDWARE="${1:-1}" \
+    UPSTREAM_HWDB="${2:-0}" \
     OMARCHY_PATH="$ROOT" \
     OMARCHY_T2_TOUCHPAD_RULE="$rule" \
     bash -euo pipefail "$migration" >/dev/null
@@ -148,10 +161,17 @@ run_migration 0
 [[ ! -s $calls ]] || fail "non-T2 systems skip the trackpad repair" "$(cat "$calls")"
 pass "migration skips unrelated hardware"
 
+: >"$calls"
+run_migration 1 1
+[[ ! -e $rule ]] || fail "upstream hwdb support needs no fallback rule"
+[[ ! -s $calls ]] || fail "upstream hwdb support skips the fallback" "$(cat "$calls")"
+pass "migration defers to upstream systemd hwdb support"
+
 run_leaf() {
   PATH="$stub_bin:$PATH" \
     TEST_LOG="$calls" \
     T2_HARDWARE="${1:-1}" \
+    UPSTREAM_HWDB="${2:-0}" \
     OMARCHY_PATH="$ROOT" \
     OMARCHY_INSTALL="$ROOT/install" \
     OMARCHY_T2_TOUCHPAD_RULE="$rule" \
@@ -170,3 +190,9 @@ run_leaf 0
 [[ ! -e $rule ]] || fail "installer leaf skips machines without T2"
 [[ ! -s $calls ]] || fail "installer leaf is silent on unrelated hardware" "$(cat "$calls")"
 pass "installer leaf skips unrelated hardware"
+
+: >"$calls"
+run_leaf 1 1
+[[ ! -e $rule ]] || fail "installer adds no fallback when systemd supports the pad"
+[[ ! -s $calls ]] || fail "installer defers to upstream systemd hwdb" "$(cat "$calls")"
+pass "installer leaf defers to upstream systemd hwdb support"

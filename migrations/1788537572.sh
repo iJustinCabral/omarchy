@@ -1,9 +1,16 @@
 echo "Mark T2 Mac built-in trackpads as internal so disable-while-typing works"
 
 # t2bce_vhci USB pads are udev-external. Existing T2 installs already have
-# linux-t2 and the keyboard quirk; they still need this udev rule.
+# linux-t2 and the keyboard quirk; they still need this udev rule until their
+# packaged systemd hwdb contains the upstream 05ac:0280 entry.
 
 if ! omarchy-hw-t2; then
+  exit 0
+fi
+
+touchpad_hwdb_key='touchpad:usb:v05acp0280:name:Apple Inc. Apple Internal Keyboard / Trackpad:'
+if systemd-hwdb query "$touchpad_hwdb_key" |
+  grep -Fqx 'ID_INPUT_TOUCHPAD_INTEGRATION=internal'; then
   exit 0
 fi
 
