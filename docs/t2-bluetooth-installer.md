@@ -18,7 +18,7 @@ The receipt at `/var/lib/omarchy-t2-bluetooth/receipt.json` records original and
 
 A repeat installation verifies exact owned content and checks for newly conflicting policy. A different future payload is deliberately refused pending a reviewed upgrade; it cannot silently rewrite this installation's saved rollback baseline. After explicit rollback, another install requires review of the retained receipt rather than automatically discarding history.
 
-The known revision-2 experimental helper, unit and configuration can be adopted in place if their content matches. Rollback restores that exact earlier arrangement. The old experiment's receipts are left intact but superseded while this installer owns the files; do not run its older rollback manager concurrently. Custom gate drop-ins, including the isolated MPC candidate wrapper on the development machine, cause a preflight refusal. They must be retired through their owning experiment before adopting the service; this source integration does not remove them from the live machine.
+The known revision-2 experimental helper, unit and configuration can be adopted in place if their content matches. Rollback restores that exact earlier arrangement. The old experiment's receipts are left intact but superseded while this installer owns the files; do not run its older rollback manager concurrently. Custom gate drop-ins, including the isolated MPC candidate wrapper on the development machine, cause a preflight refusal. They must be retired through their owning experiment before adopting the service; the validated development-machine handoff subsequently removed that candidate through its owning manager before adopting this installer.
 
 ## Boot and policy checks
 
@@ -30,7 +30,7 @@ The gate retains the qualified readiness algorithm and model/device guard, but r
 
 Seventeen isolated tests cover fresh installation, idempotence, known revision adoption, rollback, interrupted transactions, seven injected write failures, unit-validation failure, custom configurations, parent symlinks, new overrides on repeat setup, masked BlueZ, boot-image rejection/errors and model scope. Shell tests cover installer/setup/migration routing, unsupported-machine no-op, and failure propagation. CLI metadata and Bash/Python syntax checks passed. Systemd unit analysis passed with harmless sandbox socket-option warnings; it did not start services.
 
-The packaged gate's readiness logic differs from the qualified source only by removing the release pin and indentation. The original six gate fixture tests and existing T2 touchpad, sleep and Wi-Fi suites are retained. Prior hardware evidence remains documented in the consolidated audit. This installer has not been deployed on the live machine or exercised through a fresh ISO installation; no new Bluetooth playback or power-transition test is claimed.
+The packaged gate's readiness logic differs from the qualified source only by removing the release pin and indentation. The original six gate fixture tests and existing T2 touchpad, sleep and Wi-Fi suites are retained. Prior hardware evidence remains documented in the consolidated audit. This installer was subsequently deployed on the validated MacBookAir9,1 and passed its normal fresh-boot acceptance check. The user confirmed the requested Bluetooth icon, toggle and AirPods reconnect/audio checks; the journal independently verified startup ordering. Fresh ISO installation remains untested. See [the hardware validation record](t2-validation.md).
 
 ```mermaid
 flowchart TD

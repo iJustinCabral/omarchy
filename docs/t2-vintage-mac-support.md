@@ -21,6 +21,10 @@ Do not blindly copy these files onto another installation. An installer must ver
 
 The earlier Bluetooth saved-off Wi-Fi failure is retained as a failure of the combined system before Wi-Fi recovery was corrected. The latest stock saved-off boot passes with both the qualified Bluetooth gate and corrected Wi-Fi watcher running. AirPods playback was not retested in that final boot.
 
+## Current deployment acceptance
+
+The consolidated Bluetooth installer has now been deployed and passed a fresh stock boot after the obsolete MPC kernel and override were retired. The saved-off Wi-Fi acceptance case also passed on stock. [Hardware validation and remaining limits](t2-validation.md). The historical reference-only limitations above are superseded by the implemented installer and this deployment result.
+
 ## Excluded experiments
 
 The failed MPC driver policy, custom test kernel, candidate-kernel Bluetooth wrapper, raw firmware traces, hibernation experiments, and machine-specific resume configuration are not distribution fixes. They are not added to the consolidated installation path. The shipped Wi-Fi helper remains scoped to validated MacBookAir9,1 by default; other BCM4377 T2 models require explicit opt-in and separate evidence.
