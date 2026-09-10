@@ -1,0 +1,15 @@
+[Unit]
+Description=BCM4377 Bluetooth after firmware readiness, before desktop startup
+After=systemd-modules-load.service
+Before=bluetooth.service systemd-user-sessions.service
+Wants=bluetooth.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/bluetooth-after-wifi
+TimeoutStartSec=35
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
