@@ -64,7 +64,7 @@ class ResetSafety(unittest.TestCase):
     with patch.object(m, 'guard'), patch.object(m, 'save', side_effect=lambda _: order.append('save')), patch.object(m, 'device', side_effect=[self.dev, after]), patch.object(m, 'Path', return_value=reset), patch.object(m, 'log') as log:
       m.recover_locked(self.dev, self.state)
     self.assertEqual(order, ['save', 'reset'])
-    self.assertEqual(log.call_args.args[0], 'USER_DISABLED_WIFI')
+    self.assertEqual(log.call_args.args[0], 'RADIO_BLOCKED_DURING_RECOVERY')
   def test_enodev_during_replacement_keeps_verifying(self):
     after = {**self.dev, 'index': 2, 'connected': True}
     nm = MagicMock(returncode=0, stdout='100 (connected)')
@@ -148,6 +148,23 @@ class SleepCoordination(unittest.TestCase):
       with self.lock.open('a') as other:
         with self.assertRaises(BlockingIOError):
           fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    with patch.object(m, 'recover_locked', side_effect=reset): m.recover({}, {})
+    with patch.object(m, 'settle_enabled', return_value=True), patch.object(m, 'recover_locked', side_effect=reset): m.recover({}, {})
+
+class EnableSettlement(unittest.TestCase):
+  def setUp(self):
+    self.dev = {'index': 3, 'enabled': True, 'connected': False}
+  def test_original_radio_survives_persistence_window(self):
+    with patch.object(m, 'device', return_value=self.dev), patch.object(m.time, 'sleep') as sleep, patch.object(m, 'log'):
+      self.assertTrue(m.settle_enabled(self.dev))
+    self.assertEqual(sum(c.args[0] for c in sleep.call_args_list), 8)
+  def test_off_request_cancels_without_forcing_on(self):
+    with patch.object(m, 'device', side_effect=[self.dev, {**self.dev, 'enabled': False}]), patch.object(m.time, 'sleep'), patch.object(m, 'log'):
+      self.assertFalse(m.settle_enabled(self.dev))
+  def test_connection_obviates_reset(self):
+    with patch.object(m, 'device', return_value={**self.dev, 'connected': True}), patch.object(m.time, 'sleep'), patch.object(m, 'log'):
+      self.assertFalse(m.settle_enabled(self.dev))
+  def test_replacement_cancels_stale_trigger(self):
+    with patch.object(m, 'device', return_value={**self.dev, 'index': 5}), patch.object(m.time, 'sleep'), patch.object(m, 'log'):
+      self.assertFalse(m.settle_enabled(self.dev))
 
 unittest.main()

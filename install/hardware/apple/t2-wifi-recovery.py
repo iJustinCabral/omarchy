@@ -108,7 +108,7 @@ def recover_locked(dev, state):
     try:
       after = device()
       if not after['enabled']:
-        log('USER_DISABLED_WIFI', index=after['index'])
+        log('RADIO_BLOCKED_DURING_RECOVERY', index=after['index'])
         return
       if after['index'] != dev['index']:
         new_index = after['index']
@@ -141,7 +141,25 @@ def recover(dev, state):
     if SLEEP_STATE.exists():
       log('SKIP_SLEEP_PREPARED')
       return
+    if not settle_enabled(dev):
+      return
     recover_locked(dev, state)
+
+
+def settle_enabled(dev):
+  # systemd-rfkill saves after five idle seconds and cancels pending saves
+  # when the old radio disappears. A reset immediately after enable can
+  # therefore restore stale saved-off state onto the replacement radio.
+  # Leave the original radio present for eight continuously enabled seconds.
+  # Never force the radio on: an off request cancels this attempt.
+  log('WAIT_ENABLE_SETTLE', index=dev['index'])
+  for _ in range(16):
+    time.sleep(0.5)
+    current = device()
+    if current['index'] != dev['index'] or not current['enabled'] or current['connected']:
+      log('CANCELLED_STATE_CHANGED')
+      return False
+  return True
 
 
 def main():
