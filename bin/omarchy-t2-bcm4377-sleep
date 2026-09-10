@@ -266,14 +266,25 @@ prepare() {
   fi
 }
 
+# Serialize firmware recovery with both halves of the sleep transaction.
+# Busy recovery aborts preparation; RequiredBy=sleep.target prevents suspend.
+lock_wifi() {
+  umask 077
+  exec 9>"${OMARCHY_T2_BCM4377_LOCK:-/run/lock/omarchy-t2-bcm4377.lock}" || return 1
+  if ! flock -n 9; then
+    log "BCM4377 firmware recovery is busy; retry sleep after it finishes"
+    return 1
+  fi
+}
+
 case "${1:-}" in
   pre)
     if omarchy-hw-t2-bcm4377; then
-      prepare
+      lock_wifi && prepare
     fi
     ;;
   post)
-    restore
+    lock_wifi && restore
     ;;
   *)
     echo "usage: $0 pre|post" >&2

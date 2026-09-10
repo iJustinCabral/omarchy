@@ -1,0 +1,31 @@
+#!/bin/bash
+
+# omarchy:summary=Enable or disable automatic T2 BCM4377 Wi-Fi recovery
+# omarchy:args=[--disable|--allow-untested-model]
+# omarchy:requires-sudo=true
+
+set -euo pipefail
+
+case "${1:-}" in
+  --disable)
+    if (( $# != 1 )); then exit 2; fi
+    sudo systemctl disable --now omarchy-t2-wifi-recovery.service
+    ;;
+  ""|--allow-untested-model)
+    if (( $# > 1 )); then exit 2; fi
+    allow_untested=0
+    if [[ ${1:-} == "--allow-untested-model" ]]; then allow_untested=1; fi
+    sudo env OMARCHY_PATH="$OMARCHY_PATH" OMARCHY_INSTALL="$OMARCHY_PATH/install" \
+      PATH="$PATH" OMARCHY_T2_WIFI_ALLOW_UNTESTED_MODEL="$allow_untested" \
+      OMARCHY_T2_WIFI_START_NOW=1 bash -euo pipefail \
+      "$OMARCHY_PATH/install/hardware/apple/fix-wifi-recovery.sh"
+    ;;
+  -h|--help)
+    echo "Usage: omarchy setup t2-wifi-recovery [--disable|--allow-untested-model]"
+    echo "Automatic support: MacBookAir9,1 with BCM4377b. Other T2 models require explicit opt-in."
+    ;;
+  *)
+    echo "Unknown option: $1" >&2
+    exit 2
+    ;;
+esac

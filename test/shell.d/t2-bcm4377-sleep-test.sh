@@ -280,6 +280,7 @@ run_helper() {
     FAIL_BRCM_UNLOAD="${FAIL_BRCM_UNLOAD:-0}" \
     FAIL_BRCM_LOAD="${FAIL_BRCM_LOAD:-0}" \
     FAIL_WCC_LOAD="${FAIL_WCC_LOAD:-0}" \
+    OMARCHY_T2_BCM4377_LOCK="$test_tmp/recovery.lock" \
     OMARCHY_T2_BCM4377_STATE="$state" \
     OMARCHY_T2_BCM4377_PROC_MODULES="$modules" \
     OMARCHY_T2_BCM4377_SYS_CLASS_NET="$sys_class_net" \
@@ -290,6 +291,7 @@ run_helper() {
 
 reset_helper_fixture
 run_helper pre >/dev/null
+[[ $(stat -c %a "$test_tmp/recovery.lock") == "600" ]] || fail "shared recovery lock is root-private"
 [[ -f $state ]] || fail "pre records exactly what it changed"
 [[ $(stat -c %a "$state") == "600" ]] || fail "sleep state is root-private"
 ! grep -q '^brcmfmac ' "$modules" || fail "pre unloads brcmfmac"
