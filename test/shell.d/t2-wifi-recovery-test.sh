@@ -80,19 +80,3 @@ pass "migration shares setup and skips unsupported hardware"
 "$ROOT/bin/omarchy-setup-t2-wifi-recovery" --disable
 grep -Fxq 'disable --now omarchy-t2-wifi-recovery.service' "$TEST_CALLS" || fail "disable stops only the recovery service"
 pass "disable leaves radio and kernel policy alone"
-
-# A recovery holding the common lock must prevent the real sleep helper from
-# touching the mocked module state. No system power transition is involved.
-cat > "$test_tmp/bin/omarchy-hw-t2-bcm4377" <<'SH'
-#!/bin/bash
-exit 0
-SH
-chmod +x "$test_tmp/bin/omarchy-hw-t2-bcm4377"
-(
-  exec 8>"$test_tmp/wifi.lock"
-  flock -n 8
-  if OMARCHY_T2_BCM4377_LOCK="$test_tmp/wifi.lock" "$ROOT/bin/omarchy-t2-bcm4377-sleep" pre >/dev/null; then
-    fail "sleep preparation must refuse while recovery owns the lock"
-  fi
-)
-pass "sleep preparation refuses an overlapping firmware recovery"

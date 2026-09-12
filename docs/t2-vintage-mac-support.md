@@ -5,7 +5,7 @@ This branch consolidates verified MacBookAir9,1 work. It does not claim hibernat
 | Area | Included work | Evidence and limits |
 | --- | --- | --- |
 | Trackpad | `f4544c9c`, `14cb0600`: internal-device classification and defer fallback to systemd hwdb | Existing consolidated-branch commits preserved. Dedicated touchpad tests cover scope and upstream precedence. |
-| Sleep/wake | `2b4d05d2`, `e2b87c3e`: BCM4377 Wi-Fi unload/reload and hardened failure handling | Existing consolidated-branch commits preserved. Recovery adds shared locking; hardware sleep validation of that added coordination remains pending. Hibernation is not established. |
+| Sleep/wake | Wi-Fi unload workaround withdrawn | Stock tests implicated teardown in Bluetooth failure; bypassing it exposed the unresolved Wi-Fi D3 suspend abort. No suspend or hibernate support claim. |
 | Wi-Fi saved-off recovery | `1f3d63b8`, `fbbdd7d6`: scoped firmware-stall watcher and eight-second enabled-state settlement | Stock linux-t2 saved-off boot passed September 10: boot `7472ed82-5e9a-46e8-a6f7-c6f4c819bde7`, enable 92.966 s, reset 103.481 s, NM connected 110.761 s, watcher RECOVERED 111.072 s. One attempt; user confirmed. Corrected in-session reproduction also passed. |
 | Bluetooth startup/icon | Exact validated helper, unit, BlueZ ordering, blacklist and module list in `docs/t2-bluetooth-qualified/` | Normal startup, retained AirPods bonding/audio and Bluetooth off/on were user-confirmed in earlier testing. Current boot verifies helper 17.492 s, load returned 18.359 s, BlueZ started 18.412 s, sessions allowed 18.531 s. Automatic installer and migration integration now use the qualified readiness algorithm; see the installer document for transaction tests and remaining deployment validation. |
 

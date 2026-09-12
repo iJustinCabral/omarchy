@@ -45,9 +45,7 @@ flowchart TD
 
 ## Sleep coordination
 
-`omarchy-t2-bcm4377-sleep` and recovery share `/run/lock/omarchy-t2-bcm4377.lock`. The sleep helper holds it throughout pre/post; the recovery helper holds it through reset verification. Recovery also refuses to act while `/run/omarchy-t2-bcm4377-sleep.state` exists, covering the sleep interval between the two helper processes.
-
-If recovery owns the lock, sleep preparation returns a failure before changing modules. The existing sleep service's `RequiredBy=sleep.target` prevents proceeding with a partially prepared device. Normal lock acquisition is nonblocking. No new suspend or hibernate hooks, Bluetooth reloads, kernel command lines or resume settings are introduced. Tests prove mutual exclusion and state-file exclusion; actual suspend/resume with this integration is still a release gate.
+The recovery watcher retains its lock and stale sleep-state exclusion for compatibility with older installations. The Wi-Fi unload sleep helper has been withdrawn because of Bluetooth failures. The retirement migration disables its original installer-owned service; new installs no longer install it. The saved-off Wi-Fi recovery remains separate and is not a suspend fix.
 
 ## Installation, administrator policy and removal
 
@@ -59,16 +57,16 @@ Disable with `omarchy setup t2-wifi-recovery --disable`. This stops/disables onl
 
 ## Verification before broad distribution
 
-1. Run the focused T2 recovery and existing sleep suites, metadata/CLI tests, and the repository aggregate suite.
+1. Run the focused T2 recovery and sleep-retirement suites, metadata/CLI tests, and the repository aggregate suite.
 2. On stock linux-t2, replace the laboratory service with the packaged service and verify startup, no duplicate watcher, and hardware eligibility.
 3. On the next planned boot with Wi-Fi saved off, confirm the preference remains off; enable once and verify automatic discovery/association, service recovery logs, Bluetooth icon and audio. A forced reboot is not needed for further in-session development.
 4. Verify ordinary off/on with no timeout does not trigger reset, disabling Wi-Fi is respected, and repeated failures stop at the recorded budget.
-5. Validate the existing suspend path with the shared lock and confirm all devices return. Do not test hibernate as part of this patch.
+5. Resolve the Wi-Fi D3 failure and validate actual suspend with both radios; the former unload workaround is withdrawn. Do not test hibernate as part of this patch.
 6. Obtain the same evidence from other T2/BCM4377 models before adding them to automatic setup. Record model, PCI IDs, firmware, kernel and driver-reset capability.
 
 Use `journalctl -b -u omarchy-t2-wifi-recovery.service` and the corresponding current/failed boot kernel journal for review. Avoid collecting saved-network secrets or Bluetooth bonding keys. Local lab traces are not shipped in this patch.
 
-## Patch validation record
+## Historical patch validation record
 
 The new recovery suite passed 27 Python tests plus shell integration cases for installation, explicit activation, model opt-in, conflicts, administrator overrides, migration, disable and the real sleep helper's lock refusal. The existing T2 sleep suite also passed, including private lock-file permissions. Bash syntax, Python compilation, CLI metadata/routing and systemd unit analysis passed. Systemd analysis used the checkout's Bash wrapper path because the new packaged command has not been installed on the host; it did not start the unit. The portable helper's read-only `--supported` and `--check` modes passed on the actual Mac and found its connected BCM4377 adapter.
 

@@ -40,9 +40,17 @@ The consolidated branch passed the focused trackpad, T2 hardware, Broadcom suppl
 
 ## Remaining work
 
-- Hardware suspend/resume validation with the new shared recovery lock.
+- Resolve Wi-Fi D3 suspend failure without the withdrawn unload workaround, then verify Bluetooth audio across actual sleep.
 - Fresh ISO installation of the automatic Bluetooth setup.
 - Other T2 models and kernel releases before broadening automatic eligibility.
 - Hibernation boot-loop investigation, which is not resolved by these radio fixes.
 
-The existing trackpad and hardened sleep/wake fixes were preserved in the consolidated branch. No failed MPC policy, experimental kernel, or hibernation implementation was promoted as a verified fix.
+The trackpad fix remains. The Wi-Fi unload sleep workaround was withdrawn on September 11 after Bluetooth failures; disabling it exposes the original Wi-Fi D3 suspend abort. No failed MPC policy, experimental kernel, or hibernation implementation was promoted as a verified fix.
+
+## September 11 retirement of the Wi-Fi sleep workaround
+
+The Wi-Fi unload helper, unit, installer leaf and enabling migration have been removed. A new migration disables only the exact unit written by the retired installer, preserves administrator changes, and defers while a sleep transaction is active. The separate Wi-Fi recovery and Bluetooth startup integrations remain.
+
+Stock tests showed Bluetooth failure with Wi-Fi teardown; bypassing teardown exposed the original D3 suspend abort. An isolated Wi-Fi disconnect/reconnect retained audible AirPods playback. This supports withdrawing the teardown workaround, not claiming a replacement suspend fix.
+
+Focused retirement migration, Wi-Fi recovery (31 Python cases plus shell integration), Bluetooth installer (17 cases plus integration), Bluetooth gate (6 cases), trackpad and T2 hardware tests passed after removal. Migration and installer syntax checks and git diff whitespace checks passed. No live sleep operation was run for this source change.
