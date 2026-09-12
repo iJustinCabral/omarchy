@@ -1,3 +1,52 @@
+# Omarchy T2 vintage Mac support
+
+This is `fix-t2-vintage-mac-support`, the consolidated T2 support branch for
+Omarchy. It brings together trackpad input, Wi-Fi recovery, Bluetooth startup,
+and the driver work that enabled real suspend and radio/audio recovery on a
+MacBookAir9,1 with BCM4377 running Omarchy4.0.3.
+
+## Fixes in this branch
+
+| Fix | Original problem | Implementation | Validation / deployment |
+| --- | --- | --- | --- |
+| Built-in trackpad classification | Cursor jumps while typing because the USB-presented internal trackpad was classified external | Scoped udev fallback marks it internal so libinput disable-while-typing can work; defer to systemd hwdb when it already knows the device | Installer and migration integrated; existing tests retained |
+| Wi-Fi saved-off boot recovery | Enabling Wi-Fi after booting with it off found no usable networks until another reboot | Scoped firmware-stall watcher, enabled-state settlement, bounded reset and reconnection observation | Stock hardware pass; setup command integrated |
+| Bluetooth startup and missing icon | Controller initialized too early or appeared after the desktop started; unreliable toggles/discovery | Wait for Wi-Fi netdev/PHY readiness, explicitly load Bluetooth, order BlueZ and desktop startup | Transactional installer/migration integrated; stock boot, icon, toggle and AirPods passes |
+| Real S3 suspend | Firmware did not acknowledge the Wi-Fi D3 request; sleep aborted | Asahi-derived control-ring mailbox, host capability and IRQ/startup driver patches | Driver source package included; repeated actual S3 passes on tested machine |
+| Bluetooth resume and AirPods audio | Bond/connection indicators survived but firmware transport, discovery or audio did not | Restore vendor windows, rebuild lost Bluetooth transport through HCI/FLR, delay reconnect until ready | Driver patches included; repeated auto-reconnect/audio and initially-off Bluetooth passes; ResumeDelay5 is documented, not auto-installed |
+| Wi-Fi re-enable after Wi-Fi-off sleep | Firmware query timeout could falsely return interface-open success; Wi-Fi recovery coincided with Bluetooth loss | Transport-error propagation plus optional, narrowly scoped Wi-Fi function0 reset | Both patches included; latest functional cycle passed without executing Wi-Fi reset; one earlier unexpected reboot remains unexplained |
+| Retire old sleep workaround | Unloading Wi-Fi around sleep introduced Bluetooth failures | Remove unload helper/install path; guarded retirement migration | Integrated; remains removed |
+
+The latest Wi-Fi-off suspend/re-enable test passed with actual internet traffic
+and AirPods stereo playback. The earlier reboot remains recorded. This branch
+does not claim hibernation/S4 is fixed or that every T2 model is validated.
+
+## Read the implementation and evidence
+
+- [Suspend, Bluetooth audio and Wi-Fi edge case: mechanisms, diagram and test ledger](docs/t2-suspend/README.md)
+- [Driver patch package: source preparation, module-only build and tests](packages/t2-suspend/README.md)
+- [Wi-Fi recovery design](docs/t2-wifi-recovery.md) and [setup/use](manual/t2-wifi-recovery.md)
+- [Bluetooth installer design, ownership and rollback](docs/t2-bluetooth-installer.md) and [setup/use](manual/t2-bluetooth.md)
+- [Trackpad implementation](install/hardware/apple/fix-t2-touchpad.sh) and [scoped udev rule](install/hardware/apple/99-omarchy-t2-touchpad.rules)
+- [Consolidated source audit](docs/t2-vintage-mac-support.md) and [earlier stock deployment validation](docs/t2-validation.md)
+
+## What installing this branch changes
+
+Trackpad fallback, Wi-Fi recovery setup, and Bluetooth startup integration are
+part of the Omarchy source installation paths. Existing commands include
+`omarchy setup t2-wifi-recovery` and `omarchy setup t2-bluetooth`; the linked
+manuals document scope, verification and rollback.
+
+The new suspend work is a kernel-driver source package. Checking out or updating
+this branch does **not** automatically replace kernel modules or install the
+experimental boot image. Follow the package documentation for source reproduction;
+distribution kernel packaging remains separate. Machine-specific captures,
+firmware, generated kernels/UKIs and credentials are not included.
+
+The original Omarchy project information follows.
+
+---
+
 # Omarchy
 
 Omarchy is a beautiful, fun & agentic Linux distribution by DHH.

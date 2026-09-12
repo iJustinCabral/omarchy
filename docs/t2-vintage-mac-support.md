@@ -1,5 +1,7 @@
 # Consolidated T2 support audit
 
+September12 update: [root fix index](../README.md) and [suspend integration](t2-suspend/README.md) are the current branch status. The driver source series is now consolidated, with repeated S3 passes and the latest Wi-Fi-off functional pass; the unexplained reboot and unexercised Wi-Fi FLR remain explicit. The following September10/11 audit is historical. Its unresolved-S3 and excluded-driver statements describe the earlier branch, not this source integration.
+
 This branch consolidates verified MacBookAir9,1 work. It does not claim hibernation support or validation on every T2 model. Automatic Bluetooth installer integration is now implemented; see [installer design and validation](t2-bluetooth-installer.md).
 
 | Area | Included work | Evidence and limits |

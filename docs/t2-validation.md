@@ -1,3 +1,5 @@
+> September12: new driver-series results and remaining limits are recorded in the [current suspend validation ledger](t2-suspend/README.md#validation-ledger). This file preserves the earlier stock deployment record.
+
 # T2 hardware validation — September 10, 2026
 
 This record consolidates the deployment and acceptance evidence for `fix-t2-vintage-mac-support`. The machine is MacBookAir9,1 with BCM4377b, running stock `7.2.4-arch1-Watanare-T2-1-t2`. Source integration and automated tests are on the branch; raw diagnostics and machine-specific experiment managers remain in the separate laboratory repository.

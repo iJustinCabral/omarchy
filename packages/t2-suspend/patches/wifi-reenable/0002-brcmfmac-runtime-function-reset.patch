@@ -1,0 +1,172 @@
+Subject: [EXPERIMENT] wifi: brcmfmac: recover BCM4377 with explicit function 0 FLR
+
+Load-time opt-in; exact tested model/device only. No bus/watchdog fallback.
+No hardware validation or firmware-stall-prevention claim.
+
+---
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include <linux/kernel.h>
++#include <linux/dmi.h>
+ #include <linux/module.h>
+ #include <linux/firmware.h>
+ #include <linux/pci.h>
+@@ -337,7 +338,12 @@
+ 	bool valid;
+ };
+ 
++static bool brcmf_t2_recovery_flr;
++module_param_named(t2_recovery_flr, brcmf_t2_recovery_flr, bool, 0444);
++MODULE_PARM_DESC(t2_recovery_flr, "Experimental BCM4377 runtime recovery via function 0 FLR");
++
+ struct brcmf_pciedev_info {
++	bool recovery_flr;
+ 	enum brcmf_pcie_state state;
+ 	bool in_irq;
+ 	bool have_msi;
+@@ -702,6 +708,11 @@
+ 	u32 val;
+ 	u32 lsc;
+ 
++	if (devinfo->recovery_flr) {
++		/* Runtime FLR owns reset; teardown must not reset the sibling. */
++		pci_clear_master(devinfo->pdev);
++		return;
++	}
+ 	if (!devinfo->ci)
+ 		return;
+ 
+@@ -1667,6 +1678,89 @@
+ 	return 0;
+ }
+ 
++#define BRCMF_ARMCR4_CPUHALT BIT(5)
++
++/* Runtime recovery only; initial probe retains the packaged reset sequence. */
++static int brcmf_pcie_recovery_flr(struct brcmf_pciedev_info *devinfo)
++{
++	struct pci_dev *pdev = devinfo->pdev;
++	struct brcmf_bus *bus = dev_get_drvdata(&pdev->dev);
++	static const u16 offsets[] = { 0x70, 0x74, 0x80, 0x84, 0x88 };
++	struct brcmf_core *arm;
++	u32 saved[ARRAY_SIZE(offsets)], value;
++	int i, ret;
++
++	if (pdev->vendor != PCI_VENDOR_ID_BROADCOM || pdev->device != 0x4488 ||
++	    PCI_FUNC(pdev->devfn) || devinfo->ci->chip != BRCM_CC_4377_CHIP_ID ||
++	    !dmi_match(DMI_SYS_VENDOR, "Apple Inc.") ||
++	    !dmi_match(DMI_PRODUCT_NAME, "MacBookAir9,1"))
++		return -ENODEV;
++	arm = brcmf_chip_get_core(devinfo->ci, BCMA_CORE_ARM_CR4);
++	if (!arm)
++		return -ENODEV;
++	ret = pcie_reset_flr(pdev, true);
++	if (ret)
++		return ret;
++
++	/* A failed attempt must never invoke the shared watchdog. */
++	devinfo->recovery_flr = true;
++	brcmf_pcie_fwcon_timer(devinfo, false);
++	brcmf_bus_change_state(bus, BRCMF_BUS_DOWN);
++	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
++	brcmf_pcie_release_irq(devinfo);
++	pci_cfg_access_lock(pdev);
++	pci_clear_master(pdev);
++	for (i = 0; i < ARRAY_SIZE(offsets); i++) {
++		ret = pci_read_config_dword(pdev, offsets[i], &saved[i]);
++		if (ret || saved[i] == ~0U) {
++			ret = ret ? pcibios_err_to_errno(ret) : -EIO;
++			goto unlock;
++		}
++	}
++	ret = pci_save_state(pdev);
++	if (ret)
++		goto unlock;
++	/* As in PCI core reset, disable decoding and bus mastering during FLR. */
++	ret = pci_write_config_word(pdev, PCI_COMMAND, PCI_COMMAND_INTX_DISABLE);
++	if (ret) {
++		ret = pcibios_err_to_errno(ret);
++		goto unlock;
++	}
++	dev_info(&pdev->dev, "t2wifi-recovery: starting function 0 FLR\n");
++	ret = pcie_reset_flr(pdev, false);
++	pci_restore_state(pdev);
++	if (ret)
++		goto unlock;
++	for (i = 0; i < ARRAY_SIZE(offsets); i++) {
++		ret = pci_write_config_dword(pdev, offsets[i], saved[i]);
++		if (ret) {
++			ret = pcibios_err_to_errno(ret);
++			goto unlock;
++		}
++		ret = pci_read_config_dword(pdev, offsets[i], &value);
++		if (ret || value != saved[i]) {
++			ret = ret ? pcibios_err_to_errno(ret) : -EIO;
++			goto unlock;
++		}
++	}
++	/* FLR resets the PCI function. Explicitly hold the Wi-Fi CPU for the
++	 * existing firmware download path; do not assume FLR halted that CPU.
++	 */
++	brcmf_chip_set_passive(devinfo->ci);
++	brcmf_chip_coredisable(arm, BRCMF_ARMCR4_CPUHALT, 0);
++	if (brcmf_chip_iscoreup(arm)) {
++		ret = -EIO;
++		goto unlock;
++	}
++	dev_info(&pdev->dev, "t2wifi-recovery: FLR complete; Wi-Fi CPU held\n");
++	ret = 0;
++unlock:
++	pci_cfg_access_unlock(pdev);
++	if (ret)
++		dev_err(&pdev->dev, "t2wifi-recovery: stopped (%d); no watchdog fallback\n", ret);
++	return ret;
++}
++
+ static int brcmf_pcie_reset(struct device *dev)
+ {
+ 	struct brcmf_bus *bus_if = dev_get_drvdata(dev);
+@@ -1675,6 +1769,12 @@
+ 	struct brcmf_fw_request *fwreq;
+ 	int err;
+ 
++	if (brcmf_t2_recovery_flr) {
++		err = brcmf_pcie_recovery_flr(devinfo);
++		if (err)
++			return err;
++	}
++
+ 	brcmf_pcie_intr_disable(devinfo);
+ 
+ 	brcmf_pcie_bus_console_read(devinfo, true);
+@@ -1684,7 +1784,8 @@
+ 	brcmf_pcie_release_irq(devinfo);
+ 	brcmf_pcie_release_scratchbuffers(devinfo);
+ 	brcmf_pcie_release_ringbuffers(devinfo);
+-	brcmf_pcie_reset_device(devinfo);
++	if (!devinfo->recovery_flr)
++		brcmf_pcie_reset_device(devinfo);
+ 
+ 	fwreq = brcmf_pcie_prepare_fw_request(devinfo);
+ 	if (!fwreq) {
+@@ -1692,6 +1793,8 @@
+ 		return -ENOMEM;
+ 	}
+ 
++	if (devinfo->recovery_flr)
++		pci_set_master(devinfo->pdev);
+ 	err = brcmf_fw_get_firmwares(dev, fwreq, brcmf_pcie_setup);
+ 	if (err) {
+ 		dev_err(dev, "Failed to prepare FW request\n");
+@@ -2383,6 +2486,8 @@
+ 	return;
+ 
+ fail:
++	if (devinfo->recovery_flr)
++		pci_clear_master(devinfo->pdev);
+ 	brcmf_err(bus, "Dongle setup failed\n");
+ 	brcmf_pcie_bus_console_read(devinfo, true);
+ 	brcmf_fw_crashed(dev);

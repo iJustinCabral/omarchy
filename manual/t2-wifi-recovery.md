@@ -8,7 +8,7 @@ On the tested MacBookAir9,1, enable it with:
 omarchy setup t2-wifi-recovery
 ```
 
-The recovery mechanism has restored this failure without rebooting during development. Fresh-boot validation of the packaged integration is still pending. It is a recovery workaround, not a confirmed repair of the firmware defect.
+The recovery mechanism has restored this failure without rebooting during development. A saved-off stock boot passed on the tested MacBookAir9,1; see the [deployment record](../docs/t2-validation.md). It is a recovery workaround, not a confirmed repair of the firmware defect.
 
 Other T2 models with the same BCM4377b chip can explicitly opt in for testing:
 
