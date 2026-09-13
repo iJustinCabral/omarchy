@@ -50,6 +50,7 @@ class Installer(unittest.TestCase):
     if self.fail and args[:len(self.fail)] == self.fail:
       raise subprocess.CalledProcessError(1, args, stderr='injected failure')
     listing = 'etc/omarchy-t2-radio-source.json\n' + '\n'.join('/updates/dkms/' + n + '.ko' for n in m.MODULES[:-1])
+    listing += '\n' + '\n'.join('usr/lib/firmware/brcm/brcmfmac4377b3-pcie.apple,formosa' + s for s in ('.bin', '-SPPR-m.txt', '-SPPR-u.txt', '.clm_blob', '.txcap_blob'))
     return subprocess.CompletedProcess(args, 0, stdout=listing if args[0] == '/usr/bin/lsinitcpio' else '', stderr='')
 
   def install(self):
@@ -143,6 +144,36 @@ class Installer(unittest.TestCase):
     def runner(args, **kwargs):
       return subprocess.CompletedProcess(args, 0, stdout='/updates/dkms/brcmfmac.ko', stderr='')
     with self.assertRaises(ValueError): m.check_images(self.root, runner)
+
+  def test_missing_apple_firmware_refused(self):
+    def runner(args, **kwargs):
+      result = self.runner(args, **kwargs)
+      result.stdout = '\n'.join(line for line in result.stdout.splitlines() if not line.endswith('formosa.bin'))
+      return result
+    with self.assertRaisesRegex(ValueError, 'Missing Apple Wi-Fi firmware'):
+      m.check_images(self.root, runner)
+
+  def test_hook_aborts_before_modules_when_firmware_missing(self):
+    firmware = self.root / 'usr/lib/firmware/brcm'
+    firmware.mkdir(parents=True)
+    files = [firmware / ('brcmfmac4377b3-pcie.apple,formosa' + s)
+             for s in ('.bin', '-SPPR-m.txt', '-SPPR-u.txt', '.clm_blob', '.txcap_blob')]
+    for missing in files:
+      with self.subTest(missing=missing.name):
+        for p in files: p.write_bytes(b'firmware fixture')
+        missing.unlink()
+        result = subprocess.run(['bash', '-c', '''
+source "$1"
+KERNELVERSION=$2
+_optmoduleroot=$3
+error() { echo "$*" >&2; }
+modinfo() { echo "UNEXPECTED MODULE LOOKUP" >&2; return 99; }
+build
+echo "UNEXPECTED BUILD CONTINUED"
+''', 'test', str(m.HERE / 'initcpio-install'), RELEASE, str(self.root)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('Missing Apple Wi-Fi firmware: ' + str(missing), result.stderr)
+        self.assertNotIn('UNEXPECTED', result.stderr + result.stdout)
 
   def test_bluez_policy_preserves_custom_values(self):
     for data in (b'[Policy]\nResumeDelay = 9\n', b'[Policy]\n[Policy]\n'):

@@ -148,6 +148,10 @@ def check_images(root, runner=run):
     listing = runner(['/usr/bin/lsinitcpio', '-l', str(image)]).stdout
     if 'etc/omarchy-t2-radio-source.json' not in listing:
       raise ValueError('T2 verification hook did not run for ' + str(image))
+    for suffix in ('.bin', '-SPPR-m.txt', '-SPPR-u.txt', '.clm_blob', '.txcap_blob'):
+      firmware = 'usr/lib/firmware/brcm/brcmfmac4377b3-pcie.apple,formosa' + suffix
+      if firmware not in listing.splitlines():
+        raise ValueError('Missing Apple Wi-Fi firmware in boot image: ' + firmware)
     for name in MODULES[:-1]:
       if '/' + name + '.ko' not in listing:
         raise ValueError('Missing Wi-Fi module in boot image: ' + name)

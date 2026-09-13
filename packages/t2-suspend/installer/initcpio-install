@@ -4,6 +4,17 @@ build() {
   [[ $KERNELVERSION == *-t2 ]] || return 0
   local module selected built expected actual vermagic
   local root=${_optmoduleroot%/}
+  # Apple board-specific firmware is requested dynamically and is absent from
+  # MODULE_FIRMWARE metadata. Wi-Fi probes before the real root is mounted.
+  local firmware suffix
+  for suffix in .bin -SPPR-m.txt -SPPR-u.txt .clm_blob .txcap_blob; do
+    firmware=$root/usr/lib/firmware/brcm/brcmfmac4377b3-pcie.apple,formosa$suffix
+    [[ -s $firmware ]] || { error "Missing Apple Wi-Fi firmware: $firmware"; exit 1; }
+  done
+  for firmware in "$root"/usr/lib/firmware/brcm/brcmfmac4377b3-*; do
+    [[ -f $firmware ]] || continue
+    add_file "$firmware" "${firmware#"$root"}" || exit 1
+  done
   for module in brcmfmac brcmfmac-wcc brcmfmac-cyw brcmfmac-bca hci_bcm4377; do
     selected=$(modinfo -b "${root:-/}" -k "$KERNELVERSION" -n "$module") || exit 1
     built=$root/var/lib/dkms/omarchy-t2-radio/1.0/$KERNELVERSION/x86_64/module/$module.ko

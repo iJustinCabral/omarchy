@@ -47,8 +47,13 @@ if TEST_INSTALL_STATUS=1 bash -euo pipefail "$ROOT/migrations/1789256882.sh"; th
 pass "T2 suspend setup, CLI and migration routing; failure propagation"
 
 # The initcpio hook must abort before image publication on a missing replacement.
-if bash -c 'source "$1"; KERNELVERSION=7.2.4-test-t2; modinfo() { return 1; }; build; echo UNSAFE_CONTINUATION' bash "$ROOT/packages/t2-suspend/installer/initcpio-install" > "$test_tmp/hook-output"; then
+mkdir -p "$test_tmp/root/usr/lib/firmware/brcm"
+for suffix in .bin -SPPR-m.txt -SPPR-u.txt .clm_blob .txcap_blob; do
+  echo fixture > "$test_tmp/root/usr/lib/firmware/brcm/brcmfmac4377b3-pcie.apple,formosa$suffix"
+done
+if bash -c 'source "$1"; _optmoduleroot=$2; KERNELVERSION=7.2.4-test-t2; add_file() { return 0; }; modinfo() { echo MODULE_LOOKUP >&2; return 1; }; build; echo UNSAFE_CONTINUATION' bash "$ROOT/packages/t2-suspend/installer/initcpio-install" "$test_tmp/root" > "$test_tmp/hook-output" 2>&1; then
   fail "missing replacement must abort mkinitcpio"
 fi
 ! grep -q UNSAFE_CONTINUATION "$test_tmp/hook-output" || fail "hook continued after failure"
+grep -q MODULE_LOOKUP "$test_tmp/hook-output" || fail "test did not reach module verification"
 pass "boot-image guard stops generation before publishing incomplete images"
