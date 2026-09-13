@@ -73,6 +73,12 @@ Twelve installer tests and five source-preparation tests passed, along with shel
 
 ### First live deployment: ready for ordinary boot
 
-On September12, the committed installer was run on the test MacBookAir9,1. DKMS installation and the manager's verification passed. Independent extraction of the generated normal T2 UKI confirmed the unchanged stock kernel, all four matching Wi-Fi modules, embedded policy and source marker, and no early Bluetooth module. The normal menu hash matches its image. All existing test images and their menu entries were preserved.
+On September12, the committed installer was run on the test MacBookAir9,1. DKMS installation and the manager's verification passed. Independent extraction of the generated normal T2 UKI confirmed the unchanged stock kernel, all four matching Wi-Fi modules, embedded policy and source marker, and no early Bluetooth module. All existing test images and their menu entries were preserved. The separate lab verifier subsequently changed the normal image, invalidating its menu hash; see the incident below.
 
 The temporary lab Bluetooth load override was backed up and removed without unloading Bluetooth. A lab-only `noresume` guard prevents the old hibernation target from being used during this S3-driver boot validation; it is not part of the automatic installer. The running session remains on the earlier test image. A user-operated boot of the normal entry is the next validation step; no such hardware pass is claimed yet.
+
+### Lab verification caused a pre-boot hash failure
+
+The first ordinary boot attempt stopped at Limine with “URI wrong hash,” before Linux executed. The separate lab verifier used `objcopy --dump-section` on the live UKI without an output filename. Objcopy rewrote the PE image in place after the verifier's initial menu-hash check. This was a verification-tool defect, not evidence of a driver initialization failure. The automatic installer's `lsinitcpio` path supplies `/dev/null` as an explicit output and does not have this defect.
+
+The lab verifier now inspects a private copy, supplies a separate output filename, and checks that both the live image and menu remain unchanged afterward. The faulty invocation was reproduced on a disposable copy. The normal UKI and menu were regenerated through `limine-mkinitcpio` using the already installed stock kernel and DKMS modules, without compiling a kernel or changing running drivers. Corrected verification checks the menu hash, stock kernel identity, module source versions, boot policy and preservation of all five test images. A successful ordinary hardware boot remains pending.
