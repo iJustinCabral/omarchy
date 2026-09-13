@@ -1,9 +1,6 @@
 # Omarchy T2 vintage Mac support
 
-This is `fix-t2-vintage-mac-support`, the consolidated T2 support branch for
-Omarchy. It brings together trackpad input, Wi-Fi recovery, Bluetooth startup,
-and the driver work that enabled real suspend and radio/audio recovery on a
-MacBookAir9,1 with BCM4377 running Omarchy4.0.3.
+This is `fix-t2-vintage-mac-support`, the consolidated T2 support branch for Omarchy. It brings together trackpad input, Wi-Fi recovery, Bluetooth startup, and the driver work that enabled real suspend and radio/audio recovery on a MacBookAir9,1 with BCM4377 running Omarchy4.0.3.
 
 ## Fixes in this branch
 
@@ -17,9 +14,7 @@ MacBookAir9,1 with BCM4377 running Omarchy4.0.3.
 | Wi-Fi re-enable after Wi-Fi-off sleep | Firmware query timeout could falsely return interface-open success; Wi-Fi recovery coincided with Bluetooth loss | Transport-error propagation plus optional, narrowly scoped Wi-Fi function0 reset | Both patches installed on the supported model; latest functional cycle passed without executing Wi-Fi reset; one earlier unexpected reboot remains unexplained |
 | Retire old sleep workaround | Unloading Wi-Fi around sleep introduced Bluetooth failures | Remove unload helper/install path; guarded retirement migration | Integrated; remains removed |
 
-The latest Wi-Fi-off suspend/re-enable test passed with actual internet traffic
-and AirPods stereo playback. The earlier reboot remains recorded. This branch
-does not claim hibernation/S4 is fixed or that every T2 model is validated.
+The latest Wi-Fi-off suspend/re-enable test passed with actual internet traffic and AirPods stereo playback. The earlier reboot remains recorded. This branch does not claim hibernation/S4 is fixed or that every T2 model is validated.
 
 ## Read the implementation and evidence
 
@@ -28,18 +23,19 @@ does not claim hibernation/S4 is fixed or that every T2 model is validated.
 - [Wi-Fi recovery design](docs/t2-wifi-recovery.md) and [setup/use](manual/t2-wifi-recovery.md)
 - [Bluetooth installer design, ownership and rollback](docs/t2-bluetooth-installer.md) and [setup/use](manual/t2-bluetooth.md)
 - [Trackpad implementation](install/hardware/apple/fix-t2-touchpad.sh) and [scoped udev rule](install/hardware/apple/99-omarchy-t2-touchpad.rules)
-- [Consolidated source audit](docs/t2-vintage-mac-support.md) and [earlier stock deployment validation](docs/t2-validation.md)
+- [Reviewer guide: component map, scope, distribution changes and PR boundaries](docs/t2-vintage-mac-support.md) and [earlier stock deployment validation](docs/t2-validation.md)
+
+## Current validation
+
+The corrected automatic installer has passed a normal stock-kernel boot and one short S3 cycle on MacBookAir9,1. The boot image includes the required Apple Wi-Fi firmware; Bluetooth and audio recovered after suspend. [Detailed validation and deployment corrections](docs/t2-suspend/VALIDATION.md). Hibernation, a clean OS installation and other Mac models remain outside this validation.
 
 ## What installing this branch changes
 
-Trackpad fallback, Wi-Fi recovery setup, and Bluetooth startup integration are
-part of the Omarchy source installation paths. Existing commands include
-`omarchy setup t2-wifi-recovery` and `omarchy setup t2-bluetooth`; the linked
-manuals document scope, verification and rollback.
+Trackpad fallback, Wi-Fi recovery setup, and Bluetooth startup integration are part of the Omarchy source installation paths. Existing commands include `omarchy setup t2-wifi-recovery` and `omarchy setup t2-bluetooth`; the linked manuals document scope, verification and rollback.
 
 The suspend driver set now has an [automatic installer and kernel-update integration](docs/t2-suspend/INSTALLATION.md). Fresh setup and a normal upgrade migration install the DKMS drivers on the supported MacBookAir9,1, apply the tested reconnect policy, and rebuild its normal boot image. The next ordinary boot activates them. See [user setup and rollback](manual/t2-suspend.md). No manual lab-image selection or full kernel build is required.
 
-The automatic installer's transaction tests and isolated DKMS build/install validation are documented separately from the driver hardware tests. A fresh hardware boot of this new installation path has not yet been validated. Machine-specific captures, firmware, generated kernels/UKIs and credentials are not included.
+The automatic installer's transaction tests and isolated DKMS build/install validation are documented separately from the driver hardware tests. Normal boot and a short actual S3 cycle with the installed drivers have passed, including user-confirmed Bluetooth and audio recovery. A completely fresh OS installation remains unvalidated. Machine-specific captures, firmware, generated kernels/UKIs and credentials are not included.
 
 The original Omarchy project information follows.
 
@@ -53,9 +49,7 @@ Read more at [omarchy.org](https://omarchy.org).
 
 ## The Omarchy Manual
 
-The manual lives in [`manual/`](manual/), which is its authoritative source. It's
-mirrored to [learn.omacom.io](https://learn.omacom.io/2/the-omarchy-manual), where
-its screenshots are also hosted.
+The manual lives in [`manual/`](manual/), which is its authoritative source. It's mirrored to [learn.omacom.io](https://learn.omacom.io/2/the-omarchy-manual), where its screenshots are also hosted.
 
 - [Welcome to Omarchy!](manual/01-welcome-to-omarchy.md)
 
