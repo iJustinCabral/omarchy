@@ -3,8 +3,7 @@
 This package consolidates the driver changes tested on MacBookAir9,1, BCM4377,
 Omarchy 4.0.3 and `7.2.4-arch1-Watanare-T2-1-t2`. It contains ten patches,
 pinned source and patch hashes, source preparation, and extracted-C fault tests.
-It is source integration: Omarchy's installer does not yet build or deploy these
-modules. Existing trackpad, Wi-Fi recovery and Bluetooth startup installers remain
+Fresh setup and an upgrade migration now build/install these modules automatically through DKMS on the supported model; see [installer lifecycle and validation](../../docs/t2-suspend/INSTALLATION.md). Existing trackpad, Wi-Fi recovery and Bluetooth startup installers remain
 available. See [the branch overview](../../README.md) and
 [mechanisms and validation](../../docs/t2-suspend/README.md).
 
@@ -77,27 +76,10 @@ verify state/error/DMA/IRQ behavior; they cannot prove real hardware reset safet
 No generated modules, firmware, machine boot images, credentials, raw HCI/audio,
 or private diagnostics are included.
 
-## Deployment and rollback boundary
+## Automatic deployment and rollback
 
-The tested machine uses a separate UKI with stock kernel and replaced driver
-modules; stock boot remains available. Source consolidation does not change that
-machine, install a service, regenerate an initramfs, or select a boot entry.
-Distribution deployment still needs kernel package integration and boot-image
-verification. Do not copy lab boot managers with machine-specific paths into an
-unattended installer or enable the Wi-Fi FLR option globally.
+Fresh hardware setup and the upgrade migration invoke the shared automatic installer. It downloads hash-pinned source, builds only the driver modules, registers DKMS rebuilding for T2 kernel updates, applies the tested radio/reconnect policy and generates the normal boot image. It does not change running radios or initiate a power transition. See [installation details](../../docs/t2-suspend/INSTALLATION.md) and [user commands](../../manual/t2-suspend.md).
 
-The latest Wi-Fi FLR path requires `brcmfmac.t2_recovery_flr=1` at module load and
-is restricted to Apple MacBookAir9,1 / Wi-Fi PCI14e4:4488 function0. The source's
-Bluetooth recovery is chip-scoped to BCM4377, not proof that every matching model
-has passed. The original sleep unload hook stays retired.
+The supported model is MacBookAir9,1 with BCM4377. The installer chooses the `wifi-reenable` profile and load-time Wi-Fi FLR option from the latest tested image. That optional recovery path has not been hardware-proven by the latest successful repeat, which needed no Wi-Fi reset. The earlier unexplained reboot remains in the validation record. Hibernation remains unresolved.
 
-Tested companion configuration is BlueZ `[Policy] ResumeDelay = 5`, plus a scoped
-NetworkManager device section with `wifi.scan-rand-mac-address=no` for
-`wlp115s0f0`. The latter was an isolation experiment, persists across test boots,
-and was insufficient by itself; it is not installed by this package. Disabling
-scan MAC randomization changes privacy behavior. Existing connection profile MAC
-policies were not changed. Neither setting is silently applied to other machines.
-
-Rollback of a lab deployment is to manually boot its retained stock entry and
-use that experiment's owned removal/backup procedure. The source package itself
-has no live state to undo. Hibernate/S4 remains unresolved.
+The five DKMS modules include all three Wi-Fi vendor companions and Bluetooth. The initcpio guard checks the selected replacement set before publishing a boot image and preserves Bluetooth's startup gate. The installer owns a configuration receipt and initial boot backup; `omarchy setup t2-suspend --rollback` restores its configuration and the original modules for the next boot. Other T2 fixes retain their own installers.

@@ -141,11 +141,7 @@ Both use Bluetooth source from `4DF58889A43B9AC7E9E3E8C`'s build.
 Those are recorded build identities, not promises that another toolchain emits
 identical module bytes.
 
-The consolidated installer currently handles trackpad, Wi-Fi watcher and Bluetooth
-startup. It does not automatically install this kernel-driver series, change
-BlueZ ResumeDelay, disable scan randomization, or create a test UKI. Kernel
-packaging and boot-image integration are distinct from merging source. The tested
-stock kernel image was retained; only driver modules were rebuilt in isolation.
+The consolidated installer now also delivers this driver series automatically through DKMS on the supported MacBookAir9,1. Fresh setup and upgrade migration share a transactional installer, which applies the tested companion configuration and rebuilds the normal T2 boot image. [Automatic installation, update lifecycle, rollback and test boundary](INSTALLATION.md). The tested kernel image remains stock; only the driver modules are rebuilt. No hardware transition was performed to validate this new installer.
 
 Historical [Bluetooth validation](evidence/bluetooth-cold-recovery/VALIDATION.md),
 [reconnect timing](evidence/bluetooth-cold-recovery/RECONNECT_TIMING.md),

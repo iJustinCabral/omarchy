@@ -12,9 +12,9 @@ MacBookAir9,1 with BCM4377 running Omarchy4.0.3.
 | Built-in trackpad classification | Cursor jumps while typing because the USB-presented internal trackpad was classified external | Scoped udev fallback marks it internal so libinput disable-while-typing can work; defer to systemd hwdb when it already knows the device | Installer and migration integrated; existing tests retained |
 | Wi-Fi saved-off boot recovery | Enabling Wi-Fi after booting with it off found no usable networks until another reboot | Scoped firmware-stall watcher, enabled-state settlement, bounded reset and reconnection observation | Stock hardware pass; setup command integrated |
 | Bluetooth startup and missing icon | Controller initialized too early or appeared after the desktop started; unreliable toggles/discovery | Wait for Wi-Fi netdev/PHY readiness, explicitly load Bluetooth, order BlueZ and desktop startup | Transactional installer/migration integrated; stock boot, icon, toggle and AirPods passes |
-| Real S3 suspend | Firmware did not acknowledge the Wi-Fi D3 request; sleep aborted | Asahi-derived control-ring mailbox, host capability and IRQ/startup driver patches | Driver source package included; repeated actual S3 passes on tested machine |
-| Bluetooth resume and AirPods audio | Bond/connection indicators survived but firmware transport, discovery or audio did not | Restore vendor windows, rebuild lost Bluetooth transport through HCI/FLR, delay reconnect until ready | Driver patches included; repeated auto-reconnect/audio and initially-off Bluetooth passes; ResumeDelay5 is documented, not auto-installed |
-| Wi-Fi re-enable after Wi-Fi-off sleep | Firmware query timeout could falsely return interface-open success; Wi-Fi recovery coincided with Bluetooth loss | Transport-error propagation plus optional, narrowly scoped Wi-Fi function0 reset | Both patches included; latest functional cycle passed without executing Wi-Fi reset; one earlier unexpected reboot remains unexplained |
+| Real S3 suspend | Firmware did not acknowledge the Wi-Fi D3 request; sleep aborted | Asahi-derived control-ring mailbox, host capability and IRQ/startup driver patches | Automatic installer/migration and DKMS rebuilds included; repeated actual S3 driver passes on tested machine |
+| Bluetooth resume and AirPods audio | Bond/connection indicators survived but firmware transport, discovery or audio did not | Restore vendor windows, rebuild lost Bluetooth transport through HCI/FLR, delay reconnect until ready | Driver patches included; repeated auto-reconnect/audio and initially-off Bluetooth passes; installer applies ResumeDelay5 |
+| Wi-Fi re-enable after Wi-Fi-off sleep | Firmware query timeout could falsely return interface-open success; Wi-Fi recovery coincided with Bluetooth loss | Transport-error propagation plus optional, narrowly scoped Wi-Fi function0 reset | Both patches installed on the supported model; latest functional cycle passed without executing Wi-Fi reset; one earlier unexpected reboot remains unexplained |
 | Retire old sleep workaround | Unloading Wi-Fi around sleep introduced Bluetooth failures | Remove unload helper/install path; guarded retirement migration | Integrated; remains removed |
 
 The latest Wi-Fi-off suspend/re-enable test passed with actual internet traffic
@@ -37,11 +37,9 @@ part of the Omarchy source installation paths. Existing commands include
 `omarchy setup t2-wifi-recovery` and `omarchy setup t2-bluetooth`; the linked
 manuals document scope, verification and rollback.
 
-The new suspend work is a kernel-driver source package. Checking out or updating
-this branch does **not** automatically replace kernel modules or install the
-experimental boot image. Follow the package documentation for source reproduction;
-distribution kernel packaging remains separate. Machine-specific captures,
-firmware, generated kernels/UKIs and credentials are not included.
+The suspend driver set now has an [automatic installer and kernel-update integration](docs/t2-suspend/INSTALLATION.md). Fresh setup and a normal upgrade migration install the DKMS drivers on the supported MacBookAir9,1, apply the tested reconnect policy, and rebuild its normal boot image. The next ordinary boot activates them. See [user setup and rollback](manual/t2-suspend.md). No manual lab-image selection or full kernel build is required.
+
+The automatic installer's transaction tests and isolated DKMS build/install validation are documented separately from the driver hardware tests. A fresh hardware boot of this new installation path has not yet been validated. Machine-specific captures, firmware, generated kernels/UKIs and credentials are not included.
 
 The original Omarchy project information follows.
 
