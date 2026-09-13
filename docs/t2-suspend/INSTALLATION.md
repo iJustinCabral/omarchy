@@ -70,3 +70,9 @@ The real source fetch passed all pinned hashes. DKMS3.4.3 built all five modules
 A real mkinitcpio image generated under `/tmp` passed with the installed hook, all replacement Wi-Fi modules and the source-verification marker; Bluetooth was absent from early boot as intended. Missing dependencies in an earlier incomplete fixture exposed the need to terminate on accumulated build errors, which the final hook checks. No live `/boot` or system module files were modified.
 
 Twelve installer tests and five source-preparation tests passed, along with shell setup/migration/CLI/error-routing fixtures. Existing trackpad, T2 hardware, Bluetooth installer/gate, Wi-Fi recovery and sleep-retirement suites passed. The CLI suite passed; it retained its unrelated sandbox theme-lock warning. This is isolated installation/build validation, not a fresh hardware boot of the automatic installer.
+
+### First live deployment: ready for ordinary boot
+
+On September12, the committed installer was run on the test MacBookAir9,1. DKMS installation and the manager's verification passed. Independent extraction of the generated normal T2 UKI confirmed the unchanged stock kernel, all four matching Wi-Fi modules, embedded policy and source marker, and no early Bluetooth module. The normal menu hash matches its image. All existing test images and their menu entries were preserved.
+
+The temporary lab Bluetooth load override was backed up and removed without unloading Bluetooth. A lab-only `noresume` guard prevents the old hibernation target from being used during this S3-driver boot validation; it is not part of the automatic installer. The running session remains on the earlier test image. A user-operated boot of the normal entry is the next validation step; no such hardware pass is claimed yet.
