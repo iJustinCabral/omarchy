@@ -14,7 +14,9 @@ Machines without a shipped profile are untouched.
 
 ## Safety
 
-Keep the DSP volume around 75% or below. The raw converter stays at 100%. Selecting the hidden raw speaker node bypasses the woofer limiter.
+The raw converter stays at 100%. User volume is the DSP sink only — do not also map it onto the loudness-comp plugin, or the fader is applied twice and the speakers go anemic. The woofer limiter is the last stage; selecting the hidden raw speaker node bypasses it.
+
+Bass is quieter than unprocessed output on purpose (the FIR protects tiny MacBook woofers). Midrange should be near old loudness.
 
 Validated live on MacBookAir9,1: both speaker FIR and three-capsule mic beamformer linked in PipeWire 1.6.8 / WirePlumber 0.5.17. Other models are the upstream t2linux graphs with the same wrapper; they are not re-measured here.
 

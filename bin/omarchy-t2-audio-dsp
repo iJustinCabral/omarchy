@@ -214,7 +214,7 @@ case "$action" in
     rm -f "$wp_disabled"
     reload_wp
     echo "Installed T2 DSP profile $model."
-    echo "Keep volume on MacBook Speakers around 75% or below; the raw device stays at 100%."
+    echo "Volume keys control the DSP sink; the raw device stays at 100% behind the limiter."
     ;;
 
   *)

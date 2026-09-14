@@ -23,7 +23,7 @@
         "name": "ell",
         "control": {
           "enabled": 1,
-          "input": 1.0,
+          "input": 1.5,
           "fft": 4
         }
       },
@@ -43,7 +43,7 @@
         "name": "elr",
         "control": {
           "enabled": 1,
-          "input": 1.0,
+          "input": 1.5,
           "fft": 4
         }
       },
@@ -224,20 +224,6 @@
       "RW:Out",
       "RW2:Out",
       "convRT:Out"
-    ],
-    "capture.volumes": [
-      {
-        "control": "ell:volume",
-        "min": -65.0,
-        "max": 0.0,
-        "scale": "cubic"
-      },
-      {
-        "control": "elr:volume",
-        "min": -65.0,
-        "max": 0.0,
-        "scale": "cubic"
-      }
     ]
   },
   "capture.props": {
