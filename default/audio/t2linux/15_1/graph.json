@@ -191,6 +191,20 @@
       "convRW:Out",
       "convLT:Out",
       "convRT:Out"
+    ],
+    "capture.volumes": [
+      {
+        "control": "ell:volume",
+        "min": -18.0,
+        "max": 0.0,
+        "scale": "cubic"
+      },
+      {
+        "control": "elr:volume",
+        "min": -18.0,
+        "max": 0.0,
+        "scale": "cubic"
+      }
     ]
   },
   "capture.props": {

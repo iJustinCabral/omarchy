@@ -14,9 +14,9 @@ Machines without a shipped profile are untouched.
 
 ## Safety
 
-The raw converter stays at 100%. User volume is the DSP sink only — do not also map it onto the loudness-comp plugin, or the fader is applied twice and the speakers go anemic. The woofer limiter is the last stage; selecting the hidden raw speaker node bypasses it.
+The raw converter stays at 100%. User volume is mapped onto the loudness-comp **control** (`capture.volumes`, cubic −18 dB to 0 dB) instead of a second digital amp. A PulseAudio cubic fader alone is −18 dB at 50%, which with the FIR bass cut is basically mute; driving loud_comp keeps the bottom half of the slider usable. The original −40 dB floor made even 80% anemic.
 
-Bass is quieter than unprocessed output on purpose (the FIR protects tiny MacBook woofers). Midrange should be near old loudness.
+The woofer limiter is the last stage; selecting the hidden raw speaker node bypasses it. Bass stays a bit quieter than unprocessed output on purpose.
 
 Validated live on MacBookAir9,1: both speaker FIR and three-capsule mic beamformer linked in PipeWire 1.6.8 / WirePlumber 0.5.17. Other models are the upstream t2linux graphs with the same wrapper; they are not re-measured here.
 

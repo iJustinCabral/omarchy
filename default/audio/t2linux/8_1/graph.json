@@ -150,6 +150,20 @@
     "outputs": [
       "woofer_lim:out_l",
       "woofer_lim:out_r"
+    ],
+    "capture.volumes": [
+      {
+        "control": "ell:volume",
+        "min": -18.0,
+        "max": 0.0,
+        "scale": "cubic"
+      },
+      {
+        "control": "elr:volume",
+        "min": -18.0,
+        "max": 0.0,
+        "scale": "cubic"
+      }
     ]
   },
   "capture.props": {
