@@ -1,0 +1,31 @@
+#!/bin/bash
+
+# omarchy:summary=Print the T2 speaker/mic DSP profile for this Mac, if one ships
+# omarchy:hidden=true
+
+# Requires an Apple T2 coprocessor and a DMI product name with a vendored
+# t2linux audio graph. Prints the profile directory name (for example 9_1)
+# and exits 0. Exit 1 when this machine has no shipped profile.
+#
+# Drain lspci fully; grep -q would SIGPIPE and look like "no such hardware" (#6608).
+
+pci=$(lspci -nn 2>/dev/null || true)
+if [[ $pci != *106b:1801* && $pci != *106b:1802* ]]; then
+  exit 1
+fi
+
+product=$(tr -d '\0' </sys/class/dmi/id/product_name 2>/dev/null || true)
+[[ -n $product ]] || exit 1
+
+models="${OMARCHY_T2_AUDIO_MODELS:-$OMARCHY_PATH/default/audio/t2linux/models}"
+[[ -r $models ]] || exit 1
+
+while read -r dmi dir; do
+  [[ $dmi == \#* || -z $dmi ]] && continue
+  if [[ $dmi == "$product" ]]; then
+    printf '%s\n' "$dir"
+    exit 0
+  fi
+done <"$models"
+
+exit 1

@@ -1,6 +1,6 @@
 # T2 support: reviewer guide
 
-This branch combines independently scoped fixes for internal trackpad classification, saved-off Wi-Fi recovery, Bluetooth startup and real S3 suspend with radio recovery. Start with the [fix index](../README.md). The most recent validation is a normal stock-kernel boot with the installed DKMS drivers, followed by a short real S3 cycle with working Bluetooth and audio.
+This branch combines independently scoped fixes for internal trackpad classification, saved-off Wi-Fi recovery, Bluetooth startup, real S3 suspend with radio recovery, and measured speaker/mic DSP. Start with the [fix index](../README.md). The most recent validation is a normal stock-kernel boot with the installed DKMS drivers, followed by a short real S3 cycle with working Bluetooth and audio.
 
 ## Review by component
 
@@ -10,6 +10,7 @@ This branch combines independently scoped fixes for internal trackpad classifica
 | Saved-off Wi-Fi | [watcher](../install/hardware/apple/t2-wifi-recovery.py), bounded firmware-stall recovery | [design and ownership](t2-wifi-recovery.md) | [tests](../test/shell.d/t2-wifi-recovery-test.sh), [earlier stock validation](t2-validation.md) |
 | Bluetooth startup | [readiness gate](../install/hardware/apple/t2-bluetooth/gate.py), Wi-Fi readiness before Bluetooth and desktop startup | [transactional manager](../install/hardware/apple/t2-bluetooth/manage.py), [design](t2-bluetooth-installer.md) | [installer tests](../test/shell.d/t2-bluetooth-installer-test.sh), [gate tests](../test/shell.d/t2-bluetooth-qualified-test.sh) |
 | S3 and radio resume | [ten ordered driver patches](../packages/t2-suspend/README.md), [protocol and recovery design](t2-suspend/README.md) | [DKMS installer, firmware inclusion and rollback](t2-suspend/INSTALLATION.md) | [installer tests](../test/shell.d/t2-suspend-installer-test.sh), [normal boot and S3 validation](t2-suspend/VALIDATION.md) |
+| Speaker and mic DSP | [WirePlumber FIR wrapper](t2-audio-dsp.md), t2linux graphs under `default/audio/t2linux/` | [setup leaf](../install/hardware/apple/fix-t2-audio-dsp.sh), [first-run](../install/user/first-run/t2-audio-dsp.sh) | [profile and enable tests](../test/shell.d/t2-audio-dsp-test.sh), live MacBookAir9,1 PipeWire graph |
 | Old sleep workaround retirement | Removes Wi-Fi unload-around-sleep behavior implicated in Bluetooth failures | [guarded retirement migration](../migrations/1789075037.sh) | [retirement tests](../test/shell.d/t2-retire-sleep-test.sh) |
 
 The [hardware dispatcher](../install/hardware/all.sh) establishes the T2 kernel and Apple firmware, then Bluetooth ordering, then the suspend driver installation. Setup commands and migrations share the component managers. Each manager retains its own configuration ownership and rollback; rolling back the suspend drivers does not remove the trackpad or Bluetooth startup fixes.
