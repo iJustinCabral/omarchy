@@ -120,6 +120,10 @@ PM trace writes a device hash into the hardware clock so the next boot can repor
 
 ## Test sequence
 
+### Wi-Fi image isolation qualification
+
+On boot `25f6b949-99b3-4d7b-9073-bc7c5a56cee4`, checkpoint `27208506` ran `freezer --wifi-unbind --bluetooth-off` through the durable local unit `mba-hibernate-wifi-freezer.service`. The September 20 11:20:20–11:20:27 journal records Wi-Fi unbinding, freezer entry/return, and successful rebinding with service exit 0. Firmware initialization completed at 11:20:28 and NetworkManager reconnected Wi-Fi automatically. This validates the basic detach/reprobe lifecycle without an image or device suspend. Firmware logged a P2P-interface creation error (`-52`), despite the normal station connection returning; do not interpret this result as validation of every Wi-Fi mode. Deeper isolation tests remain pending.
+
 ### Recovery boot after package 1.4 installation
 
 The continuity reboot from checkpoint `9ee92a79` reached a Limine EFI hash mismatch on the normal entry. The operator selected snapshot 1; the resulting root was a temporary overlay and loaded older drivers, so this was not a successful 1.4 boot. The primary root's receipt still reported 1.4 installed, and extraction of the normal UKI confirmed Wi-Fi source version `1D85357EB5E65B246EDEE20`.
