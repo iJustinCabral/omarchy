@@ -58,6 +58,7 @@ def prepare(wifi, bluetooth, output, profile):
         # Only a fully verified source tree is published; an existing output is refused.
         if output.exists():
             raise ValueError('Output appeared during preparation')
+        root.chmod(0o755)
         root.rename(output)
     print(f'PASS: {profile} source matches pinned manifest: {output}')
 

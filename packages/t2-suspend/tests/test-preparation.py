@@ -47,6 +47,7 @@ class Preparation(unittest.TestCase):
         self.assertEqual((self.out / 'drivers/net/wireless/broadcom/brcm80211/a.c').read_bytes(), b'new\n')
         self.assertEqual((self.wifi / 'a.c').read_bytes(), b'old\n')
         self.assertTrue(json.loads((self.out / 'provenance.json').read_text())['source_parity'])
+        self.assertEqual(self.out.stat().st_mode & 0o777, 0o755)
 
     def test_existing_output_preserved(self):
         self.out.mkdir()
