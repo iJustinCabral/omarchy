@@ -11,6 +11,10 @@ SYS_POWER=${OMARCHY_T2_HIBERNATE_SYS_POWER:-/sys/power}
 DMI_ROOT=${OMARCHY_T2_HIBERNATE_DMI_ROOT:-/sys/class/dmi/id}
 CMDLINE_FILE=${OMARCHY_T2_HIBERNATE_CMDLINE:-/proc/cmdline}
 TESTED_MODEL="MacBookAir9,1"
+TEST_CLEANUP_ARMED=false
+TEST_PREVIOUS_PM_TEST=""
+TEST_PREVIOUS_DISK=""
+TEST_BLUETOOTH_WAS_POWERED=false
 
 usage() {
   cat <<'USAGE'
@@ -158,6 +162,23 @@ write_power_setting() {
   printf '%s\n' "$value" | sudo tee "$file" >/dev/null
 }
 
+restore_test_state() {
+  if ! $TEST_CLEANUP_ARMED; then
+    return 0
+  fi
+
+  TEST_CLEANUP_ARMED=false
+  if [[ -n $TEST_PREVIOUS_PM_TEST ]]; then
+    write_power_setting "$SYS_POWER/pm_test" "$TEST_PREVIOUS_PM_TEST" || true
+  fi
+  if [[ -n $TEST_PREVIOUS_DISK ]]; then
+    write_power_setting "$SYS_POWER/disk" "$TEST_PREVIOUS_DISK" || true
+  fi
+  if $TEST_BLUETOOTH_WAS_POWERED; then
+    timeout 5s bluetoothctl power on >/dev/null 2>&1 || true
+  fi
+}
+
 run_test() {
   local stage="$1"
   shift
@@ -165,9 +186,6 @@ run_test() {
   local assume_yes=false
   local disk_mode=""
   local model="unknown"
-  local previous_pm_test
-  local previous_disk
-  local bluetooth_was_powered=false
 
   while (( $# > 0 )); do
     case "$1" in
@@ -257,25 +275,17 @@ run_test() {
   fi
 
   sudo -v
-  previous_pm_test=$(selected_value "$SYS_POWER/pm_test")
-  previous_disk=$(selected_value "$SYS_POWER/disk")
-
-  restore_test_state() {
-    if [[ -n $previous_pm_test ]]; then
-      write_power_setting "$SYS_POWER/pm_test" "$previous_pm_test" || true
-    fi
-    if [[ -n $previous_disk ]]; then
-      write_power_setting "$SYS_POWER/disk" "$previous_disk" || true
-    fi
-    if $bluetooth_was_powered; then
-      timeout 5s bluetoothctl power on >/dev/null 2>&1 || true
-    fi
-  }
-  trap restore_test_state EXIT INT TERM
+  TEST_PREVIOUS_PM_TEST=$(selected_value "$SYS_POWER/pm_test")
+  TEST_PREVIOUS_DISK=$(selected_value "$SYS_POWER/disk")
+  TEST_BLUETOOTH_WAS_POWERED=false
+  TEST_CLEANUP_ARMED=true
+  trap restore_test_state EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
   if $bluetooth_off; then
     if bluetooth_powered; then
-      bluetooth_was_powered=true
+      TEST_BLUETOOTH_WAS_POWERED=true
       timeout 5s bluetoothctl power off >/dev/null
       if ! wait_for_bluetooth_power off; then
         echo "Bluetooth did not power down; refusing to start the PM test." >&2
@@ -303,7 +313,11 @@ run_test() {
   sync
   logger --tag omarchy-t2-hibernate-test "starting stage=$stage bluetooth_off=$bluetooth_off disk_mode=${disk_mode:-current}"
   echo "Entering kernel test..."
-  write_power_setting "$SYS_POWER/state" disk
+  if ! write_power_setting "$SYS_POWER/state" disk; then
+    logger --tag omarchy-t2-hibernate-test "failed stage=$stage bluetooth_off=$bluetooth_off disk_mode=${disk_mode:-current}"
+    echo "The kernel rejected the '$stage' test. Inspect the kernel journal before retrying." >&2
+    return 1
+  fi
   logger --tag omarchy-t2-hibernate-test "returned stage=$stage bluetooth_off=$bluetooth_off disk_mode=${disk_mode:-current}"
   restore_test_state
   trap - EXIT INT TERM

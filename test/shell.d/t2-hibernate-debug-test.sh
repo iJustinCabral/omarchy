@@ -129,6 +129,23 @@ grep -Fq 'logger --tag omarchy-t2-hibernate-test starting stage=test-resume blue
 [[ $(<"$power/pm_test") == "none" ]] || fail "test-resume restores the previous PM test level"
 pass "test-resume is explicit and restores kernel controls"
 
+: >"$calls"
+printf 'on\n' >"$bluetooth_state"
+printf '[platform] shutdown reboot suspend test_resume\n' >"$power/disk"
+printf '[none] core processors platform devices freezer\n' >"$power/pm_test"
+chmod 444 "$power/state"
+if output=$($command test test-resume --bluetooth-off --yes 2>&1); then
+  fail "test-resume must report a rejected state transition"
+fi
+chmod 644 "$power/state"
+[[ $output == *"The kernel rejected the 'test-resume' test."* ]] || fail "failed test reports the kernel rejection"
+[[ $output != *"unbound variable"* ]] || fail "failed test cleanup must retain its state"
+grep -Fq 'logger --tag omarchy-t2-hibernate-test failed stage=test-resume bluetooth_off=true disk_mode=current' "$calls" || fail "failed test records its failure"
+[[ $(<"$power/disk") == "platform" ]] || fail "failed test restores the previous disk mode"
+[[ $(<"$power/pm_test") == "none" ]] || fail "failed test restores the previous PM test level"
+[[ $(<"$bluetooth_state") == "on" ]] || fail "failed test restores Bluetooth"
+pass "failed power transition preserves its error and restores temporary state"
+
 printf '0:0\n' >"$power/resume"
 if $command test test-resume --yes >/dev/null 2>&1; then
   fail "test-resume must reject an unconfigured kernel resume device"
