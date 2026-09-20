@@ -52,6 +52,10 @@ if TEST_INSTALL_STATUS=1 bash -euo pipefail "$ROOT/migrations/1789872502.sh"; th
 bash -euo pipefail "$ROOT/migrations/1789905053.sh"
 grep -qx setup "$TEST_CALLS" || fail "BCE driver upgrade migration invokes setup"
 if TEST_INSTALL_STATUS=1 bash -euo pipefail "$ROOT/migrations/1789905053.sh"; then fail "BCE driver upgrade failure must remain pending"; fi
+: > "$TEST_CALLS"
+bash -euo pipefail "$ROOT/migrations/1789909734.sh"
+grep -qx setup "$TEST_CALLS" || fail "Wi-Fi hibernation upgrade migration invokes setup"
+if TEST_INSTALL_STATUS=1 bash -euo pipefail "$ROOT/migrations/1789909734.sh"; then fail "Wi-Fi hibernation upgrade failure must remain pending"; fi
 pass "T2 suspend setup, CLI and migration routing; failure propagation"
 
 # The initcpio hook must abort before image publication on a missing replacement.

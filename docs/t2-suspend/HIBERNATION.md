@@ -101,6 +101,8 @@ This pass validates the new BCE freeze/thaw boundary without writing or restorin
 
 Wi-Fi did not survive this traced run either. Immediately after image restoration, `brcmfmac` flooded invalid packet-ID errors, later timed out firmware commands and left the bus down. Pairing freeze/thaw fixed the earlier missing D0 transition but did not make its message-buffer rings safe across memory rewind. Wi-Fi restore remains a separate blocker after BCE ordering is corrected.
 
+Patch `0003-brcmfmac-rebuild-transport-after-image-restore.patch` now separates `.restore` from the ordinary `.resume` and `.thaw` paths. Thaw still sends the stateful D0 notification needed to write the image. Restore instead selects the existing MacBookAir9,1-scoped function-0 FLR path, stopping DMA before rebuilding firmware, message-buffer rings and packet-ID tables; systems without that explicit opt-in retain the upstream hot-resume behavior. The patch and callback invariant pass, and the complete Wi-Fi module set builds cleanly against the running T2 kernel. This is not yet hardware validation. After installing the next DKMS revision and confirming a normal boot, the next boundary is `test-resume --bluetooth-off --pm-trace`.
+
 The second forced restart lost the callback tail because device and console logging had already been quiesced. The guarded command therefore supports the kernel's [RTC-backed PM trace](https://github.com/torvalds/linux/blob/master/Documentation/power/s2ram.rst#using-trace_resume) for the next diagnostic attempt:
 
 ```bash

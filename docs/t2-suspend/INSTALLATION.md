@@ -14,7 +14,7 @@ Setup installs DKMS, matching T2 headers, compiler, make and patch through Omarc
 
 | Location | Purpose |
 | --- | --- |
-| `/usr/src/omarchy-t2-radio-1.2/` | Verified driver source and DKMS build description |
+| `/usr/src/omarchy-t2-radio-1.3/` | Verified driver source and DKMS build description |
 | `/var/lib/dkms/omarchy-t2-radio/` | DKMS builds, installation records and archived original modules |
 | `/usr/share/dkms/modules_to_force_install/omarchy-t2-radio` | Replace the complete radio set even when a vendor companion's source version equals stock |
 | `/etc/modprobe.d/omarchy-t2-suspend.conf` | Enable the model-scoped Wi-Fi recovery option from the tested image |

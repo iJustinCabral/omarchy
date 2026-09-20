@@ -1,11 +1,6 @@
 # T2 suspend driver source package
 
-This package consolidates the driver changes tested on MacBookAir9,1, BCM4377,
-Omarchy 4.0.3 and `7.2.4-arch1-Watanare-T2-1-t2`. It contains twelve patches,
-pinned source and patch hashes, source preparation, and extracted-C fault tests.
-Fresh setup and an upgrade migration now build/install these modules automatically through DKMS on the supported model; see [installer lifecycle and validation](../../docs/t2-suspend/INSTALLATION.md). Existing trackpad, Wi-Fi recovery and Bluetooth startup installers remain
-available. See [the branch overview](../../README.md) and
-[mechanisms and validation](../../docs/t2-suspend/README.md).
+This package consolidates the driver changes tested on MacBookAir9,1, BCM4377, Omarchy 4.0.3 and `7.2.4-arch1-Watanare-T2-1-t2`. It contains thirteen patches, pinned source and patch hashes, source preparation, and extracted-C fault tests. Fresh setup and an upgrade migration now build/install these modules automatically through DKMS on the supported model; see [installer lifecycle and validation](../../docs/t2-suspend/INSTALLATION.md). Existing trackpad, Wi-Fi recovery and Bluetooth startup installers remain available. See [the branch overview](../../README.md) and [mechanisms and validation](../../docs/t2-suspend/README.md).
 
 ## Patch series
 
@@ -13,8 +8,8 @@ available. See [the branch overview](../../README.md) and
 | --- | --- | --- |
 | `patches/wifi/` | 0001 control-ring mailbox; 0002 host capabilities; 0003 IRQ/startup; 0004 partial-attach guard; 0005 bounded diagnostics; 0006 complete hibernation callbacks | Patches 0001–0005 passed repeated actual S3 and audio recovery with the Bluetooth series; 0006 is based on the isolated `test_resume` failure and awaits hardware validation |
 | `patches/bluetooth/` | 0001 restore vendor windows; 0002 stop publishing failed rings; 0003 rebuild lost transport through HCI lifecycle and Bluetooth FLR | Repeated S3, automatic AirPods reconnect, initially-off Bluetooth recovery |
-| `patches/wifi-reenable/` | 0001 propagate interface-open transport failure; 0002 explicit Wi-Fi function0 reset | Included from current test image; successful Wi-Fi-off cycle did not execute reset; earlier unexpected reboot remains unexplained |
-| `patches/bce/` | 0001 run the existing BCE stateful handshake for freeze/thaw/restore | Source and callback invariants pass; awaits staged `devices` and `test_resume` hardware validation |
+| `patches/wifi-reenable/` | 0001 propagate interface-open transport failure; 0002 explicit Wi-Fi function0 reset; 0003 rebuild firmware and rings after image restoration | 0003 is based on the observed packet-ID/ring desynchronization and awaits `test_resume` hardware validation |
+| `patches/bce/` | 0001 run the existing BCE stateful handshake for freeze/thaw/restore | The staged `devices` freeze/thaw test passed with working internal input; `test_resume` remains pending |
 
 Patch headers and copied evidence retain their original experiment status.
 The current status is in this README and the consolidated validation document.
@@ -72,6 +67,12 @@ python3 packages/t2-suspend/tests/test-open.py /tmp/t2-s3-source/drivers/net/wir
 python3 packages/t2-suspend/tests/test-hibernate-pm.py /tmp/t2-s3-source/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
 python3 packages/t2-suspend/tests/test-bce-hibernate-pm.py /tmp/t2-s3-source/drivers/staging/t2bce/t2bce_core/t2bce_main.c
 python3 packages/t2-suspend/tests/test-flr.py
+```
+
+The automatic installer's image-restore profile has a distinct restore invariant:
+
+```sh
+python3 packages/t2-suspend/tests/test-hibernate-pm.py /tmp/t2-wifi-reenable-source/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c --image-rebuild
 ```
 
 These execute extracted C, source invariants or the exact FLR helper with failure injection. They

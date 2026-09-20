@@ -15,7 +15,7 @@ import tempfile
 HERE = Path(__file__).resolve().parent
 PACKAGE = HERE.parent
 REPO = HERE.parents[2]
-NAME, VERSION = 'omarchy-t2-radio', '1.2'
+NAME, VERSION = 'omarchy-t2-radio', '1.3'
 
 def source_name(version):
   return f'usr/src/{NAME}-{version}'
