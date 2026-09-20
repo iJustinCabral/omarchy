@@ -1,0 +1,41 @@
+Subject: [DIAGNOSTIC ONLY] t2bce: opt-in abort before image restore handshake
+
+Not part of the installed patch series. This does not fix hibernation.
+With hibernate_restore_abort=1, .restore returns before issuing a firmware
+message. The restored kernel may lose internal input and audio; a local
+durable job and a verified reboot path are required. Ordinary suspend,
+freeze/thaw, and default image restore behavior are unchanged.
+
+--- a/drivers/staging/t2bce/t2bce_core/t2bce_main.c
++++ b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
+@@ -705,6 +705,21 @@ static struct pci_device_id t2bce_ids[  ] = {
+ 
+ MODULE_DEVICE_TABLE(pci, t2bce_ids);
+ 
++static bool hibernate_restore_abort;
++module_param(hibernate_restore_abort, bool, 0444);
++MODULE_PARM_DESC(hibernate_restore_abort,
++        "Diagnostic only: abort image restore before the BCE firmware handshake");
++
++static int t2bce_image_restore(struct device *dev)
++{
++    if (hibernate_restore_abort) {
++        pr_err("t2bce_core: diagnostic image restore aborted before firmware handshake\n");
++        return -ECANCELED;
++    }
++
++    return t2bce_resume(dev);
++}
++
+ struct dev_pm_ops t2bce_pci_driver_pm = {
+         .prepare = t2bce_prepare,
+         .suspend = t2bce_suspend,
+@@ -711,7 +726,7 @@ struct dev_pm_ops t2bce_pci_driver_pm = {
+         .resume = t2bce_resume,
+         .freeze = t2bce_suspend,
+         .thaw = t2bce_resume,
+-        .restore = t2bce_resume,
++        .restore = t2bce_image_restore,
+         .complete = t2bce_complete
+ };
+ struct pci_driver t2bce_pci_driver = {
