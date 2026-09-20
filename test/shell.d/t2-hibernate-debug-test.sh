@@ -74,6 +74,9 @@ SH
 cat >"$stub_bin/sudo" <<'SH'
 #!/bin/bash
 printf 'sudo %s\n' "$*" >>"$TEST_CALLS"
+if [[ ${1:-} == "-n" ]]; then
+  shift
+fi
 if [[ ${1:-} == "-v" ]]; then
   exit 0
 fi
@@ -147,6 +150,16 @@ grep -Fq 'logger --tag omarchy-t2-hibernate-test returned stage=freezer bluetoot
 [[ $(<"$power/pm_test") == "none" ]] || fail "freezer test restores the previous PM test level"
 [[ $(<"$bluetooth_state") == "on" ]] || fail "freezer test leaves Bluetooth in its original state"
 pass "freezer isolation restores temporary PM and Bluetooth state"
+
+: >"$calls"
+printf 'on\n' >"$bluetooth_state"
+printf '[none] core processors platform devices freezer\n' >"$power/pm_test"
+$command test freezer --bluetooth-off --no-sudo-prompt --yes >/dev/null
+grep -Fxq 'sudo -n -v' "$calls" || fail "unattended test requires immediately available sudo"
+grep -Fq "sudo -n tee $power/state" "$calls" || fail "unattended test keeps sysfs writes noninteractive"
+[[ $(<"$power/pm_test") == "none" ]] || fail "unattended test restores the previous PM test level"
+[[ $(<"$bluetooth_state") == "on" ]] || fail "unattended test restores Bluetooth"
+pass "unattended test fails closed instead of prompting for sudo"
 
 : >"$calls"
 printf '[none] core processors platform devices freezer\n' >"$power/pm_test"

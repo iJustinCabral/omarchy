@@ -2,7 +2,7 @@
 
 # omarchy:summary=Inspect and run guarded T2 hibernation diagnostics
 # omarchy:group=debug
-# omarchy:args=<check|test> [freezer|devices|platform|processors|core|snapshot-create|test-resume] [--bluetooth-off] [--wifi-unbind] [--pm-trace] [--disk-mode <platform|shutdown>] [--yes]
+# omarchy:args=<check|test> [freezer|devices|platform|processors|core|snapshot-create|test-resume] [--bluetooth-off] [--wifi-unbind] [--pm-trace] [--disk-mode <platform|shutdown>] [--no-sudo-prompt] [--yes]
 # omarchy:examples=omarchy debug t2-hibernate check | omarchy debug t2-hibernate test freezer --bluetooth-off
 
 set -euo pipefail
@@ -21,12 +21,13 @@ TEST_PREVIOUS_DISK=""
 TEST_PREVIOUS_PM_TRACE=""
 TEST_BLUETOOTH_WAS_POWERED=false
 TEST_WIFI_DEVICE=""
+TEST_SUDO_ARGS=()
 
 usage() {
   cat <<'USAGE'
 Usage:
   omarchy debug t2-hibernate check
-  omarchy debug t2-hibernate test <freezer|devices|platform|processors|core|snapshot-create|test-resume> [--bluetooth-off] [--wifi-unbind] [--pm-trace] [--disk-mode <platform|shutdown>] [--yes]
+  omarchy debug t2-hibernate test <freezer|devices|platform|processors|core|snapshot-create|test-resume> [--bluetooth-off] [--wifi-unbind] [--pm-trace] [--disk-mode <platform|shutdown>] [--no-sudo-prompt] [--yes]
 
 The check is read-only. Tests use the kernel's direct hibernation test
 interface and can still freeze or reboot a broken machine. They do not change
@@ -52,6 +53,10 @@ time should correct it after reboot. Reboot promptly after a hang.
 
 The command asks for confirmation unless --yes is supplied. --yes only skips
 the prompt; it does not make a power test safe.
+
+Use --no-sudo-prompt only from an unattended harness that has already arranged
+passwordless sudo. It fails before isolation or PM changes if authorization is
+not immediately available.
 USAGE
 }
 
@@ -187,7 +192,7 @@ show_check() {
 write_power_setting() {
   local file="$1"
   local value="$2"
-  printf '%s\n' "$value" | sudo tee "$file" >/dev/null
+  printf '%s\n' "$value" | sudo "${TEST_SUDO_ARGS[@]}" tee "$file" >/dev/null
 }
 
 restore_test_state() {
@@ -267,6 +272,7 @@ run_test() {
   local wifi_unbind=false
   local pm_trace=false
   local assume_yes=false
+  local no_sudo_prompt=false
   local disk_mode=""
   local model="unknown"
 
@@ -283,6 +289,9 @@ run_test() {
         ;;
       --yes)
         assume_yes=true
+        ;;
+      --no-sudo-prompt)
+        no_sudo_prompt=true
         ;;
       --disk-mode)
         shift
@@ -391,7 +400,11 @@ run_test() {
     return 0
   fi
 
-  sudo -v
+  TEST_SUDO_ARGS=()
+  if $no_sudo_prompt; then
+    TEST_SUDO_ARGS=(-n)
+  fi
+  sudo "${TEST_SUDO_ARGS[@]}" -v
   TEST_PREVIOUS_PM_TEST=$(selected_value "$SYS_POWER/pm_test")
   TEST_PREVIOUS_DISK=$(selected_value "$SYS_POWER/disk")
   TEST_PREVIOUS_PM_TRACE=""
@@ -450,7 +463,7 @@ run_test() {
   echo "Entering kernel test..."
   local transition_status=0
   if [[ $stage == "snapshot-create" ]]; then
-    sudo "$SNAPSHOT_HELPER" --create-and-discard || transition_status=$?
+    sudo "${TEST_SUDO_ARGS[@]}" "$SNAPSHOT_HELPER" --create-and-discard || transition_status=$?
   else
     write_power_setting "$SYS_POWER/state" disk || transition_status=$?
   fi
