@@ -47,16 +47,21 @@ Boot `087573321047465480d6a9884483235c` produced the first controlled boundary:
 | `devices --bluetooth-off` | Passed | BCE VHCI suspend/resume returned status 0; five queues resumed with pending submissions |
 | `devices` | Passed with recovered fault | HCI opcode `0x0c01` timed out during resume; the controller was operational afterward |
 | `platform --bluetooth-off` with `platform` disk mode | Failed | Display returned but the session remained unresponsive and required a forced restart; no return marker or image survived |
+| `platform --bluetooth-off --disk-mode shutdown` | Passed | Device late/noirq callbacks, EC interrupt block/unblock, BCE VHCI resume and task restart completed; Wi-Fi and Bluetooth remained operational |
 
 The failed platform test started at monotonic time `922.370559`; the final durable kernel line was `PM: hibernation: hibernation entry` at `922.402052`. The next boot reported `PM: Image not found (code -22)`. This proves that no image was left behind, but not that execution stopped at the last durable line: device and filesystem logging was already being quiesced, and the display returning before input suggests a failure during rollback or resume is possible.
 
-The next discriminator keeps the `platform` PM depth while skipping ACPI S4 preparation:
+Boot `e180e61481f0417b847d7079470eec2b` then repeated the `platform` PM depth while skipping ACPI S4 preparation:
 
 ```bash
 omarchy debug t2-hibernate test platform --bluetooth-off --disk-mode shutdown
 ```
 
-If this returns, the ACPI S4 global methods are isolated. If it fails, the remaining delta from the passing `devices` test is the device late/noirq freeze/thaw path, which should be traced before any deeper test.
+That test returned successfully. The result isolates the failure to the ACPI S4 platform global path selected by `platform` disk mode, rather than device late/noirq freeze/thaw. The next stage keeps the working shutdown-mode path and adds non-boot CPU offlining:
+
+```bash
+omarchy debug t2-hibernate test processors --bluetooth-off --disk-mode shutdown
+```
 
 ## Test sequence
 
