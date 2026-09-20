@@ -1,0 +1,307 @@
+#!/bin/bash
+
+# omarchy:summary=Inspect and run guarded T2 hibernation diagnostics
+# omarchy:group=debug
+# omarchy:args=<check|test> [freezer|devices|platform|processors|core|test-resume] [--bluetooth-off] [--yes]
+# omarchy:examples=omarchy debug t2-hibernate check | omarchy debug t2-hibernate test freezer --bluetooth-off
+
+set -euo pipefail
+
+SYS_POWER=${OMARCHY_T2_HIBERNATE_SYS_POWER:-/sys/power}
+DMI_ROOT=${OMARCHY_T2_HIBERNATE_DMI_ROOT:-/sys/class/dmi/id}
+CMDLINE_FILE=${OMARCHY_T2_HIBERNATE_CMDLINE:-/proc/cmdline}
+TESTED_MODEL="MacBookAir9,1"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  omarchy debug t2-hibernate check
+  omarchy debug t2-hibernate test <freezer|devices|platform|processors|core|test-resume> [--bluetooth-off] [--yes]
+
+The check is read-only. Tests use the kernel's direct hibernation test
+interface and can still freeze or reboot a broken machine. They do not change
+persistent boot configuration.
+
+Start with:
+  omarchy debug t2-hibernate test freezer --bluetooth-off
+
+The command asks for confirmation unless --yes is supplied. --yes only skips
+the prompt; it does not make a power test safe.
+USAGE
+}
+
+selected_value() {
+  local file="$1"
+  sed -n 's/.*\[\([^]]*\)\].*/\1/p' "$file"
+}
+
+available_value() {
+  local file="$1"
+  local wanted="$2"
+  local value
+
+  for value in $(tr -d '[]' <"$file"); do
+    [[ $value == "$wanted" ]] && return 0
+  done
+
+  return 1
+}
+
+resume_arguments() {
+  local argument
+  local found=false
+
+  for argument in $(<"$CMDLINE_FILE"); do
+    case "$argument" in
+      resume=* | resume_offset=*)
+        printf '  %s\n' "$argument"
+        found=true
+        ;;
+    esac
+  done
+
+  if ! $found; then
+    echo "  none"
+  fi
+}
+
+bluetooth_powered() {
+  timeout 2s bluetoothctl show 2>/dev/null | grep -Fq "Powered: yes"
+}
+
+bluetooth_unpowered() {
+  timeout 2s bluetoothctl show 2>/dev/null | grep -Fq "Powered: no"
+}
+
+wait_for_bluetooth_power() {
+  local expected="$1"
+  local deadline=$((SECONDS + 5))
+
+  while (( SECONDS < deadline )); do
+    if [[ $expected == "on" ]] && bluetooth_powered; then
+      return 0
+    elif [[ $expected == "off" ]] && ! bluetooth_powered; then
+      return 0
+    fi
+    sleep 0.2
+  done
+
+  return 1
+}
+
+check_hardware() {
+  if ! omarchy-hw-t2; then
+    echo "This command only supports Apple T2 hardware." >&2
+    exit 1
+  fi
+}
+
+check_power_interface() {
+  local required
+
+  for required in state disk pm_test image_size; do
+    if [[ ! -r "$SYS_POWER/$required" ]]; then
+      echo "Missing hibernation interface: $SYS_POWER/$required" >&2
+      exit 1
+    fi
+  done
+
+  if ! available_value "$SYS_POWER/state" disk; then
+    echo "The running kernel does not advertise the disk sleep state." >&2
+    exit 1
+  fi
+}
+
+show_check() {
+  local model="unknown"
+  local board="unknown"
+
+  check_hardware
+  check_power_interface
+  [[ -r "$DMI_ROOT/product_name" ]] && model=$(<"$DMI_ROOT/product_name")
+  [[ -r "$DMI_ROOT/board_name" ]] && board=$(<"$DMI_ROOT/board_name")
+
+  echo "T2 hibernation diagnostic"
+  echo "  model: $model"
+  echo "  board: $board"
+  echo "  kernel: $(uname -r)"
+  echo "  power states: $(<"$SYS_POWER/state")"
+  echo "  hibernation modes: $(<"$SYS_POWER/disk")"
+  echo "  PM test levels: $(<"$SYS_POWER/pm_test")"
+  echo "  image size limit: $(<"$SYS_POWER/image_size") bytes"
+  if [[ -r "$SYS_POWER/resume" && -r "$SYS_POWER/resume_offset" ]]; then
+    echo "  kernel resume target: $(<"$SYS_POWER/resume") offset $(<"$SYS_POWER/resume_offset")"
+  fi
+  echo "  resume arguments:"
+  resume_arguments
+  echo "  active swap:"
+  swapon --show=NAME,SIZE,PRIO --noheadings 2>/dev/null | sed 's/^/    /' || echo "    unavailable"
+
+  if bluetooth_powered; then
+    echo "  Bluetooth: powered"
+  else
+    echo "  Bluetooth: off or unavailable"
+  fi
+
+  if [[ $model != "$TESTED_MODEL" ]]; then
+    echo
+    echo "Only $TESTED_MODEL is currently qualified for live tests."
+  fi
+}
+
+write_power_setting() {
+  local file="$1"
+  local value="$2"
+  printf '%s\n' "$value" | sudo tee "$file" >/dev/null
+}
+
+run_test() {
+  local stage="$1"
+  shift
+  local bluetooth_off=false
+  local assume_yes=false
+  local model="unknown"
+  local previous_pm_test
+  local previous_disk
+  local bluetooth_was_powered=false
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --bluetooth-off)
+        bluetooth_off=true
+        ;;
+      --yes)
+        assume_yes=true
+        ;;
+      *)
+        echo "Unknown option: $1" >&2
+        usage >&2
+        exit 1
+        ;;
+    esac
+    shift
+  done
+
+  check_hardware
+  check_power_interface
+  [[ -r "$DMI_ROOT/product_name" ]] && model=$(<"$DMI_ROOT/product_name")
+  if [[ $model != "$TESTED_MODEL" ]]; then
+    echo "Live hibernation tests are currently restricted to $TESTED_MODEL; found $model." >&2
+    exit 1
+  fi
+
+  case "$stage" in
+    freezer | devices | platform | processors | core)
+      if ! available_value "$SYS_POWER/pm_test" "$stage"; then
+        echo "The running kernel does not support the '$stage' PM test level." >&2
+        exit 1
+      fi
+      ;;
+    test-resume)
+      if ! available_value "$SYS_POWER/disk" test_resume; then
+        echo "The running kernel does not support test_resume." >&2
+        exit 1
+      fi
+      if [[ ! -r "$SYS_POWER/resume" || $(<"$SYS_POWER/resume") == "0:0" ]]; then
+        echo "The running kernel has no resume device configured; refusing test_resume." >&2
+        exit 1
+      fi
+      ;;
+    *)
+      echo "Unknown test stage: $stage" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+
+  echo "About to run the '$stage' kernel hibernation test on $model."
+  if [[ $stage == "freezer" ]]; then
+    echo "This exercises hibernation preparation and process freezing without suspending devices or entering ACPI S4."
+  elif [[ $stage == "test-resume" ]]; then
+    echo "This writes and immediately restores a hibernation image without entering ACPI S4. Save all work first."
+  else
+    echo "This suspends part of the live device/platform stack. Save all work first."
+  fi
+  echo "A kernel or driver fault can still require a forced restart."
+
+  if ! $assume_yes && ! gum confirm "Run the $stage test now?"; then
+    echo "Cancelled."
+    return 0
+  fi
+
+  sudo -v
+  previous_pm_test=$(selected_value "$SYS_POWER/pm_test")
+  previous_disk=$(selected_value "$SYS_POWER/disk")
+
+  restore_test_state() {
+    if [[ -n $previous_pm_test ]]; then
+      write_power_setting "$SYS_POWER/pm_test" "$previous_pm_test" || true
+    fi
+    if [[ -n $previous_disk ]]; then
+      write_power_setting "$SYS_POWER/disk" "$previous_disk" || true
+    fi
+    if $bluetooth_was_powered; then
+      timeout 5s bluetoothctl power on >/dev/null 2>&1 || true
+    fi
+  }
+  trap restore_test_state EXIT INT TERM
+
+  if $bluetooth_off; then
+    if bluetooth_powered; then
+      bluetooth_was_powered=true
+      timeout 5s bluetoothctl power off >/dev/null
+      if ! wait_for_bluetooth_power off; then
+        echo "Bluetooth did not power down; refusing to start the PM test." >&2
+        exit 1
+      fi
+      echo "Bluetooth powered down for notifier isolation."
+    elif bluetooth_unpowered; then
+      echo "Bluetooth was already off."
+    else
+      echo "Bluetooth power could not be verified; refusing the isolation test." >&2
+      exit 1
+    fi
+  fi
+
+  if [[ $stage == "test-resume" ]]; then
+    write_power_setting "$SYS_POWER/pm_test" none
+    write_power_setting "$SYS_POWER/disk" test_resume
+  else
+    write_power_setting "$SYS_POWER/pm_test" "$stage"
+  fi
+
+  sync
+  logger --tag omarchy-t2-hibernate-test "starting stage=$stage bluetooth_off=$bluetooth_off"
+  echo "Entering kernel test..."
+  write_power_setting "$SYS_POWER/state" disk
+  logger --tag omarchy-t2-hibernate-test "returned stage=$stage bluetooth_off=$bluetooth_off"
+  restore_test_state
+  trap - EXIT INT TERM
+  echo "The '$stage' test returned successfully."
+}
+
+case "${1:-}" in
+  check)
+    (( $# == 1 )) || {
+      usage >&2
+      exit 1
+    }
+    show_check
+    ;;
+  test)
+    (( $# >= 2 )) || {
+      usage >&2
+      exit 1
+    }
+    stage="$2"
+    shift 2
+    run_test "$stage" "$@"
+    ;;
+  -h | --help | "")
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 1
+    ;;
+esac

@@ -2,7 +2,7 @@
 
 The driver series enabled real S3 suspend and working Wi-Fi/Bluetooth recovery on the tested MacBookAir9,1. Repeated automatic AirPods reconnection and audible stereo playback were confirmed. The latest Wi-Fi-off suspend/re-enable cycle also passed. Earlier Wi-Fi-off failures and one unexplained reboot remain part of the record. The automatic installer subsequently passed normal boot and a short S3 cycle with working Bluetooth/audio; see the [deployment validation](VALIDATION.md).
 
-This is S3 support work, not a solution to the original hibernation boot loop. S4 image writing/restoration has not been validated. Other T2 models, kernel versions and fresh installation of the new driver package are not qualified.
+This is S3 support work, not yet a solution to the original hibernation boot loop. The MacBookAir9,1 entry failure has now been localized to the early kernel path before image creation, and a guarded staged diagnostic is available in the [hibernation investigation](HIBERNATION.md). S4 image writing/restoration has not been validated. Other T2 models, kernel versions and fresh installation of the new driver package are not qualified.
 
 ## 1. Why the old sleep workaround was removed
 
