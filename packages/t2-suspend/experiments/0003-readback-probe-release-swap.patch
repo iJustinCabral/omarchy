@@ -1,0 +1,42 @@
+Subject: [DIAGNOSTIC ONLY] release test image swap slots when not rewinding RAM
+
+Apply after 0002. Successful real image restoration rewinds the swap allocation
+state; the readback-only diagnostic must explicitly free its written image's
+slots instead. Also release them on bitmap-allocation or readback error.
+
+--- a/kernel/power/power.h
++++ b/kernel/power/power.h
+@@ -201,6 +201,7 @@ extern void swsusp_free(void);
+ extern int swsusp_read(unsigned int *flags_p);
+ extern int swsusp_write(unsigned int flags);
+ void swsusp_close(void);
++void swsusp_free_test_image(void);
+ #ifdef CONFIG_SUSPEND
+ extern int swsusp_unmark(void);
+ #else
+--- a/kernel/power/swap.c
++++ b/kernel/power/swap.c
+@@ -218,6 +218,12 @@ int swsusp_swap_in_use(void)
+ static unsigned short root_swap = 0xffff;
+ static struct file *hib_resume_bdev_file;
+ 
++void swsusp_free_test_image(void)
++{
++	/* Only called after a test_resume image was written and unmarked. */
++	free_all_swap_pages(root_swap);
++}
++
+ struct hib_bio_batch {
+ 	atomic_t		count;
+ 	wait_queue_head_t	wait;
+--- a/kernel/power/hibernate.c
++++ b/kernel/power/hibernate.c
+@@ -763,6 +763,8 @@ static int load_image_and_restore(void)
+ 	swsusp_free();
+ 	free_basic_memory_bitmaps();
+  Unlock:
++	if (hibernate_readback_probe && hibernation_mode == HIBERNATION_TEST_RESUME)
++		swsusp_free_test_image();
+ 	unlock_device_hotplug();
+ 
+ 	return error;

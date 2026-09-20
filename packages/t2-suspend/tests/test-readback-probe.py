@@ -7,6 +7,9 @@ import sys
 import tempfile
 
 source = Path(sys.argv[1]).read_text()
+swap = (Path(sys.argv[1]).parent / 'swap.c').read_text()
+release = re.search(r'void swsusp_free_test_image\(void\)\n\{.*?\n\}', swap, re.S)
+assert release
 function = re.search(r'static int load_image_and_restore\(void\)\n\{.*?\n\}', source, re.S)
 setup = re.search(r'static int __init hibernate_readback_probe_setup\(char \*value\)\n\{.*?\n\}', source, re.S)
 assert function and setup
@@ -24,7 +27,9 @@ harness = r'''
 #define pr_notice(...) (markers++)
 static bool hibernate_readback_probe;
 static int hibernation_mode, bitmap_error, read_error;
-static int locked, closes, reads, restores, freed, bitmap_freed, markers;
+static int locked, closes, reads, restores, freed, bitmap_freed, markers, swap_freed;
+static unsigned short root_swap = 42;
+static void free_all_swap_pages(int swap) { assert(swap == 42); swap_freed++; }
 static void lock_device_hotplug(void) { assert(!locked); locked = 1; }
 static void unlock_device_hotplug(void) { assert(locked); locked = 0; }
 static int create_basic_memory_bitmaps(void) { return bitmap_error; }
@@ -36,7 +41,7 @@ static int hibernation_restore(unsigned int platform) {
 static void swsusp_free(void) { freed++; }
 static void free_basic_memory_bitmaps(void) { bitmap_freed++; }
 '''
-harness += setup.group(0) + '\n' + function.group(0)
+harness += release.group(0) + '\n' + setup.group(0) + '\n' + function.group(0)
 harness += r'''
 int main(void) {
   assert(!hibernate_readback_probe);
@@ -53,8 +58,10 @@ int main(void) {
         bitmap_error = failure == 1 ? -ENOMEM : 0;
         read_error = failure == 2 ? -EIO : 0;
         locked = closes = reads = restores = freed = bitmap_freed = markers = 0;
+        swap_freed = 0;
         int result = load_image_and_restore();
         assert(!locked && closes == 1);
+        assert(swap_freed == (enabled && test_mode));
         if (bitmap_error) {
           assert(result == -ENOMEM && !reads && !restores && !freed && !bitmap_freed && !markers);
         } else {
