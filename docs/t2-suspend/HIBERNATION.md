@@ -118,6 +118,12 @@ PM trace writes a device hash into the hardware clock so the next boot can repor
 
 ## Test sequence
 
+### Recovery boot after package 1.4 installation
+
+The continuity reboot from checkpoint `9ee92a79` reached a Limine EFI hash mismatch on the normal entry. The operator selected snapshot 1; the resulting root was a temporary overlay and loaded older drivers, so this was not a successful 1.4 boot. The primary root's receipt still reported 1.4 installed, and extraction of the normal UKI confirmed Wi-Fi source version `1D85357EB5E65B246EDEE20`.
+
+The host-local verification command had used `objcopy --dump-section` on the live UKI without an explicit output file. Repeating that invocation on a private copy changed its BLAKE2 hash, demonstrating that the supposed read-only verification could rewrite the boot image. The bootstrap now supplies a separate output destination. The normal menu entry's hash was repaired after image inspection; both normal and snapshot EFI hashes then matched their files. Automatic reboot is blocked from snapshot-overlay sessions. A successful normal boot and autonomous continuation remain unvalidated; this recovery did not exercise hibernation.
+
 Advance only after the preceding stage returns successfully.
 
 | Stage | Kernel boundary | ACPI S4 entered | Image written |
