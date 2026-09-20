@@ -71,6 +71,7 @@ The first test with this image unexpectedly rebooted after Wi-Fi enable, accordi
 | Normal boot with automatically installed DKMS drivers | Passed | Corrected firmware packaging; Wi-Fi, Bluetooth and audio confirmed |
 | Normal-image short S3 cycle | Passed | Actual S3; Bluetooth recovery and audio confirmed; Wi-Fi interface up, no separate traffic probe |
 | Hibernation image write/readback | Passed intended diagnostic boundary | 2,716,000 KiB written and read with the kernel integrity checks before an opt-in stop ahead of memory restore |
+| Package 1.5 T2-audio device freeze/thaw | Passed | Patched audio suspended and resumed around the stateful BCE/VHCI sequence; internal input, T2 audio and both radios were available afterward |
 | Hibernation memory restore/S4 | Unresolved | Earlier tests reset after the now-qualified readback boundary; cold-boot restore and ACPI S4 remain unvalidated |
 
 Latest isolated Wi-Fi-off test boot ID: `ae9bd36d-1ee0-41af-86da-e5e3772f1851`. Interrupted boot: `439b59fc-6efa-4cc6-ab2f-4a759ef080e3`. Laboratory outcome commit: `68bf7e0`. No new suspend or reboot was requested or initiated during consolidation.
