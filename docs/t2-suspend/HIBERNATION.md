@@ -50,7 +50,8 @@ Boot `087573321047465480d6a9884483235c` produced the first controlled boundary:
 | `platform --bluetooth-off --disk-mode shutdown` | Passed | Device late/noirq callbacks, EC interrupt block/unblock, BCE VHCI resume and task restart completed; Wi-Fi and Bluetooth remained operational |
 | `processors --bluetooth-off --disk-mode shutdown` | Passed | CPUs 1–3 went offline and returned; all four CPUs, BCE VHCI, Wi-Fi and Bluetooth were operational afterward |
 | `core --bluetooth-off --disk-mode shutdown` | Passed | Snapshot memory was allocated, syscore suspend/resume returned, CPUs 1–3 were restored, and BCE VHCI, Wi-Fi and Bluetooth remained operational |
-| `test-resume --bluetooth-off` | Failed after image reload | The image was written and loaded completely; the second device-freeze pass failed when `brcmfmac` attempted a D3 mailbox send while its bus was already down |
+| `test-resume --bluetooth-off`, stock hibernation callback set | Failed after image reload | The image was written and loaded completely; the second device-freeze pass failed when `brcmfmac` attempted a D3 mailbox send while its bus was already down |
+| `test-resume --bluetooth-off`, complete `brcmfmac` callback set | Failed after two display cycles | The display blanked and returned for image creation, then blanked and returned again for image restoration; the visible session was unresponsive and required a forced restart. Wi-Fi appeared restored in the panel and Bluetooth remained intentionally off. Only hibernation entry and the start marker were durable. |
 
 The failed platform test started at monotonic time `922.370559`; the final durable kernel line was `PM: hibernation: hibernation entry` at `922.402052`. The next boot reported `PM: Image not found (code -22)`. This proves that no image was left behind, but not that execution stopped at the last durable line: device and filesystem logging was already being quiesced, and the display returning before input suggests a failure during rollback or resume is possible.
 
@@ -80,9 +81,21 @@ omarchy debug t2-hibernate test test-resume --bluetooth-off
 
 The image path advanced much farther than the original hibernation attempt. The kernel wrote 2,563,692 KiB, found the image signature, read the entire image and reported `Image successfully loaded`. During the second device-freeze pass, `brcmfmac` found its bus down, failed `HOST_D3_INFORM` with `-EIO`, and caused the kernel to abort restoration and recover the running system. Wi-Fi then continuously failed to reserve common-ring space until the machine was rebooted.
 
-This isolates the current `test_resume` failure to Broadcom Wi-Fi PM state between the first thaw and the second freeze. Do not repeat this test or attempt real hibernation until that driver transition is fixed.
+The first attempt isolated its `test_resume` failure to Broadcom Wi-Fi PM state between the first thaw and the second freeze. The callback patch below addressed that boundary. It did not make the complete test return, so real hibernation remains blocked.
 
-The matching Linux PCI PM implementation only invokes a driver's `.thaw` callback when that member is present; it does not substitute `.resume` when the driver supplies a PM operations table. The pinned `brcmfmac` source defines `.freeze` and `.restore`, but not `.thaw` or `.poweroff`. Patch `0006-brcmfmac-complete-hibernation-pm-callbacks.patch` pairs the existing D3 transition with freeze and poweroff, and the existing D0 transition with thaw and restore. Both pinned source profiles accept the patch, the callback invariant test passes, and all five modules compile against the current T2 kernel headers. Hardware validation is still required after installing the rebuilt modules and rebooting.
+The matching Linux PCI PM implementation only invokes a driver's `.thaw` callback when that member is present; it does not substitute `.resume` when the driver supplies a PM operations table. The pinned `brcmfmac` source defines `.freeze` and `.restore`, but not `.thaw` or `.poweroff`. Patch `0006-brcmfmac-complete-hibernation-pm-callbacks.patch` pairs the existing D3 transition with freeze and poweroff, and the existing D0 transition with thaw and restore. Both pinned source profiles accept the patch, the callback invariant test passes, and all five modules compile against the current T2 kernel headers.
+
+Boot `a0e3860f49b04ff39bed04100d493069` tested that rebuilt callback set. Unlike the first attempt, no `brcmfmac` bus-down, mailbox `-EIO`, or common-ring failure survived in the journal. The two display blank/return cycles and the visible Wi-Fi state are consistent with crossing the earlier Wi-Fi failure boundary, but are not proof that Wi-Fi traffic was functional. The final unresponsive state places the next investigation in the post-image restore path.
+
+The active `t2bce_core` driver is the next concrete lifecycle gap. Its PM table defines `.suspend` and `.resume`, but not the hibernation-specific `.freeze`, `.thaw`, `.poweroff`, or `.restore` callbacks. Consequently the PCI PM core does not run the BCE state-save handshake while creating or reloading the image. The memory rewind can restore host queue indices without a matching firmware queue state, which fits dead internal input or a wedged restored session. The platform research independently warns that BCE/VHCI queue reconstruction is a distinct hibernation boundary. This is a source-level hypothesis pending a callback trace; it is not yet a validated BCE patch.
+
+The second forced restart lost the callback tail because device and console logging had already been quiesced. The guarded command therefore supports the kernel's [RTC-backed PM trace](https://github.com/torvalds/linux/blob/master/Documentation/power/s2ram.rst#using-trace_resume) for the next diagnostic attempt:
+
+```bash
+omarchy debug t2-hibernate test test-resume --bluetooth-off --pm-trace
+```
+
+PM trace writes a device hash into the hardware clock so the next boot can report the last callback through `omarchy debug t2-hibernate check`. It can temporarily disturb the clock and must only be enabled explicitly. Reboot promptly after a hang so the RTC signature remains useful.
 
 ## Test sequence
 

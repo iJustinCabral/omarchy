@@ -2,7 +2,7 @@
 
 # omarchy:summary=Inspect and run guarded T2 hibernation diagnostics
 # omarchy:group=debug
-# omarchy:args=<check|test> [freezer|devices|platform|processors|core|test-resume] [--bluetooth-off] [--disk-mode <platform|shutdown>] [--yes]
+# omarchy:args=<check|test> [freezer|devices|platform|processors|core|test-resume] [--bluetooth-off] [--pm-trace] [--disk-mode <platform|shutdown>] [--yes]
 # omarchy:examples=omarchy debug t2-hibernate check | omarchy debug t2-hibernate test freezer --bluetooth-off
 
 set -euo pipefail
@@ -14,13 +14,14 @@ TESTED_MODEL="MacBookAir9,1"
 TEST_CLEANUP_ARMED=false
 TEST_PREVIOUS_PM_TEST=""
 TEST_PREVIOUS_DISK=""
+TEST_PREVIOUS_PM_TRACE=""
 TEST_BLUETOOTH_WAS_POWERED=false
 
 usage() {
   cat <<'USAGE'
 Usage:
   omarchy debug t2-hibernate check
-  omarchy debug t2-hibernate test <freezer|devices|platform|processors|core|test-resume> [--bluetooth-off] [--disk-mode <platform|shutdown>] [--yes]
+  omarchy debug t2-hibernate test <freezer|devices|platform|processors|core|test-resume> [--bluetooth-off] [--pm-trace] [--disk-mode <platform|shutdown>] [--yes]
 
 The check is read-only. Tests use the kernel's direct hibernation test
 interface and can still freeze or reboot a broken machine. They do not change
@@ -31,6 +32,10 @@ Start with:
 
 Use --disk-mode shutdown to skip ACPI S4 platform preparation while retaining
 the selected PM test depth. The prior hibernation mode is restored afterward.
+
+Use --pm-trace to store the last device PM callback in the RTC so the next boot
+can identify a hard hang. This temporarily disturbs the hardware clock; network
+time should correct it after reboot. Reboot promptly after a hang.
 
 The command asks for confirmation unless --yes is supplied. --yes only skips
 the prompt; it does not make a power test safe.
@@ -122,6 +127,7 @@ check_power_interface() {
 show_check() {
   local model="unknown"
   local board="unknown"
+  local trace_match=""
 
   check_hardware
   check_power_interface
@@ -135,6 +141,15 @@ show_check() {
   echo "  power states: $(<"$SYS_POWER/state")"
   echo "  hibernation modes: $(<"$SYS_POWER/disk")"
   echo "  PM test levels: $(<"$SYS_POWER/pm_test")"
+  if [[ -r "$SYS_POWER/pm_trace" ]]; then
+    echo "  PM trace: $(<"$SYS_POWER/pm_trace")"
+  fi
+  if [[ -r "$SYS_POWER/pm_trace_dev_match" ]]; then
+    trace_match=$(<"$SYS_POWER/pm_trace_dev_match")
+    if [[ -n $trace_match ]]; then
+      echo "  PM trace device match: $trace_match"
+    fi
+  fi
   echo "  image size limit: $(<"$SYS_POWER/image_size") bytes"
   if [[ -r "$SYS_POWER/resume" && -r "$SYS_POWER/resume_offset" ]]; then
     echo "  kernel resume target: $(<"$SYS_POWER/resume") offset $(<"$SYS_POWER/resume_offset")"
@@ -174,6 +189,9 @@ restore_test_state() {
   if [[ -n $TEST_PREVIOUS_DISK ]]; then
     write_power_setting "$SYS_POWER/disk" "$TEST_PREVIOUS_DISK" || true
   fi
+  if [[ -n $TEST_PREVIOUS_PM_TRACE ]]; then
+    write_power_setting "$SYS_POWER/pm_trace" "$TEST_PREVIOUS_PM_TRACE" || true
+  fi
   if $TEST_BLUETOOTH_WAS_POWERED; then
     timeout 5s bluetoothctl power on >/dev/null 2>&1 || true
   fi
@@ -183,6 +201,7 @@ run_test() {
   local stage="$1"
   shift
   local bluetooth_off=false
+  local pm_trace=false
   local assume_yes=false
   local disk_mode=""
   local model="unknown"
@@ -191,6 +210,9 @@ run_test() {
     case "$1" in
       --bluetooth-off)
         bluetooth_off=true
+        ;;
+      --pm-trace)
+        pm_trace=true
         ;;
       --yes)
         assume_yes=true
@@ -224,6 +246,10 @@ run_test() {
   fi
   if [[ -n $disk_mode ]] && ! available_value "$SYS_POWER/disk" "$disk_mode"; then
     echo "The running kernel does not support the '$disk_mode' hibernation mode." >&2
+    exit 1
+  fi
+  if $pm_trace && [[ ! -r "$SYS_POWER/pm_trace" ]]; then
+    echo "The running kernel does not provide PM trace support." >&2
     exit 1
   fi
   [[ -r "$DMI_ROOT/product_name" ]] && model=$(<"$DMI_ROOT/product_name")
@@ -268,6 +294,10 @@ run_test() {
   if [[ -n $disk_mode ]]; then
     echo "The hibernation disk mode will be temporarily set to '$disk_mode'."
   fi
+  if $pm_trace; then
+    echo "PM trace will encode the last device callback in the RTC for the next boot."
+    echo "The hardware clock may be temporarily wrong; reboot promptly after a hang."
+  fi
 
   if ! $assume_yes && ! gum confirm "Run the $stage test now?"; then
     echo "Cancelled."
@@ -277,6 +307,10 @@ run_test() {
   sudo -v
   TEST_PREVIOUS_PM_TEST=$(selected_value "$SYS_POWER/pm_test")
   TEST_PREVIOUS_DISK=$(selected_value "$SYS_POWER/disk")
+  TEST_PREVIOUS_PM_TRACE=""
+  if $pm_trace; then
+    TEST_PREVIOUS_PM_TRACE=$(<"$SYS_POWER/pm_trace")
+  fi
   TEST_BLUETOOTH_WAS_POWERED=false
   TEST_CLEANUP_ARMED=true
   trap restore_test_state EXIT
@@ -310,15 +344,19 @@ run_test() {
     write_power_setting "$SYS_POWER/pm_test" "$stage"
   fi
 
+  if $pm_trace; then
+    write_power_setting "$SYS_POWER/pm_trace" 1
+  fi
+
   sync
-  logger --tag omarchy-t2-hibernate-test "starting stage=$stage bluetooth_off=$bluetooth_off disk_mode=${disk_mode:-current}"
+  logger --tag omarchy-t2-hibernate-test "starting stage=$stage bluetooth_off=$bluetooth_off pm_trace=$pm_trace disk_mode=${disk_mode:-current}"
   echo "Entering kernel test..."
   if ! write_power_setting "$SYS_POWER/state" disk; then
-    logger --tag omarchy-t2-hibernate-test "failed stage=$stage bluetooth_off=$bluetooth_off disk_mode=${disk_mode:-current}"
+    logger --tag omarchy-t2-hibernate-test "failed stage=$stage bluetooth_off=$bluetooth_off pm_trace=$pm_trace disk_mode=${disk_mode:-current}"
     echo "The kernel rejected the '$stage' test. Inspect the kernel journal before retrying." >&2
     return 1
   fi
-  logger --tag omarchy-t2-hibernate-test "returned stage=$stage bluetooth_off=$bluetooth_off disk_mode=${disk_mode:-current}"
+  logger --tag omarchy-t2-hibernate-test "returned stage=$stage bluetooth_off=$bluetooth_off pm_trace=$pm_trace disk_mode=${disk_mode:-current}"
   restore_test_state
   trap - EXIT INT TERM
   echo "The '$stage' test returned successfully."
