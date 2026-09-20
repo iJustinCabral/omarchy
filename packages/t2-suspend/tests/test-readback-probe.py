@@ -26,6 +26,7 @@ harness = r'''
 #define pr_err(...) ((void)0)
 #define pr_notice(...) (markers++)
 static bool hibernate_readback_probe;
+static bool hibernate_quiesce_probe;
 static int hibernation_mode, bitmap_error, read_error;
 static int locked, closes, reads, restores, freed, bitmap_freed, markers, swap_freed;
 static unsigned short root_swap = 42;

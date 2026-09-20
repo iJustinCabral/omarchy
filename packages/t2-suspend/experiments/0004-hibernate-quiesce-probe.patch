@@ -1,0 +1,68 @@
+Subject: [DIAGNOSTIC ONLY] power: stop after image-restore device quiesce
+
+Apply after 0002 and 0003. The opt-in hibernate_quiesce_probe=1 boot
+parameter only affects test_resume. After a successful image readback, run the
+second PMSG_QUIESCE device pass, unwind it with PMSG_RECOVER, and return before
+resume_target_kernel can disable CPUs, suspend syscore devices or replace RAM.
+
+Like the readback-only probe, this path does not rewind memory to the snapshot,
+so release the test image's swap extents before returning to userspace.
+
+--- a/kernel/power/hibernate.c
++++ b/kernel/power/hibernate.c
+@@ -558,6 +558,18 @@ static int resume_target_kernel(int platform_mode)
+ 	return error;
+ }
+ 
++static bool hibernate_quiesce_probe;
++
++static int __init hibernate_quiesce_probe_setup(char *value)
++{
++	if (strcmp(value, "1"))
++		return 0;
++
++	hibernate_quiesce_probe = true;
++	return 1;
++}
++__setup("hibernate_quiesce_probe=", hibernate_quiesce_probe_setup);
++
+ /**
+  * hibernation_restore - Quiesce devices and restore from a hibernation image.
+  * @platform_mode: If set, use platform driver to prepare for the transition.
+@@ -571,13 +583,19 @@ int hibernation_restore(int platform_mode)
+ 	console_suspend_all();
+ 	error = dpm_suspend_start(PMSG_QUIESCE);
+ 	if (!error) {
+-		error = resume_target_kernel(platform_mode);
+-		/*
+-		 * The above should either succeed and jump to the new kernel,
+-		 * or return with an error. Otherwise things are just
+-		 * undefined, so let's be paranoid.
+-		 */
+-		BUG_ON(!error);
++		if (hibernate_quiesce_probe &&
++		    hibernation_mode == HIBERNATION_TEST_RESUME) {
++			pr_notice("DIAGNOSTIC: image-restore device quiesce complete; aborting before memory restore\n");
++			error = -ECANCELED;
++		} else {
++			error = resume_target_kernel(platform_mode);
++			/*
++			 * The above should either succeed and jump to the new kernel,
++			 * or return with an error. Otherwise things are just
++			 * undefined, so let's be paranoid.
++			 */
++			BUG_ON(!error);
++		}
+ 	}
+ 	dpm_resume_end(PMSG_RECOVER);
+ 	console_resume_all();
+@@ -764,7 +782,8 @@ static int load_image_and_restore(void)
+ 	swsusp_free();
+ 	free_basic_memory_bitmaps();
+  Unlock:
+-	if (hibernate_readback_probe && hibernation_mode == HIBERNATION_TEST_RESUME)
++	if ((hibernate_readback_probe || hibernate_quiesce_probe) &&
++	    hibernation_mode == HIBERNATION_TEST_RESUME)
+ 		swsusp_free_test_image();
+ 	unlock_device_hotplug();
+ 
