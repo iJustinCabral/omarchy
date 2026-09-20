@@ -106,6 +106,8 @@ Patch `0003-brcmfmac-rebuild-transport-after-image-restore.patch` separated `.re
 
 Hardware validation of that restore-time FLR failed on DKMS package `omarchy-t2-radio/1.3`. Boot `86077aebaa564e98b77f09ad4a91382c` logged the test start at monotonic time `138.762812` and `PM: hibernation: hibernation entry` at `138.793062`, then ended without the guarded command's return marker or an orderly shutdown. Boot `8f5916e8027d417b90e0eb829c71d355` found RTC PM-trace magic `6:18:238`, but no device hash match, and reported `PM: Image not found (code -22)`. No pstore crash report was available in the collected evidence. The trace cannot prove which instruction triggered the reset because logging was quiesced, but the regression from the preceding image-restore run strongly implicates the newly introduced restore-time function-0 FLR. Do not repeat `test-resume` with this implementation; remove the FLR restore path before further hardware testing.
 
+DKMS package `omarchy-t2-radio/1.4` removes that restore patch from the active series and the guarded diagnostic refuses `test-resume` when it detects the known-bad 1.3 Wi-Fi module still loaded. Installing 1.4 does not replace the running module; rebooting is required to leave the unsafe implementation. The retained stateful restore path is expected to reproduce the earlier Wi-Fi ring desynchronization, so this rollback is a safety correction rather than a hibernation fix.
+
 The second forced restart lost the callback tail because device and console logging had already been quiesced. The guarded command therefore supports the kernel's [RTC-backed PM trace](https://github.com/torvalds/linux/blob/master/Documentation/power/s2ram.rst#using-trace_resume) for the next diagnostic attempt:
 
 ```bash

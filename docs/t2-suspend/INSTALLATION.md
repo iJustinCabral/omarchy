@@ -14,7 +14,7 @@ Setup installs DKMS, matching T2 headers, compiler, make and patch through Omarc
 
 | Location | Purpose |
 | --- | --- |
-| `/usr/src/omarchy-t2-radio-1.3/` | Verified driver source and DKMS build description |
+| `/usr/src/omarchy-t2-radio-1.4/` | Verified driver source and DKMS build description |
 | `/var/lib/dkms/omarchy-t2-radio/` | DKMS builds, installation records and archived original modules |
 | `/usr/share/dkms/modules_to_force_install/omarchy-t2-radio` | Replace the complete radio set even when a vendor companion's source version equals stock |
 | `/etc/modprobe.d/omarchy-t2-suspend.conf` | Enable the model-scoped Wi-Fi recovery option from the tested image |
@@ -45,7 +45,7 @@ Automatic rebuilding is not a guarantee of compatibility with arbitrary future k
 
 ## Validation boundary
 
-The exact HTTPS source-fetch path and DKMS build were exercised in temporary directories against the installed T2 headers. The radio set and the BCE core are pinned independently; the rebuilt unmodified BCE core's executable text matched the kernel-shipped module byte-for-byte before the hibernation callback patch was applied. Real DKMS installation into a temporary module tree exercised original-module archival and replacement. Transaction fixtures cover idempotence, build/install/image failures, boot/configuration restoration, administrator conflicts, source drift, missing headers, early Bluetooth and exclusion of power/radio commands. Shell fixtures cover fresh setup, migration, CLI verification/rollback and error propagation. The corrected installer has also been deployed on the test machine: a normal boot and a short actual S3 cycle passed with the installed radio drivers. The BCE extension awaits reboot and hardware validation. See the [validation record](VALIDATION.md) for the deployment defects, corrections and observed results. A clean OS installation remains untested.
+The exact HTTPS source-fetch path and DKMS build were exercised in temporary directories against the installed T2 headers. The radio set and the BCE core are pinned independently; the rebuilt unmodified BCE core's executable text matched the kernel-shipped module byte-for-byte before the hibernation callback patch was applied. Real DKMS installation into a temporary module tree exercised original-module archival and replacement. Transaction fixtures cover idempotence, build/install/image failures, boot/configuration restoration, administrator conflicts, source drift, missing headers, early Bluetooth and exclusion of power/radio commands. Shell fixtures cover fresh setup, migration, CLI verification/rollback and error propagation. The corrected installer has also been deployed on the test machine: a normal boot, a short actual S3 cycle and the BCE parent/child `devices` callback test passed. The restore-time Wi-Fi FLR subsequently caused an abrupt reboot and is removed from package 1.4, which awaits installation and a normal-boot verification. See the [validation record](VALIDATION.md) for the deployment defects, corrections and observed results. A clean OS installation remains untested.
 
 The earlier hardware suspend results remain the evidence for the driver behavior. This integration makes automatic delivery concrete, but neither fixes the unresolved hibernation/S4 issue nor expands qualification to other Mac models.
 

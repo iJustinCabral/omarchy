@@ -56,6 +56,10 @@ if TEST_INSTALL_STATUS=1 bash -euo pipefail "$ROOT/migrations/1789905053.sh"; th
 bash -euo pipefail "$ROOT/migrations/1789909734.sh"
 grep -qx setup "$TEST_CALLS" || fail "Wi-Fi hibernation upgrade migration invokes setup"
 if TEST_INSTALL_STATUS=1 bash -euo pipefail "$ROOT/migrations/1789909734.sh"; then fail "Wi-Fi hibernation upgrade failure must remain pending"; fi
+: >"$TEST_CALLS"
+bash -euo pipefail "$ROOT/migrations/1789910828.sh"
+grep -qx setup "$TEST_CALLS" || fail "unsafe restore removal migration invokes setup"
+if TEST_INSTALL_STATUS=1 bash -euo pipefail "$ROOT/migrations/1789910828.sh"; then fail "unsafe restore removal failure must remain pending"; fi
 pass "T2 suspend setup, CLI and migration routing; failure propagation"
 
 # The initcpio hook must abort before image publication on a missing replacement.

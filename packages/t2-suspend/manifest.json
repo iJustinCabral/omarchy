@@ -239,12 +239,6 @@
       "sha256": "7dff74195428d9b228e2660fcce0078169e8a39a0e30b8671d1c4ed0a60deee7",
       "lab_path": "v2/stock-resume/wifi-reenable/0002-brcmfmac-runtime-function-reset.patch",
       "series": "wifi-reenable"
-    },
-    {
-      "path": "patches/wifi-reenable/0003-brcmfmac-rebuild-transport-after-image-restore.patch",
-      "sha256": "1f957f41f93c1649d3dc04144d2fd6ce94d375b14f3a02b97e24fab6f67fa238",
-      "evidence_path": "docs/t2-suspend/HIBERNATION.md",
-      "series": "wifi-reenable"
     }
   ],
   "s3": {
@@ -444,7 +438,7 @@
       "brcmfmac/of.h": "d27052440389dbc249e7435fccef43c18f8d07bf641563327ef0cf2bfab3cd7b",
       "brcmfmac/p2p.c": "53362156009a93fd0ec5743e3789c1483701a359304aa5cc1835797129f18e2e",
       "brcmfmac/p2p.h": "f0d89a7f6136140179c0297b7b10c7e9209a844164ae54c82f713f7968d5d3b3",
-      "brcmfmac/pcie.c": "e80e7234cc62dbcc7e0a170245263a0a502778b21e84e8338d3692cec3ad7b4c",
+      "brcmfmac/pcie.c": "6e6174948917184f9cbe92a5e12f1dff5b05b874c6f2ef43b6dcf7c49b0f18bd",
       "brcmfmac/pcie.h": "5d48671dc3226f929b813a0f48038d51a9a1b7de29711f41954fc4b6ce48680b",
       "brcmfmac/pno.c": "114a8750a6c223afd9085dd2ecfc190c020e5cbd22efba6924e30caa322e4b4c",
       "brcmfmac/pno.h": "190211270b7ab6f92dc63acde26c2cb87aedc1774f98eafe6953e4f583f94512",

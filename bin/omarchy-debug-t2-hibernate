@@ -10,7 +10,9 @@ set -euo pipefail
 SYS_POWER=${OMARCHY_T2_HIBERNATE_SYS_POWER:-/sys/power}
 DMI_ROOT=${OMARCHY_T2_HIBERNATE_DMI_ROOT:-/sys/class/dmi/id}
 CMDLINE_FILE=${OMARCHY_T2_HIBERNATE_CMDLINE:-/proc/cmdline}
+BRCMFMAC_SRCVERSION_FILE=${OMARCHY_T2_HIBERNATE_BRCMFMAC_SRCVERSION:-/sys/module/brcmfmac/srcversion}
 TESTED_MODEL="MacBookAir9,1"
+UNSAFE_RESTORE_SRCVERSION="5D40EE47A0592AA2E41E149"
 TEST_CLEANUP_ARMED=false
 TEST_PREVIOUS_PM_TEST=""
 TEST_PREVIOUS_DISK=""
@@ -268,6 +270,11 @@ run_test() {
     test-resume)
       if ! available_value "$SYS_POWER/disk" test_resume; then
         echo "The running kernel does not support test_resume." >&2
+        exit 1
+      fi
+      if [[ -r $BRCMFMAC_SRCVERSION_FILE && $(<"$BRCMFMAC_SRCVERSION_FILE") == "$UNSAFE_RESTORE_SRCVERSION" ]]; then
+        echo "The loaded brcmfmac module has the rejected restore-time FLR implementation; refusing test_resume." >&2
+        echo "Install the corrected T2 suspend driver package and reboot before any further image-restore test." >&2
         exit 1
       fi
       if [[ ! -r "$SYS_POWER/resume" || $(<"$SYS_POWER/resume") == "0:0" ]]; then

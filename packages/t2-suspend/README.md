@@ -1,14 +1,14 @@
 # T2 suspend driver source package
 
-This package consolidates the driver changes tested on MacBookAir9,1, BCM4377, Omarchy 4.0.3 and `7.2.4-arch1-Watanare-T2-1-t2`. It contains thirteen patches, pinned source and patch hashes, source preparation, and extracted-C fault tests. Fresh setup and an upgrade migration now build/install these modules automatically through DKMS on the supported model; see [installer lifecycle and validation](../../docs/t2-suspend/INSTALLATION.md). Existing trackpad, Wi-Fi recovery and Bluetooth startup installers remain available. See [the branch overview](../../README.md) and [mechanisms and validation](../../docs/t2-suspend/README.md).
+This package consolidates the driver changes tested on MacBookAir9,1, BCM4377, Omarchy 4.0.3 and `7.2.4-arch1-Watanare-T2-1-t2`. It contains twelve active patches, pinned source and patch hashes, source preparation, and extracted-C fault tests. Fresh setup and an upgrade migration now build/install these modules automatically through DKMS on the supported model; see [installer lifecycle and validation](../../docs/t2-suspend/INSTALLATION.md). Existing trackpad, Wi-Fi recovery and Bluetooth startup installers remain available. See [the branch overview](../../README.md) and [mechanisms and validation](../../docs/t2-suspend/README.md).
 
 ## Patch series
 
 | Series | Ordered changes | Status |
 | --- | --- | --- |
-| `patches/wifi/` | 0001 control-ring mailbox; 0002 host capabilities; 0003 IRQ/startup; 0004 partial-attach guard; 0005 bounded diagnostics; 0006 complete hibernation callbacks | Patches 0001–0005 passed repeated actual S3 and audio recovery with the Bluetooth series; 0006 is based on the isolated `test_resume` failure and awaits hardware validation |
+| `patches/wifi/` | 0001 control-ring mailbox; 0002 host capabilities; 0003 IRQ/startup; 0004 partial-attach guard; 0005 bounded diagnostics; 0006 complete hibernation callbacks | Patches 0001–0005 passed repeated actual S3 and audio recovery with the Bluetooth series; 0006 cleared the missing callback failure during `test_resume`, after which image-rewound transport state remained the blocker |
 | `patches/bluetooth/` | 0001 restore vendor windows; 0002 stop publishing failed rings; 0003 rebuild lost transport through HCI lifecycle and Bluetooth FLR | Repeated S3, automatic AirPods reconnect, initially-off Bluetooth recovery |
-| `patches/wifi-reenable/` | 0001 propagate interface-open transport failure; 0002 explicit Wi-Fi function0 reset; 0003 rebuild firmware and rings after image restoration | 0003 is based on the observed packet-ID/ring desynchronization and awaits `test_resume` hardware validation |
+| `patches/wifi-reenable/` | 0001 propagate interface-open transport failure; 0002 explicit Wi-Fi function0 reset | Runtime recovery remains model-scoped; the restore-time use of function-0 FLR was removed after it caused an abrupt reboot during `test_resume` |
 | `patches/bce/` | 0001 run the existing BCE stateful handshake for freeze/thaw/restore | The staged `devices` freeze/thaw test passed with working internal input; `test_resume` remains pending |
 
 Patch headers and copied evidence retain their original experiment status.
@@ -69,12 +69,6 @@ python3 packages/t2-suspend/tests/test-bce-hibernate-pm.py /tmp/t2-s3-source/dri
 python3 packages/t2-suspend/tests/test-flr.py
 ```
 
-The automatic installer's image-restore profile has a distinct restore invariant:
-
-```sh
-python3 packages/t2-suspend/tests/test-hibernate-pm.py /tmp/t2-wifi-reenable-source/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c --image-rebuild
-```
-
 These execute extracted C, source invariants or the exact FLR helper with failure injection. They
 verify state/error/DMA/IRQ behavior; they cannot prove real hardware reset safety.
 `manifest.json` ties the original S3 patch set to its lab path at commit `68bf7e0` and the hibernation callback patch to its captured MacBookAir9,1 evidence.
@@ -85,6 +79,6 @@ or private diagnostics are included.
 
 Fresh hardware setup and the upgrade migration invoke the shared automatic installer. It downloads hash-pinned source, builds only the driver modules, registers DKMS rebuilding for T2 kernel updates, applies the tested radio/reconnect policy and generates the normal boot image. It does not change running radios or initiate a power transition. See [installation details](../../docs/t2-suspend/INSTALLATION.md) and [user commands](../../manual/t2-suspend.md).
 
-The supported model is MacBookAir9,1 with BCM4377. The installer chooses the `wifi-reenable` profile and load-time Wi-Fi FLR option from the latest tested image. That optional recovery path has not been hardware-proven by the latest successful repeat, which needed no Wi-Fi reset. The earlier unexplained reboot remains in the validation record. Hibernation remains unresolved.
+The supported model is MacBookAir9,1 with BCM4377. The installer chooses the `wifi-reenable` profile and load-time Wi-Fi FLR option used for runtime radio recovery. The rejected hibernation `.restore` FLR is not included: hardware validation caused an abrupt reboot, so the diagnostic command blocks `test-resume` while that module is loaded. Hibernation remains unresolved.
 
 The six DKMS modules include all three Wi-Fi vendor companions, Bluetooth and the BCE core. The initcpio guard checks the selected replacement set before publishing a boot image and preserves Bluetooth's startup gate. The installer owns a configuration receipt and initial boot backup; `omarchy setup t2-suspend --rollback` restores its configuration and the original modules for the next boot. Other T2 fixes retain their own installers.

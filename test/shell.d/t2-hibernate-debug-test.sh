@@ -13,9 +13,11 @@ power="$test_tmp/power"
 dmi="$test_tmp/dmi"
 calls="$test_tmp/calls"
 bluetooth_state="$test_tmp/bluetooth-state"
+brcmfmac_srcversion="$test_tmp/brcmfmac-srcversion"
 mkdir -p "$stub_bin" "$power" "$dmi"
 : >"$calls"
 printf 'on\n' >"$bluetooth_state"
+printf 'SAFE_TEST_MODULE\n' >"$brcmfmac_srcversion"
 printf 'freeze mem disk\n' >"$power/state"
 printf '[platform] shutdown reboot suspend test_resume\n' >"$power/disk"
 printf '[none] core processors platform devices freezer\n' >"$power/pm_test"
@@ -84,6 +86,7 @@ export TEST_BLUETOOTH_STATE="$bluetooth_state"
 export OMARCHY_T2_HIBERNATE_SYS_POWER="$power"
 export OMARCHY_T2_HIBERNATE_DMI_ROOT="$dmi"
 export OMARCHY_T2_HIBERNATE_CMDLINE="$test_tmp/cmdline"
+export OMARCHY_T2_HIBERNATE_BRCMFMAC_SRCVERSION="$brcmfmac_srcversion"
 
 check_output=$($command check)
 [[ $check_output == *"model: MacBookAir9,1"* ]] || fail "check reports the T2 model"
@@ -133,6 +136,17 @@ grep -Fq 'logger --tag omarchy-t2-hibernate-test starting stage=test-resume blue
 [[ $(<"$power/pm_test") == "none" ]] || fail "test-resume restores the previous PM test level"
 [[ $(<"$power/pm_trace") == "0" ]] || fail "test-resume restores the previous PM trace state"
 pass "test-resume can persist the last device callback and restores kernel controls"
+
+: >"$calls"
+printf '[platform] shutdown reboot suspend test_resume\n' >"$power/disk"
+printf '5D40EE47A0592AA2E41E149\n' >"$brcmfmac_srcversion"
+if output=$($command test test-resume --yes 2>&1); then
+  fail "test-resume must reject the restore-time FLR module"
+fi
+[[ $output == *"rejected restore-time FLR implementation"* ]] || fail "unsafe module rejection explains the blocked test"
+! grep -Fq "sudo tee $power/state" "$calls" || fail "unsafe module must not enter a power state"
+printf 'SAFE_TEST_MODULE\n' >"$brcmfmac_srcversion"
+pass "test-resume rejects the known hard-resetting Wi-Fi module"
 
 : >"$calls"
 printf 'on\n' >"$bluetooth_state"
