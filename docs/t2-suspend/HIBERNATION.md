@@ -126,6 +126,8 @@ On boot `25f6b949-99b3-4d7b-9073-bc7c5a56cee4`, checkpoint `27208506` ran `freez
 
 Post-test inspection found Bluetooth `Powered: no` and a BlueZ `Failed to set mode` message, despite service exit 0. The old cleanup swallowed Bluetooth power-on errors. A subsequent ordinary `bluetoothctl power on` succeeded and `Powered: yes` was verified; no reset or reboot was needed. Cleanup now attempts Wi-Fi rebinding before Bluetooth power restoration, verifies the powered state, and propagates failure. The off-state wait also requires an explicit `Powered: no`, rather than treating a missing controller as off. Fault tests cover cleanup failure. The reordered cleanup still requires hardware qualification; the original freezer result is not an all-devices restoration pass.
 
+The reordered cleanup at checkpoint `ca3e937d` returned from freezer at 11:24:14 but correctly reported Bluetooth restoration failure at 11:24:16. A later normal power-on again succeeded without resetting hardware. Cleanup now allows at most three power-on attempts, separated by one second after failure, records each failed attempt, and requires a verified powered state. Offline tests cover both transient recovery and persistent failure. This handles the observed recovery behavior without claiming its underlying timing cause is known.
+
 ### Recovery boot after package 1.4 installation
 
 The continuity reboot from checkpoint `9ee92a79` reached a Limine EFI hash mismatch on the normal entry. The operator selected snapshot 1; the resulting root was a temporary overlay and loaded older drivers, so this was not a successful 1.4 boot. The primary root's receipt still reported 1.4 installed, and extraction of the normal UKI confirmed Wi-Fi source version `1D85357EB5E65B246EDEE20`.

@@ -187,6 +187,8 @@ write_power_setting() {
 
 restore_test_state() {
   local cleanup_status=0
+  local attempt
+  local bluetooth_restored=false
   if ! $TEST_CLEANUP_ARMED; then
     return 0
   fi
@@ -209,7 +211,17 @@ restore_test_state() {
   fi
   TEST_WIFI_DEVICE=""
   if $TEST_BLUETOOTH_WAS_POWERED; then
-    if ! timeout 5s bluetoothctl power on >/dev/null 2>&1 || ! wait_for_bluetooth_power on; then
+    for attempt in 1 2 3; do
+      if timeout 5s bluetoothctl power on >/dev/null 2>&1 && wait_for_bluetooth_power on; then
+        bluetooth_restored=true
+        break
+      fi
+      logger --tag omarchy-t2-hibernate-test "Bluetooth restoration attempt=$attempt failed"
+      if (( attempt < 3 )); then
+        sleep 1
+      fi
+    done
+    if ! $bluetooth_restored; then
       echo "Failed to restore Bluetooth power; inspect the controller before further testing." >&2
       cleanup_status=1
     fi

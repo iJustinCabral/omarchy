@@ -62,6 +62,10 @@ case "${1:-}" in
     if [[ $2 == "on" && ${TEST_BLUETOOTH_RESTORE_FAIL:-0} == 1 ]]; then
       exit 1
     fi
+    if [[ $2 == "on" && -n ${TEST_BLUETOOTH_FAIL_ONCE:-} && ! -e $TEST_BLUETOOTH_FAIL_ONCE ]]; then
+      touch "$TEST_BLUETOOTH_FAIL_ONCE"
+      exit 1
+    fi
     printf '%s\n' "$2" >"$TEST_BLUETOOTH_STATE"
     printf 'bluetoothctl power %s\n' "$2" >>"$TEST_CALLS"
     ;;
@@ -264,6 +268,14 @@ fi
 [[ -L "$wifi_driver/0000:73:00.0" ]] || fail "Bluetooth cleanup failure must not prevent Wi-Fi rebinding"
 printf 'on\n' >"$bluetooth_state"
 pass "Bluetooth cleanup failure propagates without skipping Wi-Fi restoration"
+
+: >"$calls"
+printf '[none] core processors platform devices freezer\n' >"$power/pm_test"
+TEST_BLUETOOTH_FAIL_ONCE="$test_tmp/bluetooth-failed-once" "$command" test freezer --bluetooth-off --yes >/dev/null
+[[ $(<"$bluetooth_state") == "on" ]] || fail "transient Bluetooth failure must recover"
+grep -Fq 'Bluetooth restoration attempt=1 failed' "$calls" || fail "transient failure must be recorded"
+! grep -Fq 'Bluetooth restoration attempt=2 failed' "$calls" || fail "Bluetooth retry must stop after verified success"
+pass "Bluetooth restoration retries a transient failure and verifies recovery"
 
 : >"$calls"
 ln -s "$wifi_device" "$wifi_driver/0000:74:00.0"
