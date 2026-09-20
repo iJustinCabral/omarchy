@@ -11,10 +11,12 @@ SYS_POWER=${OMARCHY_T2_HIBERNATE_SYS_POWER:-/sys/power}
 DMI_ROOT=${OMARCHY_T2_HIBERNATE_DMI_ROOT:-/sys/class/dmi/id}
 CMDLINE_FILE=${OMARCHY_T2_HIBERNATE_CMDLINE:-/proc/cmdline}
 BRCMFMAC_SRCVERSION_FILE=${OMARCHY_T2_HIBERNATE_BRCMFMAC_SRCVERSION:-/sys/module/brcmfmac/srcversion}
+T2BCE_AUDIO_SRCVERSION_FILE=${OMARCHY_T2_HIBERNATE_T2BCE_AUDIO_SRCVERSION:-/sys/module/t2bce_audio/srcversion}
 BRCMFMAC_DRIVER=${OMARCHY_T2_HIBERNATE_BRCMFMAC_DRIVER:-/sys/bus/pci/drivers/brcmfmac}
 SNAPSHOT_HELPER=${OMARCHY_T2_SNAPSHOT_HELPER:-}
 TESTED_MODEL="MacBookAir9,1"
 UNSAFE_RESTORE_SRCVERSION="5D40EE47A0592AA2E41E149"
+REQUIRED_AUDIO_RESTORE_SRCVERSION="151173D6F9EEF5E4612915D"
 TEST_CLEANUP_ARMED=false
 TEST_PREVIOUS_PM_TEST=""
 TEST_PREVIOUS_DISK=""
@@ -359,6 +361,11 @@ run_test() {
       if [[ -r $BRCMFMAC_SRCVERSION_FILE && $(<"$BRCMFMAC_SRCVERSION_FILE") == "$UNSAFE_RESTORE_SRCVERSION" ]]; then
         echo "The loaded brcmfmac module has the rejected restore-time FLR implementation; refusing test_resume." >&2
         echo "Install the corrected T2 suspend driver package and reboot before any further image-restore test." >&2
+        exit 1
+      fi
+      if [[ ! -r $T2BCE_AUDIO_SRCVERSION_FILE || $(<"$T2BCE_AUDIO_SRCVERSION_FILE") != "$REQUIRED_AUDIO_RESTORE_SRCVERSION" ]]; then
+        echo "The loaded T2 audio module lacks the qualified hibernation callbacks; refusing test_resume." >&2
+        echo "Install T2 suspend driver package 1.5 and reboot before any further image-restore test." >&2
         exit 1
       fi
       if [[ ! -r "$SYS_POWER/resume" || $(<"$SYS_POWER/resume") == "0:0" ]]; then
