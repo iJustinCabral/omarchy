@@ -1,0 +1,41 @@
+Subject: [DIAGNOSTIC ONLY] power: stop test_resume after successful image readback
+
+Opt-in boot parameter hibernate_readback_probe=1. Only affects test_resume;
+normal hibernation/resume remains unchanged. Return through the existing
+image-freeing path before hibernation_restore can quiesce devices or replace
+memory. -ECANCELED is intentional and must not be called a hibernation pass.
+
+--- a/kernel/power/hibernate.c
++++ b/kernel/power/hibernate.c
+@@ -717,6 +717,18 @@ exit:
+ 		pr_err("Swap will be unusable! Try swapon -a.\n");
+ }
+ 
++static bool hibernate_readback_probe;
++
++static int __init hibernate_readback_probe_setup(char *value)
++{
++	if (strcmp(value, "1"))
++		return 0;
++
++	hibernate_readback_probe = true;
++	return 1;
++}
++__setup("hibernate_readback_probe=", hibernate_readback_probe_setup);
++
+ static int load_image_and_restore(void)
+ {
+ 	int error;
+@@ -735,6 +747,12 @@ static int load_image_and_restore(void)
+ 
+ 	error = swsusp_read(&flags);
+ 	swsusp_close();
++	if (!error && hibernate_readback_probe &&
++	    hibernation_mode == HIBERNATION_TEST_RESUME) {
++		pr_notice("DIAGNOSTIC: image readback complete; aborting before memory restore\n");
++		error = -ECANCELED;
++	}
++
+ 	if (!error)
+ 		error = hibernation_restore(flags & SF_PLATFORM_MODE);
+ 
