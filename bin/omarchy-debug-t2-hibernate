@@ -2,7 +2,7 @@
 
 # omarchy:summary=Inspect and run guarded T2 hibernation diagnostics
 # omarchy:group=debug
-# omarchy:args=<check|test> [freezer|devices|platform|processors|core|test-resume] [--bluetooth-off] [--wifi-unbind] [--pm-trace] [--disk-mode <platform|shutdown>] [--yes]
+# omarchy:args=<check|test> [freezer|devices|platform|processors|core|snapshot-create|test-resume] [--bluetooth-off] [--wifi-unbind] [--pm-trace] [--disk-mode <platform|shutdown>] [--yes]
 # omarchy:examples=omarchy debug t2-hibernate check | omarchy debug t2-hibernate test freezer --bluetooth-off
 
 set -euo pipefail
@@ -12,6 +12,7 @@ DMI_ROOT=${OMARCHY_T2_HIBERNATE_DMI_ROOT:-/sys/class/dmi/id}
 CMDLINE_FILE=${OMARCHY_T2_HIBERNATE_CMDLINE:-/proc/cmdline}
 BRCMFMAC_SRCVERSION_FILE=${OMARCHY_T2_HIBERNATE_BRCMFMAC_SRCVERSION:-/sys/module/brcmfmac/srcversion}
 BRCMFMAC_DRIVER=${OMARCHY_T2_HIBERNATE_BRCMFMAC_DRIVER:-/sys/bus/pci/drivers/brcmfmac}
+SNAPSHOT_HELPER=${OMARCHY_T2_SNAPSHOT_HELPER:-}
 TESTED_MODEL="MacBookAir9,1"
 UNSAFE_RESTORE_SRCVERSION="5D40EE47A0592AA2E41E149"
 TEST_CLEANUP_ARMED=false
@@ -25,7 +26,7 @@ usage() {
   cat <<'USAGE'
 Usage:
   omarchy debug t2-hibernate check
-  omarchy debug t2-hibernate test <freezer|devices|platform|processors|core|test-resume> [--bluetooth-off] [--wifi-unbind] [--pm-trace] [--disk-mode <platform|shutdown>] [--yes]
+  omarchy debug t2-hibernate test <freezer|devices|platform|processors|core|snapshot-create|test-resume> [--bluetooth-off] [--wifi-unbind] [--pm-trace] [--disk-mode <platform|shutdown>] [--yes]
 
 The check is read-only. Tests use the kernel's direct hibernation test
 interface and can still freeze or reboot a broken machine. They do not change
@@ -40,6 +41,10 @@ the selected PM test depth. The prior hibernation mode is restored afterward.
 Use --wifi-unbind to detach the single BCM4377 Wi-Fi PCI function before the
 test and bind it again afterward. Network access will be interrupted. This
 isolates image-rewound Wi-Fi queues; a pass does not validate Wi-Fi restore.
+
+snapshot-create requires the compiled laboratory helper specified by
+OMARCHY_T2_SNAPSHOT_HELPER. It creates and discards an in-memory image without
+writing it to swap, restoring it, or entering ACPI S4.
 
 Use --pm-trace to store the last device PM callback in the RTC so the next boot
 can identify a hard hang. This temporarily disturbs the hardware clock; network
@@ -306,6 +311,10 @@ run_test() {
     echo "test-resume selects its own disk mode; do not pass --disk-mode." >&2
     exit 1
   fi
+  if [[ $stage == "snapshot-create" && -n $disk_mode ]]; then
+    echo "snapshot-create disables platform support; do not pass --disk-mode." >&2
+    exit 1
+  fi
   if [[ -n $disk_mode ]] && ! available_value "$SYS_POWER/disk" "$disk_mode"; then
     echo "The running kernel does not support the '$disk_mode' hibernation mode." >&2
     exit 1
@@ -321,6 +330,12 @@ run_test() {
   fi
 
   case "$stage" in
+    snapshot-create)
+      if [[ $SNAPSHOT_HELPER != /* || ! -x $SNAPSHOT_HELPER ]]; then
+        echo "snapshot-create requires an absolute executable OMARCHY_T2_SNAPSHOT_HELPER path." >&2
+        exit 1
+      fi
+      ;;
     freezer | devices | platform | processors | core)
       if ! available_value "$SYS_POWER/pm_test" "$stage"; then
         echo "The running kernel does not support the '$stage' PM test level." >&2
@@ -352,6 +367,8 @@ run_test() {
   echo "About to run the '$stage' kernel hibernation test on $model."
   if [[ $stage == "freezer" ]]; then
     echo "This exercises hibernation preparation and process freezing without suspending devices or entering ACPI S4."
+  elif [[ $stage == "snapshot-create" ]]; then
+    echo "This creates and discards a memory image without saving or restoring it. Save all work first."
   elif [[ $stage == "test-resume" ]]; then
     echo "This writes and immediately restores a hibernation image without entering ACPI S4. Save all work first."
   else
@@ -408,7 +425,9 @@ run_test() {
     isolate_wifi
   fi
 
-  if [[ $stage == "test-resume" ]]; then
+  if [[ $stage == "snapshot-create" ]]; then
+    write_power_setting "$SYS_POWER/pm_test" none
+  elif [[ $stage == "test-resume" ]]; then
     write_power_setting "$SYS_POWER/pm_test" none
     write_power_setting "$SYS_POWER/disk" test_resume
   else
@@ -429,7 +448,13 @@ run_test() {
   fi
   logger --tag omarchy-t2-hibernate-test "starting stage=$stage bluetooth_off=$bluetooth_off pm_trace=$pm_trace disk_mode=${disk_mode:-current} wifi_unbind=$wifi_unbind"
   echo "Entering kernel test..."
-  if ! write_power_setting "$SYS_POWER/state" disk; then
+  local transition_status=0
+  if [[ $stage == "snapshot-create" ]]; then
+    sudo "$SNAPSHOT_HELPER" --create-and-discard || transition_status=$?
+  else
+    write_power_setting "$SYS_POWER/state" disk || transition_status=$?
+  fi
+  if (( transition_status != 0 )); then
     logger --tag omarchy-t2-hibernate-test "failed stage=$stage bluetooth_off=$bluetooth_off pm_trace=$pm_trace disk_mode=${disk_mode:-current} wifi_unbind=$wifi_unbind"
     echo "The kernel rejected the '$stage' test. Inspect the kernel journal before retrying." >&2
     return 1

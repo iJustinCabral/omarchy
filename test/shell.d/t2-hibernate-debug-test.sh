@@ -91,6 +91,11 @@ cat >"$stub_bin/gum" <<'SH'
 #!/bin/bash
 exit "${TEST_CONFIRM_STATUS:-0}"
 SH
+cat >"$stub_bin/snapshot-create" <<'SH'
+#!/bin/bash
+printf 'snapshot-create %s\n' "$*" >>"$TEST_CALLS"
+exit "${TEST_SNAPSHOT_STATUS:-0}"
+SH
 cat >"$stub_bin/tee" <<'SH'
 #!/bin/bash
 if [[ $1 == "$TEST_WIFI_DRIVER/unbind" ]]; then
@@ -276,6 +281,24 @@ TEST_BLUETOOTH_FAIL_ONCE="$test_tmp/bluetooth-failed-once" "$command" test freez
 grep -Fq 'Bluetooth restoration attempt=1 failed' "$calls" || fail "transient failure must be recorded"
 ! grep -Fq 'Bluetooth restoration attempt=2 failed' "$calls" || fail "Bluetooth retry must stop after verified success"
 pass "Bluetooth restoration retries a transient failure and verifies recovery"
+
+: >"$calls"
+printf '[none] core processors platform devices freezer\n' >"$power/pm_test"
+if "$command" test snapshot-create --yes >/dev/null 2>&1; then
+  fail "snapshot-create requires an explicit helper"
+fi
+OMARCHY_T2_SNAPSHOT_HELPER="$stub_bin/snapshot-create" "$command" test snapshot-create --wifi-unbind --bluetooth-off --yes >/dev/null
+grep -Fxq 'snapshot-create --create-and-discard' "$calls" || fail "snapshot-create invokes the cancellation-only helper"
+! grep -Fq "sudo tee $power/state" "$calls" || fail "snapshot-create must not invoke kernel hibernation through sysfs"
+[[ -L "$wifi_driver/0000:73:00.0" ]] || fail "snapshot-create restores Wi-Fi"
+[[ $(<"$bluetooth_state") == "on" ]] || fail "snapshot-create restores Bluetooth"
+printf '[none] core processors platform devices freezer\n' >"$power/pm_test"
+if OMARCHY_T2_SNAPSHOT_HELPER="$stub_bin/snapshot-create" TEST_SNAPSHOT_STATUS=1 "$command" test snapshot-create --wifi-unbind --bluetooth-off --yes >/dev/null 2>&1; then
+  fail "snapshot-create helper failure must propagate"
+fi
+[[ -L "$wifi_driver/0000:73:00.0" ]] || fail "snapshot-create failure restores Wi-Fi"
+[[ $(<"$bluetooth_state") == "on" ]] || fail "snapshot-create failure restores Bluetooth"
+pass "snapshot-create isolates creation and unwinds radios on success or error"
 
 : >"$calls"
 ln -s "$wifi_device" "$wifi_driver/0000:74:00.0"
