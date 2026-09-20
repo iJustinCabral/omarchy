@@ -50,6 +50,7 @@ Boot `087573321047465480d6a9884483235c` produced the first controlled boundary:
 | `platform --bluetooth-off --disk-mode shutdown` | Passed | Device late/noirq callbacks, EC interrupt block/unblock, BCE VHCI resume and task restart completed; Wi-Fi and Bluetooth remained operational |
 | `processors --bluetooth-off --disk-mode shutdown` | Passed | CPUs 1–3 went offline and returned; all four CPUs, BCE VHCI, Wi-Fi and Bluetooth were operational afterward |
 | `core --bluetooth-off --disk-mode shutdown` | Passed | Snapshot memory was allocated, syscore suspend/resume returned, CPUs 1–3 were restored, and BCE VHCI, Wi-Fi and Bluetooth remained operational |
+| `test-resume --bluetooth-off` | Failed after image reload | The image was written and loaded completely; the second device-freeze pass failed when `brcmfmac` attempted a D3 mailbox send while its bus was already down |
 
 The failed platform test started at monotonic time `922.370559`; the final durable kernel line was `PM: hibernation: hibernation entry` at `922.402052`. The next boot reported `PM: Image not found (code -22)`. This proves that no image was left behind, but not that execution stopped at the last durable line: device and filesystem logging was already being quiesced, and the display returning before input suggests a failure during rollback or resume is possible.
 
@@ -71,13 +72,17 @@ The processor test also returned successfully. The final test before writing an 
 omarchy debug t2-hibernate test core --bluetooth-off --disk-mode shutdown
 ```
 
-The core test returned successfully. It allocated approximately 3.0 GiB of snapshot memory, passed the syscore boundary, restored CPUs 1–3, resumed BCE VHCI with the same five pending-submission warnings, and left all CPUs and both radios operational. The next stage is `test-resume`, which writes and immediately restores a real hibernation image without entering ACPI S4:
+The core test returned successfully. It allocated approximately 3.0 GiB of snapshot memory, passed the syscore boundary, restored CPUs 1–3, resumed BCE VHCI with the same five pending-submission warnings, and left all CPUs and both radios operational. The next stage was `test-resume`, which writes and immediately restores a real hibernation image without entering ACPI S4:
 
 ```bash
 omarchy debug t2-hibernate test test-resume --bluetooth-off
 ```
 
-Save all work before this test. Image creation and in-kernel restoration have not yet been exercised on this machine, so the test can hang and require a forced restart.
+The image path advanced much farther than the original hibernation attempt. The kernel wrote 2,563,692 KiB, found the image signature, read the entire image and reported `Image successfully loaded`. During the second device-freeze pass, `brcmfmac` found its bus down, failed `HOST_D3_INFORM` with `-EIO`, and caused the kernel to abort restoration and recover the running system. Wi-Fi then continuously failed to reserve common-ring space until the machine was rebooted.
+
+This isolates the current `test_resume` failure to Broadcom Wi-Fi PM state between the first thaw and the second freeze. Do not repeat this test or attempt real hibernation until that driver transition is fixed.
+
+The matching Linux PCI PM implementation only invokes a driver's `.thaw` callback when that member is present; it does not substitute `.resume` when the driver supplies a PM operations table. The pinned `brcmfmac` source defines `.freeze` and `.restore`, but not `.thaw` or `.poweroff`. Patch `0006-brcmfmac-complete-hibernation-pm-callbacks.patch` pairs the existing D3 transition with freeze and poweroff, and the existing D0 transition with thaw and restore. Both pinned source profiles accept the patch, the callback invariant test passes, and all five modules compile against the current T2 kernel headers. Hardware validation is still required after installing the rebuilt modules and rebooting.
 
 ## Test sequence
 

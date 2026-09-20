@@ -59,7 +59,7 @@ def prepare(wifi, bluetooth, output, profile):
         if output.exists():
             raise ValueError('Output appeared during preparation')
         root.rename(output)
-    print(f'PASS: {profile} source matches tested laboratory source: {output}')
+    print(f'PASS: {profile} source matches pinned manifest: {output}')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)

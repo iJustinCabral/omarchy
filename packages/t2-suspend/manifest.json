@@ -174,6 +174,12 @@
       "series": "wifi"
     },
     {
+      "path": "patches/wifi/0006-brcmfmac-complete-hibernation-pm-callbacks.patch",
+      "sha256": "d580450050f1d7ef3260515d4a508a4fb8a81579c9ef4de698cd66bdf4dbc387",
+      "evidence_path": "docs/t2-suspend/HIBERNATION.md",
+      "series": "wifi"
+    },
+    {
       "path": "patches/bluetooth/0001-bcm4377-restore-vendor-windows-before-resume.patch",
       "sha256": "107ba1e41ad57c908dd43b3c177e1b8d8071622710f28b9ca5d05e579b9241ff",
       "lab_path": "v2/stock-resume/bluetooth-window-restore/0001-bcm4377-restore-vendor-windows-before-resume.patch",
@@ -260,7 +266,7 @@
       "brcmfmac/of.h": "d27052440389dbc249e7435fccef43c18f8d07bf641563327ef0cf2bfab3cd7b",
       "brcmfmac/p2p.c": "53362156009a93fd0ec5743e3789c1483701a359304aa5cc1835797129f18e2e",
       "brcmfmac/p2p.h": "f0d89a7f6136140179c0297b7b10c7e9209a844164ae54c82f713f7968d5d3b3",
-      "brcmfmac/pcie.c": "63acb277dc77972557848923617ffe4000dfe175e6d0bc1c7e3db322675402c0",
+      "brcmfmac/pcie.c": "d4296850fbc779bdc763d059d002595d3bcd086acf8a9dfb2d1687b4e859c535",
       "brcmfmac/pcie.h": "5d48671dc3226f929b813a0f48038d51a9a1b7de29711f41954fc4b6ce48680b",
       "brcmfmac/pno.c": "114a8750a6c223afd9085dd2ecfc190c020e5cbd22efba6924e30caa322e4b4c",
       "brcmfmac/pno.h": "190211270b7ab6f92dc63acde26c2cb87aedc1774f98eafe6953e4f583f94512",
@@ -401,7 +407,7 @@
       "brcmfmac/of.h": "d27052440389dbc249e7435fccef43c18f8d07bf641563327ef0cf2bfab3cd7b",
       "brcmfmac/p2p.c": "53362156009a93fd0ec5743e3789c1483701a359304aa5cc1835797129f18e2e",
       "brcmfmac/p2p.h": "f0d89a7f6136140179c0297b7b10c7e9209a844164ae54c82f713f7968d5d3b3",
-      "brcmfmac/pcie.c": "82e3c33438487eb43a3af95eaeab22d9ac9d8bc7a9abcb450d8218de70b9e933",
+      "brcmfmac/pcie.c": "6e6174948917184f9cbe92a5e12f1dff5b05b874c6f2ef43b6dcf7c49b0f18bd",
       "brcmfmac/pcie.h": "5d48671dc3226f929b813a0f48038d51a9a1b7de29711f41954fc4b6ce48680b",
       "brcmfmac/pno.c": "114a8750a6c223afd9085dd2ecfc190c020e5cbd22efba6924e30caa322e4b4c",
       "brcmfmac/pno.h": "190211270b7ab6f92dc63acde26c2cb87aedc1774f98eafe6953e4f583f94512",

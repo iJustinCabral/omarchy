@@ -1,7 +1,7 @@
 # T2 suspend driver source package
 
 This package consolidates the driver changes tested on MacBookAir9,1, BCM4377,
-Omarchy 4.0.3 and `7.2.4-arch1-Watanare-T2-1-t2`. It contains ten patches,
+Omarchy 4.0.3 and `7.2.4-arch1-Watanare-T2-1-t2`. It contains eleven patches,
 pinned source and patch hashes, source preparation, and extracted-C fault tests.
 Fresh setup and an upgrade migration now build/install these modules automatically through DKMS on the supported model; see [installer lifecycle and validation](../../docs/t2-suspend/INSTALLATION.md). Existing trackpad, Wi-Fi recovery and Bluetooth startup installers remain
 available. See [the branch overview](../../README.md) and
@@ -11,7 +11,7 @@ available. See [the branch overview](../../README.md) and
 
 | Series | Ordered changes | Status |
 | --- | --- | --- |
-| `patches/wifi/` | 0001 control-ring mailbox; 0002 host capabilities; 0003 IRQ/startup; 0004 partial-attach guard; 0005 bounded diagnostics | Combined with Bluetooth series, repeated actual S3 and audio recovery on tested machine |
+| `patches/wifi/` | 0001 control-ring mailbox; 0002 host capabilities; 0003 IRQ/startup; 0004 partial-attach guard; 0005 bounded diagnostics; 0006 complete hibernation callbacks | Patches 0001–0005 passed repeated actual S3 and audio recovery with the Bluetooth series; 0006 is based on the isolated `test_resume` failure and awaits hardware validation |
 | `patches/bluetooth/` | 0001 restore vendor windows; 0002 stop publishing failed rings; 0003 rebuild lost transport through HCI lifecycle and Bluetooth FLR | Repeated S3, automatic AirPods reconnect, initially-off Bluetooth recovery |
 | `patches/wifi-reenable/` | 0001 propagate interface-open transport failure; 0002 explicit Wi-Fi function0 reset | Included from current test image; successful Wi-Fi-off cycle did not execute reset; earlier unexpected reboot remains unexplained |
 
@@ -67,12 +67,13 @@ After preparing the `s3` tree above:
 ```sh
 python3 packages/t2-suspend/tests/test-bluetooth.py /tmp/t2-s3-source/drivers/bluetooth/hci_bcm4377.c
 python3 packages/t2-suspend/tests/test-open.py /tmp/t2-s3-source/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c
+python3 packages/t2-suspend/tests/test-hibernate-pm.py /tmp/t2-s3-source/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
 python3 packages/t2-suspend/tests/test-flr.py
 ```
 
-These execute extracted C or the exact FLR helper with failure injection. They
+These execute extracted C, source invariants or the exact FLR helper with failure injection. They
 verify state/error/DMA/IRQ behavior; they cannot prove real hardware reset safety.
-`manifest.json` ties every patch to its original lab path at commit `68bf7e0`.
+`manifest.json` ties the original S3 patch set to its lab path at commit `68bf7e0` and the hibernation callback patch to its captured MacBookAir9,1 evidence.
 No generated modules, firmware, machine boot images, credentials, raw HCI/audio,
 or private diagnostics are included.
 
