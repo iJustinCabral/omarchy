@@ -17,7 +17,7 @@ build() {
   done
   for module in brcmfmac brcmfmac-wcc brcmfmac-cyw brcmfmac-bca hci_bcm4377; do
     selected=$(modinfo -b "${root:-/}" -k "$KERNELVERSION" -n "$module") || exit 1
-    built=$root/var/lib/dkms/omarchy-t2-radio/1.0/$KERNELVERSION/x86_64/module/$module.ko
+    built=$root/var/lib/dkms/omarchy-t2-radio/1.1/$KERNELVERSION/x86_64/module/$module.ko
     # DKMS may compress its stored modules to match the target kernel.
     if [[ ! -f $built ]]; then
       for actual in "$built.xz" "$built.zst" "$built.gz"; do
@@ -31,7 +31,7 @@ build() {
     [[ ${vermagic%% *} == "$KERNELVERSION" ]] || { error "Wrong T2 module ABI: $module"; exit 1; }
     [[ -n $expected && $expected == "$actual" ]] || { error "Stock/conflicting T2 module selected: $module"; exit 1; }
   done
-  add_file "$root/usr/src/omarchy-t2-radio-1.0/provenance.json" /etc/omarchy-t2-radio-source.json || exit 1
+  add_file "$root/usr/src/omarchy-t2-radio-1.1/provenance.json" /etc/omarchy-t2-radio-source.json || exit 1
   # Include Wi-Fi; Bluetooth stays on the root filesystem and loads through its gate.
   add_module brcmfmac || exit 1
   add_module brcmfmac-wcc || exit 1

@@ -69,6 +69,26 @@ class Installer(unittest.TestCase):
     self.assertFalse((self.root / m.SOURCE).exists())
     self.assertIsNone(m.bt.read(self.root, 'etc/modprobe.d/omarchy-t2-suspend.conf'))
 
+  def test_installed_older_version_is_rolled_back_before_upgrade(self):
+    self.install()
+    legacy_version = '1.0'
+    legacy_source = self.root / m.source_name(legacy_version)
+    (self.root / m.SOURCE).rename(legacy_source)
+    receipt = m.load(self.root)
+    receipt['version'] = legacy_version
+    m.save(self.root, receipt)
+    (self.root / f'var/lib/dkms/{m.NAME}/{legacy_version}').mkdir(parents=True)
+    self.calls.clear()
+
+    self.install()
+
+    self.assertIn(['dkms', 'remove', '-m', m.NAME, '-v', legacy_version, '--all'], self.calls)
+    self.assertIn(['dkms', 'add', '-m', m.NAME, '-v', m.VERSION], self.calls)
+    self.assertFalse(legacy_source.exists())
+    self.assertTrue((self.root / m.SOURCE).exists())
+    self.assertEqual(m.load(self.root)['version'], m.VERSION)
+    self.assertEqual(m.load(self.root)['state'], 'installed')
+
   def test_all_failure_stages_restore_boot_and_config(self):
     original = (self.root / 'etc/bluetooth/main.conf').read_bytes()
     for failure in (['dkms', 'add'], ['dkms', 'build'], ['dkms', 'install'], ['limine-mkinitcpio']):
@@ -106,6 +126,14 @@ class Installer(unittest.TestCase):
     (self.root / m.SOURCE / 'source.c').write_text('changed')
     with self.assertRaises(ValueError): m.verify(self.root, self.runner, lambda *_: None)
     with self.assertRaises(ValueError): m.rollback(self.root, self.runner)
+
+  def test_verify_rejects_an_older_installed_version(self):
+    self.install()
+    receipt = m.load(self.root)
+    receipt['version'] = '1.0'
+    m.save(self.root, receipt)
+    with self.assertRaisesRegex(ValueError, 'require an upgrade'):
+      m.verify(self.root, self.runner, lambda *_: None)
 
   def test_live_dkms_loading_refused(self):
     p = self.root / 'etc/dkms/framework.conf'

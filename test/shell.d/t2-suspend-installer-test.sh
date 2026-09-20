@@ -44,6 +44,10 @@ grep -q 'manage.py rollback$' "$TEST_CALLS" || fail "rollback routes correctly"
 bash -euo pipefail "$ROOT/migrations/1789256882.sh"
 grep -qx setup "$TEST_CALLS" || fail "migration invokes setup"
 if TEST_INSTALL_STATUS=1 bash -euo pipefail "$ROOT/migrations/1789256882.sh"; then fail "migration failure must remain pending"; fi
+: > "$TEST_CALLS"
+bash -euo pipefail "$ROOT/migrations/1789872502.sh"
+grep -qx setup "$TEST_CALLS" || fail "driver upgrade migration invokes setup"
+if TEST_INSTALL_STATUS=1 bash -euo pipefail "$ROOT/migrations/1789872502.sh"; then fail "driver upgrade failure must remain pending"; fi
 pass "T2 suspend setup, CLI and migration routing; failure propagation"
 
 # The initcpio hook must abort before image publication on a missing replacement.

@@ -14,7 +14,7 @@ Setup installs DKMS, matching T2 headers, compiler, make and patch through Omarc
 
 | Location | Purpose |
 | --- | --- |
-| `/usr/src/omarchy-t2-radio-1.0/` | Verified driver source and DKMS build description |
+| `/usr/src/omarchy-t2-radio-1.1/` | Verified driver source and DKMS build description |
 | `/var/lib/dkms/omarchy-t2-radio/` | DKMS builds, installation records and archived original modules |
 | `/usr/share/dkms/modules_to_force_install/omarchy-t2-radio` | Replace the complete radio set even when a vendor companion's source version equals stock |
 | `/etc/modprobe.d/omarchy-t2-suspend.conf` | Enable the model-scoped Wi-Fi recovery option from the tested image |
@@ -35,7 +35,7 @@ Arch's DKMS hook runs before the normal mkinitcpio hook when kernel/header files
 
 The initcpio hook checks every selected module's source version against its DKMS build and verifies the target kernel ABI. Missing or mismatched replacements terminate mkinitcpio before image publication. Returning an ordinary hook error is insufficient: mkinitcpio can otherwise write an incomplete image and return failure afterward. Bluetooth is checked on the root filesystem but not explicitly added to the initramfs; it still loads through the existing readiness gate. Image inspection also rejects early Bluetooth inclusion and missing required Apple firmware. The hook copies installed `brcmfmac4377b3-*` files and requires the Formosa binary, both SPPR NVRAM variants, CLM and TxCap blobs before building. These board-specific filenames are requested dynamically and are absent from static driver firmware metadata.
 
-During initial installation, all builds complete before any replacement is installed. A subsequent installation, selection, or boot-image failure removes the owned DKMS registration, restores configuration and original modules, and restores the boot snapshot. Edited administrator files or source are preserved and cause an explicit error. An interrupted transaction remains recorded for rollback. Repeated completed installation verifies state and does not rebuild unnecessarily.
+During initial installation, all builds complete before any replacement is installed. A subsequent installation, selection, or boot-image failure removes the owned DKMS registration, restores configuration and original modules, and restores the boot snapshot. Edited administrator files or source are preserved and cause an explicit error. An interrupted transaction remains recorded for rollback. Repeated completed installation verifies state and does not rebuild unnecessarily. When the receipt names an older owned DKMS version, setup first performs its normal rollback and publishes a stock-driver boot image, then installs the new version transactionally; failure therefore leaves a bootable stock fallback instead of mixed driver revisions.
 
 A later manual rollback rebuilds the boot image for the currently installed kernel rather than restoring an obsolete kernel image from the original installation. DKMS removal restores its archived original drivers. Backups and the receipt remain for audit. Other T2 support components remain installed.
 
