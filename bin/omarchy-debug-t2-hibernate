@@ -2,7 +2,7 @@
 
 # omarchy:summary=Inspect and run guarded T2 hibernation diagnostics
 # omarchy:group=debug
-# omarchy:args=<check|test> [freezer|devices|platform|processors|core|test-resume] [--bluetooth-off] [--pm-trace] [--disk-mode <platform|shutdown>] [--yes]
+# omarchy:args=<check|test> [freezer|devices|platform|processors|core|test-resume] [--bluetooth-off] [--wifi-unbind] [--pm-trace] [--disk-mode <platform|shutdown>] [--yes]
 # omarchy:examples=omarchy debug t2-hibernate check | omarchy debug t2-hibernate test freezer --bluetooth-off
 
 set -euo pipefail
@@ -11,6 +11,7 @@ SYS_POWER=${OMARCHY_T2_HIBERNATE_SYS_POWER:-/sys/power}
 DMI_ROOT=${OMARCHY_T2_HIBERNATE_DMI_ROOT:-/sys/class/dmi/id}
 CMDLINE_FILE=${OMARCHY_T2_HIBERNATE_CMDLINE:-/proc/cmdline}
 BRCMFMAC_SRCVERSION_FILE=${OMARCHY_T2_HIBERNATE_BRCMFMAC_SRCVERSION:-/sys/module/brcmfmac/srcversion}
+BRCMFMAC_DRIVER=${OMARCHY_T2_HIBERNATE_BRCMFMAC_DRIVER:-/sys/bus/pci/drivers/brcmfmac}
 TESTED_MODEL="MacBookAir9,1"
 UNSAFE_RESTORE_SRCVERSION="5D40EE47A0592AA2E41E149"
 TEST_CLEANUP_ARMED=false
@@ -18,12 +19,13 @@ TEST_PREVIOUS_PM_TEST=""
 TEST_PREVIOUS_DISK=""
 TEST_PREVIOUS_PM_TRACE=""
 TEST_BLUETOOTH_WAS_POWERED=false
+TEST_WIFI_DEVICE=""
 
 usage() {
   cat <<'USAGE'
 Usage:
   omarchy debug t2-hibernate check
-  omarchy debug t2-hibernate test <freezer|devices|platform|processors|core|test-resume> [--bluetooth-off] [--pm-trace] [--disk-mode <platform|shutdown>] [--yes]
+  omarchy debug t2-hibernate test <freezer|devices|platform|processors|core|test-resume> [--bluetooth-off] [--wifi-unbind] [--pm-trace] [--disk-mode <platform|shutdown>] [--yes]
 
 The check is read-only. Tests use the kernel's direct hibernation test
 interface and can still freeze or reboot a broken machine. They do not change
@@ -34,6 +36,10 @@ Start with:
 
 Use --disk-mode shutdown to skip ACPI S4 platform preparation while retaining
 the selected PM test depth. The prior hibernation mode is restored afterward.
+
+Use --wifi-unbind to detach the single BCM4377 Wi-Fi PCI function before the
+test and bind it again afterward. Network access will be interrupted. This
+isolates image-rewound Wi-Fi queues; a pass does not validate Wi-Fi restore.
 
 Use --pm-trace to store the last device PM callback in the RTC so the next boot
 can identify a hard hang. This temporarily disturbs the hardware clock; network
@@ -180,6 +186,7 @@ write_power_setting() {
 }
 
 restore_test_state() {
+  local cleanup_status=0
   if ! $TEST_CLEANUP_ARMED; then
     return 0
   fi
@@ -197,12 +204,47 @@ restore_test_state() {
   if $TEST_BLUETOOTH_WAS_POWERED; then
     timeout 5s bluetoothctl power on >/dev/null 2>&1 || true
   fi
+  if [[ -n $TEST_WIFI_DEVICE && ! -L "$BRCMFMAC_DRIVER/$TEST_WIFI_DEVICE" ]]; then
+    if ! write_power_setting "$BRCMFMAC_DRIVER/bind" "$TEST_WIFI_DEVICE" || [[ ! -L "$BRCMFMAC_DRIVER/$TEST_WIFI_DEVICE" ]]; then
+      echo "Failed to rebind Wi-Fi $TEST_WIFI_DEVICE; inspect the kernel journal before further testing." >&2
+      cleanup_status=1
+    fi
+  fi
+  TEST_WIFI_DEVICE=""
+  return "$cleanup_status"
+}
+
+isolate_wifi() {
+  local device
+  local -a devices=()
+
+  for device in "$BRCMFMAC_DRIVER"/????:??:??.?; do
+    [[ -L $device ]] && devices+=("$device")
+  done
+  if (( ${#devices[@]} != 1 )); then
+    echo "Wi-Fi isolation requires exactly one bound brcmfmac PCI device." >&2
+    return 1
+  fi
+  device=${devices[0]}
+  if [[ $(<"$device/vendor") != "0x14e4" || $(<"$device/device") != "0x4488" ]]; then
+    echo "Wi-Fi isolation is only qualified for BCM4377 (14e4:4488)." >&2
+    return 1
+  fi
+
+  TEST_WIFI_DEVICE=${device##*/}
+  logger --tag omarchy-t2-hibernate-test "unbinding wifi=$TEST_WIFI_DEVICE"
+  if ! write_power_setting "$BRCMFMAC_DRIVER/unbind" "$TEST_WIFI_DEVICE" || [[ -L $device ]]; then
+    echo "Wi-Fi did not detach; refusing to start the PM test." >&2
+    return 1
+  fi
+  echo "Wi-Fi detached before image creation; it will be rebound when the test returns."
 }
 
 run_test() {
   local stage="$1"
   shift
   local bluetooth_off=false
+  local wifi_unbind=false
   local pm_trace=false
   local assume_yes=false
   local disk_mode=""
@@ -212,6 +254,9 @@ run_test() {
     case "$1" in
       --bluetooth-off)
         bluetooth_off=true
+        ;;
+      --wifi-unbind)
+        wifi_unbind=true
         ;;
       --pm-trace)
         pm_trace=true
@@ -298,6 +343,9 @@ run_test() {
     echo "This suspends part of the live device/platform stack. Save all work first."
   fi
   echo "A kernel or driver fault can still require a forced restart."
+  if $wifi_unbind; then
+    echo "Wi-Fi will be detached for this test; network access will be interrupted."
+  fi
   if [[ -n $disk_mode ]]; then
     echo "The hibernation disk mode will be temporarily set to '$disk_mode'."
   fi
@@ -341,6 +389,10 @@ run_test() {
     fi
   fi
 
+  if $wifi_unbind; then
+    isolate_wifi
+  fi
+
   if [[ $stage == "test-resume" ]]; then
     write_power_setting "$SYS_POWER/pm_test" none
     write_power_setting "$SYS_POWER/disk" test_resume
@@ -356,14 +408,18 @@ run_test() {
   fi
 
   sync
-  logger --tag omarchy-t2-hibernate-test "starting stage=$stage bluetooth_off=$bluetooth_off pm_trace=$pm_trace disk_mode=${disk_mode:-current}"
+  if [[ -n $TEST_WIFI_DEVICE && -L "$BRCMFMAC_DRIVER/$TEST_WIFI_DEVICE" ]]; then
+    echo "Wi-Fi rebound unexpectedly; refusing to start the PM test." >&2
+    return 1
+  fi
+  logger --tag omarchy-t2-hibernate-test "starting stage=$stage bluetooth_off=$bluetooth_off pm_trace=$pm_trace disk_mode=${disk_mode:-current} wifi_unbind=$wifi_unbind"
   echo "Entering kernel test..."
   if ! write_power_setting "$SYS_POWER/state" disk; then
-    logger --tag omarchy-t2-hibernate-test "failed stage=$stage bluetooth_off=$bluetooth_off pm_trace=$pm_trace disk_mode=${disk_mode:-current}"
+    logger --tag omarchy-t2-hibernate-test "failed stage=$stage bluetooth_off=$bluetooth_off pm_trace=$pm_trace disk_mode=${disk_mode:-current} wifi_unbind=$wifi_unbind"
     echo "The kernel rejected the '$stage' test. Inspect the kernel journal before retrying." >&2
     return 1
   fi
-  logger --tag omarchy-t2-hibernate-test "returned stage=$stage bluetooth_off=$bluetooth_off pm_trace=$pm_trace disk_mode=${disk_mode:-current}"
+  logger --tag omarchy-t2-hibernate-test "returned stage=$stage bluetooth_off=$bluetooth_off pm_trace=$pm_trace disk_mode=${disk_mode:-current} wifi_unbind=$wifi_unbind"
   restore_test_state
   trap - EXIT INT TERM
   echo "The '$stage' test returned successfully."

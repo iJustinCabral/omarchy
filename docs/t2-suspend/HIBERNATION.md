@@ -36,6 +36,8 @@ Even the `freezer` test can hang when the fault occurs in an early notifier. Sav
 
 `--disk-mode shutdown` temporarily changes `/sys/power/disk` while retaining the requested PM test depth. At the `platform` level this still exercises device late/noirq callbacks, but skips the ACPI S4 global preparation used by `platform` disk mode. The original mode is restored when the test returns.
 
+`--wifi-unbind` isolates Wi-Fi transport state by detaching the single bound BCM4377 PCI function before entering the kernel test and rebinding it after return, including a rejected transition. It refuses ambiguous or unsupported PCI targets and verifies that the binding disappeared before entering PM. Rebind failure is reported as failure rather than a successful test. Network access is interrupted, so run from a local terminal or a durable local job, not a network-dependent command chain. A hard reset uses the normal boot probe; no persistent driver blacklist is created. This is a diagnostic, not a validated hibernation workaround: the current `.restore` queue rewind is removed from the experiment, while the BCE image-restore path remains under test. First validate the detach/rebind lifecycle at `freezer` depth; only advance to image restoration after networking and input are verified. The known-bad 1.3 module rejection remains active even with this option.
+
 ## MacBookAir9,1 staged results on September 19–20, 2026
 
 Boot `087573321047465480d6a9884483235c` produced the first controlled boundary:

@@ -14,6 +14,12 @@ dmi="$test_tmp/dmi"
 calls="$test_tmp/calls"
 bluetooth_state="$test_tmp/bluetooth-state"
 brcmfmac_srcversion="$test_tmp/brcmfmac-srcversion"
+wifi_driver="$test_tmp/wifi-driver"
+wifi_device="$test_tmp/wifi-device"
+mkdir -p "$wifi_driver" "$wifi_device"
+printf '0x14e4\n' >"$wifi_device/vendor"
+printf '0x4488\n' >"$wifi_device/device"
+ln -s "$wifi_device" "$wifi_driver/0000:73:00.0"
 mkdir -p "$stub_bin" "$power" "$dmi"
 : >"$calls"
 printf 'on\n' >"$bluetooth_state"
@@ -78,11 +84,31 @@ cat >"$stub_bin/gum" <<'SH'
 #!/bin/bash
 exit "${TEST_CONFIRM_STATUS:-0}"
 SH
+cat >"$stub_bin/tee" <<'SH'
+#!/bin/bash
+if [[ $1 == "$TEST_WIFI_DRIVER/unbind" ]]; then
+  read -r device
+  [[ ${TEST_WIFI_UNBIND_FAIL:-0} == 1 ]] && exit 1
+  if [[ ${TEST_WIFI_UNBIND_NOOP:-0} != 1 ]]; then
+    rm "$TEST_WIFI_DRIVER/$device"
+  fi
+  printf '%s\n' "$device"
+elif [[ $1 == "$TEST_WIFI_DRIVER/bind" ]]; then
+  read -r device
+  [[ ${TEST_WIFI_BIND_FAIL:-0} == 1 ]] && exit 1
+  ln -s "$TEST_WIFI_TARGET" "$TEST_WIFI_DRIVER/$device"
+  printf '%s\n' "$device"
+else
+  exec /usr/bin/tee "$@"
+fi
+SH
 chmod +x "$stub_bin"/*
 
 export PATH="$stub_bin:$PATH"
 export TEST_CALLS="$calls"
 export TEST_BLUETOOTH_STATE="$bluetooth_state"
+export TEST_WIFI_DRIVER="$wifi_driver" TEST_WIFI_TARGET="$wifi_device"
+export OMARCHY_T2_HIBERNATE_BRCMFMAC_DRIVER="$wifi_driver"
 export OMARCHY_T2_HIBERNATE_SYS_POWER="$power"
 export OMARCHY_T2_HIBERNATE_DMI_ROOT="$dmi"
 export OMARCHY_T2_HIBERNATE_CMDLINE="$test_tmp/cmdline"
@@ -181,6 +207,64 @@ grep -Fq "sudo tee $power/disk" "$calls" || fail "disk-mode test writes the temp
 grep -Fq 'logger --tag omarchy-t2-hibernate-test starting stage=platform bluetooth_off=false pm_trace=false disk_mode=shutdown' "$calls" || fail "disk-mode test records the isolation condition"
 [[ $(<"$power/disk") == "platform" ]] || fail "disk-mode test restores the previous mode"
 pass "platform test can isolate ACPI S4 preparation with temporary shutdown mode"
+
+: >"$calls"
+printf '[none] core processors platform devices freezer\n' >"$power/pm_test"
+$command test devices --wifi-unbind --yes >/dev/null
+[[ -L "$wifi_driver/0000:73:00.0" ]] || fail "Wi-Fi isolation restores the binding"
+awk -v unbind="sudo tee $wifi_driver/unbind" -v state="sudo tee $power/state" -v bind="sudo tee $wifi_driver/bind" '
+  $0 == unbind { detached = NR }
+  $0 == state { entered = NR }
+  $0 == bind { restored = NR }
+  END { exit !(detached > 0 && entered > detached && restored > entered) }
+' "$calls" || fail "Wi-Fi detach/test/rebind ordering"
+grep -Fq 'disk_mode=current wifi_unbind=true' "$calls" || fail "Wi-Fi isolation is recorded"
+pass "Wi-Fi is detached before the test and rebound after return"
+
+for failure in TEST_WIFI_UNBIND_FAIL TEST_WIFI_UNBIND_NOOP; do
+  : >"$calls"
+  printf '[none] core processors platform devices freezer\n' >"$power/pm_test"
+  if env "$failure=1" "$command" test devices --wifi-unbind --yes >/dev/null 2>&1; then
+    fail "Wi-Fi isolation must reject $failure"
+  fi
+  ! grep -Fq "sudo tee $power/state" "$calls" || fail "failed detach must not enter PM"
+  [[ -L "$wifi_driver/0000:73:00.0" ]] || fail "failed detach retains Wi-Fi"
+done
+pass "Wi-Fi isolation requires verified detachment"
+
+: >"$calls"
+printf '[none] core processors platform devices freezer\n' >"$power/pm_test"
+chmod 444 "$power/state"
+if "$command" test devices --wifi-unbind --yes >/dev/null 2>&1; then
+  fail "Wi-Fi-isolated rejected PM transition must fail"
+fi
+chmod 644 "$power/state"
+[[ -L "$wifi_driver/0000:73:00.0" ]] || fail "failed PM transition must rebind Wi-Fi"
+pass "Wi-Fi binding is restored after a rejected PM transition"
+
+printf '[none] core processors platform devices freezer\n' >"$power/pm_test"
+if output=$(TEST_WIFI_BIND_FAIL=1 "$command" test devices --wifi-unbind --yes 2>&1); then
+  fail "Wi-Fi rebind failure must not report success"
+fi
+[[ $output == *"Failed to rebind Wi-Fi"* ]] || fail "Wi-Fi rebind failure is actionable"
+[[ $output != *"test returned successfully"* ]] || fail "failed cleanup must not claim success"
+ln -s "$wifi_device" "$wifi_driver/0000:73:00.0"
+pass "Wi-Fi rebind failure propagates"
+
+: >"$calls"
+ln -s "$wifi_device" "$wifi_driver/0000:74:00.0"
+if "$command" test devices --wifi-unbind --yes >/dev/null 2>&1; then
+  fail "ambiguous Wi-Fi devices must be rejected"
+fi
+! grep -Fq "sudo tee $wifi_driver/unbind" "$calls" || fail "ambiguous target must not be detached"
+rm "$wifi_driver/0000:74:00.0"
+printf '0xffff\n' >"$wifi_device/device"
+if "$command" test devices --wifi-unbind --yes >/dev/null 2>&1; then
+  fail "unqualified Wi-Fi hardware must be rejected"
+fi
+! grep -Fq "sudo tee $wifi_driver/unbind" "$calls" || fail "unqualified target must not be detached"
+printf '0x4488\n' >"$wifi_device/device"
+pass "Wi-Fi isolation rejects ambiguous and unqualified PCI targets"
 
 printf 'MacBookPro16,1\n' >"$dmi/product_name"
 if $command test freezer --yes >/dev/null 2>&1; then
