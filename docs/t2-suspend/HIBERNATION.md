@@ -14,7 +14,7 @@ The failed hibernation boot ended after these events:
 
 The resume device, Btrfs swap-file offset and initramfs `resume` hook were present. The surviving evidence therefore places this failure before image creation, in console preparation, a hibernation prepare notifier, or the initial filesystem-sync boundary. It does not implicate image restoration yet.
 
-The Bluetooth HCI power-management notifier is the strongest T2-specific entry suspect currently identified. It handles `PM_HIBERNATION_PREPARE` by synchronously quiescing the controller, and the BCM4377 transport has already shown command timeouts after S3. This remains a hypothesis until the isolated `freezer` result is captured.
+The Bluetooth HCI power-management notifier was an early T2-specific suspect because it handles `PM_HIBERNATION_PREPARE` by synchronously quiescing the controller, and the BCM4377 transport has shown command timeouts after S3. Both `freezer` variants returned, however, so an active HCI controller is not a deterministic cause of the entry failure.
 
 ## Guarded diagnostic command
 
@@ -49,6 +49,7 @@ Boot `087573321047465480d6a9884483235c` produced the first controlled boundary:
 | `platform --bluetooth-off` with `platform` disk mode | Failed | Display returned but the session remained unresponsive and required a forced restart; no return marker or image survived |
 | `platform --bluetooth-off --disk-mode shutdown` | Passed | Device late/noirq callbacks, EC interrupt block/unblock, BCE VHCI resume and task restart completed; Wi-Fi and Bluetooth remained operational |
 | `processors --bluetooth-off --disk-mode shutdown` | Passed | CPUs 1–3 went offline and returned; all four CPUs, BCE VHCI, Wi-Fi and Bluetooth were operational afterward |
+| `core --bluetooth-off --disk-mode shutdown` | Passed | Snapshot memory was allocated, syscore suspend/resume returned, CPUs 1–3 were restored, and BCE VHCI, Wi-Fi and Bluetooth remained operational |
 
 The failed platform test started at monotonic time `922.370559`; the final durable kernel line was `PM: hibernation: hibernation entry` at `922.402052`. The next boot reported `PM: Image not found (code -22)`. This proves that no image was left behind, but not that execution stopped at the last durable line: device and filesystem logging was already being quiesced, and the display returning before input suggests a failure during rollback or resume is possible.
 
@@ -64,11 +65,19 @@ That test returned successfully. The result isolates the failure to the ACPI S4 
 omarchy debug t2-hibernate test processors --bluetooth-off --disk-mode shutdown
 ```
 
-The processor test also returned successfully. The final test before writing an image adds syscore suspend/resume with interrupts disabled:
+The processor test also returned successfully. The final test before writing an image added syscore suspend/resume with interrupts disabled:
 
 ```bash
 omarchy debug t2-hibernate test core --bluetooth-off --disk-mode shutdown
 ```
+
+The core test returned successfully. It allocated approximately 3.0 GiB of snapshot memory, passed the syscore boundary, restored CPUs 1–3, resumed BCE VHCI with the same five pending-submission warnings, and left all CPUs and both radios operational. The next stage is `test-resume`, which writes and immediately restores a real hibernation image without entering ACPI S4:
+
+```bash
+omarchy debug t2-hibernate test test-resume --bluetooth-off
+```
+
+Save all work before this test. Image creation and in-kernel restoration have not yet been exercised on this machine, so the test can hang and require a forced restart.
 
 ## Test sequence
 
