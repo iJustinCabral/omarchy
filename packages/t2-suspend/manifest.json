@@ -147,6 +147,16 @@
     "path": "1001-Add-t2bce-driver-stack.patch",
     "sha256": "f0f77f2d321ac53e1cb9a33a6e8f378d2c6852ac25d7e4dcac5657bf0d99d7ec",
     "base": {
+      "drivers/staging/t2bce/t2bce_audio/Makefile": "94c0969fedaa2f63e0f51ea25c26d08bf447b2411c6081e1c036cada924ada9b",
+      "drivers/staging/t2bce/t2bce_audio/audio.c": "8556d5b2229b47cc1a137a152797964161cb7755b16a96d6765eb4038187bac6",
+      "drivers/staging/t2bce/t2bce_audio/audio.h": "47b43718856b8e8642c82efe8c01f316144f01781e55eb4c9a12e38e2e830a57",
+      "drivers/staging/t2bce/t2bce_audio/description.h": "2362145aeaa6390661e5744de0bbefd86133853ba34af08312a305465587f32e",
+      "drivers/staging/t2bce/t2bce_audio/pcm.c": "8ba770a810c757fd1c56a05029e582de542367dbc2b4467da28363cce1787aa7",
+      "drivers/staging/t2bce/t2bce_audio/pcm.h": "2f726e27d311a62abde951a9376948b7bb1645dd546567a5cc6697b80b741c0f",
+      "drivers/staging/t2bce/t2bce_audio/protocol.c": "d499c1bd315f27d5dfd2ccbabdc1ce5a127d530e68c38a4bb349de7dffd9c7be",
+      "drivers/staging/t2bce/t2bce_audio/protocol.h": "51a6c46e4613607ebae1064a71eaa790f17a86df6dcc4ce2760d0d17d3005ad4",
+      "drivers/staging/t2bce/t2bce_audio/protocol_bce.c": "51da84b233ab02bc4935aba92e2426c129010ab5cb7028ece34d8ad2bb0804ca",
+      "drivers/staging/t2bce/t2bce_audio/protocol_bce.h": "3d9c62ff84dd530d1f96bc48ee853d110a91651b33f0f76d367faecd36e557ab",
       "drivers/staging/t2bce/t2bce_core/Makefile": "760ec7df1cb4ca6132b1f2d0921e34e70b093f5f31659b6f0e0f211e1b666dec",
       "drivers/staging/t2bce/t2bce_core/include/t2bce_core_transport.h": "abc8cf1a193d262f56a0ae81dd51a5aca6cba148279ab4926d1c13bc257a2e2f",
       "drivers/staging/t2bce/t2bce_core/mailbox.c": "94ccb550abf05d6392c8738fe33222a983ab056ff5c163be0291e6aac26c865a",
@@ -158,6 +168,16 @@
     }
   },
   "t2bce_patched": {
+    "drivers/staging/t2bce/t2bce_audio/Makefile": "94c0969fedaa2f63e0f51ea25c26d08bf447b2411c6081e1c036cada924ada9b",
+    "drivers/staging/t2bce/t2bce_audio/audio.c": "4c09bb0b81b863dd99d2e43ce322e8a1c968c6fa21bfe736052c2afd47bd1750",
+    "drivers/staging/t2bce/t2bce_audio/audio.h": "47b43718856b8e8642c82efe8c01f316144f01781e55eb4c9a12e38e2e830a57",
+    "drivers/staging/t2bce/t2bce_audio/description.h": "2362145aeaa6390661e5744de0bbefd86133853ba34af08312a305465587f32e",
+    "drivers/staging/t2bce/t2bce_audio/pcm.c": "8ba770a810c757fd1c56a05029e582de542367dbc2b4467da28363cce1787aa7",
+    "drivers/staging/t2bce/t2bce_audio/pcm.h": "2f726e27d311a62abde951a9376948b7bb1645dd546567a5cc6697b80b741c0f",
+    "drivers/staging/t2bce/t2bce_audio/protocol.c": "d499c1bd315f27d5dfd2ccbabdc1ce5a127d530e68c38a4bb349de7dffd9c7be",
+    "drivers/staging/t2bce/t2bce_audio/protocol.h": "51a6c46e4613607ebae1064a71eaa790f17a86df6dcc4ce2760d0d17d3005ad4",
+    "drivers/staging/t2bce/t2bce_audio/protocol_bce.c": "51da84b233ab02bc4935aba92e2426c129010ab5cb7028ece34d8ad2bb0804ca",
+    "drivers/staging/t2bce/t2bce_audio/protocol_bce.h": "3d9c62ff84dd530d1f96bc48ee853d110a91651b33f0f76d367faecd36e557ab",
     "drivers/staging/t2bce/t2bce_core/Makefile": "760ec7df1cb4ca6132b1f2d0921e34e70b093f5f31659b6f0e0f211e1b666dec",
     "drivers/staging/t2bce/t2bce_core/include/t2bce_core_transport.h": "abc8cf1a193d262f56a0ae81dd51a5aca6cba148279ab4926d1c13bc257a2e2f",
     "drivers/staging/t2bce/t2bce_core/mailbox.c": "94ccb550abf05d6392c8738fe33222a983ab056ff5c163be0291e6aac26c865a",
@@ -207,6 +227,12 @@
     {
       "path": "patches/bce/0001-t2bce-run-stateful-handshake-for-image-restore.patch",
       "sha256": "8fbe8632feeb4f4cab8e412659565cc319b5103e3018d8c376b5a9d7791fcadf",
+      "evidence_path": "docs/t2-suspend/HIBERNATION.md",
+      "series": "bce"
+    },
+    {
+      "path": "patches/bce/0002-t2bce-audio-pair-hibernation-callbacks.patch",
+      "sha256": "657d83100a121918440ade0aab4c123d54056d1f125a4a84ffee2eee16c26e6d",
       "evidence_path": "docs/t2-suspend/HIBERNATION.md",
       "series": "bce"
     },

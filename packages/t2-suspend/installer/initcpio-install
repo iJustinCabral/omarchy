@@ -15,9 +15,9 @@ build() {
     [[ -f $firmware ]] || continue
     add_file "$firmware" "${firmware#"$root"}" || exit 1
   done
-  for module in brcmfmac brcmfmac-wcc brcmfmac-cyw brcmfmac-bca t2bce_core hci_bcm4377; do
+  for module in brcmfmac brcmfmac-wcc brcmfmac-cyw brcmfmac-bca t2bce_core t2bce_audio hci_bcm4377; do
     selected=$(modinfo -b "${root:-/}" -k "$KERNELVERSION" -n "$module") || exit 1
-    built=$root/var/lib/dkms/omarchy-t2-radio/1.4/$KERNELVERSION/x86_64/module/$module.ko
+    built=$root/var/lib/dkms/omarchy-t2-radio/1.5/$KERNELVERSION/x86_64/module/$module.ko
     # DKMS may compress its stored modules to match the target kernel.
     if [[ ! -f $built ]]; then
       for actual in "$built.xz" "$built.zst" "$built.gz"; do
@@ -31,8 +31,8 @@ build() {
     [[ ${vermagic%% *} == "$KERNELVERSION" ]] || { error "Wrong T2 module ABI: $module"; exit 1; }
     [[ -n $expected && $expected == "$actual" ]] || { error "Stock/conflicting T2 module selected: $module"; exit 1; }
   done
-  add_file "$root/usr/src/omarchy-t2-radio-1.4/provenance.json" /etc/omarchy-t2-radio-source.json || exit 1
-  # Include Wi-Fi and the BCE parent; Bluetooth stays on the root filesystem and loads through its gate.
+  add_file "$root/usr/src/omarchy-t2-radio-1.5/provenance.json" /etc/omarchy-t2-radio-source.json || exit 1
+  # Include Wi-Fi and the BCE parent. Audio stays on the root filesystem, and Bluetooth loads through its gate.
   add_module brcmfmac || exit 1
   add_module brcmfmac-wcc || exit 1
   add_module brcmfmac-cyw || exit 1
@@ -41,5 +41,5 @@ build() {
   (( _builderrors == 0 )) || { error "T2 initramfs dependency errors; preserving existing image"; exit 1; }
 }
 help() {
-  echo "Verify the T2 radio DKMS modules and include Wi-Fi without early Bluetooth loading."
+  echo "Verify the T2 DKMS modules and include Wi-Fi without early audio or Bluetooth loading."
 }

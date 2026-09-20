@@ -49,7 +49,7 @@ class Installer(unittest.TestCase):
       (self.root / 'boot/new-file').write_text('new')
     if self.fail and args[:len(self.fail)] == self.fail:
       raise subprocess.CalledProcessError(1, args, stderr='injected failure')
-    listing = 'etc/omarchy-t2-radio-source.json\n' + '\n'.join('/updates/dkms/' + n + '.ko' for n in m.MODULES[:-1])
+    listing = 'etc/omarchy-t2-radio-source.json\n' + '\n'.join('/updates/dkms/' + n + '.ko' for n in m.INITRAMFS_MODULES)
     listing += '\n' + '\n'.join('usr/lib/firmware/brcm/brcmfmac4377b3-pcie.apple,formosa' + s for s in ('.bin', '-SPPR-m.txt', '-SPPR-u.txt', '.clm_blob', '.txcap_blob'))
     return subprocess.CompletedProcess(args, 0, stdout=listing if args[0] == '/usr/bin/lsinitcpio' else '', stderr='')
 
@@ -122,6 +122,11 @@ class Installer(unittest.TestCase):
     (self.root / f'usr/lib/modules/{RELEASE}/build/Makefile').unlink()
     with self.assertRaises(ValueError): self.install()
     self.assertFalse(any(c[0] != '/usr/bin/lsinitcpio' for c in self.calls))
+
+  def test_audio_is_verified_without_forcing_early_load(self):
+    self.assertIn('t2bce_audio', m.MODULES)
+    self.assertNotIn('t2bce_audio', m.INITRAMFS_MODULES)
+    self.assertIn('t2bce_core', m.INITRAMFS_MODULES)
 
   def test_source_drift(self):
     self.install()

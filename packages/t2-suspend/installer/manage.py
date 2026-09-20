@@ -15,7 +15,7 @@ import tempfile
 HERE = Path(__file__).resolve().parent
 PACKAGE = HERE.parent
 REPO = HERE.parents[2]
-NAME, VERSION = 'omarchy-t2-radio', '1.4'
+NAME, VERSION = 'omarchy-t2-radio', '1.5'
 
 def source_name(version):
   return f'usr/src/{NAME}-{version}'
@@ -23,7 +23,10 @@ def source_name(version):
 SOURCE = source_name(VERSION)
 STATE = 'var/lib/omarchy-t2-suspend'
 RECEIPT = STATE + '/receipt.json'
-MODULES = ('brcmfmac', 'brcmfmac-wcc', 'brcmfmac-cyw', 'brcmfmac-bca', 't2bce_core', 'hci_bcm4377')
+MODULES = ('brcmfmac', 'brcmfmac-wcc', 'brcmfmac-cyw', 'brcmfmac-bca',
+           't2bce_core', 't2bce_audio', 'hci_bcm4377')
+INITRAMFS_MODULES = ('brcmfmac', 'brcmfmac-wcc', 'brcmfmac-cyw', 'brcmfmac-bca',
+                     't2bce_core')
 
 def load_module(name, path):
   spec = importlib.util.spec_from_file_location(name, path)
@@ -162,7 +165,7 @@ def check_images(root, runner=run):
       firmware = 'usr/lib/firmware/brcm/brcmfmac4377b3-pcie.apple,formosa' + suffix
       if firmware not in listing.splitlines():
         raise ValueError('Missing Apple Wi-Fi firmware in boot image: ' + firmware)
-    for name in MODULES[:-1]:
+    for name in INITRAMFS_MODULES:
       if '/' + name + '.ko' not in listing:
         raise ValueError('Missing required module in boot image: ' + name)
 
