@@ -48,6 +48,7 @@ Boot `087573321047465480d6a9884483235c` produced the first controlled boundary:
 | `devices` | Passed with recovered fault | HCI opcode `0x0c01` timed out during resume; the controller was operational afterward |
 | `platform --bluetooth-off` with `platform` disk mode | Failed | Display returned but the session remained unresponsive and required a forced restart; no return marker or image survived |
 | `platform --bluetooth-off --disk-mode shutdown` | Passed | Device late/noirq callbacks, EC interrupt block/unblock, BCE VHCI resume and task restart completed; Wi-Fi and Bluetooth remained operational |
+| `processors --bluetooth-off --disk-mode shutdown` | Passed | CPUs 1–3 went offline and returned; all four CPUs, BCE VHCI, Wi-Fi and Bluetooth were operational afterward |
 
 The failed platform test started at monotonic time `922.370559`; the final durable kernel line was `PM: hibernation: hibernation entry` at `922.402052`. The next boot reported `PM: Image not found (code -22)`. This proves that no image was left behind, but not that execution stopped at the last durable line: device and filesystem logging was already being quiesced, and the display returning before input suggests a failure during rollback or resume is possible.
 
@@ -57,10 +58,16 @@ Boot `e180e61481f0417b847d7079470eec2b` then repeated the `platform` PM depth wh
 omarchy debug t2-hibernate test platform --bluetooth-off --disk-mode shutdown
 ```
 
-That test returned successfully. The result isolates the failure to the ACPI S4 platform global path selected by `platform` disk mode, rather than device late/noirq freeze/thaw. The next stage keeps the working shutdown-mode path and adds non-boot CPU offlining:
+That test returned successfully. The result isolates the failure to the ACPI S4 platform global path selected by `platform` disk mode, rather than device late/noirq freeze/thaw. The next stage kept the working shutdown-mode path and added non-boot CPU offlining:
 
 ```bash
 omarchy debug t2-hibernate test processors --bluetooth-off --disk-mode shutdown
+```
+
+The processor test also returned successfully. The final test before writing an image adds syscore suspend/resume with interrupts disabled:
+
+```bash
+omarchy debug t2-hibernate test core --bluetooth-off --disk-mode shutdown
 ```
 
 ## Test sequence
