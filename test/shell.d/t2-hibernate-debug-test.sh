@@ -155,7 +155,7 @@ pass "freezer isolation restores temporary PM and Bluetooth state"
 printf 'on\n' >"$bluetooth_state"
 printf '[none] core processors platform devices freezer\n' >"$power/pm_test"
 $command test freezer --bluetooth-off --no-sudo-prompt --yes >/dev/null
-grep -Fxq 'sudo -n -v' "$calls" || fail "unattended test requires immediately available sudo"
+grep -Fxq 'sudo -n true' "$calls" || fail "unattended test requires immediately available sudo"
 grep -Fq "sudo -n tee $power/state" "$calls" || fail "unattended test keeps sysfs writes noninteractive"
 [[ $(<"$power/pm_test") == "none" ]] || fail "unattended test restores the previous PM test level"
 [[ $(<"$bluetooth_state") == "on" ]] || fail "unattended test restores Bluetooth"

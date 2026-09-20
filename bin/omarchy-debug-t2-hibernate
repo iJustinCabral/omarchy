@@ -403,8 +403,10 @@ run_test() {
   TEST_SUDO_ARGS=()
   if $no_sudo_prompt; then
     TEST_SUDO_ARGS=(-n)
+    sudo -n true
+  else
+    sudo -v
   fi
-  sudo "${TEST_SUDO_ARGS[@]}" -v
   TEST_PREVIOUS_PM_TEST=$(selected_value "$SYS_POWER/pm_test")
   TEST_PREVIOUS_DISK=$(selected_value "$SYS_POWER/disk")
   TEST_PREVIOUS_PM_TRACE=""
