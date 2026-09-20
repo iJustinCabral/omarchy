@@ -124,6 +124,8 @@ The continuity reboot from checkpoint `9ee92a79` reached a Limine EFI hash misma
 
 The host-local verification command had used `objcopy --dump-section` on the live UKI without an explicit output file. Repeating that invocation on a private copy changed its BLAKE2 hash, demonstrating that the supposed read-only verification could rewrite the boot image. The bootstrap now supplies a separate output destination. The normal menu entry's hash was repaired after image inspection; both normal and snapshot EFI hashes then matched their files. Automatic reboot is blocked from snapshot-overlay sessions. A successful normal boot and autonomous continuation remain unvalidated; this recovery did not exercise hibernation.
 
+Normal boot `d192588b-31a0-44b6-a694-c689083c0aff` subsequently reached the primary `@` root on kernel `7.2.6-arch2-Watanare-T2-2-t2`. Loaded Wi-Fi source version `1D85357EB5E65B246EDEE20`, BCE `2394814A96D483B58C48501`, and Bluetooth `4DF58889A43B9AC7E9E3E8C` match the 1.4 module set. Wi-Fi was connected, NetworkManager/SDDM/Bluetooth were active, no migration remained pending, and both the embedded-key argument and hibernation resume target/offset survived. UWSM launched the named Foot window and its Codex child with the `mba-autonomous` profile, configured for `gpt-6-astra` and medium reasoning. The active goal resumed work. This validates normal boot and session relaunch after the menu repair; the initial unattended transition required operator snapshot recovery and is not an end-to-end unattended success. Hibernation remains unvalidated.
+
 Advance only after the preceding stage returns successfully.
 
 | Stage | Kernel boundary | ACPI S4 entered | Image written |
