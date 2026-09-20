@@ -2,7 +2,7 @@
 
 # omarchy:summary=Inspect and run guarded T2 hibernation diagnostics
 # omarchy:group=debug
-# omarchy:args=<check|test> [freezer|devices|platform|processors|core|test-resume] [--bluetooth-off] [--yes]
+# omarchy:args=<check|test> [freezer|devices|platform|processors|core|test-resume] [--bluetooth-off] [--disk-mode <platform|shutdown>] [--yes]
 # omarchy:examples=omarchy debug t2-hibernate check | omarchy debug t2-hibernate test freezer --bluetooth-off
 
 set -euo pipefail
@@ -16,7 +16,7 @@ usage() {
   cat <<'USAGE'
 Usage:
   omarchy debug t2-hibernate check
-  omarchy debug t2-hibernate test <freezer|devices|platform|processors|core|test-resume> [--bluetooth-off] [--yes]
+  omarchy debug t2-hibernate test <freezer|devices|platform|processors|core|test-resume> [--bluetooth-off] [--disk-mode <platform|shutdown>] [--yes]
 
 The check is read-only. Tests use the kernel's direct hibernation test
 interface and can still freeze or reboot a broken machine. They do not change
@@ -24,6 +24,9 @@ persistent boot configuration.
 
 Start with:
   omarchy debug t2-hibernate test freezer --bluetooth-off
+
+Use --disk-mode shutdown to skip ACPI S4 platform preparation while retaining
+the selected PM test depth. The prior hibernation mode is restored afterward.
 
 The command asks for confirmation unless --yes is supplied. --yes only skips
 the prompt; it does not make a power test safe.
@@ -160,6 +163,7 @@ run_test() {
   shift
   local bluetooth_off=false
   local assume_yes=false
+  local disk_mode=""
   local model="unknown"
   local previous_pm_test
   local previous_disk
@@ -173,6 +177,14 @@ run_test() {
       --yes)
         assume_yes=true
         ;;
+      --disk-mode)
+        shift
+        if (( $# == 0 )); then
+          echo "--disk-mode requires platform or shutdown." >&2
+          exit 1
+        fi
+        disk_mode="$1"
+        ;;
       *)
         echo "Unknown option: $1" >&2
         usage >&2
@@ -184,6 +196,18 @@ run_test() {
 
   check_hardware
   check_power_interface
+  if [[ -n $disk_mode && $disk_mode != "platform" && $disk_mode != "shutdown" ]]; then
+    echo "Unsupported hibernation disk mode: $disk_mode" >&2
+    exit 1
+  fi
+  if [[ $stage == "test-resume" && -n $disk_mode ]]; then
+    echo "test-resume selects its own disk mode; do not pass --disk-mode." >&2
+    exit 1
+  fi
+  if [[ -n $disk_mode ]] && ! available_value "$SYS_POWER/disk" "$disk_mode"; then
+    echo "The running kernel does not support the '$disk_mode' hibernation mode." >&2
+    exit 1
+  fi
   [[ -r "$DMI_ROOT/product_name" ]] && model=$(<"$DMI_ROOT/product_name")
   if [[ $model != "$TESTED_MODEL" ]]; then
     echo "Live hibernation tests are currently restricted to $TESTED_MODEL; found $model." >&2
@@ -223,6 +247,9 @@ run_test() {
     echo "This suspends part of the live device/platform stack. Save all work first."
   fi
   echo "A kernel or driver fault can still require a forced restart."
+  if [[ -n $disk_mode ]]; then
+    echo "The hibernation disk mode will be temporarily set to '$disk_mode'."
+  fi
 
   if ! $assume_yes && ! gum confirm "Run the $stage test now?"; then
     echo "Cancelled."
@@ -267,14 +294,17 @@ run_test() {
     write_power_setting "$SYS_POWER/pm_test" none
     write_power_setting "$SYS_POWER/disk" test_resume
   else
+    if [[ -n $disk_mode ]]; then
+      write_power_setting "$SYS_POWER/disk" "$disk_mode"
+    fi
     write_power_setting "$SYS_POWER/pm_test" "$stage"
   fi
 
   sync
-  logger --tag omarchy-t2-hibernate-test "starting stage=$stage bluetooth_off=$bluetooth_off"
+  logger --tag omarchy-t2-hibernate-test "starting stage=$stage bluetooth_off=$bluetooth_off disk_mode=${disk_mode:-current}"
   echo "Entering kernel test..."
   write_power_setting "$SYS_POWER/state" disk
-  logger --tag omarchy-t2-hibernate-test "returned stage=$stage bluetooth_off=$bluetooth_off"
+  logger --tag omarchy-t2-hibernate-test "returned stage=$stage bluetooth_off=$bluetooth_off disk_mode=${disk_mode:-current}"
   restore_test_state
   trap - EXIT INT TERM
   echo "The '$stage' test returned successfully."

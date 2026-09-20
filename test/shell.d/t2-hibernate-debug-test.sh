@@ -98,8 +98,8 @@ $command test freezer --bluetooth-off --yes >/dev/null
 grep -Fxq 'bluetoothctl power off' "$calls" || fail "freezer isolation powers Bluetooth down"
 grep -Fxq 'bluetoothctl power on' "$calls" || fail "freezer isolation restores Bluetooth"
 grep -Fq "sudo tee $power/state" "$calls" || fail "freezer test enters the disk power state"
-grep -Fq 'logger --tag omarchy-t2-hibernate-test starting stage=freezer bluetooth_off=true' "$calls" || fail "freezer test records its start"
-grep -Fq 'logger --tag omarchy-t2-hibernate-test returned stage=freezer bluetooth_off=true' "$calls" || fail "freezer test records its return"
+grep -Fq 'logger --tag omarchy-t2-hibernate-test starting stage=freezer bluetooth_off=true disk_mode=current' "$calls" || fail "freezer test records its start"
+grep -Fq 'logger --tag omarchy-t2-hibernate-test returned stage=freezer bluetooth_off=true disk_mode=current' "$calls" || fail "freezer test records its return"
 [[ $(<"$power/pm_test") == "none" ]] || fail "freezer test restores the previous PM test level"
 [[ $(<"$bluetooth_state") == "on" ]] || fail "freezer test leaves Bluetooth in its original state"
 pass "freezer isolation restores temporary PM and Bluetooth state"
@@ -124,7 +124,7 @@ printf '[platform] shutdown reboot suspend test_resume\n' >"$power/disk"
 printf '[none] core processors platform devices freezer\n' >"$power/pm_test"
 $command test test-resume --yes >/dev/null
 grep -Fq "sudo tee $power/disk" "$calls" || fail "test-resume selects the hibernation mode"
-grep -Fq 'logger --tag omarchy-t2-hibernate-test starting stage=test-resume bluetooth_off=false' "$calls" || fail "test-resume records its start"
+grep -Fq 'logger --tag omarchy-t2-hibernate-test starting stage=test-resume bluetooth_off=false disk_mode=current' "$calls" || fail "test-resume records its start"
 [[ $(<"$power/disk") == "platform" ]] || fail "test-resume restores the previous disk mode"
 [[ $(<"$power/pm_test") == "none" ]] || fail "test-resume restores the previous PM test level"
 pass "test-resume is explicit and restores kernel controls"
@@ -135,6 +135,15 @@ if $command test test-resume --yes >/dev/null 2>&1; then
 fi
 printf '253:0\n' >"$power/resume"
 pass "test-resume requires a live kernel resume target"
+
+: >"$calls"
+printf '[platform] shutdown reboot suspend test_resume\n' >"$power/disk"
+printf '[none] core processors platform devices freezer\n' >"$power/pm_test"
+$command test platform --disk-mode shutdown --yes >/dev/null
+grep -Fq "sudo tee $power/disk" "$calls" || fail "disk-mode test writes the temporary mode"
+grep -Fq 'logger --tag omarchy-t2-hibernate-test starting stage=platform bluetooth_off=false disk_mode=shutdown' "$calls" || fail "disk-mode test records the isolation condition"
+[[ $(<"$power/disk") == "platform" ]] || fail "disk-mode test restores the previous mode"
+pass "platform test can isolate ACPI S4 preparation with temporary shutdown mode"
 
 printf 'MacBookPro16,1\n' >"$dmi/product_name"
 if $command test freezer --yes >/dev/null 2>&1; then

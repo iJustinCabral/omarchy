@@ -34,6 +34,30 @@ The command explains the risk and asks for confirmation. It temporarily powers B
 
 Even the `freezer` test can hang when the fault occurs in an early notifier. Save work before running it. The command never runs automatically during setup, update or boot.
 
+`--disk-mode shutdown` temporarily changes `/sys/power/disk` while retaining the requested PM test depth. At the `platform` level this still exercises device late/noirq callbacks, but skips the ACPI S4 global preparation used by `platform` disk mode. The original mode is restored when the test returns.
+
+## MacBookAir9,1 staged results on September 19, 2026
+
+Boot `087573321047465480d6a9884483235c` produced the first controlled boundary:
+
+| Test | Result | Evidence |
+| --- | --- | --- |
+| `freezer --bluetooth-off` | Passed | Filesystem sync, both freezer phases, task restart and hibernation exit completed |
+| `freezer` | Passed | Same boundary completed with Bluetooth powered |
+| `devices --bluetooth-off` | Passed | BCE VHCI suspend/resume returned status 0; five queues resumed with pending submissions |
+| `devices` | Passed with recovered fault | HCI opcode `0x0c01` timed out during resume; the controller was operational afterward |
+| `platform --bluetooth-off` with `platform` disk mode | Failed | Display returned but the session remained unresponsive and required a forced restart; no return marker or image survived |
+
+The failed platform test started at monotonic time `922.370559`; the final durable kernel line was `PM: hibernation: hibernation entry` at `922.402052`. The next boot reported `PM: Image not found (code -22)`. This proves that no image was left behind, but not that execution stopped at the last durable line: device and filesystem logging was already being quiesced, and the display returning before input suggests a failure during rollback or resume is possible.
+
+The next discriminator keeps the `platform` PM depth while skipping ACPI S4 preparation:
+
+```bash
+omarchy debug t2-hibernate test platform --bluetooth-off --disk-mode shutdown
+```
+
+If this returns, the ACPI S4 global methods are isolated. If it fails, the remaining delta from the passing `devices` test is the device late/noirq freeze/thaw path, which should be traced before any deeper test.
+
 ## Test sequence
 
 Advance only after the preceding stage returns successfully.
