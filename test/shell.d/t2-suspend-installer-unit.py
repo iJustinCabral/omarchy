@@ -34,7 +34,7 @@ class Installer(unittest.TestCase):
     self.preparer.start()
     self.addCleanup(self.preparer.stop)
 
-  def prepare(self, wifi, bluetooth, output, profile):
+  def prepare(self, wifi, bluetooth, t2bce_source_patch, output, profile):
     self.assertEqual(profile, 'wifi-reenable')
     output.mkdir()
     (output / 'source.c').write_text('verified source')

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch only hash-pinned radio source; never execute downloaded code."""
+"""Fetch only hash-pinned T2 driver source; never execute downloaded code."""
 import concurrent.futures
 import hashlib
 import json
@@ -7,19 +7,25 @@ from pathlib import Path
 import urllib.request
 
 HERE = Path(__file__).resolve().parent
-BASE = 'https://raw.githubusercontent.com/gregkh/linux/v7.2.4/'
+LINUX_BASE = 'https://raw.githubusercontent.com/gregkh/linux/v7.2.4/'
+T2_PATCH_BASE = 'https://raw.githubusercontent.com/t2linux/linux-t2-patches/'
 
 def fetch(output):
   manifest = json.loads((HERE / 'manifest.json').read_text())
-  files = {'drivers/net/wireless/broadcom/brcm80211/' + name: digest
+  files = {'drivers/net/wireless/broadcom/brcm80211/' + name:
+           (LINUX_BASE + 'drivers/net/wireless/broadcom/brcm80211/' + name, digest)
            for name, digest in manifest['wifi_base'].items()}
-  files['drivers/bluetooth/hci_bcm4377.c'] = manifest['bluetooth_base_sha256']
+  files['drivers/bluetooth/hci_bcm4377.c'] = (
+    LINUX_BASE + 'drivers/bluetooth/hci_bcm4377.c', manifest['bluetooth_base_sha256'])
+  t2bce = manifest['t2bce_source']
+  files['t2bce/' + t2bce['path']] = (
+    T2_PATCH_BASE + t2bce['commit'] + '/' + t2bce['path'], t2bce['sha256'])
   def one(item):
-    name, expected = item
+    name, (url, expected) = item
     path = output / name
     if path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == expected:
       return
-    with urllib.request.urlopen(BASE + name, timeout=60) as response:
+    with urllib.request.urlopen(url, timeout=60) as response:
       data = response.read(4 * 1024 * 1024)
     if hashlib.sha256(data).hexdigest() != expected:
       raise ValueError('Upstream source hash mismatch: ' + name)

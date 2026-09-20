@@ -1,7 +1,7 @@
 # T2 suspend driver source package
 
 This package consolidates the driver changes tested on MacBookAir9,1, BCM4377,
-Omarchy 4.0.3 and `7.2.4-arch1-Watanare-T2-1-t2`. It contains eleven patches,
+Omarchy 4.0.3 and `7.2.4-arch1-Watanare-T2-1-t2`. It contains twelve patches,
 pinned source and patch hashes, source preparation, and extracted-C fault tests.
 Fresh setup and an upgrade migration now build/install these modules automatically through DKMS on the supported model; see [installer lifecycle and validation](../../docs/t2-suspend/INSTALLATION.md). Existing trackpad, Wi-Fi recovery and Bluetooth startup installers remain
 available. See [the branch overview](../../README.md) and
@@ -14,6 +14,7 @@ available. See [the branch overview](../../README.md) and
 | `patches/wifi/` | 0001 control-ring mailbox; 0002 host capabilities; 0003 IRQ/startup; 0004 partial-attach guard; 0005 bounded diagnostics; 0006 complete hibernation callbacks | Patches 0001–0005 passed repeated actual S3 and audio recovery with the Bluetooth series; 0006 is based on the isolated `test_resume` failure and awaits hardware validation |
 | `patches/bluetooth/` | 0001 restore vendor windows; 0002 stop publishing failed rings; 0003 rebuild lost transport through HCI lifecycle and Bluetooth FLR | Repeated S3, automatic AirPods reconnect, initially-off Bluetooth recovery |
 | `patches/wifi-reenable/` | 0001 propagate interface-open transport failure; 0002 explicit Wi-Fi function0 reset | Included from current test image; successful Wi-Fi-off cycle did not execute reset; earlier unexpected reboot remains unexplained |
+| `patches/bce/` | 0001 run the existing BCE stateful handshake for freeze/thaw/restore | Source and callback invariants pass; awaits staged `devices` and `test_resume` hardware validation |
 
 Patch headers and copied evidence retain their original experiment status.
 The current status is in this README and the consolidated validation document.
@@ -33,6 +34,7 @@ From the repository root, with paths to your source checkout:
 python3 packages/t2-suspend/prepare-source.py \
   --wifi-source /path/to/linux/drivers/net/wireless/broadcom/brcm80211 \
   --bluetooth-source /path/to/linux/drivers/bluetooth/hci_bcm4377.c \
+  --t2bce-source-patch /path/to/linux-t2-patches/1001-Add-t2bce-driver-stack.patch \
   --output /tmp/t2-s3-source --profile s3
 ```
 
@@ -68,6 +70,7 @@ After preparing the `s3` tree above:
 python3 packages/t2-suspend/tests/test-bluetooth.py /tmp/t2-s3-source/drivers/bluetooth/hci_bcm4377.c
 python3 packages/t2-suspend/tests/test-open.py /tmp/t2-s3-source/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c
 python3 packages/t2-suspend/tests/test-hibernate-pm.py /tmp/t2-s3-source/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+python3 packages/t2-suspend/tests/test-bce-hibernate-pm.py /tmp/t2-s3-source/drivers/staging/t2bce/t2bce_core/t2bce_main.c
 python3 packages/t2-suspend/tests/test-flr.py
 ```
 
@@ -83,4 +86,4 @@ Fresh hardware setup and the upgrade migration invoke the shared automatic insta
 
 The supported model is MacBookAir9,1 with BCM4377. The installer chooses the `wifi-reenable` profile and load-time Wi-Fi FLR option from the latest tested image. That optional recovery path has not been hardware-proven by the latest successful repeat, which needed no Wi-Fi reset. The earlier unexplained reboot remains in the validation record. Hibernation remains unresolved.
 
-The five DKMS modules include all three Wi-Fi vendor companions and Bluetooth. The initcpio guard checks the selected replacement set before publishing a boot image and preserves Bluetooth's startup gate. The installer owns a configuration receipt and initial boot backup; `omarchy setup t2-suspend --rollback` restores its configuration and the original modules for the next boot. Other T2 fixes retain their own installers.
+The six DKMS modules include all three Wi-Fi vendor companions, Bluetooth and the BCE core. The initcpio guard checks the selected replacement set before publishing a boot image and preserves Bluetooth's startup gate. The installer owns a configuration receipt and initial boot backup; `omarchy setup t2-suspend --rollback` restores its configuration and the original modules for the next boot. Other T2 fixes retain their own installers.

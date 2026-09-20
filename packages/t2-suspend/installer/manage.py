@@ -15,7 +15,7 @@ import tempfile
 HERE = Path(__file__).resolve().parent
 PACKAGE = HERE.parent
 REPO = HERE.parents[2]
-NAME, VERSION = 'omarchy-t2-radio', '1.1'
+NAME, VERSION = 'omarchy-t2-radio', '1.2'
 
 def source_name(version):
   return f'usr/src/{NAME}-{version}'
@@ -23,7 +23,7 @@ def source_name(version):
 SOURCE = source_name(VERSION)
 STATE = 'var/lib/omarchy-t2-suspend'
 RECEIPT = STATE + '/receipt.json'
-MODULES = ('brcmfmac', 'brcmfmac-wcc', 'brcmfmac-cyw', 'brcmfmac-bca', 'hci_bcm4377')
+MODULES = ('brcmfmac', 'brcmfmac-wcc', 'brcmfmac-cyw', 'brcmfmac-bca', 't2bce_core', 'hci_bcm4377')
 
 def load_module(name, path):
   spec = importlib.util.spec_from_file_location(name, path)
@@ -164,7 +164,7 @@ def check_images(root, runner=run):
         raise ValueError('Missing Apple Wi-Fi firmware in boot image: ' + firmware)
     for name in MODULES[:-1]:
       if '/' + name + '.ko' not in listing:
-        raise ValueError('Missing Wi-Fi module in boot image: ' + name)
+        raise ValueError('Missing required module in boot image: ' + name)
 
 def verify(root, runner=run, selection=check_selection):
   receipt = load(root)
@@ -255,7 +255,9 @@ def install(root, runner=run, selection=check_selection, fetch=fetcher.fetch):
     work = Path(temp)
     fetch(work / 'input')
     prepare.prepare(work / 'input/drivers/net/wireless/broadcom/brcm80211',
-                    work / 'input/drivers/bluetooth/hci_bcm4377.c', work / 'source', 'wifi-reenable')
+                    work / 'input/drivers/bluetooth/hci_bcm4377.c',
+                    work / 'input/t2bce/1001-Add-t2bce-driver-stack.patch',
+                    work / 'source', 'wifi-reenable')
     for name in ('dkms.conf', 'build-modules.sh'):
       shutil.copyfile(HERE / name, work / 'source' / name)
     hashes = tree_hash(work / 'source')

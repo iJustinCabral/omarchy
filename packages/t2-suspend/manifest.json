@@ -142,6 +142,31 @@
     "include/soc.h": "7b74ceaf8afce6ec9c79f9f3053c5120d6e68a61c41f19a8cb6084a65046fbfa"
   },
   "bluetooth_base_sha256": "86c9d478763aa53548deb2a5cb28af630b24d84c1f10321690b6f8e061f5e8ff",
+  "t2bce_source": {
+    "commit": "fea007484b84b28acc3fd55e018345db3685ac08",
+    "path": "1001-Add-t2bce-driver-stack.patch",
+    "sha256": "f0f77f2d321ac53e1cb9a33a6e8f378d2c6852ac25d7e4dcac5657bf0d99d7ec",
+    "base": {
+      "drivers/staging/t2bce/t2bce_core/Makefile": "760ec7df1cb4ca6132b1f2d0921e34e70b093f5f31659b6f0e0f211e1b666dec",
+      "drivers/staging/t2bce/t2bce_core/include/t2bce_core_transport.h": "abc8cf1a193d262f56a0ae81dd51a5aca6cba148279ab4926d1c13bc257a2e2f",
+      "drivers/staging/t2bce/t2bce_core/mailbox.c": "94ccb550abf05d6392c8738fe33222a983ab056ff5c163be0291e6aac26c865a",
+      "drivers/staging/t2bce/t2bce_core/mailbox.h": "5a9dc2c07402684fcc27dbb7ffcb23f489aa83740f07a5efa475929d0f007d18",
+      "drivers/staging/t2bce/t2bce_core/t2bce.h": "b4e68a2a8bec9e1e841a72949918b923c5d0f174de709de5e3ead344720720e9",
+      "drivers/staging/t2bce/t2bce_core/t2bce_main.c": "8e54e85ba059256d2e46023a9c87a61ad139d46209354e6440e687764637bba6",
+      "drivers/staging/t2bce/t2bce_core/transport.c": "358436d785c34292708621698e7981fa3b83ffa76570f7e1a49cf2a42a3ce006",
+      "drivers/staging/t2bce/t2bce_dma/include/t2bce_dma_queue.h": "1e77738ac9dd2a5c4106bbca63a88a893991eaa5b32c3d4370347894504507b2"
+    }
+  },
+  "t2bce_patched": {
+    "drivers/staging/t2bce/t2bce_core/Makefile": "760ec7df1cb4ca6132b1f2d0921e34e70b093f5f31659b6f0e0f211e1b666dec",
+    "drivers/staging/t2bce/t2bce_core/include/t2bce_core_transport.h": "abc8cf1a193d262f56a0ae81dd51a5aca6cba148279ab4926d1c13bc257a2e2f",
+    "drivers/staging/t2bce/t2bce_core/mailbox.c": "94ccb550abf05d6392c8738fe33222a983ab056ff5c163be0291e6aac26c865a",
+    "drivers/staging/t2bce/t2bce_core/mailbox.h": "5a9dc2c07402684fcc27dbb7ffcb23f489aa83740f07a5efa475929d0f007d18",
+    "drivers/staging/t2bce/t2bce_core/t2bce.h": "b4e68a2a8bec9e1e841a72949918b923c5d0f174de709de5e3ead344720720e9",
+    "drivers/staging/t2bce/t2bce_core/t2bce_main.c": "18f85a884a1b87b35d4746c87eec2339ac3801d8c40100bbc58a43a7e43d96a9",
+    "drivers/staging/t2bce/t2bce_core/transport.c": "358436d785c34292708621698e7981fa3b83ffa76570f7e1a49cf2a42a3ce006",
+    "drivers/staging/t2bce/t2bce_dma/include/t2bce_dma_queue.h": "1e77738ac9dd2a5c4106bbca63a88a893991eaa5b32c3d4370347894504507b2"
+  },
   "patches": [
     {
       "path": "patches/wifi/0001-brcmfmac-control-ring-mailbox.patch",
@@ -178,6 +203,12 @@
       "sha256": "d580450050f1d7ef3260515d4a508a4fb8a81579c9ef4de698cd66bdf4dbc387",
       "evidence_path": "docs/t2-suspend/HIBERNATION.md",
       "series": "wifi"
+    },
+    {
+      "path": "patches/bce/0001-t2bce-run-stateful-handshake-for-image-restore.patch",
+      "sha256": "8fbe8632feeb4f4cab8e412659565cc319b5103e3018d8c376b5a9d7791fcadf",
+      "evidence_path": "docs/t2-suspend/HIBERNATION.md",
+      "series": "bce"
     },
     {
       "path": "patches/bluetooth/0001-bcm4377-restore-vendor-windows-before-resume.patch",

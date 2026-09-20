@@ -9,3 +9,4 @@ if grep -qx 'CONFIG_BRCMDBG=y' "$headers/.config"; then
 fi
 make -C "$headers" M="$PWD/drivers/net/wireless/broadcom/brcm80211/brcmfmac" W=1 "${debug[@]}" -j4 modules
 make -C "$headers" M="$PWD/drivers/bluetooth" W=1 -j4 modules
+make -C "$headers" M="$PWD/drivers/staging/t2bce/t2bce_core" CONFIG_T2BCE_CORE=m W=1 -j4 modules
