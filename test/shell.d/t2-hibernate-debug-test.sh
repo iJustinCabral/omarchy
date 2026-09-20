@@ -59,6 +59,9 @@ case "${1:-}" in
     esac
     ;;
   power)
+    if [[ $2 == "on" && ${TEST_BLUETOOTH_RESTORE_FAIL:-0} == 1 ]]; then
+      exit 1
+    fi
     printf '%s\n' "$2" >"$TEST_BLUETOOTH_STATE"
     printf 'bluetoothctl power %s\n' "$2" >>"$TEST_CALLS"
     ;;
@@ -250,6 +253,17 @@ fi
 [[ $output != *"test returned successfully"* ]] || fail "failed cleanup must not claim success"
 ln -s "$wifi_device" "$wifi_driver/0000:73:00.0"
 pass "Wi-Fi rebind failure propagates"
+
+: >"$calls"
+printf 'on\n' >"$bluetooth_state"
+printf '[none] core processors platform devices freezer\n' >"$power/pm_test"
+if output=$(TEST_BLUETOOTH_RESTORE_FAIL=1 "$command" test devices --wifi-unbind --bluetooth-off --yes 2>&1); then
+  fail "Bluetooth restoration failure must not report success"
+fi
+[[ $output == *"Failed to restore Bluetooth power"* ]] || fail "Bluetooth restoration failure is actionable"
+[[ -L "$wifi_driver/0000:73:00.0" ]] || fail "Bluetooth cleanup failure must not prevent Wi-Fi rebinding"
+printf 'on\n' >"$bluetooth_state"
+pass "Bluetooth cleanup failure propagates without skipping Wi-Fi restoration"
 
 : >"$calls"
 ln -s "$wifi_device" "$wifi_driver/0000:74:00.0"

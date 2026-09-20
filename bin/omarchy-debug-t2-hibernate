@@ -100,7 +100,7 @@ wait_for_bluetooth_power() {
   while (( SECONDS < deadline )); do
     if [[ $expected == "on" ]] && bluetooth_powered; then
       return 0
-    elif [[ $expected == "off" ]] && ! bluetooth_powered; then
+    elif [[ $expected == "off" ]] && bluetooth_unpowered; then
       return 0
     fi
     sleep 0.2
@@ -201,9 +201,6 @@ restore_test_state() {
   if [[ -n $TEST_PREVIOUS_PM_TRACE ]]; then
     write_power_setting "$SYS_POWER/pm_trace" "$TEST_PREVIOUS_PM_TRACE" || true
   fi
-  if $TEST_BLUETOOTH_WAS_POWERED; then
-    timeout 5s bluetoothctl power on >/dev/null 2>&1 || true
-  fi
   if [[ -n $TEST_WIFI_DEVICE && ! -L "$BRCMFMAC_DRIVER/$TEST_WIFI_DEVICE" ]]; then
     if ! write_power_setting "$BRCMFMAC_DRIVER/bind" "$TEST_WIFI_DEVICE" || [[ ! -L "$BRCMFMAC_DRIVER/$TEST_WIFI_DEVICE" ]]; then
       echo "Failed to rebind Wi-Fi $TEST_WIFI_DEVICE; inspect the kernel journal before further testing." >&2
@@ -211,6 +208,12 @@ restore_test_state() {
     fi
   fi
   TEST_WIFI_DEVICE=""
+  if $TEST_BLUETOOTH_WAS_POWERED; then
+    if ! timeout 5s bluetoothctl power on >/dev/null 2>&1 || ! wait_for_bluetooth_power on; then
+      echo "Failed to restore Bluetooth power; inspect the controller before further testing." >&2
+      cleanup_status=1
+    fi
+  fi
   return "$cleanup_status"
 }
 
