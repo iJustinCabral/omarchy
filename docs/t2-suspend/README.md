@@ -2,7 +2,7 @@
 
 The driver series enabled real S3 suspend and working Wi-Fi/Bluetooth recovery on the tested MacBookAir9,1. Repeated automatic AirPods reconnection and audible stereo playback were confirmed. The latest Wi-Fi-off suspend/re-enable cycle also passed. Earlier Wi-Fi-off failures and one unexplained reboot remain part of the record. The automatic installer subsequently passed normal boot and a short S3 cycle with working Bluetooth/audio; see the [deployment validation](VALIDATION.md).
 
-This is S3 support work, not yet a solution to the original hibernation boot loop. The MacBookAir9,1 entry failure has now been localized to the early kernel path before image creation, and a guarded staged diagnostic is available in the [hibernation investigation](HIBERNATION.md). S4 image writing/restoration has not been validated. Other T2 models, kernel versions and fresh installation of the new driver package are not qualified.
+This is S3 support work, not yet a solution to the original hibernation boot loop. A guarded MacBookAir9,1 diagnostic has now validated snapshot creation, writing and integrity-checked readback of a 2,716,000 KiB hibernation image. The unresolved reset is localized after readback, in the device-quiesce and atomic memory-restoration path described in the [hibernation investigation](HIBERNATION.md). Cold-boot restoration and ACPI S4 remain unvalidated. Other T2 models, kernel versions and fresh installation of the new driver package are not qualified.
 
 ## 1. Why the old sleep workaround was removed
 
@@ -70,7 +70,8 @@ The first test with this image unexpectedly rebooted after Wi-Fi enable, accordi
 | Latest Wi-Fi-off S3/re-enable repeat | Passed | Real S3; enable about4.79sec after PM exit; Wi-Fi activation about2.95sec later; HTTPS204 and active AirPods stereo; no Wi-Fi reset |
 | Normal boot with automatically installed DKMS drivers | Passed | Corrected firmware packaging; Wi-Fi, Bluetooth and audio confirmed |
 | Normal-image short S3 cycle | Passed | Actual S3; Bluetooth recovery and audio confirmed; Wi-Fi interface up, no separate traffic probe |
-| Hibernation/S4 | Unresolved | Test UKIs used `noresume` |
+| Hibernation image write/readback | Passed intended diagnostic boundary | 2,716,000 KiB written and read with the kernel integrity checks before an opt-in stop ahead of memory restore |
+| Hibernation memory restore/S4 | Unresolved | Earlier tests reset after the now-qualified readback boundary; cold-boot restore and ACPI S4 remain unvalidated |
 
 Latest isolated Wi-Fi-off test boot ID: `ae9bd36d-1ee0-41af-86da-e5e3772f1851`. Interrupted boot: `439b59fc-6efa-4cc6-ab2f-4a759ef080e3`. Laboratory outcome commit: `68bf7e0`. No new suspend or reboot was requested or initiated during consolidation.
 

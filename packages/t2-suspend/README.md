@@ -9,7 +9,7 @@ This package consolidates the driver changes tested on MacBookAir9,1, BCM4377, O
 | `patches/wifi/` | 0001 control-ring mailbox; 0002 host capabilities; 0003 IRQ/startup; 0004 partial-attach guard; 0005 bounded diagnostics; 0006 complete hibernation callbacks | Patches 0001–0005 passed repeated actual S3 and audio recovery with the Bluetooth series; 0006 cleared the missing callback failure during `test_resume`, after which image-rewound transport state remained the blocker |
 | `patches/bluetooth/` | 0001 restore vendor windows; 0002 stop publishing failed rings; 0003 rebuild lost transport through HCI lifecycle and Bluetooth FLR | Repeated S3, automatic AirPods reconnect, initially-off Bluetooth recovery |
 | `patches/wifi-reenable/` | 0001 propagate interface-open transport failure; 0002 explicit Wi-Fi function0 reset | Runtime recovery remains model-scoped; the restore-time use of function-0 FLR was removed after it caused an abrupt reboot during `test_resume` |
-| `patches/bce/` | 0001 run the existing BCE stateful handshake for freeze/thaw/restore | The staged `devices` freeze/thaw test passed with working internal input; `test_resume` remains pending |
+| `patches/bce/` | 0001 run the existing BCE stateful handshake for freeze/thaw/restore | The staged `devices` freeze/thaw test passed with working internal input; diagnostic `test_resume` passed image write/readback, while the later quiesce/atomic-restore path remains unresolved |
 
 Patch headers and copied evidence retain their original experiment status.
 The current status is in this README and the consolidated validation document.
