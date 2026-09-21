@@ -194,4 +194,20 @@ python3 packages/t2-suspend/experiments/verify-hibernation-candidate.py \
 
 The clean build passed against `7.2.6-arch2-Watanare-T2-2-t2`, producing brcmfmac and its three companion modules, BCM4377 Bluetooth, BCE DMA, core, VHCI, audio and AVE. The only build warning was the already-known pahole 1.31 versus kernel-build 1.32 version mismatch. The verifier never installs or loads a module, writes a boot image, changes a boot entry, or initiates a power transition; its provenance explicitly records `installed: false` and `hardware_qualified: false`.
 
+## Private candidate boot image
+
+`build-hibernation-candidate-uki.py` addresses the two rejected custom images that dropped into an emergency shell because `/dev/mapper/root` could not be mounted. It refuses to publish under `/boot` or `/efi`, builds a complete initramfs from the machine's current known-good mkinitcpio configuration and a private copy of the installed module tree, and embeds the nine candidate modules needed before `switch_root`. Optional AVE remains unloaded. It verifies the root-unlock key, `cryptsetup`, Btrfs tooling, init, every embedded module hash and module ABI before creating the image.
+
+The builder then copies the healthy production UKI privately, replaces only its final `.initrd` section, and proves that the EFI stub, production kernel, embedded command line and every other PE section remain byte-identical. The root-critical command-line values must match the healthy running boot and include the expected encrypted `/dev/mapper/root`, `subvol=@`, Btrfs, resume device, resume offset and embedded key parameters. Both the source and resulting UKI are checked without invoking `objcopy` against the live image in place.
+
+Run the builder as root because the generated initramfs contains the protected root-unlock key. Its output directory and files are restricted to the invoking user:
+
+```sh
+sudo python3 packages/t2-suspend/experiments/build-hibernation-candidate-uki.py \
+  --candidate-source /path/to/verified-candidate-stack \
+  --output /private/path/t2-hibernation-candidate-uki
+```
+
+The private build passed against the healthy `7.2.6-arch2-Watanare-T2-2-t2` production image. `bootctl kernel-inspect` identifies the result as a UKI with the exact production kernel version and encrypted-root command line. The builder records `production_modified: false`, `installed: false`, `boot_entry_created: false` and `hardware_qualified: false`. It does not copy the result to the ESP, edit Limine, set `LoaderEntryOneShot`, reboot or run a PM transition.
+
 Hardware testing remains paused. The earlier diagnostic boots repeatedly returned unusable machines and forced the operator to power off and manually choose the production image. Do not install this candidate, create another diagnostic image, reboot, or run a PM transition without a separately reviewed cold-power recovery design and explicit operator approval.
