@@ -101,12 +101,56 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-boot-") as directory:
     raise AssertionError("armed candidate rollback was not blocked")
   except ValueError as error:
     assert "Disarm" in str(error)
+  try:
+    candidate_boot.clear_rolled_back(root)
+    raise AssertionError("armed candidate state clear was not blocked")
+  except ValueError as error:
+    assert "Disarm" in str(error)
 
   (root / candidate_boot.ONESHOT).unlink()
+  try:
+    candidate_boot.clear_rolled_back(root)
+    raise AssertionError("staged candidate state was cleared before rollback")
+  except ValueError as error:
+    assert "rolled back" in str(error)
   rolled_back = candidate_boot.rollback(root)
   assert rolled_back["state"] == "rolled-back"
   assert limine.read_text() == original_limine
   assert not (root / candidate_boot.IMAGE).exists()
+  try:
+    candidate_boot.stage(root, candidate)
+    raise AssertionError("staging replaced an uncleared transaction")
+  except ValueError as error:
+    assert "already exists" in str(error)
+  cleared = candidate_boot.clear_rolled_back(root)
+  assert cleared["state"] == "cleared"
+  assert not (root / candidate_boot.STATE).exists()
+  assert candidate_boot.clear_rolled_back(root) == {"state": "cleared"}
+  restaged = candidate_boot.stage(root, candidate)
+  assert restaged["state"] == "staged"
+  assert candidate_boot.rollback(root)["state"] == "rolled-back"
+  receipt_path = root / candidate_boot.RECEIPT
+  backup_path = root / candidate_boot.BACKUP
+  backup_data = backup_path.read_bytes()
+  backup_path.write_bytes(b"changed backup")
+  try:
+    candidate_boot.clear_rolled_back(root)
+    raise AssertionError("changed rollback backup was cleared")
+  except ValueError as error:
+    assert "backup changed" in str(error)
+  backup_path.write_bytes(backup_data)
+  unknown = root / candidate_boot.STATE / "unknown"
+  unknown.write_text("unexpected state")
+  try:
+    candidate_boot.clear_rolled_back(root)
+    raise AssertionError("unknown transaction state was cleared")
+  except ValueError as error:
+    assert "unknown files" in str(error)
+  unknown.unlink()
+  backup_path.unlink()
+  assert candidate_boot.clear_rolled_back(root)["state"] == "cleared"
+  assert not receipt_path.exists()
+  assert not (root / candidate_boot.STATE).exists()
 
   original_writer = candidate_boot.atomic_write
   for fail_at in (1, 2, 3, 4, 5):
@@ -165,5 +209,28 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-boot-") as directory:
     assert candidate_boot.rollback(root)["state"] == "rolled-back"
     assert limine.read_text() == original_limine
     assert not (root / candidate_boot.IMAGE).exists()
+
+  for fail_at in (1, 2):
+    case = Path(directory) / ("clear-failure-" + str(fail_at))
+    root, candidate, _candidate_image, limine, original_limine = prepare_fixture(case)
+    candidate_boot.stage(root, candidate)
+    candidate_boot.rollback(root)
+    unlinks = [0]
+
+    def failing_unlink(path):
+      unlinks[0] += 1
+      path.unlink()
+      if unlinks[0] == fail_at:
+        raise RuntimeError("injected clear failure")
+
+    try:
+      candidate_boot.clear_rolled_back(root, unlink=failing_unlink)
+      raise AssertionError("injected clear failure was ignored")
+    except RuntimeError as error:
+      assert "injected clear failure" in str(error)
+
+    assert candidate_boot.clear_rolled_back(root)["state"] == "cleared"
+    assert limine.read_text() == original_limine
+    assert not (root / candidate_boot.STATE).exists()
 
 print("PASS: candidate boot stages transactionally, requires a loader refresh, arms once and restores production exactly")

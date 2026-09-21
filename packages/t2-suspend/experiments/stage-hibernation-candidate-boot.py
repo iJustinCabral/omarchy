@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Stage, arm or roll back a one-shot T2 hibernation candidate boot.
+"""Stage, arm, roll back or clear a one-shot T2 hibernation candidate boot.
 
 Staging leaves the production entry as the default and does not arm a boot.
 Arming is a separate action whose final mutation is LoaderEntryOneShot.
+Clearing removes transaction records only after rollback verifies production.
 """
 
 import argparse
@@ -74,6 +75,10 @@ def fsync_directory(path):
     os.fsync(descriptor)
   finally:
     os.close(descriptor)
+
+
+def unlink_path(path):
+  path.unlink()
 
 
 def read_efi_string(path):
@@ -348,9 +353,48 @@ def rollback(root):
   return receipt
 
 
+def clear_rolled_back(root, unlink=unlink_path):
+  if rooted(root, ONESHOT).exists():
+    raise ValueError("Disarm LoaderEntryOneShot before clearing candidate state")
+  state = rooted(root, STATE)
+  if not state.exists():
+    return {"state": "cleared"}
+  if not state.is_dir() or state.is_symlink():
+    raise ValueError("Candidate transaction state is not a real directory")
+
+  receipt_path = rooted(root, RECEIPT)
+  backup = rooted(root, BACKUP)
+  allowed = {receipt_path.name, backup.name}
+  unexpected = sorted(path.name for path in state.iterdir() if path.name not in allowed)
+  if unexpected:
+    raise ValueError("Candidate transaction state contains unknown files: " + ", ".join(unexpected))
+
+  if not receipt_path.exists():
+    if backup.exists():
+      raise ValueError("Candidate transaction backup remains without a receipt")
+    state.rmdir()
+    fsync_directory(state.parent)
+    return {"state": "cleared"}
+
+  receipt = load_receipt(root)
+  if receipt.get("state") != "rolled-back":
+    raise ValueError("Candidate transaction must be rolled back before clearing")
+  verify_recovered(root, receipt)
+  if backup.exists():
+    if digest(backup) != receipt["original_limine_sha256"]:
+      raise ValueError("Candidate transaction backup changed")
+    unlink(backup)
+    fsync_directory(state)
+  unlink(receipt_path)
+  fsync_directory(state)
+  state.rmdir()
+  fsync_directory(state.parent)
+  return {**receipt, "state": "cleared"}
+
+
 def main():
   parser = argparse.ArgumentParser(description=__doc__)
-  parser.add_argument("action", choices=("stage", "verify", "arm", "rollback"))
+  parser.add_argument("action", choices=("stage", "verify", "arm", "rollback", "clear"))
   parser.add_argument("--candidate-source", type=Path)
   args = parser.parse_args()
   if os.geteuid() != 0:
@@ -364,6 +408,8 @@ def main():
     result = arm(root)
   elif args.action == "rollback":
     result = rollback(root)
+  elif args.action == "clear":
+    result = clear_rolled_back(root)
   else:
     result = load_receipt(root)
     verify_staged(root, result)
