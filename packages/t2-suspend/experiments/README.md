@@ -180,4 +180,18 @@ The optional `t2bce_ave` video encoder is a BCE client, so experiment 0006 corre
 
 Experiment `0009-t2bce-ave-hibernation-idle.patch` registers explicit no-op drop and rebuild callbacks to certify that prepared queue-free state. It does not preserve an encoding session and does not bypass the core check for any other client. `python3 packages/t2-suspend/tests/test-ave-hibernation-idle.py <patched-source>` verifies that PM prepare reaches session teardown, that teardown destroys the only AVE queue graph, and that the callbacks leave the client idle. The patch applies with fuzz disabled after experiments 0006 and 0007; the AVE module builds with `W=1` against the production kernel headers with SHA-256 `7a69be8c1ca6236ba26ab12b32408fdf2e54ab6d7c6bbaf518f0585e572fa6df` and source version `0CD7299381C7756074241C2`. The AVE, cold-S4, shared-DMA and PCI-serialization harnesses all pass. The module is not loaded on the current MacBookAir9,1, and this candidate has not been installed or hardware-qualified.
 
+## Complete candidate reproduction
+
+`verify-hibernation-candidate.py` closes the clean-build gap between the installed package subset and the experimental stack. It fetches or accepts the existing hash-pinned inputs, reproduces the manifest-verified `wifi-reenable` baseline, reconstructs the complete BCE source tree from the pinned upstream patch, overlays the reviewed package changes, and applies experiments 0005, 0006, 0007 and 0009 in order with fuzz disabled. Baseline regression tests run before the experimental patches, while the DMA gate, two-pass queue reconstruction, shared PCI serialization, AVE idle and Wi-Fi isolation harnesses run against the composed candidate.
+
+From the repository root, the following command performs those checks, builds all ten radio and BCE modules against the selected installed T2 kernel headers, records patch and module SHA-256 values in `provenance.json`, and publishes the output only after every stage passes:
+
+```sh
+python3 packages/t2-suspend/experiments/verify-hibernation-candidate.py \
+  --output /tmp/t2-hibernation-candidate \
+  --kernel-release "$(uname -r)"
+```
+
+The clean build passed against `7.2.6-arch2-Watanare-T2-2-t2`, producing brcmfmac and its three companion modules, BCM4377 Bluetooth, BCE DMA, core, VHCI, audio and AVE. The only build warning was the already-known pahole 1.31 versus kernel-build 1.32 version mismatch. The verifier never installs or loads a module, writes a boot image, changes a boot entry, or initiates a power transition; its provenance explicitly records `installed: false` and `hardware_qualified: false`.
+
 Hardware testing remains paused. The earlier diagnostic boots repeatedly returned unusable machines and forced the operator to power off and manually choose the production image. Do not install this candidate, create another diagnostic image, reboot, or run a PM transition without a separately reviewed cold-power recovery design and explicit operator approval.
