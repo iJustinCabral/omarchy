@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 
 
 HERE = Path(__file__).resolve().parent
@@ -155,10 +156,13 @@ def inspect(root, candidate_directory):
   cmdline = read(confined(root, CMDLINE))
   if cmdline != provenance.get("cmdline"):
     raise ValueError("Running kernel command line differs from the private candidate")
+  boot_id = read(confined(root, BOOT_ID))
+  if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", boot_id):
+    raise ValueError("Running boot ID is malformed")
 
   return {
     "qualification": "candidate-boot-preflight-passed",
-    "boot_id": read(confined(root, BOOT_ID)),
+    "boot_id": boot_id,
     "entry_id": receipt["entry_id"],
     "kernel_release": provenance["kernel_release"],
     "cmdline_sha256": sha256_text(cmdline),
