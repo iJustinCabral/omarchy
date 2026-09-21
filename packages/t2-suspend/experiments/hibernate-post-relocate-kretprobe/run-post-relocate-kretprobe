@@ -1,0 +1,212 @@
+#!/bin/bash
+
+set -euo pipefail
+
+umask 077
+
+project=/home/jjc/Projects/MBA_9_1
+state=/var/lib/codex-mba-post-relocate-kretprobe
+attempts=$state/attempts
+hardware_guard=$state/hardware-test-started
+module=$state/mba_hibernate_post_relocate_kretprobe.ko
+module_name=mba_hibernate_post_relocate_kretprobe
+module_sysfs=/sys/module/$module_name
+release=7.2.6-arch2-Watanare-T2-2-t2
+normal_uki=/boot/EFI/Linux/omarchy_linux-t2.efi
+main_state=/var/lib/codex-mba-quiesce-kretprobe
+main_boot=26bc9b67-972b-418f-8ba8-ef5687ad12dd
+main_attempt=$main_state/attempts/$main_boot
+pre_cpu_state=/var/lib/codex-mba-pre-cpu-ftrace
+pre_cpu_boot=5f667617-0fc0-4a93-a35c-4748c2c05000
+pre_cpu_attempt=$pre_cpu_state/attempts/$pre_cpu_boot
+post_cpu_state=/var/lib/codex-mba-post-cpu-kretprobe
+post_cpu_boot=d66562ff-def9-4698-bb79-f67d0a756993
+post_cpu_attempt=$post_cpu_state/attempts/$post_cpu_boot
+post_syscore_state=/var/lib/codex-mba-post-syscore-kretprobe
+post_syscore_boot=1f05cc60-7e14-4e11-830f-8befaa60ad94
+post_syscore_attempt=$post_syscore_state/attempts/$post_syscore_boot
+pre_arch_state=/var/lib/codex-mba-pre-arch-resume-ftrace
+pre_arch_boot=10e1196f-41ae-4d74-846b-fe4eb34b4ceb
+pre_arch_attempt=$pre_arch_state/attempts/$pre_arch_boot
+expected_normal_sha256=18491469d046bd5805a10c7a80e47c1e9ae2af1879a3ce78b1e9c14826c789bc
+expected_command_sha256=e47e500103e36537a8c899eaa45eed215ea4a136a8c479b766704c12739634e6
+expected_module_sha256=8a3bfeb11bb69d48489eee4bcc5038a8b79f09ad10c71288b7aa2b7d4ff5b2e4
+expected_bce_srcversion=2394814A96D483B58C48501
+expected_audio_srcversion=151173D6F9EEF5E4612915D
+expected_wifi_srcversion=1D85357EB5E65B246EDEE20
+expected_bluetooth_srcversion=4DF58889A43B9AC7E9E3E8C
+marker='mba-hibernate-post-relocate: temporary mappings and restore-code relocation complete; aborting before restore_image'
+
+export OMARCHY_PATH=$project
+export PATH=$project/bin:/usr/local/sbin:/usr/local/bin:/usr/bin
+
+(( EUID == 0 ))
+
+module_loaded() {
+  [[ -d $module_sysfs ]]
+}
+
+disarm_module() {
+  if module_loaded; then
+    printf '%s\n' N > "$module_sysfs/parameters/armed" || true
+  fi
+}
+
+unload_module() {
+  disarm_module
+  if module_loaded; then
+    rmmod "$module_name" || true
+  fi
+}
+
+validate_deployment() {
+  [[ $(uname -r) == $release ]]
+  [[ ! -e $hardware_guard ]]
+  [[ $(<"$main_state/hardware-test-started/boot-id") == "$main_boot" ]]
+  [[ $(<"$main_attempt/classification") == "quiesce-complete" ]]
+  [[ $(<"$main_attempt/interceptions") == "1" ]]
+  [[ $(<"$pre_cpu_state/hardware-test-started/boot-id") == "$pre_cpu_boot" ]]
+  [[ $(<"$pre_cpu_attempt/classification") == "pre-cpu-complete" ]]
+  [[ $(<"$pre_cpu_attempt/interceptions") == "1" ]]
+  [[ $(<"$post_cpu_state/hardware-test-started/boot-id") == "$post_cpu_boot" ]]
+  [[ $(<"$post_cpu_attempt/classification") == "post-cpu-complete" ]]
+  [[ $(<"$post_cpu_attempt/interceptions") == "1" ]]
+  [[ $(<"$post_syscore_state/hardware-test-started/boot-id") == "$post_syscore_boot" ]]
+  [[ $(<"$post_syscore_attempt/classification") == "post-syscore-complete" ]]
+  [[ $(<"$post_syscore_attempt/successful-calls") == "2" ]]
+  [[ $(<"$post_syscore_attempt/interceptions") == "1" ]]
+  [[ $(<"$pre_arch_state/hardware-test-started/boot-id") == "$pre_arch_boot" ]]
+  [[ $(<"$pre_arch_attempt/classification") == "pre-arch-resume-complete" ]]
+  [[ $(<"$pre_arch_attempt/interceptions") == "1" ]]
+  [[ ! -e /sys/firmware/efi/efivars/LoaderEntryOneShot-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f ]]
+  [[ $(sha256sum "$normal_uki" | cut -d ' ' -f 1) == $expected_normal_sha256 ]]
+  [[ $(sha256sum "$project/bin/omarchy-debug-t2-hibernate" | cut -d ' ' -f 1) == $expected_command_sha256 ]]
+  [[ $(sha256sum "$module" | cut -d ' ' -f 1) == $expected_module_sha256 ]]
+  [[ $(modinfo -F vermagic "$module") == "$release SMP preempt mod_unload " ]]
+  [[ $(< /sys/module/t2bce_core/srcversion) == $expected_bce_srcversion ]]
+  [[ $(< /sys/module/t2bce_audio/srcversion) == $expected_audio_srcversion ]]
+  [[ $(< /sys/module/brcmfmac/srcversion) == $expected_wifi_srcversion ]]
+  [[ $(< /sys/module/hci_bcm4377/srcversion) == $expected_bluetooth_srcversion ]]
+  [[ $(< /sys/power/resume) == "253:0" ]]
+  [[ $(< /sys/power/resume_offset) == "1923214" ]]
+  [[ $(< /sys/power/pm_test) == "[none] core processors platform devices freezer" ]]
+  [[ $(< /sys/power/disk) == "[platform] shutdown reboot suspend test_resume" ]]
+  [[ $(awk '/^default_entry:/{print $2}' /boot/limine.conf) == "2" ]]
+  ! grep -Fq 'MBA-Hibernate-quiesce-probe' /boot/limine.conf
+  ! module_loaded
+}
+
+load_disarmed_module() {
+  insmod "$module"
+  [[ $(<"$module_sysfs/parameters/armed") == "N" ]]
+  [[ $(<"$module_sysfs/parameters/interceptions") == "0" ]]
+  grep -Eq 'relocate_restore_code.*\[FTRACE\]' /sys/kernel/debug/kprobes/list
+}
+
+validate_only() {
+  local result=0
+
+  validate_deployment || result=$?
+  if (( result == 0 )); then
+    "$project/bin/omarchy-debug-t2-hibernate" check || result=$?
+  fi
+  if (( result == 0 )); then
+    load_disarmed_module || result=$?
+  fi
+  unload_module
+  if module_loaded; then
+    result=1
+  fi
+  (( result == 0 ))
+  echo "Post-relocation kretprobe deployment validated without a PM transition."
+}
+
+if [[ ${1:-} == "--validate-only" ]]; then
+  validate_only
+  exit 0
+fi
+
+if (( $# > 0 )); then
+  echo "Usage: $0 [--validate-only]" >&2
+  exit 2
+fi
+
+boot_id=$(< /proc/sys/kernel/random/boot_id)
+attempt=$attempts/$boot_id
+mkdir -p "$attempts"
+mkdir "$attempt"
+printf '%s\n' "$boot_id" > "$attempt/boot-id"
+cp /proc/cmdline "$attempt/cmdline"
+printf '%s\n' initialized > "$attempt/phase"
+
+recover() {
+  local result=$?
+  local classification=preflight-failed
+
+  trap - EXIT
+  disarm_module
+  if [[ -f $hardware_guard/boot-id ]] && [[ $(<"$hardware_guard/boot-id") == "$boot_id" ]]; then
+    classification=marker-absent
+    if journalctl -b -k --no-pager | grep -F "$marker" >/dev/null; then
+      classification=post-relocate-complete
+    fi
+  fi
+  if module_loaded; then
+    cat "$module_sysfs/parameters/interceptions" > "$attempt/interceptions" || true
+  fi
+  unload_module
+  printf '%s\n' "$result" > "$attempt/runner-status"
+  printf '%s\n' "$classification" > "$attempt/classification"
+  journalctl -b -k --no-pager > "$attempt/kernel.log" || true
+  journalctl -b -u mba-post-relocate-kretprobe-probe.service --no-pager > "$attempt/service.log" || true
+  journalctl -b -t omarchy-t2-hibernate-test --no-pager > "$attempt/test-journal.log" || true
+  systemctl show mba-post-relocate-kretprobe-probe.service > "$attempt/service-state" || true
+  systemctl stop mba-post-relocate-kretprobe-recovery.timer >/dev/null 2>&1 || true
+  logger -t mba-post-relocate-kretprobe "probe finished result=$result classification=$classification; rebooting to clear diagnostic swap allocations"
+  install -d -m 0700 -o jjc -g jjc /home/jjc/.local/state/codex-mba-autonomous
+  install -m 0600 -o jjc -g jjc /dev/null /home/jjc/.local/state/codex-mba-autonomous/continue
+  rm -f /home/jjc/.local/state/codex-mba-autonomous/continue.dispatched
+  journalctl --sync || true
+  sync
+  systemctl reboot
+}
+
+trap recover EXIT
+
+systemd-run \
+  --unit=mba-post-relocate-kretprobe-recovery \
+  --on-active=300s \
+  --timer-property=AccuracySec=1s \
+  /usr/bin/systemctl reboot
+
+validate_deployment > "$attempt/deployment-validation.log" 2>&1
+printf '%s\n' "$release" > "$attempt/kernel-release"
+printf '%s\n' deployment-validated > "$attempt/phase"
+
+"$project/bin/omarchy-debug-t2-hibernate" check > "$attempt/preflight.log" 2>&1
+printf '%s\n' preflight-passed > "$attempt/phase"
+
+load_disarmed_module
+printf '%s\n' module-loaded-disarmed > "$attempt/phase"
+
+# This mkdir is the atomic hardware-attempt guard. Never remove it to retry.
+mkdir "$hardware_guard"
+printf '%s\n' "$boot_id" > "$hardware_guard/boot-id"
+printf '%s\n' "$attempt" > "$hardware_guard/evidence-directory"
+printf '%s\n' hardware-test-started > "$attempt/phase"
+printf '%s\n' Y > "$module_sysfs/parameters/armed"
+[[ $(<"$module_sysfs/parameters/armed") == "Y" ]]
+journalctl --sync
+sync
+
+set +e
+"$project/bin/omarchy-debug-t2-hibernate" test test-resume --wifi-unbind --bluetooth-off --pm-trace --no-sudo-prompt --yes \
+  > >(tee "$attempt/test.log") 2>&1
+test_status=$?
+set -e
+printf '%s\n' N > "$module_sysfs/parameters/armed"
+printf '%s\n' "$test_status" > "$attempt/test-status"
+printf '%s\n' hardware-test-returned > "$attempt/phase"
+
+[[ $(<"$module_sysfs/parameters/interceptions") == "1" ]]
+journalctl -b -k --no-pager | grep -F "$marker" >/dev/null

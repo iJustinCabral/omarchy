@@ -1,0 +1,1 @@
+obj-m := mba_hibernate_post_relocate_kretprobe.o
