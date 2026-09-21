@@ -1,0 +1,107 @@
+Subject: [PATCH] t2bce: serialize shared-function PCI PM
+
+The BCE noirq callbacks deliberately clear and save the PCI command state
+for all four functions behind the T2 link.  PCI devices opt into asynchronous
+system suspend by default, so the ANS, BCE, SEP, and audio callbacks could
+otherwise update those sibling pci_dev snapshots concurrently.
+
+Disable asynchronous system PM for the four-function group while BCE is
+bound.  Preserve the original per-function setting and restore it on probe
+failure or driver removal.  This makes the existing cross-function noirq
+transaction ordered without changing ordinary runtime PM.
+
+This applies after the cold-S4 queue-rebuild experiment and has not been
+installed or hardware-qualified.
+
+---
+diff --git a/drivers/staging/t2bce/t2bce_core/t2bce.h b/drivers/staging/t2bce/t2bce_core/t2bce.h
+index 8b37c79f..e34b65b7 100644
+--- a/drivers/staging/t2bce/t2bce_core/t2bce.h
++++ b/drivers/staging/t2bce/t2bce_core/t2bce.h
+@@ -34,6 +34,7 @@ struct t2bce_device {
+     bool mailbox_channel_active;
+     bool pci_dma_restore_failed;
+     unsigned long pci_master_mask;
++    unsigned long pci_async_suspend_mask;
+     struct mutex pm_lock;
+     struct mutex clients_lock;
+     struct list_head clients;
+diff --git a/drivers/staging/t2bce/t2bce_core/t2bce_main.c b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
+index 5925175c..299f94fb 100644
+--- a/drivers/staging/t2bce/t2bce_core/t2bce_main.c
++++ b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
+@@ -45,6 +45,8 @@ static int t2bce_dma_unregister_queue(void *userdata, u16 qid);
+ static int t2bce_dma_flush_queue(void *userdata, u16 qid);
+ static int bce_alloc_state_buffer(struct t2bce_device *bce);
+ static void bce_free_state_buffer(struct t2bce_device *bce);
++static void bce_pm_disable_shared_async(struct t2bce_device *bce);
++static void bce_pm_restore_shared_async(struct t2bce_device *bce);
+ static int bce_pm_suspend_prepare(struct t2bce_device *bce);
+ static void bce_pm_suspend_abort(struct t2bce_device *bce);
+ static void bce_pm_resume_finish(struct t2bce_device *bce);
+@@ -82,6 +84,31 @@ static void bce_free_state_buffer(struct t2bce_device *bce)
+     bce->saved_data_dma_size = 0;
+ }
+ 
++static void bce_pm_disable_shared_async(struct t2bce_device *bce)
++{
++    struct pci_dev *functions[] = { bce->pci0, bce->pci, bce->pci2, bce->pci3 };
++    size_t i;
++
++    bce->pci_async_suspend_mask = 0;
++    for (i = 0; i < ARRAY_SIZE(functions); i++) {
++        if (device_async_suspend_enabled(&functions[i]->dev))
++            bce->pci_async_suspend_mask |= BIT(i);
++        device_disable_async_suspend(&functions[i]->dev);
++    }
++}
++
++static void bce_pm_restore_shared_async(struct t2bce_device *bce)
++{
++    struct pci_dev *functions[] = { bce->pci0, bce->pci, bce->pci2, bce->pci3 };
++    unsigned long mask = bce->pci_async_suspend_mask;
++    size_t i;
++
++    for (i = 0; i < ARRAY_SIZE(functions); i++)
++        if (mask & BIT(i))
++            device_enable_async_suspend(&functions[i]->dev);
++    bce->pci_async_suspend_mask = 0;
++}
++
+ static int t2bce_probe(struct pci_dev *dev, const struct pci_device_id *id)
+ {
+     struct t2bce_device *bce = NULL;
+@@ -174,10 +201,15 @@ static int t2bce_probe(struct pci_dev *dev, const struct pci_device_id *id)
+         status = -ENODEV;
+         goto fail_dev0;
+     }
++    /* The noirq PM callback owns the saved PCI state of all four functions.
++     * Serialize the sibling callbacks so that ANS, BCE, SEP, and audio cannot
++     * update those shared snapshots concurrently.
++     */
++    bce_pm_disable_shared_async(bce);
+ #ifndef WITHOUT_NVME_PATCH
+     if ((status = pci_enable_device_mem(bce->pci0))) {
+         dev_warn(&dev->dev, "t2bce_core: failed to enable function 0\n");
+-        goto fail_dev0;
++        goto fail_shared_pm;
+     }
+ #endif
+     pci_set_master(bce->pci0);
+@@ -205,6 +237,8 @@ fail_ts:
+ #ifndef WITHOUT_NVME_PATCH
+     pci_disable_device(bce->pci0);
++fail_shared_pm:
+ #endif
++    bce_pm_restore_shared_async(bce);
+ fail_dev0:
+     pci_dev_put(bce->pci3);
+     pci_dev_put(bce->pci2);
+@@ -466,6 +500,7 @@ static void t2bce_remove(struct pci_dev *dev)
+ #ifndef WITHOUT_NVME_PATCH
+     pci_disable_device(bce->pci0);
+ #endif
++    bce_pm_restore_shared_async(bce);
+     pci_dev_put(bce->pci3);
+     pci_dev_put(bce->pci2);
+     pci_dev_put(bce->pci0);
