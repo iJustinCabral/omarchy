@@ -1,0 +1,1 @@
+obj-m := mba_hibernate_post_cpu_kretprobe.o
