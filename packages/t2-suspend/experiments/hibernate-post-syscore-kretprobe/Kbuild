@@ -1,0 +1,1 @@
+obj-m := mba_hibernate_post_syscore_kretprobe.o
