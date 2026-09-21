@@ -1,0 +1,45 @@
+Subject: [PATCH] t2bce_ave: certify idle state for hibernation rebuild
+
+The AVE client allocates BCE queues only inside an active encoding session.
+Its existing PM prepare callback tears that session down, destroys all four
+queue pairs and frees their DMA rings before the BCE core requests
+SLEEP_NO_STATE.
+
+Register explicit no-state drop and rebuild callbacks so the core can
+distinguish this prepared queue-free client from an unsupported client.  The
+callbacks deliberately do no work: queue destruction belongs to the earlier
+session teardown, and userspace must restart streaming after resume.
+
+This is an offline follow-up to the BCE queue-reconstruction candidate.  It
+does not preserve an active encoding session across hibernation and has not
+been installed or hardware-qualified.
+
+---
+diff --git a/drivers/staging/t2bce/t2bce_ave/ave.c b/drivers/staging/t2bce/t2bce_ave/ave.c
+--- a/drivers/staging/t2bce/t2bce_ave/ave.c
++++ b/drivers/staging/t2bce/t2bce_ave/ave.c
+@@ -38,9 +38,24 @@ static int t2bce_ave_pm_prepare(void *userdata)
+ 	return 0;
+ }
+ 
++static void t2bce_ave_pm_drop_no_state_queues(void *userdata)
++{
++	/* pm_prepare has already torn down the only AVE queue owner. */
++	(void)userdata;
++}
++
++static int t2bce_ave_pm_rebuild_no_state_queues(void *userdata)
++{
++	/* Userspace must create a new encoding session after resume. */
++	(void)userdata;
++	return 0;
++}
++
+ static const struct t2bce_core_client_pm_ops t2bce_ave_pm_ops = {
+ 	.shutdown = t2bce_ave_shutdown,
+ 	.pm_prepare = t2bce_ave_pm_prepare,
++	.pm_drop_no_state_queues = t2bce_ave_pm_drop_no_state_queues,
++	.pm_rebuild_no_state_queues = t2bce_ave_pm_rebuild_no_state_queues,
+ };
+ 
+ static int __init t2bce_ave_init(void)
