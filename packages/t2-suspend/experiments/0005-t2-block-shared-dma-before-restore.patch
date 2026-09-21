@@ -1,0 +1,223 @@
+Subject: [PATCH] t2: block PCI bus mastering before atomic image restore
+
+The x86 hibernation restore path disables Intel IOMMU translation in
+syscore_suspend() before restore_image() overwrites physical memory.  The PCI
+QUIESCE path only saves configuration and does not generically clear the bus
+master bit.  On T2 systems this leaves identity-mapped functions capable of
+DMA while the old kernel is replacing itself with the saved image.
+
+Gate all four functions on the shared ANS/BCE/SEP/audio link from the BCE
+noirq callback, after their ordinary quiesce callbacks have completed.  Keep
+references to the otherwise unowned SEP function and the audio sibling, save
+which functions were bus masters, verify that every bit cleared, and restore
+only the previous masters on thaw or resume.  Also gate the BCM4377 Bluetooth
+function after its firmware quiesce callback and restore it only if the
+transport remains valid.
+
+This is an unqualified diagnostic candidate.  It deliberately does not gate
+the Wi-Fi sibling, so the existing Wi-Fi-unbind isolation remains mandatory.
+
+--- a/drivers/staging/t2bce/t2bce_core/t2bce.h
++++ b/drivers/staging/t2bce/t2bce_core/t2bce.h
+@@ -12,7 +12,7 @@
+ #define BC_PROTOCOL_VERSION 0x20001
+ 
+ struct t2bce_device {
+-    struct pci_dev *pci, *pci0;
++    struct pci_dev *pci, *pci0, *pci2, *pci3;
+     dev_t devt;
+     struct device *dev;
+     void __iomem *reg_mem_mb;
+@@ -30,6 +30,7 @@ struct t2bce_device {
+     bool no_state_fallback;
+     bool no_state_resume;
+     bool mailbox_channel_active;
++    unsigned long pci_master_mask;
+     struct mutex pm_lock;
+     struct mutex clients_lock;
+     struct list_head clients;
+--- a/drivers/staging/t2bce/t2bce_core/t2bce_main.c
++++ b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
+@@ -166,6 +166,13 @@ static int t2bce_probe(struct pci_dev *dev, const struct pci_device_id *id)
+      * host state.
+      */
+     bce->pci0 = pci_get_slot(dev->bus, PCI_DEVFN(PCI_SLOT(dev->devfn), 0));
++    bce->pci2 = pci_get_slot(dev->bus, PCI_DEVFN(PCI_SLOT(dev->devfn), 2));
++    bce->pci3 = pci_get_slot(dev->bus, PCI_DEVFN(PCI_SLOT(dev->devfn), 3));
++    if (!bce->pci0 || !bce->pci2 || !bce->pci3) {
++        dev_warn(&dev->dev, "t2bce_core: incomplete shared PCI function set\n");
++        status = -ENODEV;
++        goto fail_dev0;
++    }
+ #ifndef WITHOUT_NVME_PATCH
+     if ((status = pci_enable_device_mem(bce->pci0))) {
+         dev_warn(&dev->dev, "t2bce_core: failed to enable function 0\n");
+@@ -196,8 +203,10 @@ fail_ts:
+     bce_xhci_pm_stop(&bce->xhci_pm);
+ #ifndef WITHOUT_NVME_PATCH
+     pci_disable_device(bce->pci0);
+-fail_dev0:
+ #endif
++fail_dev0:
++    pci_dev_put(bce->pci3);
++    pci_dev_put(bce->pci2);
+     pci_dev_put(bce->pci0);
+ fail_segment_list_pool:
+     t2bce_dma_destroy_segment_list_pool(&bce->dma);
+@@ -447,6 +456,8 @@ static void t2bce_remove(struct pci_dev *dev)
+ #ifndef WITHOUT_NVME_PATCH
+     pci_disable_device(bce->pci0);
+ #endif
++    pci_dev_put(bce->pci3);
++    pci_dev_put(bce->pci2);
+     pci_dev_put(bce->pci0);
+     pci_free_irq(dev, 0, dev);
+     pci_free_irq(dev, 4, dev);
+@@ -672,6 +683,61 @@ static int t2bce_resume(struct device *dev)
+     return status;
+ }
+ 
++static int t2bce_suspend_noirq(struct device *dev)
++{
++    struct t2bce_device *bce = pci_get_drvdata(to_pci_dev(dev));
++    struct pci_dev *functions[] = { bce->pci0, bce->pci, bce->pci2, bce->pci3 };
++    unsigned long master_mask = 0;
++    u16 command;
++    size_t i;
++
++    for (i = 0; i < ARRAY_SIZE(functions); i++) {
++        if (pci_read_config_word(functions[i], PCI_COMMAND, &command))
++            goto restore;
++        if (command & PCI_COMMAND_MASTER)
++            master_mask |= BIT(i);
++        pci_clear_master(functions[i]);
++        if (pci_read_config_word(functions[i], PCI_COMMAND, &command) ||
++                command & PCI_COMMAND_MASTER)
++            goto restore;
++    }
++
++    bce->pci_master_mask = master_mask;
++    pr_info("t2bce_core: noirq: blocked shared-link DMA mask=%#lx\n", master_mask);
++    return 0;
++
++restore:
++    for (i = 0; i < ARRAY_SIZE(functions); i++)
++        if (master_mask & BIT(i))
++            pci_set_master(functions[i]);
++    pr_err("t2bce_core: noirq: failed to block shared-link DMA\n");
++    return -EIO;
++}
++
++static int t2bce_resume_noirq(struct device *dev)
++{
++    struct t2bce_device *bce = pci_get_drvdata(to_pci_dev(dev));
++    struct pci_dev *functions[] = { bce->pci0, bce->pci, bce->pci2, bce->pci3 };
++    unsigned long master_mask = bce->pci_master_mask;
++    u16 command;
++    size_t i;
++
++    for (i = 0; i < ARRAY_SIZE(functions); i++) {
++        if (!(master_mask & BIT(i)))
++            continue;
++        pci_set_master(functions[i]);
++        if (pci_read_config_word(functions[i], PCI_COMMAND, &command) ||
++                !(command & PCI_COMMAND_MASTER)) {
++            pr_err("t2bce_core: noirq: failed to restore PCI function %zu DMA\n", i);
++            return -EIO;
++        }
++    }
++
++    bce->pci_master_mask = 0;
++    pr_info("t2bce_core: noirq: restored shared-link DMA mask=%#lx\n", master_mask);
++    return 0;
++}
++
+ static int t2bce_prepare(struct device *dev)
+ {
+     /*
+@@ -709,9 +775,14 @@ struct dev_pm_ops t2bce_pci_driver_pm = {
+         .prepare = t2bce_prepare,
+         .suspend = t2bce_suspend,
+         .resume = t2bce_resume,
++        .suspend_noirq = t2bce_suspend_noirq,
++        .resume_noirq = t2bce_resume_noirq,
+         .freeze = t2bce_suspend,
+         .thaw = t2bce_resume,
+         .restore = t2bce_resume,
++        .freeze_noirq = t2bce_suspend_noirq,
++        .thaw_noirq = t2bce_resume_noirq,
++        .restore_noirq = t2bce_resume_noirq,
+         .complete = t2bce_complete
+ };
+ struct pci_driver t2bce_pci_driver = {
+--- a/drivers/bluetooth/hci_bcm4377.c
++++ b/drivers/bluetooth/hci_bcm4377.c
+@@ -567,6 +567,7 @@ struct bcm4377_data {
+ 	bool transport_lost;
+ 	bool irq_blocked;
+ 	bool pm_blocked;
++	bool pm_was_busmaster;
+ 	bool setup_needed;
+ 	void *firmware_buffer;
+ 	dma_addr_t firmware_dma;
+@@ -2701,6 +2702,24 @@ static int bcm4377_resume(struct device *dev)
+ 	return hci_resume_dev(bcm4377->hdev);
+ }
+ 
++static int bcm4377_suspend_noirq(struct device *dev)
++{
++	struct pci_dev *pdev = to_pci_dev(dev);
++	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
++	u16 command;
++
++	if (pci_read_config_word(pdev, PCI_COMMAND, &command))
++		return -EIO;
++
++	bcm4377->pm_was_busmaster = command & PCI_COMMAND_MASTER;
++	pci_clear_master(pdev);
++	if (pci_read_config_word(pdev, PCI_COMMAND, &command) ||
++	    command & PCI_COMMAND_MASTER)
++		return -EIO;
++
++	return 0;
++}
++
+ /* PCI core has restored the standard header; restore vendor mappings
+  * before device interrupts and the normal unquiesce/HCI resume callback.
+  */
+@@ -2712,8 +2731,12 @@ static int bcm4377_resume_noirq(struct device *dev)
+ 	u32 before[ARRAY_SIZE(offsets)], after, expected[ARRAY_SIZE(offsets)];
+ 	int ret, i;
+ 
+-	if (bcm4377->hw->id != 0x4377)
++	if (bcm4377->hw->id != 0x4377) {
++		if (bcm4377->pm_was_busmaster)
++			pci_set_master(pdev);
++		bcm4377->pm_was_busmaster = false;
+ 		return 0;
++	}
+ 
+ 	WRITE_ONCE(bcm4377->resume_config_failed, true);
+ 	for (i = 0; i < ARRAY_SIZE(offsets); i++) {
+@@ -2747,6 +2770,10 @@ static int bcm4377_resume_noirq(struct device *dev)
+ 		}
+ 	}
+ 	WRITE_ONCE(bcm4377->resume_config_failed, false);
++	if (bcm4377->pm_was_busmaster &&
++	    !READ_ONCE(bcm4377->transport_lost))
++		pci_set_master(pdev);
++	bcm4377->pm_was_busmaster = false;
+ 	dev_info(dev, "t2bt-resume: restored vendor windows (before %08x %08x %08x %08x %08x)\n",
+ 		 before[0], before[1], before[2], before[3], before[4]);
+ 	return 0;
+@@ -2774,6 +2801,10 @@ static void bcm4377_complete(struct device *dev)
+ 
+ static const struct dev_pm_ops bcm4377_ops = {
+ 	SYSTEM_SLEEP_PM_OPS(bcm4377_suspend, bcm4377_resume)
++	.freeze_noirq = bcm4377_suspend_noirq,
++	.thaw_noirq = bcm4377_resume_noirq,
++	.poweroff_noirq = bcm4377_suspend_noirq,
++	.restore_noirq = bcm4377_resume_noirq,
+ 	.resume_noirq = bcm4377_resume_noirq,
+ 	.complete = bcm4377_complete,
+ };

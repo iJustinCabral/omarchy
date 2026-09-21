@@ -1,20 +1,20 @@
 # T2 hibernation investigation
 
-Hibernation is not yet fixed or enabled by the T2 suspend driver package. The MacBookAir9,1 now passes snapshot creation, image writing and integrity-checked image readback; the unresolved failure is in the later device-quiesce and atomic memory-restoration path. This document records the boundary evidence, the restore problem predicted by the T2 driver architecture and the guarded tests used to distinguish them.
+Hibernation is not yet fixed or enabled by the T2 suspend driver package. The MacBookAir9,1 now passes snapshot creation, image writing, integrity-checked image readback, both device-quiesce phases, secondary-CPU disable, IRQ disable, all syscore callbacks, processor-state save, temporary page-table construction and restore-code relocation. The unresolved failure is confined to `restore_image()` or the restored execution it enters. This document records the boundary evidence, the restore problem predicted by the T2 driver architecture and the guarded tests used to distinguish them.
 
 ## Current MacBookAir9,1 failure boundary
 
-The failed hibernation boot ended after these events:
+Six one-shot boundary probes on the production kernel progressively completed main device quiesce, late/noirq device quiesce and platform preparation, balanced secondary-CPU disable, IRQ disable and all syscore suspend callbacks, processor-state save, temporary mapping construction, and restore-code relocation. The final source boot `9bb52121-0564-4366-adf2-0ff45d6d0899` emitted `mba-hibernate-post-relocate: temporary mappings and restore-code relocation complete; aborting before restore_image`, then returned through the kernel's failure cleanup. Every probe has a durable no-repeat guard and must not run again.
 
-1. systemd successfully froze `user.slice`.
-2. `systemd-sleep` requested `hibernate`.
-3. The kernel logged `PM: hibernation: hibernation entry`.
-4. The kernel never logged `Filesystems sync` or image allocation.
-5. The next boot reported `PM: Image not found (code -22)`.
+On x86-64, the next instruction path switches to the temporary CR3, flushes the TLB, copies every restore PBE page to its original physical address, switches to the saved image kernel's CR3 and jumps to its restore entry. There is no recoverable C boundary after `restore_image()` begins. The failure is therefore no longer attributed to image creation, readback, ordinary device callbacks or restore-code setup.
 
-The resume device, Btrfs swap-file offset and initramfs `resume` hook were present. The surviving evidence therefore places this failure before image creation, in console preparation, a hibernation prepare notifier, or the initial filesystem-sync boundary. It does not implicate image restoration yet.
+Source and live PCI evidence identify an unqualified DMA-quiesce candidate. Both T2 IOMMU groups use identity domains under `intel_iommu=on iommu=pt`; Intel's syscore suspend callback disables translation before `restore_image()`. The PCI hibernation `freeze_noirq` path saves configuration but does not generically clear bus mastering. On a healthy boot, the BCE and Bluetooth functions retain `PCI_COMMAND_MASTER`; BCE also keeps an extra enable reference to ANS function 0, and the unbound SEP function 2 has bus mastering enabled without any Linux driver callback. This permits T2 functions to remain capable of direct DMA while the restore assembly overwrites physical memory.
 
-The Bluetooth HCI power-management notifier was an early T2-specific suspect because it handles `PM_HIBERNATION_PREPARE` by synchronously quiescing the controller, and the BCM4377 transport has shown command timeouts after S3. Both `freezer` variants returned, however, so an active HCI controller is not a deterministic cause of the entry failure.
+Experimental patch `packages/t2-suspend/experiments/0005-t2-block-shared-dma-before-restore.patch` gates the complete ANS/BCE/SEP/audio function set from BCE's noirq callback and gates Bluetooth after its firmware quiesce callback. It verifies every bus-master bit, remembers the previous mask and restores only prior masters during unwind or resume. Wi-Fi remains deliberately outside this candidate, so Wi-Fi unbinding is still required for any later diagnostic. The patch builds and passes an offline control-flow harness but is neither installed nor hardware-qualified.
+
+Hardware testing is paused. The operator reported that the warm reboot after each recent boundary probe produced an unresponsive machine and required a forced power-off plus manual production-entry selection. Runner status 0 proves only that the source kernel reached its controlled return and requested an orderly reboot; it does not prove recovery usability. No future transition may rely on automatic warm reboot, and no new hardware test is authorized until a separate cold-power recovery design is documented and explicitly accepted.
+
+The earliest failed boot, recorded below for history, had only an entry marker and initially suggested a notifier or filesystem-sync failure. Later creation, readback and boundary probes supersede that localization. Bluetooth remains relevant as a DMA-capable PCI function, but both freezer variants returning showed that its HCI prepare notifier was not a deterministic entry blocker.
 
 ## Guarded diagnostic command
 
