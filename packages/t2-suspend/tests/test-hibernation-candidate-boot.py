@@ -66,8 +66,15 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-boot-") as directory:
   assert receipt["state"] == "staged"
   assert "default_entry: 2" in limine.read_text()
   assert candidate_boot.BEGIN in limine.read_text()
+  assert receipt["entry_id"] == candidate_boot.entry_id(receipt["candidate_uki_sha256"])
+  assert "/" + receipt["entry_id"] + "\n" in limine.read_text()
   assert (root / candidate_boot.IMAGE).read_bytes() == candidate_image.read_bytes()
   assert not (root / candidate_boot.ONESHOT).exists()
+  try:
+    candidate_boot.verify_staged(root, {**receipt, "entry_id": candidate_boot.ENTRY_PREFIX})
+    raise AssertionError("candidate entry identifier was not bound to its UKI hash")
+  except ValueError as error:
+    assert "bound" in str(error)
 
   try:
     candidate_boot.arm(root, runner=lambda *_args, **_kwargs: None)
@@ -76,18 +83,18 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-boot-") as directory:
     assert "advertised" in str(error)
 
   entries = root / candidate_boot.ENTRIES
-  entries.write_bytes(efi_strings(("Omarchy.linux-t2", candidate_boot.ENTRY_ID)))
+  entries.write_bytes(efi_strings(("Omarchy.linux-t2", receipt["entry_id"])))
   sync_calls = []
 
   def fake_bootctl(arguments, check):
-    assert arguments == ["bootctl", "set-oneshot", candidate_boot.ENTRY_ID]
+    assert arguments == ["bootctl", "set-oneshot", receipt["entry_id"]]
     assert check
     assert sync_calls == [True]
-    (root / candidate_boot.ONESHOT).write_bytes(efi_string(candidate_boot.ENTRY_ID))
+    (root / candidate_boot.ONESHOT).write_bytes(efi_string(receipt["entry_id"]))
 
   armed = candidate_boot.arm(root, runner=fake_bootctl, sync=lambda: sync_calls.append(True))
   assert armed["state"] == "arming"
-  assert candidate_boot.read_efi_string(root / candidate_boot.ONESHOT) == candidate_boot.ENTRY_ID
+  assert candidate_boot.read_efi_string(root / candidate_boot.ONESHOT) == receipt["entry_id"]
 
   try:
     candidate_boot.rollback(root)
@@ -132,5 +139,31 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-boot-") as directory:
       assert recovered["state"] == "stage-failed-recovered"
       candidate_boot.verify_recovered(root, recovered)
       assert candidate_boot.rollback(root)["state"] == "rolled-back"
+
+  for fail_at in (1, 2, 3):
+    case = Path(directory) / ("rollback-failure-" + str(fail_at))
+    root, candidate, _candidate_image, limine, original_limine = prepare_fixture(case)
+    candidate_boot.stage(root, candidate)
+    writes = [0]
+
+    def failing_rollback_writer(path, data, mode):
+      writes[0] += 1
+      original_writer(path, data, mode)
+      if writes[0] == fail_at:
+        raise RuntimeError("injected rollback failure")
+
+    candidate_boot.atomic_write = failing_rollback_writer
+    try:
+      try:
+        candidate_boot.rollback(root)
+        raise AssertionError("injected rollback failure was ignored")
+      except RuntimeError as error:
+        assert "injected rollback failure" in str(error)
+    finally:
+      candidate_boot.atomic_write = original_writer
+
+    assert candidate_boot.rollback(root)["state"] == "rolled-back"
+    assert limine.read_text() == original_limine
+    assert not (root / candidate_boot.IMAGE).exists()
 
 print("PASS: candidate boot stages transactionally, requires a loader refresh, arms once and restores production exactly")

@@ -11,13 +11,11 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import tempfile
 
 
-ENTRY_NAME = "MBA-T2-hibernation-candidate"
-ENTRY_ID = ENTRY_NAME
+ENTRY_PREFIX = "MBA-T2-hibernation-candidate"
 IMAGE_NAME = "mba_t2_hibernation_candidate.efi"
 PRODUCTION_IMAGE = "omarchy_linux-t2.efi"
 STATE = Path("var/lib/omarchy-t2-hibernation-candidate")
@@ -92,10 +90,16 @@ def read_efi_strings(path):
   return tuple(value for value in data[4:].decode("utf-16-le").split("\x00") if value)
 
 
-def entry_block(image_hash):
+def entry_id(candidate_hash):
+  if not re.fullmatch(r"[0-9a-f]{64}", candidate_hash):
+    raise ValueError("Candidate UKI SHA-256 is malformed")
+  return ENTRY_PREFIX + "-" + candidate_hash[:16]
+
+
+def entry_block(candidate_entry, image_hash):
   return (
     f"\n{BEGIN}\n"
-    f"/{ENTRY_NAME}\n"
+    f"/{candidate_entry}\n"
     "comment: One-shot candidate; production remains the explicit default\n"
     "protocol: efi\n"
     f"path: boot():/EFI/Linux/{IMAGE_NAME}#{image_hash}\n"
@@ -156,11 +160,20 @@ def verify_staged(root, receipt):
   limine = rooted(root, LIMINE)
   if digest(image) != receipt["candidate_uki_sha256"]:
     raise ValueError("Staged candidate image changed")
+  if blake2(image) != receipt["candidate_uki_blake2"]:
+    raise ValueError("Staged candidate Limine hash changed")
   if digest(limine) != receipt["staged_limine_sha256"]:
     raise ValueError("Staged Limine configuration changed")
+  backup = rooted(root, BACKUP)
+  if not backup.is_file() or digest(backup) != receipt["original_limine_sha256"]:
+    raise ValueError("Limine backup changed")
   text = limine.read_text()
   if text.count(BEGIN) != 1 or text.count(END) != 1:
     raise ValueError("Managed candidate entry is missing or duplicated")
+  if receipt.get("entry_id") != entry_id(receipt["candidate_uki_sha256"]):
+    raise ValueError("Candidate entry identifier is not bound to the UKI hash")
+  if text.count("/" + receipt["entry_id"] + "\n") != 1:
+    raise ValueError("Hash-bound candidate entry is missing or duplicated")
   if len(re.findall(r"^default_entry:\s*2\s*$", text, re.M)) != 1:
     raise ValueError("Staging changed the production default")
   expected = "path: boot():/EFI/Linux/" + IMAGE_NAME + "#" + receipt["candidate_uki_blake2"]
@@ -223,17 +236,18 @@ def stage(root, candidate_directory):
     raise ValueError("Candidate boot transaction already exists")
   image_data, provenance = load_candidate(candidate_directory)
   limine, production, original = validate_production(root, provenance)
-  if BEGIN in original or END in original or f"/{ENTRY_NAME}" in original:
+  if BEGIN in original or END in original or f"/{ENTRY_PREFIX}" in original:
     raise ValueError("Unowned candidate entry already exists")
 
   state.mkdir(parents=True, mode=0o700)
   state.chmod(0o700)
   image_sha256 = hashlib.sha256(image_data).hexdigest()
   image_blake2 = hashlib.blake2b(image_data).hexdigest()
-  staged = original.encode() + entry_block(image_blake2)
+  candidate_entry = entry_id(image_sha256)
+  staged = original.encode() + entry_block(candidate_entry, image_blake2)
   receipt = {
     "state": "preparing",
-    "entry_id": ENTRY_ID,
+    "entry_id": candidate_entry,
     "candidate_uki_sha256": image_sha256,
     "candidate_uki_blake2": image_blake2,
     "production_uki_sha256": digest(production),
@@ -279,15 +293,16 @@ def arm(root, runner=subprocess.run, sync=os.sync):
     "production_uki_sha256": receipt["production_uki_sha256"],
   })
   verify_staged(root, receipt)
+  candidate_entry = receipt["entry_id"]
   entries = rooted(root, ENTRIES)
-  if not entries.is_file() or ENTRY_ID not in read_efi_strings(entries):
+  if not entries.is_file() or candidate_entry not in read_efi_strings(entries):
     raise ValueError("Limine has not advertised the candidate entry; boot production once after staging")
   receipt["state"] = "arming"
   save_receipt(root, receipt)
   sync()
-  runner(["bootctl", "set-oneshot", ENTRY_ID], check=True)
+  runner(["bootctl", "set-oneshot", candidate_entry], check=True)
   one_shot = rooted(root, ONESHOT)
-  if not one_shot.is_file() or read_efi_string(one_shot) != ENTRY_ID:
+  if not one_shot.is_file() or read_efi_string(one_shot) != candidate_entry:
     raise ValueError("LoaderEntryOneShot verification failed")
   return receipt
 
@@ -296,21 +311,38 @@ def rollback(root):
   receipt = load_receipt(root)
   if rooted(root, ONESHOT).exists():
     raise ValueError("Disarm LoaderEntryOneShot before rollback")
+  if receipt.get("state") == "rolled-back":
+    verify_recovered(root, receipt)
+    return receipt
   if receipt.get("state") == "stage-failed-recovered":
     verify_recovered(root, receipt)
     receipt["state"] = "rolled-back"
     save_receipt(root, receipt)
     return receipt
-  if receipt.get("state") not in ("staged", "arming"):
+  if receipt.get("state") in ("staged", "arming"):
+    verify_staged(root, receipt)
+    receipt["state"] = "rolling-back"
+    save_receipt(root, receipt)
+  elif receipt.get("state") != "rolling-back":
     raise ValueError("Candidate transaction cannot be rolled back from this state")
-  verify_staged(root, receipt)
+
   backup = rooted(root, BACKUP)
-  if digest(backup) != receipt["original_limine_sha256"]:
+  if not backup.is_file() or digest(backup) != receipt["original_limine_sha256"]:
     raise ValueError("Limine backup changed")
-  atomic_write(rooted(root, LIMINE), backup.read_bytes(), 0o600)
+  limine = rooted(root, LIMINE)
+  limine_hash = digest(limine)
+  if limine_hash == receipt["staged_limine_sha256"]:
+    atomic_write(limine, backup.read_bytes(), 0o600)
+  elif limine_hash != receipt["original_limine_sha256"]:
+    raise ValueError("Refusing rollback of an unknown Limine configuration")
+
   image = rooted(root, IMAGE)
-  image.unlink()
-  fsync_directory(image.parent)
+  if image.exists():
+    if digest(image) != receipt["candidate_uki_sha256"]:
+      raise ValueError("Refusing rollback of an unknown candidate image")
+    image.unlink()
+    fsync_directory(image.parent)
+  verify_recovered(root, receipt)
   receipt["state"] = "rolled-back"
   save_receipt(root, receipt)
   return receipt
