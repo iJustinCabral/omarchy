@@ -5,6 +5,7 @@ python3 "$ROOT/test/shell.d/t2-suspend-installer-unit.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-preparation.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-wifi-hibernate-isolation.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernation-candidate-uki.py"
+python3 "$ROOT/packages/t2-suspend/tests/test-hibernation-candidate-boot.py"
 pass "T2 suspend source and installer transactions"
 
 test_tmp=$(mktemp -d)

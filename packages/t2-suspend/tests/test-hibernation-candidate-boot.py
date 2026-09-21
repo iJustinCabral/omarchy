@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Exercise the candidate boot staging transaction against a synthetic ESP."""
+
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import tempfile
+
+
+package = Path(__file__).resolve().parents[1]
+script = package / "experiments/stage-hibernation-candidate-boot.py"
+spec = importlib.util.spec_from_file_location("candidate_boot", script)
+candidate_boot = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(candidate_boot)
+
+
+def efi_string(value):
+  return b"\x07\x00\x00\x00" + (value + "\x00").encode("utf-16-le")
+
+
+def efi_strings(values):
+  return b"\x06\x00\x00\x00" + "".join(value + "\x00" for value in values).encode("utf-16-le")
+
+
+def prepare_fixture(directory):
+  root = directory / "root"
+  candidate = directory / "candidate"
+  production = root / "boot/EFI/Linux/omarchy_linux-t2.efi"
+  limine = root / "boot/limine.conf"
+  selected = root / candidate_boot.SELECTED
+  production.parent.mkdir(parents=True)
+  selected.parent.mkdir(parents=True)
+  candidate.mkdir()
+  production.write_bytes(b"healthy production uki")
+  production_blake2 = hashlib.blake2b(production.read_bytes()).hexdigest()
+  original_limine = (
+    "timeout: 3\n"
+    "default_entry: 2\n"
+    "/+Omarchy\n"
+    "  //linux-t2\n"
+    "  protocol: efi\n"
+    f"  path: boot():/EFI/Linux/omarchy_linux-t2.efi#{production_blake2}\n"
+  )
+  limine.write_text(original_limine)
+  selected.write_bytes(efi_string("Omarchy.linux-t2"))
+
+  candidate_image = candidate / "mba-t2-hibernation-candidate.efi"
+  candidate_image.write_bytes(b"private candidate uki")
+  (candidate / "provenance.json").write_text(json.dumps({
+    "candidate": "mba-t2-hibernation-module-overlay",
+    "candidate_uki_sha256": hashlib.sha256(candidate_image.read_bytes()).hexdigest(),
+    "production_uki_sha256": hashlib.sha256(production.read_bytes()).hexdigest(),
+    "production_modified": False,
+    "installed": False,
+    "boot_entry_created": False,
+    "hardware_qualified": False,
+  }))
+  return root, candidate, candidate_image, limine, original_limine
+
+
+with tempfile.TemporaryDirectory(prefix="t2-candidate-boot-") as directory:
+  root, candidate, candidate_image, limine, original_limine = prepare_fixture(Path(directory) / "happy")
+
+  receipt = candidate_boot.stage(root, candidate)
+  assert receipt["state"] == "staged"
+  assert "default_entry: 2" in limine.read_text()
+  assert candidate_boot.BEGIN in limine.read_text()
+  assert (root / candidate_boot.IMAGE).read_bytes() == candidate_image.read_bytes()
+  assert not (root / candidate_boot.ONESHOT).exists()
+
+  try:
+    candidate_boot.arm(root, runner=lambda *_args, **_kwargs: None)
+    raise AssertionError("candidate armed before Limine advertised its entry")
+  except ValueError as error:
+    assert "advertised" in str(error)
+
+  entries = root / candidate_boot.ENTRIES
+  entries.write_bytes(efi_strings(("Omarchy.linux-t2", candidate_boot.ENTRY_ID)))
+  sync_calls = []
+
+  def fake_bootctl(arguments, check):
+    assert arguments == ["bootctl", "set-oneshot", candidate_boot.ENTRY_ID]
+    assert check
+    assert sync_calls == [True]
+    (root / candidate_boot.ONESHOT).write_bytes(efi_string(candidate_boot.ENTRY_ID))
+
+  armed = candidate_boot.arm(root, runner=fake_bootctl, sync=lambda: sync_calls.append(True))
+  assert armed["state"] == "arming"
+  assert candidate_boot.read_efi_string(root / candidate_boot.ONESHOT) == candidate_boot.ENTRY_ID
+
+  try:
+    candidate_boot.rollback(root)
+    raise AssertionError("armed candidate rollback was not blocked")
+  except ValueError as error:
+    assert "Disarm" in str(error)
+
+  (root / candidate_boot.ONESHOT).unlink()
+  rolled_back = candidate_boot.rollback(root)
+  assert rolled_back["state"] == "rolled-back"
+  assert limine.read_text() == original_limine
+  assert not (root / candidate_boot.IMAGE).exists()
+
+  original_writer = candidate_boot.atomic_write
+  for fail_at in (1, 2, 3, 4, 5):
+    case = Path(directory) / ("failure-" + str(fail_at))
+    root, candidate, _candidate_image, limine, original_limine = prepare_fixture(case)
+    writes = [0]
+
+    def failing_writer(path, data, mode):
+      writes[0] += 1
+      original_writer(path, data, mode)
+      if writes[0] == fail_at:
+        raise RuntimeError("injected write failure")
+
+    candidate_boot.atomic_write = failing_writer
+    try:
+      try:
+        candidate_boot.stage(root, candidate)
+        raise AssertionError("injected staging failure was ignored")
+      except RuntimeError as error:
+        assert "injected write failure" in str(error)
+    finally:
+      candidate_boot.atomic_write = original_writer
+
+    assert limine.read_text() == original_limine
+    assert not (root / candidate_boot.IMAGE).exists()
+    if fail_at == 1:
+      assert not (root / candidate_boot.STATE).exists()
+    else:
+      recovered = candidate_boot.load_receipt(root)
+      assert recovered["state"] == "stage-failed-recovered"
+      candidate_boot.verify_recovered(root, recovered)
+      assert candidate_boot.rollback(root)["state"] == "rolled-back"
+
+print("PASS: candidate boot stages transactionally, requires a loader refresh, arms once and restores production exactly")
