@@ -1,0 +1,149 @@
+#!/usr/bin/python3
+"""Detach BCM4377 Wi-Fi around hibernation without resetting the device."""
+
+import os
+from pathlib import Path
+import sys
+
+
+MODEL = "MacBookAir9,1"
+DEVICE = "0000:73:00.0"
+VENDOR = "0x14e4"
+DEVICE_ID = "0x4488"
+DRIVER = "brcmfmac"
+STATE = Path("run/omarchy-t2-hibernate-wifi")
+MARKER = "rebind-device"
+
+
+class IsolationError(RuntimeError):
+  pass
+
+
+def rooted(root, path):
+  return root / str(path).lstrip("/")
+
+
+def read(path):
+  try:
+    return path.read_text().strip()
+  except OSError as error:
+    raise IsolationError(f"cannot read {path}: {error.strerror}") from error
+
+
+def validate_hardware(root):
+  model = read(rooted(root, "sys/class/dmi/id/product_name"))
+  if model != MODEL:
+    return False
+
+  device = rooted(root, f"sys/bus/pci/devices/{DEVICE}")
+  if read(device / "vendor") != VENDOR or read(device / "device") != DEVICE_ID:
+    raise IsolationError(f"{DEVICE} is not the expected BCM4377 Wi-Fi function")
+  return True
+
+
+def bound_driver(device):
+  link = device / "driver"
+  if not link.is_symlink():
+    return None
+  try:
+    return link.resolve(strict=True)
+  except OSError as error:
+    raise IsolationError(f"cannot resolve {link}: {error.strerror}") from error
+
+
+def write_control(path, value):
+  try:
+    path.write_text(value)
+  except OSError as error:
+    raise IsolationError(f"cannot write {path}: {error.strerror}") from error
+
+
+def state_paths(root):
+  directory = rooted(root, STATE)
+  return directory, directory / MARKER
+
+
+def create_marker(directory, marker):
+  try:
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if directory.is_symlink() or not directory.is_dir():
+      raise IsolationError(f"unsafe state directory: {directory}")
+    os.chmod(directory, 0o700)
+    descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "w") as stream:
+      stream.write(DEVICE + "\n")
+  except FileExistsError as error:
+    raise IsolationError("a previous Wi-Fi hibernation cleanup is still pending") from error
+  except OSError as error:
+    raise IsolationError(f"cannot create {marker}: {error.strerror}") from error
+
+
+def remove_marker(directory, marker):
+  try:
+    marker.unlink()
+    directory.rmdir()
+  except FileNotFoundError:
+    pass
+  except OSError:
+    # The marker is the safety boundary. It is already gone; a nonempty state
+    # directory can remain for inspection without changing the next action.
+    pass
+
+
+def prepare(root=Path("/"), writer=write_control):
+  if not validate_hardware(root):
+    return
+
+  device = rooted(root, f"sys/bus/pci/devices/{DEVICE}")
+  driver = rooted(root, f"sys/bus/pci/drivers/{DRIVER}")
+  current = bound_driver(device)
+  if current is None:
+    return
+  if current != driver.resolve(strict=True):
+    raise IsolationError(f"{DEVICE} is bound to an unexpected driver: {current}")
+
+  directory, marker = state_paths(root)
+  create_marker(directory, marker)
+  writer(driver / "unbind", DEVICE)
+  if bound_driver(device) is not None:
+    raise IsolationError(f"{DEVICE} remained bound after the hibernation preflight")
+
+
+def restore(root=Path("/"), writer=write_control):
+  directory, marker = state_paths(root)
+  if not marker.exists():
+    return
+  if read(marker) != DEVICE:
+    raise IsolationError(f"invalid Wi-Fi hibernation marker: {marker}")
+  if not validate_hardware(root):
+    raise IsolationError("Wi-Fi hibernation cleanup reached unsupported hardware")
+
+  device = rooted(root, f"sys/bus/pci/devices/{DEVICE}")
+  driver = rooted(root, f"sys/bus/pci/drivers/{DRIVER}")
+  current = bound_driver(device)
+  expected = driver.resolve(strict=True)
+  if current is None:
+    writer(driver / "bind", DEVICE)
+    current = bound_driver(device)
+  if current != expected:
+    raise IsolationError(f"{DEVICE} did not rebind to {DRIVER}")
+  remove_marker(directory, marker)
+
+
+def main():
+  if len(sys.argv) != 2 or sys.argv[1] not in ("prepare", "restore"):
+    raise SystemExit("usage: omarchy-t2-hibernate-wifi <prepare|restore>")
+
+  root = Path(os.environ.get("OMARCHY_T2_HIBERNATE_TEST_ROOT", "/"))
+  try:
+    if sys.argv[1] == "prepare":
+      prepare(root)
+    else:
+      restore(root)
+  except IsolationError as error:
+    print(f"omarchy-t2-hibernate-wifi: {error}", file=sys.stderr)
+    raise SystemExit(1) from error
+
+
+if __name__ == "__main__":
+  main()
