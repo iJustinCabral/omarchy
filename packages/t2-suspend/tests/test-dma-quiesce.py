@@ -47,7 +47,7 @@ bce_harness = r'''
 #define pr_info(...) ((void)0)
 #define pr_err(...) ((void)0)
 typedef uint16_t u16;
-struct pci_dev { u16 command; int fail_read; int fail_clear; void *data; };
+struct pci_dev { u16 command; int reads; int fail_read_at; int fail_clear; void *data; };
 struct t2bce_device {
   struct pci_dev *pci, *pci0, *pci2, *pci3;
   unsigned long pci_master_mask;
@@ -57,7 +57,8 @@ static struct pci_dev *to_pci_dev(struct device *dev) { return dev->pdev; }
 static void *pci_get_drvdata(struct pci_dev *pdev) { return pdev->data; }
 static int pci_read_config_word(struct pci_dev *pdev, int where, u16 *value) {
   assert(where == PCI_COMMAND);
-  if (pdev->fail_read)
+  pdev->reads++;
+  if (pdev->fail_read_at && pdev->reads == pdev->fail_read_at)
     return -EIO;
   *value = pdev->command;
   return 0;
@@ -95,10 +96,24 @@ int main(void) {
 
   functions[2].fail_clear = 1;
   assert(t2bce_suspend_noirq(&dev) == -EIO);
+  assert(bce.pci_master_mask == 0);
   assert((functions[0].command & PCI_COMMAND_MASTER));
   assert((functions[1].command & PCI_COMMAND_MASTER));
   assert((functions[2].command & PCI_COMMAND_MASTER));
   assert(!(functions[3].command & PCI_COMMAND_MASTER));
+
+  functions[2].fail_clear = 0;
+  assert(t2bce_suspend_noirq(&dev) == 0);
+  functions[2].reads = 0;
+  functions[2].fail_read_at = 1;
+  assert(t2bce_resume_noirq(&dev) == -EIO);
+  assert(bce.pci_master_mask == 7);
+  for (int i = 0; i < 4; i++)
+    assert(!(functions[i].command & PCI_COMMAND_MASTER));
+  functions[2].reads = 0;
+  functions[2].fail_read_at = 0;
+  assert(t2bce_resume_noirq(&dev) == 0);
+  assert(bce.pci_master_mask == 0);
   return 0;
 }
 '''
@@ -123,13 +138,14 @@ bluetooth_harness = r'''
 #define PCI_COMMAND_MASTER 4
 typedef uint16_t u16;
 struct bcm4377_data { bool pm_was_busmaster; };
-struct pci_dev { u16 command; int fail_read; int fail_clear; void *data; };
+struct pci_dev { u16 command; int reads; int fail_read_at; int fail_clear; void *data; };
 struct device { struct pci_dev *pdev; };
 static struct pci_dev *to_pci_dev(struct device *dev) { return dev->pdev; }
 static void *pci_get_drvdata(struct pci_dev *pdev) { return pdev->data; }
 static int pci_read_config_word(struct pci_dev *pdev, int where, u16 *value) {
   assert(where == PCI_COMMAND);
-  if (pdev->fail_read)
+  pdev->reads++;
+  if (pdev->fail_read_at && pdev->reads == pdev->fail_read_at)
     return -EIO;
   *value = pdev->command;
   return 0;
@@ -138,6 +154,7 @@ static void pci_clear_master(struct pci_dev *pdev) {
   if (!pdev->fail_clear)
     pdev->command &= ~PCI_COMMAND_MASTER;
 }
+static void pci_set_master(struct pci_dev *pdev) { pdev->command |= PCI_COMMAND_MASTER; }
 '''
 bluetooth_harness += bluetooth_suspend
 bluetooth_harness += r'''
@@ -149,8 +166,17 @@ int main(void) {
   assert(state.pm_was_busmaster);
   assert(!(pdev.command & PCI_COMMAND_MASTER));
   pdev.command = PCI_COMMAND_MASTER;
+  pdev.reads = 0;
   pdev.fail_clear = 1;
   assert(bcm4377_suspend_noirq(&dev) == -EIO);
+  assert(!state.pm_was_busmaster);
+  assert(pdev.command & PCI_COMMAND_MASTER);
+  pdev.reads = 0;
+  pdev.fail_clear = 0;
+  pdev.fail_read_at = 2;
+  assert(bcm4377_suspend_noirq(&dev) == -EIO);
+  assert(!state.pm_was_busmaster);
+  assert(pdev.command & PCI_COMMAND_MASTER);
   return 0;
 }
 '''

@@ -73,7 +73,7 @@ the Wi-Fi sibling, so the existing Wi-Fi-unbind isolation remains mandatory.
      pci_dev_put(bce->pci0);
      pci_free_irq(dev, 0, dev);
      pci_free_irq(dev, 4, dev);
-@@ -672,6 +683,61 @@ static int t2bce_resume(struct device *dev)
+@@ -672,6 +683,68 @@ static int t2bce_resume(struct device *dev)
      return status;
  }
  
@@ -85,6 +85,7 @@ the Wi-Fi sibling, so the existing Wi-Fi-unbind isolation remains mandatory.
 +    u16 command;
 +    size_t i;
 +
++    bce->pci_master_mask = 0;
 +    for (i = 0; i < ARRAY_SIZE(functions); i++) {
 +        if (pci_read_config_word(functions[i], PCI_COMMAND, &command))
 +            goto restore;
@@ -104,6 +105,7 @@ the Wi-Fi sibling, so the existing Wi-Fi-unbind isolation remains mandatory.
 +    for (i = 0; i < ARRAY_SIZE(functions); i++)
 +        if (master_mask & BIT(i))
 +            pci_set_master(functions[i]);
++    bce->pci_master_mask = 0;
 +    pr_err("t2bce_core: noirq: failed to block shared-link DMA\n");
 +    return -EIO;
 +}
@@ -121,21 +123,26 @@ the Wi-Fi sibling, so the existing Wi-Fi-unbind isolation remains mandatory.
 +            continue;
 +        pci_set_master(functions[i]);
 +        if (pci_read_config_word(functions[i], PCI_COMMAND, &command) ||
-+                !(command & PCI_COMMAND_MASTER)) {
-+            pr_err("t2bce_core: noirq: failed to restore PCI function %zu DMA\n", i);
-+            return -EIO;
-+        }
++                !(command & PCI_COMMAND_MASTER))
++            goto block;
 +    }
 +
 +    bce->pci_master_mask = 0;
 +    pr_info("t2bce_core: noirq: restored shared-link DMA mask=%#lx\n", master_mask);
 +    return 0;
++
++block:
++    for (i = 0; i < ARRAY_SIZE(functions); i++)
++        if (master_mask & BIT(i))
++            pci_clear_master(functions[i]);
++    pr_err("t2bce_core: noirq: failed to restore shared-link DMA\n");
++    return -EIO;
 +}
 +
  static int t2bce_prepare(struct device *dev)
  {
      /*
-@@ -709,9 +775,14 @@ struct dev_pm_ops t2bce_pci_driver_pm = {
+@@ -709,9 +782,14 @@ struct dev_pm_ops t2bce_pci_driver_pm = {
          .prepare = t2bce_prepare,
          .suspend = t2bce_suspend,
          .resume = t2bce_resume,
@@ -160,7 +167,7 @@ the Wi-Fi sibling, so the existing Wi-Fi-unbind isolation remains mandatory.
  	bool setup_needed;
  	void *firmware_buffer;
  	dma_addr_t firmware_dma;
-@@ -2701,6 +2702,24 @@ static int bcm4377_resume(struct device *dev)
+@@ -2701,6 +2702,29 @@ static int bcm4377_resume(struct device *dev)
  	return hci_resume_dev(bcm4377->hdev);
  }
  
@@ -170,14 +177,19 @@ the Wi-Fi sibling, so the existing Wi-Fi-unbind isolation remains mandatory.
 +	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
 +	u16 command;
 +
++	bcm4377->pm_was_busmaster = false;
 +	if (pci_read_config_word(pdev, PCI_COMMAND, &command))
 +		return -EIO;
 +
 +	bcm4377->pm_was_busmaster = command & PCI_COMMAND_MASTER;
 +	pci_clear_master(pdev);
 +	if (pci_read_config_word(pdev, PCI_COMMAND, &command) ||
-+	    command & PCI_COMMAND_MASTER)
++	    command & PCI_COMMAND_MASTER) {
++		if (bcm4377->pm_was_busmaster)
++			pci_set_master(pdev);
++		bcm4377->pm_was_busmaster = false;
 +		return -EIO;
++	}
 +
 +	return 0;
 +}
@@ -185,7 +197,7 @@ the Wi-Fi sibling, so the existing Wi-Fi-unbind isolation remains mandatory.
  /* PCI core has restored the standard header; restore vendor mappings
   * before device interrupts and the normal unquiesce/HCI resume callback.
   */
-@@ -2712,8 +2731,12 @@ static int bcm4377_resume_noirq(struct device *dev)
+@@ -2712,8 +2736,12 @@ static int bcm4377_resume_noirq(struct device *dev)
  	u32 before[ARRAY_SIZE(offsets)], after, expected[ARRAY_SIZE(offsets)];
  	int ret, i;
  
@@ -199,7 +211,7 @@ the Wi-Fi sibling, so the existing Wi-Fi-unbind isolation remains mandatory.
  
  	WRITE_ONCE(bcm4377->resume_config_failed, true);
  	for (i = 0; i < ARRAY_SIZE(offsets); i++) {
-@@ -2747,6 +2770,10 @@ static int bcm4377_resume_noirq(struct device *dev)
+@@ -2747,6 +2775,10 @@ static int bcm4377_resume_noirq(struct device *dev)
  		}
  	}
  	WRITE_ONCE(bcm4377->resume_config_failed, false);
@@ -210,7 +222,7 @@ the Wi-Fi sibling, so the existing Wi-Fi-unbind isolation remains mandatory.
  	dev_info(dev, "t2bt-resume: restored vendor windows (before %08x %08x %08x %08x %08x)\n",
  		 before[0], before[1], before[2], before[3], before[4]);
  	return 0;
-@@ -2774,6 +2801,10 @@ static void bcm4377_complete(struct device *dev)
+@@ -2774,6 +2806,10 @@ static void bcm4377_complete(struct device *dev)
  
  static const struct dev_pm_ops bcm4377_ops = {
  	SYSTEM_SLEEP_PM_OPS(bcm4377_suspend, bcm4377_resume)
