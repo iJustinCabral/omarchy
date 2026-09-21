@@ -32,6 +32,9 @@ MODULES = {
   "t2bce_ave": "drivers/staging/t2bce/t2bce_ave/t2bce_ave.ko",
 }
 EARLY_MODULES = tuple(name for name in MODULES if name != "t2bce_ave")
+FORBIDDEN_INITRD_FILES = (
+  "etc/modprobe.d/t2-bluetooth-order.conf",
+)
 CRITICAL_CMDLINE_KEYS = {
   "cryptdevice",
   "cryptkey",
@@ -175,6 +178,9 @@ def build_initrd(work, module_root, release, expected):
   for name in required:
     if not (extracted / name).exists():
       raise ValueError("Candidate initramfs omitted boot-critical file: " + name)
+  for name in FORBIDDEN_INITRD_FILES:
+    if (extracted / name).exists():
+      raise ValueError("Candidate initramfs retained host-only policy: " + name)
 
   initrd_modules = {}
   for name in EARLY_MODULES:
@@ -184,6 +190,32 @@ def build_initrd(work, module_root, release, expected):
     if digest(matches[0]) != expected[name]["sha256"]:
       raise ValueError("Candidate initramfs module hash mismatch: " + name)
     initrd_modules[name] = str(matches[0].relative_to(extracted))
+
+  runtime = work / "initrd-runtime-root"
+  runtime.mkdir()
+  run(("lsinitcpio", "--early", "--extract", initrd), cwd=runtime)
+  run(("lsinitcpio", "--cpio", "--extract", initrd), cwd=runtime)
+  bluetooth = runtime / initrd_modules["hci_bcm4377"]
+  resolution = run((
+    "modprobe",
+    "--config",
+    runtime / "etc/modprobe.d",
+    "--dirname",
+    runtime,
+    "--set-version",
+    release,
+    "--show-depends",
+    "--use-blacklist",
+    "hci_bcm4377",
+  ), capture=True)
+  if resolution.stderr.strip():
+    raise ValueError("Candidate initramfs cannot resolve hci_bcm4377 dependencies: " + resolution.stderr.strip())
+  loaded = [Path(line.split()[1]) for line in resolution.stdout.splitlines() if line.startswith("insmod ")]
+  selected = [path for path in loaded if path.name == "hci_bcm4377.ko"]
+  if len(selected) != 1 or selected[0].resolve() != bluetooth.resolve():
+    raise ValueError("Candidate initramfs blacklist suppresses hci_bcm4377")
+  if digest(bluetooth) != expected["hci_bcm4377"]["sha256"]:
+    raise ValueError("Candidate initramfs resolves the wrong hci_bcm4377 module")
   return initrd, initrd_modules
 
 

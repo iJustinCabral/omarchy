@@ -24,6 +24,9 @@ assert set(builder.MODULES) == {
   "t2bce_ave",
 }
 assert set(builder.EARLY_MODULES) == set(builder.MODULES) - {"t2bce_ave"}
+assert builder.FORBIDDEN_INITRD_FILES == (
+  "etc/modprobe.d/t2-bluetooth-order.conf",
+)
 
 cmdline = "cryptdevice=PARTUUID=test:root root=/dev/mapper/root rootflags=subvol=@ rw rootfstype=btrfs resume=/dev/mapper/root resume_offset=42 cryptkey=rootfs:/key quiet"
 assert builder.cmdline_values(cmdline) == {
@@ -40,7 +43,10 @@ assert builder.under(Path("/boot/EFI/Linux/candidate.efi"), Path("/boot"))
 assert not builder.under(Path("/tmp/candidate.efi"), Path("/boot"))
 
 config = (package / "experiments/hibernate-candidate-mkinitcpio.conf").read_text()
-assert '[[ $candidate_hook == "omarchy-t2-suspend" ]] ||' in config
+assert '$candidate_hook != "omarchy-t2-suspend"' in config
+assert '$candidate_hook != "modconf"' in config
+assert 'candidate_bluetooth_blacklist=/etc/modprobe.d/t2-bluetooth-order.conf' in config
+assert "candidate_modprobe_conf != $candidate_bluetooth_blacklist" in config
 for name in builder.EARLY_MODULES:
   assert name in config
 
