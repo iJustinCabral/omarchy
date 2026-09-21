@@ -1,0 +1,5 @@
+# Pre-CPU-disable restore probe
+
+This external diagnostic module redirects `hibernate_resume_nonboot_cpu_disable()` through ftrace only while its root-only `armed` parameter is set. The replacement returns `-ECANCELED` before the function disables any secondary CPU. Reaching it proves that `dpm_suspend_end(PMSG_QUIESCE)` completed all late and noirq callbacks and that `platform_pre_restore()` returned successfully. The stock `resume_target_kernel()` error labels then enable CPUs, run platform cleanup, resume noirq and early devices, and return through the outer main-device and console recovery path.
+
+Loading the module leaves it disarmed and does not initiate a power-management transition. It refuses insertion with `armed=1`. The hardware runner additionally requires the completed, guarded main-quiesce experiment as durable proof, verifies the production boot and exact module, creates a separate atomic guard, arms only immediately before one `test_resume` invocation, and reboots after evidence capture.
