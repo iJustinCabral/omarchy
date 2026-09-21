@@ -131,6 +131,13 @@ static int find_event(enum event event) {
       return i;
   return -1;
 }
+static int count_event_between(enum event event, int start, int end) {
+  int count = 0;
+  for (int i = start; i < end; i++)
+    if (events[i] == event)
+      count++;
+  return count;
+}
 static void reset_controls(void) {
   event_count = 0;
   can_rebuild = true;
@@ -189,9 +196,10 @@ static void init_device(struct t2bce_device *bce, struct pci_dev functions[2], s
 }
 
 int main(void) {
-  struct t2bce_device bce;
+  struct t2bce_device bce, snapshot;
   struct pci_dev functions[2];
   struct device dev;
+  int first_freeze_end, first_thaw_end, second_freeze_end;
 
   reset_controls(); init_device(&bce, functions, &dev);
   assert(t2bce_suspend_common(&dev, true) == 0);
@@ -199,6 +207,32 @@ int main(void) {
   assert(find_event(EV_PREPARE_NO_STATE) < find_event(EV_SLEEP_NO_STATE));
   assert(find_event(EV_SLEEP_NO_STATE) < find_event(EV_SYNC_IRQ));
   assert(find_event(EV_DROP_CLIENTS) < find_event(EV_FREE_COMMANDS));
+
+  /* Linux snapshots the queue-absent state, thaws the source kernel, then
+   * freezes it again for either PMSG_QUIESCE (test-resume/image restore) or
+   * PMSG_HIBERNATE (real S4 poweroff).  Atomic restore must use the earlier
+   * snapshot, not the queue graph rebuilt during the source-kernel thaw.
+   */
+  reset_controls(); init_device(&bce, functions, &dev);
+  assert(t2bce_suspend_common(&dev, true) == 0);
+  snapshot = bce;
+  first_freeze_end = event_count;
+  assert(snapshot.no_state_queues_dropped && snapshot.no_state_resume);
+  assert(t2bce_resume_mode(&dev, false) == 0);
+  first_thaw_end = event_count;
+  assert(!bce.no_state_queues_dropped && !bce.no_state_rebuild_failed);
+  assert(t2bce_suspend_common(&dev, true) == 0);
+  second_freeze_end = event_count;
+  assert(bce.no_state_queues_dropped && bce.no_state_resume);
+  assert(snapshot.no_state_queues_dropped && snapshot.no_state_resume);
+  bce = snapshot;
+  functions[0].data = &bce;
+  assert(t2bce_resume_mode(&dev, true) == 0);
+  assert(!bce.no_state_queues_dropped && !bce.no_state_rebuild_failed);
+  assert(count_event_between(EV_DROP_CLIENTS, 0, first_freeze_end) == 1);
+  assert(count_event_between(EV_REBUILD_CLIENTS, first_freeze_end, first_thaw_end) == 1);
+  assert(count_event_between(EV_DROP_CLIENTS, first_thaw_end, second_freeze_end) == 1);
+  assert(count_event_between(EV_REBUILD_CLIENTS, second_freeze_end, event_count) == 1);
 
   reset_controls(); init_device(&bce, functions, &dev); can_rebuild = false;
   assert(t2bce_suspend_common(&dev, true) == -EOPNOTSUPP);

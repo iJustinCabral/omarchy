@@ -58,6 +58,7 @@ bce_harness = r'''
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define BIT(i) (1UL << (i))
 #define PCI_COMMAND 4
@@ -104,6 +105,57 @@ static int pci_save_state(struct pci_dev *pdev) {
 '''
 bce_harness += bce_block + bce_save + bce_suspend + bce_resume_noirq + bce_restore_dma
 bce_harness += r'''
+static void test_two_pass_image_restore(void) {
+  struct pci_dev functions[4] = {
+    {.command = PCI_COMMAND_MASTER}, {.command = PCI_COMMAND_MASTER},
+    {.command = PCI_COMMAND_MASTER}, {.command = 0},
+  };
+  struct pci_dev snapshot_functions[4];
+  struct t2bce_device bce = {
+    .pci0 = &functions[0], .pci = &functions[1],
+    .pci2 = &functions[2], .pci3 = &functions[3],
+  };
+  struct t2bce_device snapshot_bce;
+  struct pci_dev owner = {.data = &bce};
+  struct device dev = {.pdev = &owner};
+
+  /* The first noirq pass is part of the saved image. */
+  assert(t2bce_suspend_noirq(&dev) == 0);
+  snapshot_bce = bce;
+  memcpy(snapshot_functions, functions, sizeof(functions));
+  assert(snapshot_bce.pci_master_mask == 7);
+
+  /* The source kernel thaws, restores DMA, then blocks it again while the
+   * image-loading kernel is quiesced for atomic restoration.
+   */
+  assert(t2bce_resume_noirq(&dev) == 0);
+  assert(t2bce_restore_shared_dma(&bce) == 0);
+  assert(t2bce_suspend_noirq(&dev) == 0);
+  for (int i = 0; i < 4; i++)
+    assert(!(functions[i].command & PCI_COMMAND_MASTER));
+
+  /* Atomic restore rewinds both driver and PCI saved-state memory to the
+   * first blocked snapshot.  restore_noirq must preserve that gate until
+   * ordinary queue reconstruction completes.
+   */
+  bce = snapshot_bce;
+  memcpy(functions, snapshot_functions, sizeof(functions));
+  owner.data = &bce;
+  assert(t2bce_resume_noirq(&dev) == 0);
+  assert(bce.pci_master_mask == 7);
+  for (int i = 0; i < 4; i++) {
+    assert(!(functions[i].command & PCI_COMMAND_MASTER));
+    assert(!(functions[i].saved_command & PCI_COMMAND_MASTER));
+  }
+
+  /* The image-restore callback consumes the saved mask without re-enabling
+   * the unbound SEP function; BCE, ANS, and audio recover in their drivers.
+   */
+  bce.pci_master_mask = 0;
+  for (int i = 0; i < 4; i++)
+    assert(!(functions[i].command & PCI_COMMAND_MASTER));
+}
+
 int main(void) {
   struct pci_dev functions[4] = {
     {.command = PCI_COMMAND_MASTER}, {.command = PCI_COMMAND_MASTER},
@@ -115,6 +167,8 @@ int main(void) {
   };
   struct pci_dev owner = {.data = &bce};
   struct device dev = {.pdev = &owner};
+
+  test_two_pass_image_restore();
 
   assert(t2bce_suspend_noirq(&dev) == 0);
   assert(bce.pci_master_mask == 7);
