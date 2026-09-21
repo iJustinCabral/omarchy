@@ -13,8 +13,8 @@ bce_header = Path(sys.argv[2]).read_text()
 bluetooth_source = Path(sys.argv[3]).read_text()
 
 
-def function(source, name):
-  match = re.search(r"static int " + name + r"\([^;]+?\)\n\{", source)
+def function(source, name, return_type="int"):
+  match = re.search(r"static " + return_type + " " + name + r"\([^;]+?\)\n\{", source)
   assert match, f"missing {name}"
   index = match.end()
   depth = 1
@@ -24,20 +24,34 @@ def function(source, name):
   return source[match.start():index] + "\n"
 
 
+bce_block = function(bce_source, "t2bce_block_shared_dma", "void")
+bce_save = function(bce_source, "t2bce_save_shared_pci_state")
 bce_suspend = function(bce_source, "t2bce_suspend_noirq")
-bce_resume = function(bce_source, "t2bce_resume_noirq")
+bce_resume_noirq = function(bce_source, "t2bce_resume_noirq")
+bce_restore_dma = function(bce_source, "t2bce_restore_shared_dma")
+bce_resume_wrapper = function(bce_source, "t2bce_resume_with_shared_dma")
+bce_image_restore = function(bce_source, "t2bce_restore")
 assert "struct pci_dev *pci, *pci0, *pci2, *pci3;" in bce_header
+assert "bool pci_dma_restore_failed;" in bce_header
 assert "unsigned long pci_master_mask;" in bce_header
 assert "{ bce->pci0, bce->pci, bce->pci2, bce->pci3 }" in bce_suspend
 assert bce_suspend.index("pci_read_config_word") < bce_suspend.index("pci_clear_master")
-assert bce_suspend.index("pci_clear_master") < bce_suspend.index("bce->pci_master_mask = master_mask")
+assert bce_suspend.index("pci_clear_master") < bce_suspend.index("t2bce_save_shared_pci_state")
+assert bce_suspend.index("t2bce_save_shared_pci_state") < bce_suspend.index("bce->pci_master_mask = master_mask")
 assert ".freeze_noirq = t2bce_suspend_noirq" in bce_source
 assert ".thaw_noirq = t2bce_resume_noirq" in bce_source
 assert ".restore_noirq = t2bce_resume_noirq" in bce_source
+assert ".resume = t2bce_resume_with_shared_dma" in bce_source
+assert ".thaw = t2bce_resume_with_shared_dma" in bce_source
+assert ".restore = t2bce_restore" in bce_source
+assert bce_resume_wrapper.index("pci_dma_restore_failed") < bce_resume_wrapper.index("t2bce_resume(dev)")
+assert bce_image_restore.index("pci_dma_restore_failed") < bce_image_restore.index("t2bce_resume(dev)")
+assert "Leave the\n     * unbound SEP function blocked" in bce_image_restore
 
 bce_harness = r'''
 #include <assert.h>
 #include <errno.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
@@ -47,9 +61,14 @@ bce_harness = r'''
 #define pr_info(...) ((void)0)
 #define pr_err(...) ((void)0)
 typedef uint16_t u16;
-struct pci_dev { u16 command; int reads; int fail_read_at; int fail_clear; void *data; };
+struct pci_dev {
+  u16 command, saved_command;
+  int reads, saves, fail_read_at, fail_save_at, fail_clear, fail_set;
+  void *data;
+};
 struct t2bce_device {
   struct pci_dev *pci, *pci0, *pci2, *pci3;
+  bool pci_dma_restore_failed;
   unsigned long pci_master_mask;
 };
 struct device { struct pci_dev *pdev; };
@@ -67,9 +86,19 @@ static void pci_clear_master(struct pci_dev *pdev) {
   if (!pdev->fail_clear)
     pdev->command &= ~PCI_COMMAND_MASTER;
 }
-static void pci_set_master(struct pci_dev *pdev) { pdev->command |= PCI_COMMAND_MASTER; }
+static void pci_set_master(struct pci_dev *pdev) {
+  if (!pdev->fail_set)
+    pdev->command |= PCI_COMMAND_MASTER;
+}
+static int pci_save_state(struct pci_dev *pdev) {
+  pdev->saves++;
+  if (pdev->fail_save_at && pdev->saves == pdev->fail_save_at)
+    return -EIO;
+  pdev->saved_command = pdev->command;
+  return 0;
+}
 '''
-bce_harness += bce_suspend + bce_resume
+bce_harness += bce_block + bce_save + bce_suspend + bce_resume_noirq + bce_restore_dma
 bce_harness += r'''
 int main(void) {
   struct pci_dev functions[4] = {
@@ -85,15 +114,25 @@ int main(void) {
 
   assert(t2bce_suspend_noirq(&dev) == 0);
   assert(bce.pci_master_mask == 7);
+  for (int i = 0; i < 4; i++) {
+    assert(!(functions[i].command & PCI_COMMAND_MASTER));
+    assert(!(functions[i].saved_command & PCI_COMMAND_MASTER));
+  }
+  assert(t2bce_resume_noirq(&dev) == 0);
+  assert(bce.pci_master_mask == 7);
   for (int i = 0; i < 4; i++)
     assert(!(functions[i].command & PCI_COMMAND_MASTER));
-  assert(t2bce_resume_noirq(&dev) == 0);
+  assert(t2bce_restore_shared_dma(&bce) == 0);
   assert(bce.pci_master_mask == 0);
   assert((functions[0].command & PCI_COMMAND_MASTER));
   assert((functions[1].command & PCI_COMMAND_MASTER));
   assert((functions[2].command & PCI_COMMAND_MASTER));
   assert(!(functions[3].command & PCI_COMMAND_MASTER));
 
+  for (int i = 0; i < 4; i++) {
+    functions[i].reads = 0;
+    functions[i].saves = 0;
+  }
   functions[2].fail_clear = 1;
   assert(t2bce_suspend_noirq(&dev) == -EIO);
   assert(bce.pci_master_mask == 0);
@@ -101,33 +140,58 @@ int main(void) {
   assert((functions[1].command & PCI_COMMAND_MASTER));
   assert((functions[2].command & PCI_COMMAND_MASTER));
   assert(!(functions[3].command & PCI_COMMAND_MASTER));
+  for (int i = 0; i < 4; i++)
+    assert(functions[i].saved_command == functions[i].command);
 
   functions[2].fail_clear = 0;
+  for (int i = 0; i < 4; i++) {
+    functions[i].reads = 0;
+    functions[i].saves = 0;
+  }
+  functions[2].fail_save_at = 1;
+  assert(t2bce_suspend_noirq(&dev) == -EIO);
+  assert(bce.pci_master_mask == 0);
+  for (int i = 0; i < 4; i++)
+    assert(functions[i].saved_command == functions[i].command);
+
+  functions[2].fail_save_at = 0;
+  for (int i = 0; i < 4; i++) {
+    functions[i].reads = 0;
+    functions[i].saves = 0;
+  }
   assert(t2bce_suspend_noirq(&dev) == 0);
-  functions[2].reads = 0;
-  functions[2].fail_read_at = 1;
+  functions[2].command = PCI_COMMAND_MASTER;
   assert(t2bce_resume_noirq(&dev) == -EIO);
+  assert(bce.pci_dma_restore_failed);
   assert(bce.pci_master_mask == 7);
   for (int i = 0; i < 4; i++)
     assert(!(functions[i].command & PCI_COMMAND_MASTER));
-  functions[2].reads = 0;
-  functions[2].fail_read_at = 0;
-  assert(t2bce_resume_noirq(&dev) == 0);
+
+  bce.pci_dma_restore_failed = false;
+  functions[2].fail_set = 1;
+  assert(t2bce_restore_shared_dma(&bce) == -EIO);
+  assert(bce.pci_master_mask == 7);
+  for (int i = 0; i < 4; i++)
+    assert(!(functions[i].command & PCI_COMMAND_MASTER));
+  functions[2].fail_set = 0;
+  assert(t2bce_restore_shared_dma(&bce) == 0);
   assert(bce.pci_master_mask == 0);
   return 0;
 }
 '''
 
 bluetooth_suspend = function(bluetooth_source, "bcm4377_suspend_noirq")
+bluetooth_restore = function(bluetooth_source, "bcm4377_restore_busmaster")
 assert bluetooth_suspend.index("pci_read_config_word") < bluetooth_suspend.index("pci_clear_master")
 assert "bcm4377->pm_was_busmaster = command & PCI_COMMAND_MASTER;" in bluetooth_suspend
 assert ".freeze_noirq = bcm4377_suspend_noirq" in bluetooth_source
 assert ".thaw_noirq = bcm4377_resume_noirq" in bluetooth_source
 assert ".restore_noirq = bcm4377_resume_noirq" in bluetooth_source
 bluetooth_resume = function(bluetooth_source, "bcm4377_resume_noirq")
-assert "bcm4377->pm_was_busmaster &&" in bluetooth_resume
-assert "!READ_ONCE(bcm4377->transport_lost)" in bluetooth_resume
-assert bluetooth_resume.index("WRITE_ONCE(bcm4377->resume_config_failed, false)") < bluetooth_resume.rindex("pci_set_master(pdev)")
+assert "READ_ONCE(bcm4377->transport_lost)" in bluetooth_restore
+assert bluetooth_restore.index("pci_set_master(pdev)") < bluetooth_restore.index("pci_read_config_word")
+assert bluetooth_restore.index("pci_read_config_word") < bluetooth_restore.rindex("pci_clear_master(pdev)")
+assert bluetooth_resume.index("WRITE_ONCE(bcm4377->resume_config_failed, false)") < bluetooth_resume.rindex("bcm4377_restore_busmaster")
 
 bluetooth_harness = r'''
 #include <assert.h>
@@ -136,9 +200,10 @@ bluetooth_harness = r'''
 #include <stdint.h>
 #define PCI_COMMAND 4
 #define PCI_COMMAND_MASTER 4
+#define READ_ONCE(x) (x)
 typedef uint16_t u16;
-struct bcm4377_data { bool pm_was_busmaster; };
-struct pci_dev { u16 command; int reads; int fail_read_at; int fail_clear; void *data; };
+struct bcm4377_data { bool pm_was_busmaster, transport_lost; };
+struct pci_dev { u16 command; int reads; int fail_read_at; int fail_clear, fail_set; void *data; };
 struct device { struct pci_dev *pdev; };
 static struct pci_dev *to_pci_dev(struct device *dev) { return dev->pdev; }
 static void *pci_get_drvdata(struct pci_dev *pdev) { return pdev->data; }
@@ -154,9 +219,12 @@ static void pci_clear_master(struct pci_dev *pdev) {
   if (!pdev->fail_clear)
     pdev->command &= ~PCI_COMMAND_MASTER;
 }
-static void pci_set_master(struct pci_dev *pdev) { pdev->command |= PCI_COMMAND_MASTER; }
+static void pci_set_master(struct pci_dev *pdev) {
+  if (!pdev->fail_set)
+    pdev->command |= PCI_COMMAND_MASTER;
+}
 '''
-bluetooth_harness += bluetooth_suspend
+bluetooth_harness += bluetooth_suspend + bluetooth_restore
 bluetooth_harness += r'''
 int main(void) {
   struct bcm4377_data state = {0};
@@ -165,6 +233,10 @@ int main(void) {
   assert(bcm4377_suspend_noirq(&dev) == 0);
   assert(state.pm_was_busmaster);
   assert(!(pdev.command & PCI_COMMAND_MASTER));
+  assert(bcm4377_restore_busmaster(&pdev, &state) == 0);
+  assert(!state.pm_was_busmaster);
+  assert(pdev.command & PCI_COMMAND_MASTER);
+
   pdev.command = PCI_COMMAND_MASTER;
   pdev.reads = 0;
   pdev.fail_clear = 1;
@@ -177,6 +249,27 @@ int main(void) {
   assert(bcm4377_suspend_noirq(&dev) == -EIO);
   assert(!state.pm_was_busmaster);
   assert(pdev.command & PCI_COMMAND_MASTER);
+
+  pdev.reads = 0;
+  pdev.fail_read_at = 0;
+  assert(bcm4377_suspend_noirq(&dev) == 0);
+  pdev.reads = 0;
+  pdev.fail_read_at = 1;
+  assert(bcm4377_restore_busmaster(&pdev, &state) == -EIO);
+  assert(state.pm_was_busmaster);
+  assert(!(pdev.command & PCI_COMMAND_MASTER));
+  pdev.reads = 0;
+  pdev.fail_read_at = 0;
+  assert(bcm4377_restore_busmaster(&pdev, &state) == 0);
+  assert(!state.pm_was_busmaster);
+  assert(pdev.command & PCI_COMMAND_MASTER);
+
+  pdev.reads = 0;
+  assert(bcm4377_suspend_noirq(&dev) == 0);
+  state.transport_lost = true;
+  assert(bcm4377_restore_busmaster(&pdev, &state) == 0);
+  assert(!state.pm_was_busmaster);
+  assert(!(pdev.command & PCI_COMMAND_MASTER));
   return 0;
 }
 '''
@@ -190,4 +283,4 @@ with tempfile.TemporaryDirectory(prefix="t2-dma-quiesce-") as directory:
     subprocess.run(["cc", "-Wall", "-Wextra", "-Werror", "-O2", str(source), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
 
-print("PASS: T2 noirq DMA gates block, verify, unwind, and restore prior bus masters")
+print("PASS: T2 DMA gates persist blocked PCI state through noirq and restore only after recovery")

@@ -9,14 +9,25 @@ DMA while the old kernel is replacing itself with the saved image.
 Gate all four functions on the shared ANS/BCE/SEP/audio link from the BCE
 noirq callback, after their ordinary quiesce callbacks have completed.  Keep
 references to the otherwise unowned SEP function and the audio sibling, save
-which functions were bus masters, verify that every bit cleared, and restore
-only the previous masters on thaw or resume.  Also gate the BCM4377 Bluetooth
-function after its firmware quiesce callback and restore it only if the
-transport remains valid.
+which functions were bus masters, verify that every bit cleared, and overwrite
+each sibling's saved PCI state while DMA is blocked.  This prevents later PCI
+core callbacks from restoring an earlier bus-master bit.
+
+Keep the complete link blocked throughout noirq recovery.  On thaw or an
+aborted suspend, restore the previous mask only after the ordinary BCE
+recovery handshake succeeds.  After image restoration, BCE and ANS are
+enabled by bridge recovery, audio restores itself, and the unbound SEP
+function remains blocked.  Latch an unexpected noirq re-enable so ordinary
+recovery cannot silently undo the safety failure.  BCM4377 Bluetooth similarly
+saves a disabled PCI state, restores vendor mappings first, and verifies bus
+mastering before allowing DMA again.
 
 This is an unqualified diagnostic candidate.  It deliberately does not gate
 the Wi-Fi sibling, so the existing Wi-Fi-unbind isolation remains mandatory.
+It does not implement the separate cold-S4 BCE reconstruction path.
 
+---
+diff --git a/drivers/staging/t2bce/t2bce_core/t2bce.h b/drivers/staging/t2bce/t2bce_core/t2bce.h
 --- a/drivers/staging/t2bce/t2bce_core/t2bce.h
 +++ b/drivers/staging/t2bce/t2bce_core/t2bce.h
 @@ -12,7 +12,7 @@
@@ -28,17 +39,19 @@ the Wi-Fi sibling, so the existing Wi-Fi-unbind isolation remains mandatory.
      dev_t devt;
      struct device *dev;
      void __iomem *reg_mem_mb;
-@@ -30,6 +30,7 @@ struct t2bce_device {
+@@ -30,6 +30,8 @@
      bool no_state_fallback;
      bool no_state_resume;
      bool mailbox_channel_active;
++    bool pci_dma_restore_failed;
 +    unsigned long pci_master_mask;
      struct mutex pm_lock;
      struct mutex clients_lock;
      struct list_head clients;
+diff --git a/drivers/staging/t2bce/t2bce_core/t2bce_main.c b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
 --- a/drivers/staging/t2bce/t2bce_core/t2bce_main.c
 +++ b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
-@@ -166,6 +166,13 @@ static int t2bce_probe(struct pci_dev *dev, const struct pci_device_id *id)
+@@ -166,6 +166,13 @@
       * host state.
       */
      bce->pci0 = pci_get_slot(dev->bus, PCI_DEVFN(PCI_SLOT(dev->devfn), 0));
@@ -52,7 +65,7 @@ the Wi-Fi sibling, so the existing Wi-Fi-unbind isolation remains mandatory.
  #ifndef WITHOUT_NVME_PATCH
      if ((status = pci_enable_device_mem(bce->pci0))) {
          dev_warn(&dev->dev, "t2bce_core: failed to enable function 0\n");
-@@ -196,8 +203,10 @@ fail_ts:
+@@ -196,8 +203,10 @@
      bce_xhci_pm_stop(&bce->xhci_pm);
  #ifndef WITHOUT_NVME_PATCH
      pci_disable_device(bce->pci0);
@@ -64,7 +77,7 @@ the Wi-Fi sibling, so the existing Wi-Fi-unbind isolation remains mandatory.
      pci_dev_put(bce->pci0);
  fail_segment_list_pool:
      t2bce_dma_destroy_segment_list_pool(&bce->dma);
-@@ -447,6 +456,8 @@ static void t2bce_remove(struct pci_dev *dev)
+@@ -447,6 +456,8 @@
  #ifndef WITHOUT_NVME_PATCH
      pci_disable_device(bce->pci0);
  #endif
@@ -73,10 +86,34 @@ the Wi-Fi sibling, so the existing Wi-Fi-unbind isolation remains mandatory.
      pci_dev_put(bce->pci0);
      pci_free_irq(dev, 0, dev);
      pci_free_irq(dev, 4, dev);
-@@ -672,6 +683,68 @@ static int t2bce_resume(struct device *dev)
+@@ -672,6 +683,151 @@
      return status;
  }
  
++static void t2bce_block_shared_dma(struct t2bce_device *bce)
++{
++    struct pci_dev *functions[] = { bce->pci0, bce->pci, bce->pci2, bce->pci3 };
++    size_t i;
++
++    for (i = 0; i < ARRAY_SIZE(functions); i++)
++        pci_clear_master(functions[i]);
++}
++
++static int t2bce_save_shared_pci_state(struct t2bce_device *bce)
++{
++    struct pci_dev *functions[] = { bce->pci0, bce->pci, bce->pci2, bce->pci3 };
++    int status;
++    size_t i;
++
++    for (i = 0; i < ARRAY_SIZE(functions); i++) {
++        status = pci_save_state(functions[i]);
++        if (status)
++            return status;
++    }
++
++    return 0;
++}
++
 +static int t2bce_suspend_noirq(struct device *dev)
 +{
 +    struct t2bce_device *bce = pci_get_drvdata(to_pci_dev(dev));
@@ -85,6 +122,7 @@ the Wi-Fi sibling, so the existing Wi-Fi-unbind isolation remains mandatory.
 +    u16 command;
 +    size_t i;
 +
++    bce->pci_dma_restore_failed = false;
 +    bce->pci_master_mask = 0;
 +    for (i = 0; i < ARRAY_SIZE(functions); i++) {
 +        if (pci_read_config_word(functions[i], PCI_COMMAND, &command))
@@ -97,14 +135,19 @@ the Wi-Fi sibling, so the existing Wi-Fi-unbind isolation remains mandatory.
 +            goto restore;
 +    }
 +
++    if (t2bce_save_shared_pci_state(bce))
++        goto restore;
++
 +    bce->pci_master_mask = master_mask;
-+    pr_info("t2bce_core: noirq: blocked shared-link DMA mask=%#lx\n", master_mask);
++    pr_info("t2bce_core: noirq: blocked shared-link DMA and saved disabled state mask=%#lx\n",
++            master_mask);
 +    return 0;
 +
 +restore:
 +    for (i = 0; i < ARRAY_SIZE(functions); i++)
 +        if (master_mask & BIT(i))
 +            pci_set_master(functions[i]);
++    t2bce_save_shared_pci_state(bce);
 +    bce->pci_master_mask = 0;
 +    pr_err("t2bce_core: noirq: failed to block shared-link DMA\n");
 +    return -EIO;
@@ -114,52 +157,110 @@ the Wi-Fi sibling, so the existing Wi-Fi-unbind isolation remains mandatory.
 +{
 +    struct t2bce_device *bce = pci_get_drvdata(to_pci_dev(dev));
 +    struct pci_dev *functions[] = { bce->pci0, bce->pci, bce->pci2, bce->pci3 };
-+    unsigned long master_mask = bce->pci_master_mask;
 +    u16 command;
 +    size_t i;
 +
 +    for (i = 0; i < ARRAY_SIZE(functions); i++) {
-+        if (!(master_mask & BIT(i)))
-+            continue;
-+        pci_set_master(functions[i]);
 +        if (pci_read_config_word(functions[i], PCI_COMMAND, &command) ||
-+                !(command & PCI_COMMAND_MASTER))
-+            goto block;
++                command & PCI_COMMAND_MASTER) {
++            t2bce_block_shared_dma(bce);
++            bce->pci_dma_restore_failed = true;
++            pr_err("t2bce_core: noirq: shared-link DMA became enabled during restore\n");
++            return -EIO;
++        }
 +    }
 +
-+    bce->pci_master_mask = 0;
-+    pr_info("t2bce_core: noirq: restored shared-link DMA mask=%#lx\n", master_mask);
++    pr_info("t2bce_core: noirq: shared-link DMA remains blocked\n");
 +    return 0;
++}
 +
-+block:
++static int t2bce_restore_shared_dma(struct t2bce_device *bce)
++{
++    struct pci_dev *functions[] = { bce->pci0, bce->pci, bce->pci2, bce->pci3 };
++    unsigned long master_mask = bce->pci_master_mask;
++    u16 command;
++    size_t i;
++
 +    for (i = 0; i < ARRAY_SIZE(functions); i++)
-+        if (master_mask & BIT(i))
-+            pci_clear_master(functions[i]);
-+    pr_err("t2bce_core: noirq: failed to restore shared-link DMA\n");
-+    return -EIO;
++        if (master_mask & BIT(i)) {
++            pci_set_master(functions[i]);
++            if (pci_read_config_word(functions[i], PCI_COMMAND, &command) ||
++                    !(command & PCI_COMMAND_MASTER)) {
++                t2bce_block_shared_dma(bce);
++                pr_err("t2bce_core: failed to restore shared-link DMA\n");
++                return -EIO;
++            }
++        }
++
++    bce->pci_master_mask = 0;
++    pr_info("t2bce_core: restored shared-link DMA mask=%#lx\n", master_mask);
++    return 0;
++}
++
++static int t2bce_resume_with_shared_dma(struct device *dev)
++{
++    struct t2bce_device *bce = pci_get_drvdata(to_pci_dev(dev));
++    int status;
++
++    if (bce->pci_dma_restore_failed)
++        return -EIO;
++
++    status = t2bce_resume(dev);
++    if (status) {
++        t2bce_block_shared_dma(bce);
++        return status;
++    }
++
++    return t2bce_restore_shared_dma(bce);
++}
++
++static int t2bce_restore(struct device *dev)
++{
++    struct t2bce_device *bce = pci_get_drvdata(to_pci_dev(dev));
++    int status;
++
++    if (bce->pci_dma_restore_failed)
++        return -EIO;
++
++    status = t2bce_resume(dev);
++    if (status) {
++        t2bce_block_shared_dma(bce);
++        return status;
++    }
++
++    /* BCE and ANS were enabled by the bridge recovery above.  Leave the
++     * unbound SEP function blocked; audio restores itself in its callback.
++     */
++    bce->pci_master_mask = 0;
++    return 0;
 +}
 +
  static int t2bce_prepare(struct device *dev)
  {
      /*
-@@ -709,9 +782,14 @@ struct dev_pm_ops t2bce_pci_driver_pm = {
+@@ -708,10 +864,15 @@
+ struct dev_pm_ops t2bce_pci_driver_pm = {
          .prepare = t2bce_prepare,
          .suspend = t2bce_suspend,
-         .resume = t2bce_resume,
+-        .resume = t2bce_resume,
++        .resume = t2bce_resume_with_shared_dma,
 +        .suspend_noirq = t2bce_suspend_noirq,
 +        .resume_noirq = t2bce_resume_noirq,
          .freeze = t2bce_suspend,
-         .thaw = t2bce_resume,
-         .restore = t2bce_resume,
+-        .thaw = t2bce_resume,
+-        .restore = t2bce_resume,
++        .thaw = t2bce_resume_with_shared_dma,
++        .restore = t2bce_restore,
 +        .freeze_noirq = t2bce_suspend_noirq,
 +        .thaw_noirq = t2bce_resume_noirq,
 +        .restore_noirq = t2bce_resume_noirq,
          .complete = t2bce_complete
  };
  struct pci_driver t2bce_pci_driver = {
+diff --git a/drivers/bluetooth/hci_bcm4377.c b/drivers/bluetooth/hci_bcm4377.c
 --- a/drivers/bluetooth/hci_bcm4377.c
 +++ b/drivers/bluetooth/hci_bcm4377.c
-@@ -567,6 +567,7 @@ struct bcm4377_data {
+@@ -567,6 +567,7 @@
  	bool transport_lost;
  	bool irq_blocked;
  	bool pm_blocked;
@@ -167,7 +268,7 @@ the Wi-Fi sibling, so the existing Wi-Fi-unbind isolation remains mandatory.
  	bool setup_needed;
  	void *firmware_buffer;
  	dma_addr_t firmware_dma;
-@@ -2701,6 +2702,29 @@ static int bcm4377_resume(struct device *dev)
+@@ -2701,6 +2702,51 @@
  	return hci_resume_dev(bcm4377->hdev);
  }
  
@@ -194,35 +295,54 @@ the Wi-Fi sibling, so the existing Wi-Fi-unbind isolation remains mandatory.
 +	return 0;
 +}
 +
++static int bcm4377_restore_busmaster(struct pci_dev *pdev,
++				     struct bcm4377_data *bcm4377)
++{
++	u16 command;
++
++	if (!bcm4377->pm_was_busmaster ||
++	    READ_ONCE(bcm4377->transport_lost)) {
++		bcm4377->pm_was_busmaster = false;
++		return 0;
++	}
++
++	pci_set_master(pdev);
++	if (pci_read_config_word(pdev, PCI_COMMAND, &command) ||
++	    !(command & PCI_COMMAND_MASTER)) {
++		pci_clear_master(pdev);
++		return -EIO;
++	}
++
++	bcm4377->pm_was_busmaster = false;
++	return 0;
++}
++
  /* PCI core has restored the standard header; restore vendor mappings
   * before device interrupts and the normal unquiesce/HCI resume callback.
   */
-@@ -2712,8 +2736,12 @@ static int bcm4377_resume_noirq(struct device *dev)
- 	u32 before[ARRAY_SIZE(offsets)], after, expected[ARRAY_SIZE(offsets)];
+@@ -2713,7 +2759,7 @@
  	int ret, i;
  
--	if (bcm4377->hw->id != 0x4377)
-+	if (bcm4377->hw->id != 0x4377) {
-+		if (bcm4377->pm_was_busmaster)
-+			pci_set_master(pdev);
-+		bcm4377->pm_was_busmaster = false;
- 		return 0;
-+	}
+ 	if (bcm4377->hw->id != 0x4377)
+-		return 0;
++		return bcm4377_restore_busmaster(pdev, bcm4377);
  
  	WRITE_ONCE(bcm4377->resume_config_failed, true);
  	for (i = 0; i < ARRAY_SIZE(offsets); i++) {
-@@ -2747,6 +2775,10 @@ static int bcm4377_resume_noirq(struct device *dev)
+@@ -2747,6 +2793,12 @@
  		}
  	}
  	WRITE_ONCE(bcm4377->resume_config_failed, false);
-+	if (bcm4377->pm_was_busmaster &&
-+	    !READ_ONCE(bcm4377->transport_lost))
-+		pci_set_master(pdev);
-+	bcm4377->pm_was_busmaster = false;
++	ret = bcm4377_restore_busmaster(pdev, bcm4377);
++	if (ret) {
++		WRITE_ONCE(bcm4377->resume_config_failed, true);
++		dev_err(dev, "PCI bus-master restore failed\n");
++		return ret;
++	}
  	dev_info(dev, "t2bt-resume: restored vendor windows (before %08x %08x %08x %08x %08x)\n",
  		 before[0], before[1], before[2], before[3], before[4]);
  	return 0;
-@@ -2774,6 +2806,10 @@ static void bcm4377_complete(struct device *dev)
+@@ -2774,6 +2826,10 @@
  
  static const struct dev_pm_ops bcm4377_ops = {
  	SYSTEM_SLEEP_PM_OPS(bcm4377_suspend, bcm4377_resume)
