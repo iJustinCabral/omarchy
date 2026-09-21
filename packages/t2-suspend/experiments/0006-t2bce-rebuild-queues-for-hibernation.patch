@@ -1,0 +1,1028 @@
+Subject: [PATCH] t2bce: rebuild hibernation queue graph
+
+A hibernation image cannot assume that bridgeOS retained registrations for
+BCE command, VHCI, or audio queues across S4.  Capturing live host queue
+objects causes the restored kernel to reuse indices and DMA mappings from a
+firmware epoch that no longer exists.
+
+Force the hibernation freeze and poweroff callbacks through a complete
+no-state path.  Remove the virtual HCD, ask bridgeOS to sleep without saved
+state, and locally discard all client and core queues without sending
+unregister commands.  Capture the image with the transport absent.  Thaw
+and restore perform a fresh firmware handshake, rebuild command queues,
+rebuild every client queue graph, and only then let VHCI re-add its HCD and
+audio reconnect.
+
+If RESTORE_NO_STATE is unavailable after real S4, use the probe-time
+firmware handshake as a new epoch.  Restrict this fallback to the image
+restore callback; ordinary S3 and hibernation unwind remain fail-closed.
+Refuse the no-state path when any registered client lacks queue
+reconstruction callbacks, and suppress client completion after a failed
+rebuild.
+
+This remains an offline diagnostic candidate.  It applies after the shared
+DMA-blocking experiment, requires rebuilding t2bce_core, t2bce_vhci and
+t2bce_audio together, and has not been installed or hardware-qualified.
+
+---
+diff --git a/drivers/staging/t2bce/t2bce_audio/audio.c b/drivers/staging/t2bce/t2bce_audio/audio.c
+index d227b209..247fd518 100644
+--- a/drivers/staging/t2bce/t2bce_audio/audio.c
++++ b/drivers/staging/t2bce/t2bce_audio/audio.c
+@@ -21,6 +21,8 @@ static struct class *t2audio_class;
+ 
+ static int t2audio_init_cmd(struct t2audio_device *a);
+ static int t2audio_init_bs(struct t2audio_device *a);
++static int t2audio_wait_remote_alive(struct t2audio_device *a);
++static int t2audio_refresh_bs_mapping(struct t2audio_device *a);
+ static void t2audio_init_dev(struct t2audio_device *a, t2audio_device_id_t dev_id);
+ static void t2audio_free_dev(struct t2audio_subdevice *sdev);
+ static void t2audio_reset_stream(struct t2audio_stream *stream);
+@@ -28,12 +30,18 @@ static void t2audio_reset_streams(struct t2audio_device *a);
+ static void t2audio_resume_work(struct work_struct *ws);
+ static void t2audio_resume_complete(void *userdata);
+ static int t2audio_pm_prepare_client(void *userdata);
++static void t2audio_pm_abort_client(void *userdata);
++static void t2audio_pm_drop_no_state_queues(void *userdata);
++static int t2audio_pm_rebuild_no_state_queues(void *userdata);
+ static void t2audio_pm_shutdown_client(void *userdata);
+ static int t2audio_debugfs_init(struct t2audio_device *a);
+ 
+ static const struct t2bce_core_client_pm_ops t2audio_pm_ops = {
+         .shutdown = t2audio_pm_shutdown_client,
+         .pm_prepare = t2audio_pm_prepare_client,
++        .pm_abort = t2audio_pm_abort_client,
++        .pm_drop_no_state_queues = t2audio_pm_drop_no_state_queues,
++        .pm_rebuild_no_state_queues = t2audio_pm_rebuild_no_state_queues,
+ };
+ 
+ static int t2audio_probe(struct pci_dev *dev, const struct pci_device_id *id)
+@@ -275,7 +283,39 @@ static int t2audio_suspend(struct device *dev)
+ 
+ static int t2audio_pm_prepare_client(void *userdata)
+ {
+-    return t2audio_quiesce(userdata, true);
++    struct t2audio_device *t2audio = userdata;
++    int status;
++
++    status = t2audio_quiesce(t2audio, true);
++    if (!status && t2audio_bce_has_pending(t2audio)) {
++        dev_err(t2audio->dev, "pending audio commands after PM quiesce\n");
++        status = -EBUSY;
++    }
++    return status;
++}
++
++static void t2audio_pm_abort_client(void *userdata)
++{
++    struct t2audio_device *t2audio = userdata;
++
++    if (!t2audio->pm_quiesced)
++        return;
++    if (t2audio_cmd_set_remote_access(t2audio, T2AUDIO_REMOTE_ACCESS_ON)) {
++        dev_err(t2audio->dev, "Failed to restore remote access after PM abort\n");
++        return;
++    }
++    t2audio->pm_quiesced = false;
++    t2audio_reset_streams(t2audio);
++}
++
++static void t2audio_pm_drop_no_state_queues(void *userdata)
++{
++    t2audio_bce_destroy(userdata);
++}
++
++static int t2audio_pm_rebuild_no_state_queues(void *userdata)
++{
++    return t2audio_bce_init(userdata);
+ }
+ 
+ static void t2audio_pm_shutdown_client(void *userdata)
+@@ -320,6 +360,20 @@ static int t2audio_resume(struct device *dev)
+         return 0;
+     }
+ 
++    status = t2audio_wait_remote_alive(t2audio);
++    if (status) {
++        dev_err(t2audio->dev, "Failed to reconnect audio transport\n");
++        pr_info("t2bce_audio: resume exit status=%d path=%s\n", status, path);
++        return status;
++    }
++
++    status = t2audio_refresh_bs_mapping(t2audio);
++    if (status) {
++        dev_err(t2audio->dev, "Failed to revalidate BufferStruct mapping\n");
++        pr_info("t2bce_audio: resume exit status=%d path=%s\n", status, path);
++        return status;
++    }
++
+     if ((status = t2audio_cmd_set_remote_access(t2audio, T2AUDIO_REMOTE_ACCESS_ON))) {
+         dev_err(t2audio->dev, "Failed to set remote access\n");
+         pr_info("t2bce_audio: resume exit status=%d path=%s\n", status, path);
+@@ -389,21 +443,13 @@ static void t2audio_reset_streams(struct t2audio_device *a)
+ static int t2audio_init_cmd(struct t2audio_device *a)
+ {
+     int status;
+-    struct t2audio_send_ctx sctx;
+     struct t2audio_msg buf;
+     u64 dev_cnt, dev_i;
+     t2audio_device_id_t *dev_l;
+ 
+-    if ((status = t2audio_send(a, &sctx, 500,
+-                              t2audio_msg_write_alive_notification, 1, 3))) {
+-        dev_err(a->dev, "Sending alive notification failed\n");
++    status = t2audio_wait_remote_alive(a);
++    if (status)
+         return status;
+-    }
+-
+-    if (wait_for_completion_timeout(&a->remote_alive, msecs_to_jiffies(500)) == 0) {
+-        dev_err(a->dev, "Timed out waiting for remote\n");
+-        return -ETIMEDOUT;
+-    }
+     pr_debug("t2bce_audio: Continuing init\n");
+ 
+     buf = t2audio_reply_alloc();
+@@ -419,6 +465,27 @@ static int t2audio_init_cmd(struct t2audio_device *a)
+     return 0;
+ }
+ 
++static int t2audio_wait_remote_alive(struct t2audio_device *a)
++{
++    struct t2audio_send_ctx sctx;
++    int status;
++
++    reinit_completion(&a->remote_alive);
++    status = t2audio_send(a, &sctx, 500,
++            t2audio_msg_write_alive_notification, 1, 3);
++    if (status) {
++        dev_err(a->dev, "Sending alive notification failed\n");
++        return status;
++    }
++
++    if (!wait_for_completion_timeout(&a->remote_alive, msecs_to_jiffies(500))) {
++        dev_err(a->dev, "Timed out waiting for remote\n");
++        return -ETIMEDOUT;
++    }
++
++    return 0;
++}
++
+ static void t2audio_init_stream_info(struct t2audio_subdevice *sdev, struct t2audio_stream *strm);
+ static void t2audio_handle_jack_connection_change(struct t2audio_subdevice *sdev);
+ 
+@@ -580,24 +647,9 @@ static int t2audio_init_bs(struct t2audio_device *a)
+     int i, j;
+     struct t2audio_buffer_struct_device *dev;
+     struct t2audio_subdevice *sdev;
+-    u32 ver, sig, bs_base;
+ 
+-    ver = ioread32(&a->reg_mem_gpr[0]);
+-    if (ver < 3) {
+-        dev_err(a->dev, "t2bce_audio: Bad GPR version (%u)", ver);
++    if (t2audio_refresh_bs_mapping(a))
+         return -EINVAL;
+-    }
+-    sig = ioread32(&a->reg_mem_gpr[1]);
+-    if (sig != T2AUDIO_SIG) {
+-        dev_err(a->dev, "t2bce_audio: Bad GPR sig (%x)", sig);
+-        return -EINVAL;
+-    }
+-    bs_base = ioread32(&a->reg_mem_gpr[2]);
+-    a->bs = (struct t2audio_buffer_struct *) ((u8 *) a->reg_mem_bs + bs_base);
+-    if (a->bs->signature != T2AUDIO_SIG) {
+-        dev_err(a->dev, "t2bce_audio: Bad BufferStruct sig (%x)", a->bs->signature);
+-        return -EINVAL;
+-    }
+     pr_debug("t2bce_audio: BufferStruct ver = %i\n", a->bs->version);
+     pr_debug("t2bce_audio: Num devices = %i\n", a->bs->num_devices);
+     for (i = 0; i < a->bs->num_devices; i++) {
+@@ -645,6 +697,37 @@ static int t2audio_init_bs(struct t2audio_device *a)
+     return 0;
+ }
+ 
++static int t2audio_refresh_bs_mapping(struct t2audio_device *a)
++{
++    resource_size_t bs_bar_len;
++    u32 ver, sig, bs_base;
++
++    ver = ioread32(&a->reg_mem_gpr[0]);
++    if (ver < 3) {
++        dev_err(a->dev, "t2bce_audio: Bad GPR version (%u)", ver);
++        return -EINVAL;
++    }
++    sig = ioread32(&a->reg_mem_gpr[1]);
++    if (sig != T2AUDIO_SIG) {
++        dev_err(a->dev, "t2bce_audio: Bad GPR sig (%x)", sig);
++        return -EINVAL;
++    }
++    bs_base = ioread32(&a->reg_mem_gpr[2]);
++    bs_bar_len = pci_resource_len(a->pci, 0);
++    if (bs_base > bs_bar_len || sizeof(*a->bs) > bs_bar_len - bs_base) {
++        dev_err(a->dev, "t2bce_audio: BufferStruct offset outside BAR (%x)\n",
++                bs_base);
++        return -ERANGE;
++    }
++    a->bs = (struct t2audio_buffer_struct *)((u8 *)a->reg_mem_bs + bs_base);
++    if (a->bs->signature != T2AUDIO_SIG) {
++        dev_err(a->dev, "t2bce_audio: Bad BufferStruct sig (%x)", a->bs->signature);
++        return -EINVAL;
++    }
++
++    return 0;
++}
++
+ static ssize_t t2audio_debugfs_buffer_struct_read(struct file *file,
+         char __user *user_buf, size_t count, loff_t *ppos)
+ {
+diff --git a/drivers/staging/t2bce/t2bce_audio/protocol_bce.c b/drivers/staging/t2bce/t2bce_audio/protocol_bce.c
+index a6f3de97..3d9208f5 100644
+--- a/drivers/staging/t2bce/t2bce_audio/protocol_bce.c
++++ b/drivers/staging/t2bce/t2bce_audio/protocol_bce.c
+@@ -2,11 +2,14 @@
+ 
+ #include "audio.h"
+ #include <linux/dma-mapping.h>
++#include <linux/kernel.h>
++#include <linux/string.h>
+ 
+ static void t2audio_bce_out_queue_completion(struct t2bce_core_queue_sq *sq);
+ static void t2audio_bce_in_queue_completion(struct t2bce_core_queue_sq *sq);
+ static int t2audio_bce_queue_init(struct t2audio_device *dev, struct t2audio_bce_queue *q, const char *name,
+                                  enum dma_data_direction direction, t2bce_core_sq_completion cfn);
++static void t2audio_bce_queue_destroy(struct t2audio_device *dev, struct t2audio_bce_queue *q);
+ void t2audio_bce_in_queue_submit_pending(struct t2audio_bce_queue *q, size_t count);
+ static void t2audio_deferred_msg_work(struct work_struct *ws);
+ 
+@@ -14,20 +17,29 @@ int t2audio_bce_init(struct t2audio_device *dev)
+ {
+     int status;
+     struct t2audio_bce *bce = &dev->bcem;
++
++    memset(&bce->qin, 0, sizeof(bce->qin));
++    memset(&bce->qout, 0, sizeof(bce->qout));
++    memset(bce->pending_entries, 0, sizeof(bce->pending_entries));
++    bce->tag_num = 0;
+     bce->cq = t2bce_core_create_cq(dev->bce, 0x80);
+     spin_lock_init(&bce->spinlock);
+     if (!bce->cq)
+         return -EINVAL;
+     if ((status = t2audio_bce_queue_init(dev, &bce->qout, "com.apple.BridgeAudio.IntelToARM", DMA_TO_DEVICE,
+             t2audio_bce_out_queue_completion))) {
+-        return status;
++        goto fail;
+     }
+     if ((status = t2audio_bce_queue_init(dev, &bce->qin, "com.apple.BridgeAudio.ARMToIntel", DMA_FROM_DEVICE,
+             t2audio_bce_in_queue_completion))) {
+-        return status;
++        goto fail;
+     }
+     t2audio_bce_in_queue_submit_pending(&bce->qin, bce->qin.el_count);
+     return 0;
++
++fail:
++    t2audio_bce_destroy(dev);
++    return status;
+ }
+ 
+ int t2audio_bce_queue_init(struct t2audio_device *dev, struct t2audio_bce_queue *q, const char *name,
+@@ -44,11 +56,51 @@ int t2audio_bce_queue_init(struct t2audio_device *dev, struct t2audio_bce_queue
+     q->data = dma_alloc_coherent(t2bce_core_client_dma_dev(dev->bce), q->el_size * q->el_count, &q->dma_addr, GFP_KERNEL);
+     if (!q->data) {
+         t2bce_core_destroy_sq(dev->bce, q->sq);
++        q->sq = NULL;
+         return -EINVAL;
+     }
+     return 0;
+ }
+ 
++static void t2audio_bce_queue_destroy(struct t2audio_device *dev, struct t2audio_bce_queue *q)
++{
++    if (q->data)
++        dma_free_coherent(t2bce_core_client_dma_dev(dev->bce),
++                q->el_size * q->el_count, q->data, q->dma_addr);
++    if (q->sq)
++        t2bce_core_destroy_sq(dev->bce, q->sq);
++    memset(q, 0, sizeof(*q));
++}
++
++void t2audio_bce_destroy(struct t2audio_device *dev)
++{
++    struct t2audio_bce *bce = &dev->bcem;
++
++    t2audio_bce_queue_destroy(dev, &bce->qin);
++    t2audio_bce_queue_destroy(dev, &bce->qout);
++    if (bce->cq)
++        t2bce_core_destroy_cq(dev->bce, bce->cq);
++    bce->cq = NULL;
++    memset(bce->pending_entries, 0, sizeof(bce->pending_entries));
++}
++
++bool t2audio_bce_has_pending(struct t2audio_device *dev)
++{
++    struct t2audio_bce *bce = &dev->bcem;
++    unsigned long flags;
++    bool pending = false;
++    size_t i;
++
++    spin_lock_irqsave(&bce->spinlock, flags);
++    for (i = 0; i < ARRAY_SIZE(bce->pending_entries); i++)
++        if (bce->pending_entries[i]) {
++            pending = true;
++            break;
++        }
++    spin_unlock_irqrestore(&bce->spinlock, flags);
++    return pending;
++}
++
+ static void t2audio_send_create_tag(struct t2audio_bce *b, int *tagn, char tag[4])
+ {
+     b->tag_num = (b->tag_num + 1) % T2AUDIO_BCE_QUEUE_TAG_COUNT;
+diff --git a/drivers/staging/t2bce/t2bce_audio/protocol_bce.h b/drivers/staging/t2bce/t2bce_audio/protocol_bce.h
+index 8e474d2f..1d32418f 100644
+--- a/drivers/staging/t2bce/t2bce_audio/protocol_bce.h
++++ b/drivers/staging/t2bce/t2bce_audio/protocol_bce.h
+@@ -41,6 +41,8 @@ struct t2audio_send_ctx {
+ };
+ 
+ int t2audio_bce_init(struct t2audio_device *dev);
++void t2audio_bce_destroy(struct t2audio_device *dev);
++bool t2audio_bce_has_pending(struct t2audio_device *dev);
+ int __t2audio_send_prepare(struct t2audio_bce *b, struct t2audio_send_ctx *ctx, char *tag);
+ void __t2audio_send(struct t2audio_bce *b, struct t2audio_send_ctx *ctx);
+ int __t2audio_send_cmd_sync(struct t2audio_bce *b, struct t2audio_send_ctx *ctx, struct t2audio_msg *reply);
+diff --git a/drivers/staging/t2bce/t2bce_core/include/t2bce_core_transport.h b/drivers/staging/t2bce/t2bce_core/include/t2bce_core_transport.h
+index 22e201f0..f5dd7035 100644
+--- a/drivers/staging/t2bce/t2bce_core/include/t2bce_core_transport.h
++++ b/drivers/staging/t2bce/t2bce_core/include/t2bce_core_transport.h
+@@ -19,7 +19,10 @@ struct t2bce_core_client_pm_ops {
+     void (*shutdown)(void *userdata);
+     void (*pm_reset)(void *userdata);
+     int (*pm_prepare)(void *userdata);
++    void (*pm_abort)(void *userdata);
+     void (*pm_prepare_no_state)(void *userdata);
++    void (*pm_drop_no_state_queues)(void *userdata);
++    int (*pm_rebuild_no_state_queues)(void *userdata);
+     void (*pm_mark_no_state_resume)(void *userdata);
+     bool (*pm_is_no_state_resume)(void *userdata);
+     void (*pm_complete)(void *userdata);
+diff --git a/drivers/staging/t2bce/t2bce_core/t2bce.h b/drivers/staging/t2bce/t2bce_core/t2bce.h
+index 5f6e8455..8b37c79f 100644
+--- a/drivers/staging/t2bce/t2bce_core/t2bce.h
++++ b/drivers/staging/t2bce/t2bce_core/t2bce.h
+@@ -29,6 +29,8 @@ struct t2bce_device {
+     bool stateful_suspend_valid;
+     bool no_state_fallback;
+     bool no_state_resume;
++    bool no_state_queues_dropped;
++    bool no_state_rebuild_failed;
+     bool mailbox_channel_active;
+     bool pci_dma_restore_failed;
+     unsigned long pci_master_mask;
+@@ -45,7 +47,11 @@ void t2bce_core_notify_resume_complete(struct t2bce_device *bce);
+ void t2bce_core_clients_shutdown(struct t2bce_device *bce);
+ void t2bce_core_clients_pm_reset(struct t2bce_device *bce);
+ int t2bce_core_clients_pm_prepare(struct t2bce_device *bce);
++void t2bce_core_clients_pm_abort(struct t2bce_device *bce);
+ void t2bce_core_clients_pm_prepare_no_state(struct t2bce_device *bce);
++bool t2bce_core_clients_pm_can_rebuild_no_state(struct t2bce_device *bce);
++void t2bce_core_clients_pm_drop_no_state_queues(struct t2bce_device *bce);
++int t2bce_core_clients_pm_rebuild_no_state_queues(struct t2bce_device *bce);
+ void t2bce_core_clients_pm_mark_no_state_resume(struct t2bce_device *bce);
+ bool t2bce_core_clients_pm_has_no_state_resume(struct t2bce_device *bce);
+ void t2bce_core_clients_pm_complete(struct t2bce_device *bce);
+diff --git a/drivers/staging/t2bce/t2bce_core/t2bce_main.c b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
+index 389bbf8a..5925175c 100644
+--- a/drivers/staging/t2bce/t2bce_core/t2bce_main.c
++++ b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
+@@ -2,6 +2,7 @@
+ #include <linux/module.h>
+ #include <linux/crc32.h>
+ #include <linux/delay.h>
++#include <linux/interrupt.h>
+ #include <linux/version.h>
+ 
+ /*
+@@ -241,7 +242,7 @@ fail:
+ static int bce_create_command_queues(struct t2bce_device *bce)
+ {
+     int status;
+-    struct bce_queue_memcfg *cfg;
++    struct bce_queue_memcfg *cfg = NULL;
+     struct t2bce_dma_engine *dma = &bce->dma;
+ 
+     dma->cmd_cq = t2bce_dma_alloc_cq(dma, 0, 0x20);
+@@ -269,10 +270,15 @@ static int bce_create_command_queues(struct t2bce_device *bce)
+     return 0;
+ 
+ err:
++    kfree(cfg);
+     if (dma->cmd_cq)
+         t2bce_dma_free_cq(dma, dma->cmd_cq);
+     if (dma->cmd_cmdq)
+         t2bce_dma_free_cmdq(dma, dma->cmd_cmdq);
++    dma->cmd_cq = NULL;
++    dma->cmd_cmdq = NULL;
++    dma->queues[0] = NULL;
++    dma->queues[1] = NULL;
+     return status;
+ }
+ 
+@@ -280,10 +286,14 @@ static void bce_free_command_queues(struct t2bce_device *bce)
+ {
+     struct t2bce_dma_engine *dma = &bce->dma;
+ 
+-    t2bce_dma_free_cq(dma, dma->cmd_cq);
+-    t2bce_dma_free_cmdq(dma, dma->cmd_cmdq);
++    if (dma->cmd_cq)
++        t2bce_dma_free_cq(dma, dma->cmd_cq);
++    if (dma->cmd_cmdq)
++        t2bce_dma_free_cmdq(dma, dma->cmd_cmdq);
+     dma->cmd_cq = NULL;
++    dma->cmd_cmdq = NULL;
+     dma->queues[0] = NULL;
++    dma->queues[1] = NULL;
+ }
+ 
+ static irqreturn_t bce_handle_mb_irq(int irq, void *dev)
+@@ -586,36 +596,108 @@ static int bce_pm_resume_stateful(struct t2bce_device *bce)
+     return 0;
+ }
+ 
+-static int t2bce_suspend(struct device *dev)
++static void bce_pm_drop_no_state_queue_graph(struct t2bce_device *bce)
++{
++    /* SLEEP_NO_STATE has stopped the remote producer.  Drain any handler that
++     * entered before the sleep request, then free host objects without asking
++     * the now-stateless firmware to unregister them.
++     */
++    synchronize_irq(pci_irq_vector(bce->pci, 4));
++    bce->dma.is_being_removed = true;
++    t2bce_core_clients_pm_drop_no_state_queues(bce);
++    bce_free_command_queues(bce);
++    bce->dma.is_being_removed = false;
++    bce->no_state_queues_dropped = true;
++}
++
++static int bce_pm_rebuild_no_state_queue_graph(struct t2bce_device *bce)
++{
++    int status;
++
++    status = bce_fw_version_handshake(bce);
++    if (status) {
++        bce->no_state_rebuild_failed = true;
++        pr_err("t2bce_core: no-state firmware handshake failed: %d\n", status);
++        return status;
++    }
++
++    status = bce_create_command_queues(bce);
++    if (status) {
++        bce->no_state_rebuild_failed = true;
++        pr_err("t2bce_core: no-state command-queue rebuild failed: %d\n", status);
++        return status;
++    }
++
++    status = t2bce_core_clients_pm_rebuild_no_state_queues(bce);
++    if (!status) {
++        bce->no_state_queues_dropped = false;
++        bce->no_state_rebuild_failed = false;
++        return 0;
++    }
++
++    pr_err("t2bce_core: no-state client-queue rebuild failed: %d\n", status);
++    synchronize_irq(pci_irq_vector(bce->pci, 4));
++    bce->dma.is_being_removed = true;
++    t2bce_core_clients_pm_drop_no_state_queues(bce);
++    bce_free_command_queues(bce);
++    bce->dma.is_being_removed = false;
++    bce->no_state_rebuild_failed = true;
++    return status;
++}
++
++static int bce_pm_suspend_no_state(struct t2bce_device *bce)
++{
++    int status;
++
++    if (!t2bce_core_clients_pm_can_rebuild_no_state(bce)) {
++        pr_err("t2bce_core: no-state PM refused: a client cannot rebuild queues\n");
++        return -EOPNOTSUPP;
++    }
++
++    t2bce_core_clients_pm_prepare_no_state(bce);
++    status = bce_pm_suspend_fallback_no_state(bce);
++    if (status)
++        return status;
++
++    bce_pm_drop_no_state_queue_graph(bce);
++    bce->no_state_fallback = true;
++    bce->no_state_resume = true;
++    t2bce_core_clients_pm_mark_no_state_resume(bce);
++    return 0;
++}
++
++static int t2bce_suspend_common(struct device *dev, bool force_no_state)
+ {
+     struct t2bce_device *bce = pci_get_drvdata(to_pci_dev(dev));
+     int status;
+ 
+-    pr_info("t2bce_core: suspend: entry\n");
++    pr_info("t2bce_core: suspend: entry policy=%s\n",
++            force_no_state ? "hibernate-no-state" : "stateful-first");
+     mutex_lock(&bce->pm_lock);
+ 
+     bce->stateful_suspend_valid = false;
+     bce->no_state_fallback = false;
+     bce->no_state_resume = false;
++    bce->no_state_queues_dropped = false;
++    bce->no_state_rebuild_failed = false;
+     t2bce_core_clients_pm_reset(bce);
+     status = t2bce_core_clients_pm_prepare(bce);
+-    if (status)
++    if (status) {
++        t2bce_core_clients_pm_abort(bce);
+         goto out_unlock;
++    }
+ 
+     status = bce_pm_suspend_prepare(bce);
+-    if (status)
++    if (status) {
++        t2bce_core_clients_pm_abort(bce);
+         goto out_unlock;
++    }
+ 
+-    if (!bce_stateful_supported(bce)) {
+-        /* No-state resume tears down and rebuilds clients that cannot preserve firmware state. */
+-        t2bce_core_clients_pm_prepare_no_state(bce);
+-        status = bce_pm_suspend_fallback_no_state(bce);
+-        if (!status) {
+-            bce->no_state_fallback = true;
+-            bce->no_state_resume = true;
+-            t2bce_core_clients_pm_mark_no_state_resume(bce);
+-        } else {
++    if (force_no_state || !bce_stateful_supported(bce)) {
++        status = bce_pm_suspend_no_state(bce);
++        if (status) {
+             bce_pm_suspend_abort(bce);
++            t2bce_core_clients_pm_abort(bce);
+         }
+         goto out_unlock;
+     }
+@@ -626,19 +708,16 @@ static int t2bce_suspend(struct device *dev)
+ 
+     if (status != -EAGAIN) {
+         bce_pm_suspend_abort(bce);
++        t2bce_core_clients_pm_abort(bce);
+         goto out_unlock;
+     }
+ 
+     /* bridgeOS can reject state save; fall back to the no-state path then. */
+     pr_debug("t2bce_core: suspend: stateful path not ready, falling back to no-state\n");
+-    t2bce_core_clients_pm_prepare_no_state(bce);
+-    status = bce_pm_suspend_fallback_no_state(bce);
+-    if (!status) {
+-        bce->no_state_fallback = true;
+-        bce->no_state_resume = true;
+-        t2bce_core_clients_pm_mark_no_state_resume(bce);
+-    } else {
++    status = bce_pm_suspend_no_state(bce);
++    if (status) {
+         bce_pm_suspend_abort(bce);
++        t2bce_core_clients_pm_abort(bce);
+     }
+ 
+ out_unlock:
+@@ -648,10 +727,21 @@ out_unlock:
+     return status;
+ }
+ 
+-static int t2bce_resume(struct device *dev)
++static int t2bce_suspend(struct device *dev)
++{
++    return t2bce_suspend_common(dev, false);
++}
++
++static int t2bce_freeze(struct device *dev)
++{
++    return t2bce_suspend_common(dev, true);
++}
++
++static int t2bce_resume_mode(struct device *dev, bool allow_cold_boot)
+ {
+     struct t2bce_device *bce = pci_get_drvdata(to_pci_dev(dev));
+     int status;
++    int wake_status;
+     bool used_stateful;
+ 
+     pr_info("t2bce_core: resume: entry\n");
+@@ -663,17 +753,40 @@ static int t2bce_resume(struct device *dev)
+     /* Resume follows the suspend result, not a preselected policy. */
+     used_stateful = bce_stateful_supported(bce) && bce->stateful_suspend_valid;
+     pr_info("t2bce_core: resume path: %s\n", used_stateful ? "stateful" : "no-state");
+-    if (used_stateful)
++    if (used_stateful) {
+         status = bce_pm_resume_stateful(bce);
+-    else
+-        status = bce_pm_resume_no_state(bce);
+-    if (status)
+-        goto out_unlock;
+-
+-    if (used_stateful)
++        if (status)
++            goto out_unlock;
+         bce->stateful_suspend_valid = false;
++        bce_pm_resume_finish(bce);
++        goto out_unlock;
++    }
+ 
+-    bce_pm_resume_finish(bce);
++    if (!bce->no_state_queues_dropped) {
++        status = -EINVAL;
++        bce->no_state_rebuild_failed = true;
++        pr_err("t2bce_core: no-state resume refused without a dropped queue graph\n");
++        bce_pm_suspend_abort(bce);
++        goto out_unlock;
++    }
++
++    wake_status = bce_pm_resume_no_state(bce);
++    if (wake_status && !allow_cold_boot) {
++        status = wake_status;
++        bce->no_state_rebuild_failed = true;
++        bce_pm_suspend_abort(bce);
++        goto out_unlock;
++    }
++
++    if (wake_status) {
++        pr_info("t2bce_core: cold restore: RESTORE_NO_STATE unavailable; starting a fresh firmware epoch\n");
++        bce_xhci_pm_start(&bce->xhci_pm, true);
++        bce_pm_channel_resume(bce);
++    } else {
++        bce_pm_resume_finish(bce);
++    }
++
++    status = bce_pm_rebuild_no_state_queue_graph(bce);
+ 
+ out_unlock:
+     mutex_unlock(&bce->pm_lock);
+@@ -683,6 +796,11 @@ out_unlock:
+     return status;
+ }
+ 
++static int t2bce_resume(struct device *dev)
++{
++    return t2bce_resume_mode(dev, false);
++}
++
+ static void t2bce_block_shared_dma(struct t2bce_device *bce)
+ {
+     struct pci_dev *functions[] = { bce->pci0, bce->pci, bce->pci2, bce->pci3 };
+@@ -815,7 +933,7 @@ static int t2bce_restore(struct device *dev)
+     if (bce->pci_dma_restore_failed)
+         return -EIO;
+ 
+-    status = t2bce_resume(dev);
++    status = t2bce_resume_mode(dev, true);
+     if (status) {
+         t2bce_block_shared_dma(bce);
+         return status;
+@@ -844,12 +962,14 @@ static void t2bce_complete(struct device *dev)
+ 
+     pr_debug("t2bce_core: complete: entry no_state_fallback=%d no_state_resume=%d\n",
+             bce->no_state_fallback, bce->no_state_resume);
+-    if (bce->no_state_fallback && t2bce_core_clients_pm_has_no_state_resume(bce)) {
++    if (bce->no_state_fallback && !bce->no_state_rebuild_failed &&
++            t2bce_core_clients_pm_has_no_state_resume(bce)) {
+         t2bce_core_clients_pm_complete(bce);
+-        bce->no_state_fallback = false;
+     }
++    bce->no_state_fallback = false;
+ 
+-    t2bce_core_notify_resume_complete(bce);
++    if (!bce->no_state_rebuild_failed)
++        t2bce_core_notify_resume_complete(bce);
+     bce->no_state_resume = false;
+     pr_debug("t2bce_core: complete: exit\n");
+ }
+@@ -867,11 +987,13 @@ struct dev_pm_ops t2bce_pci_driver_pm = {
+         .resume = t2bce_resume_with_shared_dma,
+         .suspend_noirq = t2bce_suspend_noirq,
+         .resume_noirq = t2bce_resume_noirq,
+-        .freeze = t2bce_suspend,
++        .freeze = t2bce_freeze,
+         .thaw = t2bce_resume_with_shared_dma,
++        .poweroff = t2bce_freeze,
+         .restore = t2bce_restore,
+         .freeze_noirq = t2bce_suspend_noirq,
+         .thaw_noirq = t2bce_resume_noirq,
++        .poweroff_noirq = t2bce_suspend_noirq,
+         .restore_noirq = t2bce_resume_noirq,
+         .complete = t2bce_complete
+ };
+diff --git a/drivers/staging/t2bce/t2bce_core/transport.c b/drivers/staging/t2bce/t2bce_core/transport.c
+index ab78e214..373cf633 100644
+--- a/drivers/staging/t2bce/t2bce_core/transport.c
++++ b/drivers/staging/t2bce/t2bce_core/transport.c
+@@ -212,6 +212,20 @@ int t2bce_core_clients_pm_prepare(struct t2bce_device *bce)
+     return ret;
+ }
+ 
++void t2bce_core_clients_pm_abort(struct t2bce_device *bce)
++{
++    struct t2bce_core_client *client;
++    int srcu_idx;
++
++    srcu_idx = srcu_read_lock(&bce->clients_srcu);
++    list_for_each_entry_srcu(client, &bce->clients, list,
++            srcu_read_lock_held(&bce->clients_srcu)) {
++        if (client->pm_ops.pm_abort)
++            client->pm_ops.pm_abort(READ_ONCE(client->pm_userdata));
++    }
++    srcu_read_unlock(&bce->clients_srcu, srcu_idx);
++}
++
+ void t2bce_core_clients_pm_prepare_no_state(struct t2bce_device *bce)
+ {
+     struct t2bce_core_client *client;
+@@ -226,6 +240,56 @@ void t2bce_core_clients_pm_prepare_no_state(struct t2bce_device *bce)
+     srcu_read_unlock(&bce->clients_srcu, srcu_idx);
+ }
+ 
++bool t2bce_core_clients_pm_can_rebuild_no_state(struct t2bce_device *bce)
++{
++    struct t2bce_core_client *client;
++    bool ret = true;
++    int srcu_idx;
++
++    srcu_idx = srcu_read_lock(&bce->clients_srcu);
++    list_for_each_entry_srcu(client, &bce->clients, list,
++            srcu_read_lock_held(&bce->clients_srcu)) {
++        if (!client->pm_ops.pm_drop_no_state_queues ||
++                !client->pm_ops.pm_rebuild_no_state_queues) {
++            ret = false;
++            break;
++        }
++    }
++    srcu_read_unlock(&bce->clients_srcu, srcu_idx);
++    return ret;
++}
++
++void t2bce_core_clients_pm_drop_no_state_queues(struct t2bce_device *bce)
++{
++    struct t2bce_core_client *client;
++    int srcu_idx;
++
++    srcu_idx = srcu_read_lock(&bce->clients_srcu);
++    list_for_each_entry_srcu(client, &bce->clients, list,
++            srcu_read_lock_held(&bce->clients_srcu))
++        client->pm_ops.pm_drop_no_state_queues(READ_ONCE(client->pm_userdata));
++    srcu_read_unlock(&bce->clients_srcu, srcu_idx);
++}
++
++int t2bce_core_clients_pm_rebuild_no_state_queues(struct t2bce_device *bce)
++{
++    struct t2bce_core_client *client;
++    void *userdata;
++    int ret = 0;
++    int srcu_idx;
++
++    srcu_idx = srcu_read_lock(&bce->clients_srcu);
++    list_for_each_entry_srcu(client, &bce->clients, list,
++            srcu_read_lock_held(&bce->clients_srcu)) {
++        userdata = READ_ONCE(client->pm_userdata);
++        ret = client->pm_ops.pm_rebuild_no_state_queues(userdata);
++        if (ret)
++            break;
++    }
++    srcu_read_unlock(&bce->clients_srcu, srcu_idx);
++    return ret;
++}
++
+ void t2bce_core_clients_pm_mark_no_state_resume(struct t2bce_device *bce)
+ {
+     struct t2bce_core_client *client;
+diff --git a/drivers/staging/t2bce/t2bce_vhci/queue.c b/drivers/staging/t2bce/t2bce_vhci/queue.c
+index 8698a6a3..1da088a7 100644
+--- a/drivers/staging/t2bce/t2bce_vhci/queue.c
++++ b/drivers/staging/t2bce/t2bce_vhci/queue.c
+@@ -40,11 +40,17 @@ void bce_vhci_message_queue_destroy(struct bce_vhci *vhci, struct bce_vhci_messa
+ {
+     if (!q->cq)
+         return;
+-    dma_free_coherent(t2bce_core_client_dma_dev(vhci->client),
+-                      sizeof(struct bce_vhci_message) * VHCI_EVENT_QUEUE_EL_COUNT,
+-                      q->data, q->dma_addr);
+-    t2bce_core_destroy_sq(vhci->client, q->sq);
++    if (q->data)
++        dma_free_coherent(t2bce_core_client_dma_dev(vhci->client),
++                          sizeof(struct bce_vhci_message) * VHCI_EVENT_QUEUE_EL_COUNT,
++                          q->data, q->dma_addr);
++    if (q->sq)
++        t2bce_core_destroy_sq(vhci->client, q->sq);
+     t2bce_core_destroy_cq(vhci->client, q->cq);
++    q->data = NULL;
++    q->dma_addr = 0;
++    q->sq = NULL;
++    q->cq = NULL;
+ }
+ 
+ void bce_vhci_message_queue_write(struct bce_vhci_message_queue *q, struct bce_vhci_message *req)
+@@ -101,10 +107,14 @@ void bce_vhci_event_queue_destroy(struct bce_vhci *vhci, struct bce_vhci_event_q
+ {
+     if (!q->sq)
+         return;
+-    dma_free_coherent(t2bce_core_client_dma_dev(vhci->client),
+-                      sizeof(struct bce_vhci_message) * VHCI_EVENT_QUEUE_EL_COUNT,
+-                      q->data, q->dma_addr);
++    if (q->data)
++        dma_free_coherent(t2bce_core_client_dma_dev(vhci->client),
++                          sizeof(struct bce_vhci_message) * VHCI_EVENT_QUEUE_EL_COUNT,
++                          q->data, q->dma_addr);
+     t2bce_core_destroy_sq(vhci->client, q->sq);
++    q->data = NULL;
++    q->dma_addr = 0;
++    q->sq = NULL;
+ }
+ 
+ static void bce_vhci_event_queue_completion(struct t2bce_core_queue_sq *sq)
+diff --git a/drivers/staging/t2bce/t2bce_vhci/vhci.c b/drivers/staging/t2bce/t2bce_vhci/vhci.c
+index 30ed51a0..ebf7c83b 100644
+--- a/drivers/staging/t2bce/t2bce_vhci/vhci.c
++++ b/drivers/staging/t2bce/t2bce_vhci/vhci.c
+@@ -42,7 +42,10 @@ static int __bce_vhci_add_hcd(struct bce_vhci *vhci);
+ static void bce_vhci_shutdown_client(void *userdata);
+ static void bce_vhci_pm_reset_client(void *userdata);
+ static int bce_vhci_pm_prepare_client(void *userdata);
++static void bce_vhci_pm_abort_client(void *userdata);
+ static void bce_vhci_pm_prepare_no_state_client(void *userdata);
++static void bce_vhci_pm_drop_no_state_queues_client(void *userdata);
++static int bce_vhci_pm_rebuild_no_state_queues_client(void *userdata);
+ static void bce_vhci_pm_mark_no_state_resume_client(void *userdata);
+ static bool bce_vhci_pm_is_no_state_resume_client(void *userdata);
+ static void bce_vhci_pm_complete_client(void *userdata);
+@@ -51,7 +54,10 @@ static const struct t2bce_core_client_pm_ops bce_vhci_pm_ops = {
+         .shutdown = bce_vhci_shutdown_client,
+         .pm_reset = bce_vhci_pm_reset_client,
+         .pm_prepare = bce_vhci_pm_prepare_client,
++        .pm_abort = bce_vhci_pm_abort_client,
+         .pm_prepare_no_state = bce_vhci_pm_prepare_no_state_client,
++        .pm_drop_no_state_queues = bce_vhci_pm_drop_no_state_queues_client,
++        .pm_rebuild_no_state_queues = bce_vhci_pm_rebuild_no_state_queues_client,
+         .pm_mark_no_state_resume = bce_vhci_pm_mark_no_state_resume_client,
+         .pm_is_no_state_resume = bce_vhci_pm_is_no_state_resume_client,
+         .pm_complete = bce_vhci_pm_complete_client,
+@@ -186,6 +192,8 @@ void bce_vhci_shutdown(struct bce_vhci *vhci)
+ void bce_vhci_pm_reset(struct bce_vhci *vhci)
+ {
+     vhci->no_state_resume = false;
++    vhci->no_state_queues_rebuilt = false;
++    vhci->pm_queues_paused = false;
+ }
+ 
+ static void bce_vhci_resume_event_queues(struct bce_vhci *vhci)
+@@ -237,14 +245,53 @@ int bce_vhci_pm_prepare(struct bce_vhci *vhci)
+     status = bce_vhci_pause_event_queues(vhci);
+     if (status)
+         WRITE_ONCE(vhci->system_suspending, false);
++    else
++        vhci->pm_queues_paused = true;
+     return status;
+ }
+ 
++void bce_vhci_pm_abort(struct bce_vhci *vhci)
++{
++    if (vhci->pm_queues_paused) {
++        bce_vhci_resume_event_queues(vhci);
++        vhci->pm_queues_paused = false;
++    }
++    WRITE_ONCE(vhci->system_suspending, false);
++    if (!vhci->hcd_registered)
++        queue_work(vhci->tq_state_wq, &vhci->w_add_hcd);
++}
++
+ void bce_vhci_pm_prepare_no_state(struct bce_vhci *vhci)
+ {
+     bce_vhci_remove_hcd(vhci);
+ }
+ 
++void bce_vhci_pm_drop_no_state_queues(struct bce_vhci *vhci)
++{
++    cancel_work_sync(&vhci->w_fw_events);
++    bce_vhci_destroy_event_queues(vhci);
++    bce_vhci_destroy_message_queues(vhci);
++    vhci->no_state_queues_rebuilt = false;
++}
++
++int bce_vhci_pm_rebuild_no_state_queues(struct bce_vhci *vhci)
++{
++    int status;
++
++    status = bce_vhci_create_message_queues(vhci);
++    if (status)
++        return status;
++
++    status = bce_vhci_create_event_queues(vhci);
++    if (status) {
++        bce_vhci_destroy_message_queues(vhci);
++        return status;
++    }
++
++    vhci->no_state_queues_rebuilt = true;
++    return 0;
++}
++
+ void bce_vhci_pm_mark_no_state_resume(struct bce_vhci *vhci)
+ {
+     vhci->no_state_resume = true;
+@@ -260,7 +307,10 @@ void bce_vhci_pm_complete(struct bce_vhci *vhci)
+     if (!vhci->no_state_resume)
+         return;
+ 
+-    bce_vhci_resume_event_queues(vhci);
++    if (!vhci->no_state_queues_rebuilt && vhci->pm_queues_paused)
++        bce_vhci_resume_event_queues(vhci);
++    vhci->pm_queues_paused = false;
++    vhci->no_state_queues_rebuilt = false;
+     WRITE_ONCE(vhci->system_suspending, false);
+     /* No-state fallback still requires the pre-existing HCD rebuild path. */
+     pr_debug("t2bce_vhci: scheduling HCD re-add after no-state wake\n");
+@@ -277,6 +327,11 @@ static int bce_vhci_pm_prepare_client(void *userdata)
+     return bce_vhci_pm_prepare(userdata);
+ }
+ 
++static void bce_vhci_pm_abort_client(void *userdata)
++{
++    bce_vhci_pm_abort(userdata);
++}
++
+ static void bce_vhci_shutdown_client(void *userdata)
+ {
+     bce_vhci_shutdown(userdata);
+@@ -287,6 +342,16 @@ static void bce_vhci_pm_prepare_no_state_client(void *userdata)
+     bce_vhci_pm_prepare_no_state(userdata);
+ }
+ 
++static void bce_vhci_pm_drop_no_state_queues_client(void *userdata)
++{
++    bce_vhci_pm_drop_no_state_queues(userdata);
++}
++
++static int bce_vhci_pm_rebuild_no_state_queues_client(void *userdata)
++{
++    return bce_vhci_pm_rebuild_no_state_queues(userdata);
++}
++
+ static void bce_vhci_pm_mark_no_state_resume_client(void *userdata)
+ {
+     bce_vhci_pm_mark_no_state_resume(userdata);
+@@ -817,12 +882,16 @@ static int bce_vhci_create_message_queues(struct bce_vhci *vhci)
+     }
+     spin_lock_init(&vhci->msg_asynchronous_lock);
+     bce_vhci_command_queue_create(&vhci->cq, &vhci->msg_commands);
++    vhci->command_queue_initialized = true;
+     return 0;
+ }
+ 
+ static void bce_vhci_destroy_message_queues(struct bce_vhci *vhci)
+ {
+-    bce_vhci_command_queue_destroy(&vhci->cq);
++    if (vhci->command_queue_initialized) {
++        bce_vhci_command_queue_destroy(&vhci->cq);
++        vhci->command_queue_initialized = false;
++    }
+     bce_vhci_message_queue_destroy(vhci, &vhci->msg_commands);
+     bce_vhci_message_queue_destroy(vhci, &vhci->msg_system);
+     bce_vhci_message_queue_destroy(vhci, &vhci->msg_isochronous);
+@@ -861,6 +930,7 @@ static void bce_vhci_destroy_event_queues(struct bce_vhci *vhci)
+     bce_vhci_event_queue_destroy(vhci, &vhci->ev_asynchronous);
+     if (vhci->ev_cq)
+         t2bce_core_destroy_cq(vhci->client, vhci->ev_cq);
++    vhci->ev_cq = NULL;
+ }
+ 
+ static void bce_vhci_send_fw_event_response(struct bce_vhci *vhci, struct bce_vhci_message *req, u16 status)
+diff --git a/drivers/staging/t2bce/t2bce_vhci/vhci.h b/drivers/staging/t2bce/t2bce_vhci/vhci.h
+index 2f8f19e9..ff043e63 100644
+--- a/drivers/staging/t2bce/t2bce_vhci/vhci.h
++++ b/drivers/staging/t2bce/t2bce_vhci/vhci.h
+@@ -40,8 +40,11 @@ struct bce_vhci {
+     struct work_struct w_fw_events;
+     struct work_struct w_add_hcd;
+     unsigned long port_change_pending;
++    bool command_queue_initialized;
+     bool no_state_resume;
++    bool no_state_queues_rebuilt;
+     bool hcd_registered;
++    bool pm_queues_paused;
+     bool system_suspending;
+ };
+ 
+@@ -57,7 +60,10 @@ void bce_vhci_remove_hcd(struct bce_vhci *vhci);
+ void bce_vhci_shutdown(struct bce_vhci *vhci);
+ void bce_vhci_pm_reset(struct bce_vhci *vhci);
+ int bce_vhci_pm_prepare(struct bce_vhci *vhci);
++void bce_vhci_pm_abort(struct bce_vhci *vhci);
+ void bce_vhci_pm_prepare_no_state(struct bce_vhci *vhci);
++void bce_vhci_pm_drop_no_state_queues(struct bce_vhci *vhci);
++int bce_vhci_pm_rebuild_no_state_queues(struct bce_vhci *vhci);
+ void bce_vhci_pm_mark_no_state_resume(struct bce_vhci *vhci);
+ bool bce_vhci_pm_is_no_state_resume(struct bce_vhci *vhci);
+ void bce_vhci_pm_complete(struct bce_vhci *vhci);

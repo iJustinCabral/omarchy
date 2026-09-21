@@ -45,7 +45,11 @@ assert ".resume = t2bce_resume_with_shared_dma" in bce_source
 assert ".thaw = t2bce_resume_with_shared_dma" in bce_source
 assert ".restore = t2bce_restore" in bce_source
 assert bce_resume_wrapper.index("pci_dma_restore_failed") < bce_resume_wrapper.index("t2bce_resume(dev)")
-assert bce_image_restore.index("pci_dma_restore_failed") < bce_image_restore.index("t2bce_resume(dev)")
+if "t2bce_resume_mode(dev, true)" in bce_image_restore:
+  image_restore_call = "t2bce_resume_mode(dev, true)"
+else:
+  image_restore_call = "t2bce_resume(dev)"
+assert bce_image_restore.index("pci_dma_restore_failed") < bce_image_restore.index(image_restore_call)
 assert "Leave the\n     * unbound SEP function blocked" in bce_image_restore
 
 bce_harness = r'''
