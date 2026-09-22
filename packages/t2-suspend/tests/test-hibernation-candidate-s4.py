@@ -15,6 +15,7 @@ spec.loader.exec_module(s4)
 
 
 BOOT_ID = "22222222-3333-4444-5555-666666666666"
+PROOF_BOOT_ID = "11111111-2222-3333-4444-555555555555"
 CANDIDATE_HASH = "01234567" * 8
 ENTRY_ID = "MBA-T2-hibernation-candidate-0123456701234567"
 
@@ -63,9 +64,14 @@ def platform_preflight(_root, _candidate):
 
 def proof_verifier(_root, _evidence, _post_input):
   return {
+    "test_resume_boot_id": PROOF_BOOT_ID,
     "test_resume_attempt": "/proof/test-resume.json",
     "post_test_resume_input": "/proof/post-input.json",
   }
+
+
+def current_input_verifier(_root, _evidence, _pre_s4_input):
+  return {"pre_s4_input": "/proof/pre-s4-input.json"}
 
 
 def staging_verifier(_root, _evidence):
@@ -132,8 +138,10 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-s4-") as directory:
     root,
     candidate,
     Path("proof/post-input.json"),
+    Path("proof/pre-s4-input.json"),
     platform_preflight,
     proof_verifier,
+    current_input_verifier,
     staging_verifier,
   )
   assert result["transition_vector"] == CANDIDATE_HASH
@@ -143,8 +151,10 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-s4-") as directory:
     root,
     candidate,
     Path("proof/post-input.json"),
+    Path("proof/pre-s4-input.json"),
     platform_preflight,
     proof_verifier,
+    current_input_verifier,
     staging_verifier,
     wifi_prepare,
     wifi_restore,
@@ -173,8 +183,10 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-s4-") as directory:
       root,
       candidate,
       Path("proof/post-input.json"),
+      Path("proof/pre-s4-input.json"),
       platform_preflight,
       proof_verifier,
+      current_input_verifier,
       staging_verifier,
     )
     raise AssertionError("runner accepted a consumed real-S4 vector")
@@ -221,8 +233,10 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-s4-failure-") as directory
       root,
       candidate,
       Path("proof/post-input.json"),
+      Path("proof/pre-s4-input.json"),
       platform_preflight,
       proof_verifier,
+      current_input_verifier,
       staging_verifier,
       lambda _root: None,
       lambda _root: None,
@@ -243,5 +257,60 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-s4-failure-") as directory
   assert record["state"] == "transition-failed"
   assert record["hibernate_attempted"] is True
   assert record["real_s4_attempted"] is True
+
+with tempfile.TemporaryDirectory(prefix="t2-candidate-s4-proof-") as directory:
+  root = fixture(Path(directory))
+  evidence = platform_preflight(root, Path("candidate"))
+  attempts, guard = s4.TEST.vector_paths(root, evidence)
+  write(guard, PROOF_BOOT_ID + "\n")
+  write(
+    attempts / PROOF_BOOT_ID / "attempt.json",
+    json.dumps({
+      "boot_id": PROOF_BOOT_ID,
+      "entry_id": ENTRY_ID,
+      "candidate_uki_sha256": CANDIDATE_HASH,
+      "transition_vector": CANDIDATE_HASH,
+      "state": "returned-and-cleaned",
+      "hibernate_attempted": True,
+      "physical_input_confirmed": True,
+    }),
+  )
+  write(
+    root / "proof/post-input.json",
+    json.dumps({
+      "boot_id": PROOF_BOOT_ID,
+      "entry_id": ENTRY_ID,
+      "keyboard_seen": True,
+      "trackpad_seen": True,
+    }),
+  )
+  write(
+    root / "proof/pre-s4-input.json",
+    json.dumps({
+      "boot_id": BOOT_ID,
+      "entry_id": ENTRY_ID,
+      "keyboard_seen": True,
+      "trackpad_seen": True,
+    }),
+  )
+  proof = s4.verify_test_resume_proof(root, evidence, Path("proof/post-input.json"))
+  assert proof["test_resume_boot_id"] == PROOF_BOOT_ID
+  assert PROOF_BOOT_ID != BOOT_ID
+  current = s4.verify_current_input(root, evidence, Path("proof/pre-s4-input.json"))
+  assert current["pre_s4_input"].endswith("proof/pre-s4-input.json")
+  write(
+    root / "proof/pre-s4-input.json",
+    json.dumps({
+      "boot_id": PROOF_BOOT_ID,
+      "entry_id": ENTRY_ID,
+      "keyboard_seen": True,
+      "trackpad_seen": True,
+    }),
+  )
+  try:
+    s4.verify_current_input(root, evidence, Path("proof/pre-s4-input.json"))
+    raise AssertionError("runner accepted pre-S4 input evidence from an earlier boot")
+  except ValueError as error:
+    assert "another boot or entry" in str(error)
 
 print("PASS: real-S4 runner arms exact resume UKI, executes once and restores isolated devices")

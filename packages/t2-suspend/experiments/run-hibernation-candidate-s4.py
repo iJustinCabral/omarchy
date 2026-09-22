@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 
 
@@ -68,13 +69,15 @@ def vector_paths(root, evidence):
 
 def verify_test_resume_proof(root, evidence, post_input_path):
   attempts, guard = TEST.vector_paths(root, evidence)
-  boot_id = evidence["boot_id"]
-  if guard.is_symlink() or not guard.is_file() or guard.read_text().strip() != boot_id:
-    raise ValueError("Successful test_resume guard does not match this boot")
-  attempt = attempts / boot_id / "attempt.json"
+  if guard.is_symlink() or not guard.is_file():
+    raise ValueError("Successful test_resume guard is missing or symlinked")
+  proof_boot_id = guard.read_text().strip()
+  if re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", proof_boot_id) is None:
+    raise ValueError("Successful test_resume guard has a malformed boot ID")
+  attempt = attempts / proof_boot_id / "attempt.json"
   record = load_json_file(attempt, "test_resume attempt evidence")
   expected = {
-    "boot_id": boot_id,
+    "boot_id": proof_boot_id,
     "entry_id": evidence["entry_id"],
     "candidate_uki_sha256": evidence["candidate_uki_sha256"],
     "transition_vector": evidence["candidate_uki_sha256"],
@@ -87,14 +90,25 @@ def verify_test_resume_proof(root, evidence, post_input_path):
       raise ValueError("test_resume proof mismatch: " + key)
 
   post_input = load_json_file(supplied_path(root, post_input_path), "post-test_resume input evidence")
-  if post_input.get("boot_id") != boot_id or post_input.get("entry_id") != evidence["entry_id"]:
+  if post_input.get("boot_id") != proof_boot_id or post_input.get("entry_id") != evidence["entry_id"]:
     raise ValueError("Post-test_resume input evidence names another boot or entry")
   if post_input.get("keyboard_seen") is not True or post_input.get("trackpad_seen") is not True:
     raise ValueError("Post-test_resume input evidence is incomplete")
   return {
+    "test_resume_boot_id": proof_boot_id,
     "test_resume_attempt": str(attempt),
     "post_test_resume_input": str(supplied_path(root, post_input_path)),
   }
+
+
+def verify_current_input(root, evidence, pre_s4_input_path):
+  path = supplied_path(root, pre_s4_input_path)
+  pre_s4_input = load_json_file(path, "pre-S4 input evidence")
+  if pre_s4_input.get("boot_id") != evidence["boot_id"] or pre_s4_input.get("entry_id") != evidence["entry_id"]:
+    raise ValueError("Pre-S4 input evidence names another boot or entry")
+  if pre_s4_input.get("keyboard_seen") is not True or pre_s4_input.get("trackpad_seen") is not True:
+    raise ValueError("Pre-S4 input evidence is incomplete")
+  return {"pre_s4_input": str(path)}
 
 
 def verify_staging(root, evidence):
@@ -117,8 +131,10 @@ def preflight(
   root,
   candidate_directory,
   post_input_path,
+  pre_s4_input_path,
   platform_preflight=TEST.platform_preflight,
   proof_verifier=verify_test_resume_proof,
+  current_input_verifier=verify_current_input,
   staging_verifier=verify_staging,
 ):
   evidence = platform_preflight(root, candidate_directory)
@@ -130,12 +146,14 @@ def preflight(
     raise ValueError("Platform hibernation is not selected")
   staging_verifier(root, evidence)
   proof = proof_verifier(root, evidence, post_input_path)
+  current_input = current_input_verifier(root, evidence, pre_s4_input_path)
   attempts, guard = vector_paths(root, evidence)
   if guard.exists():
     raise ValueError("The candidate real-S4 attempt was already consumed")
   return {
     **evidence,
     **proof,
+    **current_input,
     "transition_vector": identity,
     "s4_attempts": str(attempts),
     "real_s4_attempted": False,
@@ -178,8 +196,10 @@ def execute(
   root,
   candidate_directory,
   post_input_path,
+  pre_s4_input_path,
   platform_preflight=TEST.platform_preflight,
   proof_verifier=verify_test_resume_proof,
+  current_input_verifier=verify_current_input,
   staging_verifier=verify_staging,
   wifi_prepare=WIFI.prepare,
   wifi_restore=WIFI.restore,
@@ -195,8 +215,10 @@ def execute(
     root,
     candidate_directory,
     post_input_path,
+    pre_s4_input_path,
     platform_preflight,
     proof_verifier,
+    current_input_verifier,
     staging_verifier,
   )
   services_verifier(runner)
@@ -319,6 +341,7 @@ def main():
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--candidate-source", type=Path, required=True)
   parser.add_argument("--post-resume-input-evidence", type=Path, required=True)
+  parser.add_argument("--pre-s4-input-evidence", type=Path, required=True)
   parser.add_argument("--validate-only", action="store_true")
   parser.add_argument("--execute", action="store_true")
   args = parser.parse_args()
@@ -329,9 +352,19 @@ def main():
   try:
     if args.validate_only:
       verify_services()
-      result = preflight(Path("/"), args.candidate_source.resolve(), args.post_resume_input_evidence)
+      result = preflight(
+        Path("/"),
+        args.candidate_source.resolve(),
+        args.post_resume_input_evidence,
+        args.pre_s4_input_evidence,
+      )
     else:
-      result = execute(Path("/"), args.candidate_source.resolve(), args.post_resume_input_evidence)
+      result = execute(
+        Path("/"),
+        args.candidate_source.resolve(),
+        args.post_resume_input_evidence,
+        args.pre_s4_input_evidence,
+      )
   except (OSError, RuntimeError, ValueError) as error:
     raise SystemExit("Candidate real-S4 refused: " + str(error)) from error
   print(json.dumps(result, indent=2, sort_keys=True))
