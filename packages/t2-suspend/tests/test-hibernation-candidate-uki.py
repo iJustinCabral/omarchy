@@ -25,32 +25,39 @@ assert set(builder.MODULES) == {
   "t2bce_audio",
   "t2bce_ave",
 }
-assert set(builder.EARLY_MODULES) == set(builder.MODULES) - {"t2bce_ave"}
+assert set(builder.PRE_RESTORE_EXCLUDED_MODULES) == set(builder.MODULES)
 assert builder.REQUIRED_INITRD_FILES == (
-  "etc/modprobe.d/t2-bluetooth-order.conf",
-  "hooks/omarchy-t2-candidate-bluetooth",
-  "usr/bin/find",
+  "hooks/omarchy-t2-candidate-modules",
+  "usr/lib/omarchy-t2-hibernation-candidate/load-modules.py",
   "usr/lib/omarchy-t2-hibernation-candidate/bluetooth-after-wifi.py",
+  "usr/lib/omarchy-t2-hibernation-candidate/payload/manifest.json",
 )
 assert builder.CANDIDATE_HOOKS.is_dir()
+assert builder.CANDIDATE_MODULE_HELPER.is_file()
+assert builder.CANDIDATE_MODULE_HELPER.stat().st_mode & 0o111
 assert builder.CANDIDATE_BLUETOOTH_HELPER.is_file()
 assert builder.CANDIDATE_BLUETOOTH_HELPER.stat().st_mode & 0o111
-install_hook = builder.CANDIDATE_HOOKS / "install/omarchy-t2-candidate-bluetooth"
-assert "add_binary find || exit 1" in install_hook.read_text()
+builder_source = builder_path.read_text()
+assert 'run(("lsinitcpio", "--early", "--extract", initrd), cwd=extracted)' in builder_source
+install_hook = builder.CANDIDATE_HOOKS / "install/omarchy-t2-candidate-modules"
+assert "OMARCHY_T2_CANDIDATE_PAYLOAD" in install_hook.read_text()
 
-runtime_hook = builder.CANDIDATE_HOOKS / "hooks/omarchy-t2-candidate-bluetooth"
+runtime_hook = builder.CANDIDATE_HOOKS / "hooks/omarchy-t2-candidate-modules"
 with tempfile.TemporaryDirectory(prefix="t2-candidate-hook-") as directory:
   root = Path(directory)
   release = "7.2.6-test-t2"
   osrelease = root / "proc/sys/kernel/osrelease"
   osrelease.parent.mkdir(parents=True)
   osrelease.write_text(release + "\n")
-  module = root / "usr/lib/modules" / release / "updates/dkms/hci_bcm4377.ko"
-  module.parent.mkdir(parents=True)
-  module.write_bytes(b"candidate hci module")
-  helper = root / "usr/lib/omarchy-t2-hibernation-candidate/bluetooth-after-wifi.py"
-  helper.parent.mkdir(parents=True)
-  helper.write_bytes(builder.CANDIDATE_BLUETOOTH_HELPER.read_bytes())
+  source = root / "usr/lib/omarchy-t2-hibernation-candidate"
+  payload = source / "payload"
+  payload.mkdir(parents=True)
+  for name in builder.MODULES:
+    (payload / (name + ".ko")).write_bytes(("candidate " + name).encode())
+  (payload / "manifest.json").write_text('{"policy":"post-switch-root-only"}\n')
+  (payload / "hci_bcm4377.sha256").write_text("candidate digest\n")
+  (source / "load-modules.py").write_bytes(builder.CANDIDATE_MODULE_HELPER.read_bytes())
+  (source / "bluetooth-after-wifi.py").write_bytes(builder.CANDIDATE_BLUETOOTH_HELPER.read_bytes())
   subprocess.run(
     [
       "bash",
@@ -65,15 +72,29 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-hook-") as directory:
     text=True,
   )
   state = root / "run/omarchy-t2-hibernation-candidate"
-  assert (state / "hci_bcm4377.ko").read_bytes() == module.read_bytes()
-  assert (state / "bluetooth-after-wifi.py").read_bytes() == helper.read_bytes()
-  assert (state / "hci_bcm4377.sha256").read_text().strip() == builder.digest(module)
+  for name in builder.MODULES:
+    assert (state / (name + ".ko")).read_bytes() == (payload / (name + ".ko")).read_bytes()
+    assert (state / (name + ".ko")).stat().st_mode & 0o777 == 0o600
+  assert (state / "manifest.json").read_bytes() == (payload / "manifest.json").read_bytes()
+  assert (state / "hci_bcm4377.sha256").read_bytes() == (payload / "hci_bcm4377.sha256").read_bytes()
+  assert (state / "load-modules.py").read_bytes() == builder.CANDIDATE_MODULE_HELPER.read_bytes()
+  assert (state / "bluetooth-after-wifi.py").read_bytes() == builder.CANDIDATE_BLUETOOTH_HELPER.read_bytes()
   dropin = root / "run/systemd/system/bluetooth-after-wifi.service.d/50-hibernation-candidate.conf"
+  unit = root / "run/systemd/system/omarchy-t2-hibernation-candidate-modules.service"
+  wanted = root / "run/systemd/system/sysinit.target.wants/omarchy-t2-hibernation-candidate-modules.service"
   assert state.stat().st_mode & 0o777 == 0o700
   assert (root / "run/systemd").stat().st_mode & 0o777 == 0o755
   assert (root / "run/systemd/system").stat().st_mode & 0o777 == 0o755
   assert dropin.parent.stat().st_mode & 0o777 == 0o755
+  assert unit.is_file()
+  assert "Before=systemd-modules-load.service systemd-udev-trigger.service" in unit.read_text()
+  assert wanted.is_symlink()
+  assert wanted.readlink() == Path("../omarchy-t2-hibernation-candidate-modules.service")
   assert dropin.read_text() == (
+    "[Unit]\n"
+    "Requires=omarchy-t2-hibernation-candidate-modules.service\n"
+    "After=omarchy-t2-hibernation-candidate-modules.service\n"
+    "\n"
     "[Service]\n"
     "ExecStart=\n"
     "ExecStart=/usr/bin/python3 /run/omarchy-t2-hibernation-candidate/bluetooth-after-wifi.py\n"
@@ -96,8 +117,9 @@ assert not builder.under(Path("/tmp/candidate.efi"), Path("/boot"))
 config = (package / "experiments/hibernate-candidate-mkinitcpio.conf").read_text()
 assert '$candidate_hook != "omarchy-t2-suspend"' in config
 assert '$candidate_hook != "modconf"' not in config
-assert "HOOKS+=(omarchy-t2-candidate-bluetooth)" in config
-for name in builder.EARLY_MODULES:
+assert "HOOKS+=(omarchy-t2-candidate-modules)" in config
+assert "MODULES+=(" not in config
+for name in ("brcmfmac", "hci_bcm4377", "t2bce_core", "t2bce_vhci"):
   assert name in config
 
-print("PASS: candidate UKI builder keeps complete module and encrypted-root safety gates")
+print("PASS: candidate UKI keeps T2 modules out of pre-restore initramfs and stages exact ordinary-boot payload")

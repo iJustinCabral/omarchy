@@ -26,6 +26,7 @@ OSRELEASE = Path("proc/sys/kernel/osrelease")
 CMDLINE = Path("proc/cmdline")
 INPUT_DEVICES = Path("proc/bus/input/devices")
 ASOUND_CARDS = Path("proc/asound/cards")
+ORDINARY_BOOT_MARKER = Path("run/omarchy-t2-hibernation-candidate/ordinary-boot-loaded.json")
 REQUIRED_MODULES = (
   "brcmfmac",
   "brcmfmac-wcc",
@@ -135,6 +136,42 @@ def verify_devices(root):
   }
 
 
+def verify_post_switch_root_policy(root, provenance, boot_id, entry_id):
+  policy = provenance.get("pre_restore_module_policy")
+  if policy is None:
+    return None
+  if policy != "root-only-no-t2-radio":
+    raise ValueError("Candidate provenance has an unknown pre-restore module policy")
+  excluded = provenance.get("pre_restore_excluded_modules")
+  if not isinstance(excluded, list) or not set(REQUIRED_MODULES).issubset(excluded):
+    raise ValueError("Candidate provenance does not exclude every required module before restore")
+  marker_path = confined(root, ORDINARY_BOOT_MARKER)
+  if marker_path.is_symlink() or not marker_path.is_file():
+    raise ValueError("Candidate post-switch-root module marker is missing or symlinked")
+  try:
+    marker = json.loads(marker_path.read_text())
+  except json.JSONDecodeError as error:
+    raise ValueError("Candidate post-switch-root module marker is malformed") from error
+  expected = {
+    "boot_id": boot_id,
+    "entry_id": entry_id,
+    "kernel_release": provenance["kernel_release"],
+    "policy": "post-switch-root-only",
+  }
+  for key, value in expected.items():
+    if marker.get(key) != value:
+      raise ValueError("Candidate post-switch-root module marker mismatch: " + key)
+  loaded = marker.get("loaded_srcversions")
+  if not isinstance(loaded, dict):
+    raise ValueError("Candidate post-switch-root module marker omits source versions")
+  for name in REQUIRED_MODULES:
+    if name == "hci_bcm4377":
+      continue
+    if loaded.get(name) != provenance.get("modules", {}).get(name, {}).get("srcversion"):
+      raise ValueError("Candidate post-switch-root module marker mismatch: " + name)
+  return policy
+
+
 def inspect(root, candidate_directory):
   receipt = STAGER.load_receipt(root)
   if receipt.get("state") != "arming":
@@ -159,6 +196,12 @@ def inspect(root, candidate_directory):
   boot_id = read(confined(root, BOOT_ID))
   if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", boot_id):
     raise ValueError("Running boot ID is malformed")
+  pre_restore_module_policy = verify_post_switch_root_policy(
+    root,
+    provenance,
+    boot_id,
+    receipt["entry_id"],
+  )
 
   return {
     "qualification": "candidate-boot-preflight-passed",
@@ -167,6 +210,7 @@ def inspect(root, candidate_directory):
     "kernel_release": provenance["kernel_release"],
     "cmdline_sha256": sha256_text(cmdline),
     "candidate_uki_sha256": receipt["candidate_uki_sha256"],
+    "pre_restore_module_policy": pre_restore_module_policy,
     "modules": verify_modules(root, provenance),
     "pci": verify_pci(root),
     "devices": verify_devices(root),

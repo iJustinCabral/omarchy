@@ -20,6 +20,7 @@ import tempfile
 HERE = Path(__file__).resolve().parent
 CONFIG = HERE / "hibernate-candidate-mkinitcpio.conf"
 CANDIDATE_HOOKS = HERE / "hibernate-candidate-initcpio"
+CANDIDATE_MODULE_HELPER = HERE / "hibernate-candidate-modules.py"
 CANDIDATE_BLUETOOTH_HELPER = HERE / "hibernate-candidate-bluetooth.py"
 MODULES = {
   "brcmfmac": "drivers/net/wireless/broadcom/brcm80211/brcmfmac/brcmfmac.ko",
@@ -33,12 +34,12 @@ MODULES = {
   "t2bce_audio": "drivers/staging/t2bce/t2bce_audio/t2bce_audio.ko",
   "t2bce_ave": "drivers/staging/t2bce/t2bce_ave/t2bce_ave.ko",
 }
-EARLY_MODULES = tuple(name for name in MODULES if name != "t2bce_ave")
+PRE_RESTORE_EXCLUDED_MODULES = tuple(MODULES)
 REQUIRED_INITRD_FILES = (
-  "etc/modprobe.d/t2-bluetooth-order.conf",
-  "hooks/omarchy-t2-candidate-bluetooth",
-  "usr/bin/find",
+  "hooks/omarchy-t2-candidate-modules",
+  "usr/lib/omarchy-t2-hibernation-candidate/load-modules.py",
   "usr/lib/omarchy-t2-hibernation-candidate/bluetooth-after-wifi.py",
+  "usr/lib/omarchy-t2-hibernation-candidate/payload/manifest.json",
 )
 CRITICAL_CMDLINE_KEYS = {
   "cryptdevice",
@@ -157,12 +158,40 @@ def prepare_module_root(work, candidate, release, expected):
   return module_root, selected
 
 
-def build_initrd(work, module_root, release, expected):
+def prepare_payload(work, candidate, release, expected):
+  payload = work / "candidate-payload"
+  payload.mkdir()
+  modules = {}
+  for name, relative in MODULES.items():
+    source = candidate / relative
+    destination = payload / (name + ".ko")
+    shutil.copyfile(source, destination)
+    destination.chmod(0o600)
+    modules[name] = {
+      "file": destination.name,
+      "sha256": expected[name]["sha256"],
+      "srcversion": expected[name]["srcversion"],
+    }
+  manifest = {
+    "kernel_release": release,
+    "modules": modules,
+    "policy": "post-switch-root-only",
+  }
+  (payload / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+  (payload / "manifest.json").chmod(0o600)
+  (payload / "hci_bcm4377.sha256").write_text(expected["hci_bcm4377"]["sha256"] + "\n")
+  (payload / "hci_bcm4377.sha256").chmod(0o600)
+  return payload, modules
+
+
+def build_initrd(work, module_root, payload, release, expected):
   initrd = work / "candidate.initrd"
   run((
     "env",
     "MKINITCPIO_HOOKS=" + str(CANDIDATE_HOOKS / "hooks") + ":/etc/initcpio/hooks:/usr/lib/initcpio/hooks",
     "MKINITCPIO_INSTALL=" + str(CANDIDATE_HOOKS / "install") + ":/etc/initcpio/install:/usr/lib/initcpio/install",
+    "OMARCHY_T2_CANDIDATE_PAYLOAD=" + str(payload),
+    "OMARCHY_T2_CANDIDATE_MODULE_HELPER=" + str(CANDIDATE_MODULE_HELPER),
     "OMARCHY_T2_CANDIDATE_BLUETOOTH_HELPER=" + str(CANDIDATE_BLUETOOTH_HELPER),
     "mkinitcpio",
     "--config",
@@ -177,6 +206,7 @@ def build_initrd(work, module_root, release, expected):
 
   extracted = work / "initrd-root"
   extracted.mkdir()
+  run(("lsinitcpio", "--early", "--extract", initrd), cwd=extracted)
   run(("lsinitcpio", "--cpio", "--extract", initrd), cwd=extracted)
   required = (
     "init",
@@ -190,44 +220,44 @@ def build_initrd(work, module_root, release, expected):
   for name in REQUIRED_INITRD_FILES:
     if not (extracted / name).is_file():
       raise ValueError("Candidate initramfs omitted candidate boot policy: " + name)
-  blacklist = (extracted / "etc/modprobe.d/t2-bluetooth-order.conf").read_text()
-  if not re.search(r"^\s*blacklist\s+hci_bcm4377(?:\s|$)", blacklist, re.M):
-    raise ValueError("Candidate initramfs Bluetooth blacklist is inactive")
   build_config = (extracted / "config").read_text()
-  if "omarchy-t2-candidate-bluetooth" not in build_config:
+  if "omarchy-t2-candidate-modules" not in build_config:
     raise ValueError("Candidate initramfs late hook is not scheduled")
 
-  initrd_modules = {}
-  for name in EARLY_MODULES:
-    matches = list((extracted / "usr/lib/modules" / release).rglob(name + ".ko"))
-    if len(matches) != 1:
-      raise ValueError(f"Candidate initramfs contains {len(matches)} uncompressed copies of {name}")
-    if digest(matches[0]) != expected[name]["sha256"]:
-      raise ValueError("Candidate initramfs module hash mismatch: " + name)
-    initrd_modules[name] = str(matches[0].relative_to(extracted))
+  module_tree = extracted / "usr/lib/modules" / release
+  for name in PRE_RESTORE_EXCLUDED_MODULES:
+    if list(module_tree.rglob(name + ".ko")) or list(module_tree.rglob(name + ".ko.*")):
+      raise ValueError("Candidate initramfs would load a pre-restore module: " + name)
 
-  runtime = work / "initrd-runtime-root"
-  runtime.mkdir()
-  run(("lsinitcpio", "--early", "--extract", initrd), cwd=runtime)
-  run(("lsinitcpio", "--cpio", "--extract", initrd), cwd=runtime)
-  resolution = run((
-    "modprobe",
-    "--config",
-    runtime / "etc/modprobe.d",
-    "--dirname",
-    runtime,
-    "--set-version",
-    release,
-    "--show-depends",
-    "--use-blacklist",
-    "hci_bcm4377",
-  ), capture=True)
-  if resolution.stderr.strip():
-    raise ValueError("Candidate initramfs cannot resolve hci_bcm4377 dependencies: " + resolution.stderr.strip())
-  loaded = [Path(line.split()[1]) for line in resolution.stdout.splitlines() if line.startswith("insmod ")]
-  if any(path.name == "hci_bcm4377.ko" for path in loaded):
-    raise ValueError("Candidate initramfs would load hci_bcm4377 before Wi-Fi readiness")
-  return initrd, initrd_modules
+  for name in ("nvme", "nvme-core", "dm-crypt"):
+    matches = list(module_tree.rglob(name + ".ko")) + list(module_tree.rglob(name + ".ko.*"))
+    if len(matches) != 1:
+      raise ValueError(f"Candidate initramfs contains {len(matches)} copies of root-critical module {name}")
+
+  payload_root = extracted / "usr/lib/omarchy-t2-hibernation-candidate/payload"
+  payload_manifest = json.loads((payload_root / "manifest.json").read_text())
+  if payload_manifest.get("policy") != "post-switch-root-only":
+    raise ValueError("Candidate initramfs payload policy mismatch")
+  bluetooth_digest = payload_root / "hci_bcm4377.sha256"
+  if bluetooth_digest.read_text().strip() != expected["hci_bcm4377"]["sha256"]:
+    raise ValueError("Candidate initramfs Bluetooth digest mismatch")
+  staged_payload = {}
+  for name in MODULES:
+    expected_path = payload_root / (name + ".ko")
+    if not expected_path.is_file() or expected_path.is_symlink():
+      raise ValueError("Candidate initramfs omitted post-switch-root payload: " + name)
+    if digest(expected_path) != expected[name]["sha256"]:
+      raise ValueError("Candidate initramfs payload hash mismatch: " + name)
+    metadata = payload_manifest.get("modules", {}).get(name, {})
+    if metadata.get("file") != name + ".ko" or metadata.get("sha256") != expected[name]["sha256"]:
+      raise ValueError("Candidate initramfs payload manifest mismatch: " + name)
+    staged_payload[name] = str(expected_path.relative_to(extracted))
+
+  for name in PRE_RESTORE_EXCLUDED_MODULES:
+    matches = list((extracted / "usr/lib/modules" / release).rglob(name + ".ko"))
+    if matches:
+      raise ValueError("Candidate initramfs duplicated payload in module tree: " + name)
+  return initrd, staged_payload
 
 
 def pe_sections(path):
@@ -341,7 +371,8 @@ def main():
     work = Path(directory)
     provenance_path, expected = validate_candidate(candidate_source, args.kernel_release)
     module_root, selected = prepare_module_root(work, candidate_source, args.kernel_release, expected)
-    initrd, initrd_modules = build_initrd(work, module_root, args.kernel_release, expected)
+    payload, payload_modules = prepare_payload(work, candidate_source, args.kernel_release, expected)
+    initrd, staged_payload = build_initrd(work, module_root, payload, args.kernel_release, expected)
     uki, cmdline, sections, production_hash = build_uki(work, production, initrd)
 
     publish = work / "publish"
@@ -360,7 +391,11 @@ def main():
       "source_provenance_sha256": digest(provenance_path),
       "modules": expected,
       "private_module_selection": selected,
-      "initrd_module_selection": initrd_modules,
+      "initrd_module_selection": {},
+      "pre_restore_module_policy": "root-only-no-t2-radio",
+      "pre_restore_excluded_modules": list(PRE_RESTORE_EXCLUDED_MODULES),
+      "post_switch_root_payload": staged_payload,
+      "payload_modules": payload_modules,
       "production_modified": False,
       "installed": False,
       "boot_entry_created": False,

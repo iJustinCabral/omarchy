@@ -66,6 +66,8 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-boot-verifier-") as direct
     "kernel_release": release,
     "cmdline": cmdline,
     "modules": modules,
+    "pre_restore_module_policy": "root-only-no-t2-radio",
+    "pre_restore_excluded_modules": list(modules),
   }
   (candidate / "provenance.json").write_text(json.dumps(provenance))
 
@@ -103,10 +105,23 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-boot-verifier-") as direct
       (path / "driver").symlink_to("../../../drivers/" + driver)
   (root / "sys/bus/pci/devices/0000:73:00.0/net/wlp115s0f0").mkdir(parents=True)
   (root / "sys/class/bluetooth/hci0").mkdir(parents=True)
+  marker = root / verifier.ORDINARY_BOOT_MARKER
+  write(marker, json.dumps({
+    "boot_id": "11111111-2222-3333-4444-555555555555",
+    "entry_id": receipt["entry_id"],
+    "kernel_release": release,
+    "loaded_srcversions": {
+      name: modules[name]["srcversion"]
+      for name in verifier.REQUIRED_MODULES
+      if name != "hci_bcm4377"
+    },
+    "policy": "post-switch-root-only",
+  }))
 
   result = verifier.inspect(root, candidate)
   assert result["qualification"] == "candidate-boot-preflight-passed"
   assert result["entry_id"] == receipt["entry_id"]
+  assert result["pre_restore_module_policy"] == "root-only-no-t2-radio"
   assert result["physical_input_confirmed"] is False
   assert result["hibernate_attempted"] is False
   assert result["hardware_qualified"] is False
@@ -126,5 +141,15 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-boot-verifier-") as direct
     raise AssertionError("wrong loaded candidate module passed verification")
   except ValueError as error:
     assert "does not match candidate" in str(error)
+  module_version.write_text(modules["t2bce_core"]["srcversion"] + "\n")
+
+  marker_data = json.loads(marker.read_text())
+  marker_data["boot_id"] = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+  marker.write_text(json.dumps(marker_data))
+  try:
+    verifier.inspect(root, candidate)
+    raise AssertionError("stale post-switch-root marker passed verification")
+  except ValueError as error:
+    assert "marker mismatch: boot_id" in str(error)
 
 print("PASS: candidate boot verifier proves selected entry, loaded modules and T2 devices without claiming physical input")
