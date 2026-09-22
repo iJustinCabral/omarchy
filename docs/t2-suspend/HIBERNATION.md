@@ -162,6 +162,14 @@ The new result weakens the earlier attribution of the reset to Wi-Fi restore-tim
 
 The returned boot printed RTC magic `6:883:393` without a file/device match, and `/sys/power/pm_trace_dev_match` was empty. Its early RTC read was `1970-01-01 19:23:55`, making the trace unqualified evidence rather than a usable callback identification. Wall-clock timestamps across this transition are unreliable. Further work must distinguish image-restoration state from ordinary freeze/thaw and obtain reliable failure localization before another image test. All five non-image passes remain valid only for their tested boundaries.
 
+### Candidate v9 real-S4 result
+
+Candidate v9 later made the in-place `test_resume` path return successfully with usable internal input and radios, but its separate guarded real-S4 attempt did not restore userspace. Source boot `590a1875-4ae7-4e14-b958-86f037447888` passed exact candidate, staging, swap/resume, platform-mode, service and physical-input gates. Its journal records the guarded runner start followed by `PM: hibernation: hibernation entry`; the hash-bound S4 guard names that boot and the attempt remains `transition-armed` with `real_s4_attempted=true`.
+
+The candidate resume one-shot was consumed without producing a candidate userspace journal, after which production boot `33708738-107c-4e73-b072-4784cedb5ab9` returned healthy. The stock kernel found no remaining image, pstore is empty, and PM-trace magic `6:271:339` matches neither a compiled trace site nor a current device. As in earlier attempts, the Apple RTC trace is not sufficient to identify a callback. Preserve the S4 guard and attempt permanently; never repeat this v9 vector.
+
+The decisive difference from the successful in-place restore is now the cold resume kernel and platform cycle. The v9 initramfs forcibly loads the candidate BCE and Broadcom Wi-Fi module families before its resume hook restores the image. That creates and then quiesces a fresh firmware and DMA-queue epoch which does not exist during `test_resume`. The next materially distinct candidate should keep every non-root T2 and radio module outside the initramfs module tree, retain only the encrypted-root and image-resume path before restoration, and stage the exact candidate modules for post-`switch_root` loading when the image boots normally without a hibernation image. This is a bounded hypothesis derived from the observed path difference, not a claim that pre-restore probing caused the reset.
+
 ### Recovery boot after package 1.4 installation
 
 The continuity reboot from checkpoint `9ee92a79` reached a Limine EFI hash mismatch on the normal entry. The operator selected snapshot 1; the resulting root was a temporary overlay and loaded older drivers, so this was not a successful 1.4 boot. The primary root's receipt still reported 1.4 installed, and extraction of the normal UKI confirmed Wi-Fi source version `1D85357EB5E65B246EDEE20`.
