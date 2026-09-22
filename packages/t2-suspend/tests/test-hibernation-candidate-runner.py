@@ -15,6 +15,7 @@ spec.loader.exec_module(candidate_runner)
 
 
 BOOT_ID = "11111111-2222-3333-4444-555555555555"
+CANDIDATE_HASH = "deadbeef" * 8
 
 
 def write(path, data):
@@ -41,6 +42,7 @@ def inspect(_root, _candidate):
     "qualification": "candidate-boot-preflight-passed",
     "boot_id": BOOT_ID,
     "entry_id": "MBA-T2-hibernation-candidate-deadbeefdeadbeef",
+    "candidate_uki_sha256": CANDIDATE_HASH,
     "physical_input_confirmed": False,
     "hibernate_attempted": False,
     "hardware_qualified": False,
@@ -61,6 +63,7 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-runner-") as directory:
   events = []
   bluetooth = [True]
   timer = [False]
+  vector = root / candidate_runner.VECTORS / CANDIDATE_HASH
 
   def runner(arguments, check=True, capture=False):
     arguments = tuple(arguments)
@@ -88,13 +91,14 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-runner-") as directory:
     events.append(("power", path.name, value))
     if path.name == "state":
       assert timer[0]
-      assert (root / candidate_runner.GUARD).read_text().strip() == BOOT_ID
+      assert (vector / "test-resume-attempted").read_text().strip() == BOOT_ID
 
   result = candidate_runner.preflight(root, candidate, inspector=inspect)
   assert result["resume_offset"] == 42
   assert result["swap_file"] == "/dev/mapper/root"
   assert result["pm_test_before"] == "none"
   assert result["disk_before"] == "platform"
+  assert result["transition_vector"] == CANDIDATE_HASH
 
   try:
     candidate_runner.execute(root, candidate, False, inspector=inspect)
@@ -122,7 +126,7 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-runner-") as directory:
   assert timer == [False]
   assert events.index(("wifi", "prepare")) < events.index(("power", "state", "disk"))
   assert events.index(("power", "state", "disk")) < events.index(("wifi", "restore"))
-  attempt = root / candidate_runner.ATTEMPTS / BOOT_ID / "attempt.json"
+  attempt = vector / "attempts" / BOOT_ID / "attempt.json"
   assert json.loads(attempt.read_text())["state"] == "returned-and-cleaned"
 
   try:
@@ -132,6 +136,7 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-runner-") as directory:
     assert "already consumed" in str(error)
 
   root = fixture(base / "failure")
+  vector = root / candidate_runner.VECTORS / CANDIDATE_HASH
   bluetooth = [True]
   timer = [False]
   events = []
@@ -139,7 +144,7 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-runner-") as directory:
   def failing_power_writer(path, value):
     events.append(("power", path.name, value))
     if path.name == "state":
-      assert (root / candidate_runner.GUARD).exists()
+      assert (vector / "test-resume-attempted").exists()
       raise OSError("injected transition rejection")
 
   try:
@@ -158,15 +163,16 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-runner-") as directory:
     raise AssertionError("transition rejection was ignored")
   except OSError as error:
     assert "injected transition rejection" in str(error)
-  failure = json.loads((root / candidate_runner.ATTEMPTS / BOOT_ID / "attempt.json").read_text())
+  failure = json.loads((vector / "attempts" / BOOT_ID / "attempt.json").read_text())
   assert failure["state"] == "transition-failed"
   assert failure["hibernate_attempted"] is True
-  assert (root / candidate_runner.GUARD).exists()
+  assert (vector / "test-resume-attempted").exists()
   assert bluetooth == [True]
   assert timer == [False]
   assert ("wifi", "restore") in events
 
   root = fixture(base / "cleanup-failure")
+  vector = root / candidate_runner.VECTORS / CANDIDATE_HASH
   bluetooth = [True]
   timer = [False]
   events = []
@@ -191,10 +197,34 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-runner-") as directory:
     raise AssertionError("cleanup failure was ignored")
   except RuntimeError as error:
     assert "cleanup failed" in str(error)
-  cleanup_failure = json.loads((root / candidate_runner.ATTEMPTS / BOOT_ID / "attempt.json").read_text())
+  cleanup_failure = json.loads((vector / "attempts" / BOOT_ID / "attempt.json").read_text())
   assert cleanup_failure["state"] == "cleanup-failed"
   assert "wifi" in cleanup_failure["cleanup_errors"][0]
   assert timer == [True]
-  assert (root / candidate_runner.GUARD).exists()
+  assert (vector / "test-resume-attempted").exists()
+
+  root = fixture(base / "legacy-same-candidate")
+  write(root / candidate_runner.GUARD, BOOT_ID + "\n")
+  legacy_attempt = root / candidate_runner.ATTEMPTS / BOOT_ID / "attempt.json"
+  write(legacy_attempt, json.dumps({
+    "boot_id": BOOT_ID,
+    "candidate_uki_sha256": CANDIDATE_HASH,
+  }) + "\n")
+  try:
+    candidate_runner.preflight(root, candidate, inspector=inspect)
+    raise AssertionError("legacy guard allowed the same candidate to repeat")
+  except ValueError as error:
+    assert "legacy guard" in str(error)
+
+  root = fixture(base / "legacy-other-candidate")
+  write(root / candidate_runner.GUARD, BOOT_ID + "\n")
+  legacy_attempt = root / candidate_runner.ATTEMPTS / BOOT_ID / "attempt.json"
+  write(legacy_attempt, json.dumps({
+    "boot_id": BOOT_ID,
+    "candidate_uki_sha256": "01234567" * 8,
+  }) + "\n")
+  result = candidate_runner.preflight(root, candidate, inspector=inspect)
+  assert result["transition_vector"] == CANDIDATE_HASH
+  assert (root / candidate_runner.GUARD).read_text().strip() == BOOT_ID
 
 print("PASS: candidate runner validates read-only, executes once, recovers devices and preserves failed-attempt evidence")

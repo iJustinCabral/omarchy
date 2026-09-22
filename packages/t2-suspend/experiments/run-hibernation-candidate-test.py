@@ -37,6 +37,7 @@ POWER = Path("sys/power")
 SWAPS = Path("proc/swaps")
 ATTEMPTS = STAGER.STATE / "test-resume-attempts"
 GUARD = STAGER.STATE / "test-resume-attempted"
+VECTORS = STAGER.STATE / "test-resume-vectors"
 RECOVERY_UNIT = "omarchy-t2-hibernation-candidate-recovery"
 
 
@@ -103,8 +104,40 @@ def save_attempt(path, data):
   STAGER.atomic_write(path, (json.dumps(data, indent=2, sort_keys=True) + "\n").encode(), 0o600)
 
 
+def candidate_hash(value):
+  if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+    raise ValueError("Candidate UKI hash is malformed")
+  return value
+
+
+def vector_paths(root, evidence):
+  identity = candidate_hash(evidence.get("candidate_uki_sha256"))
+  directory = confined(root, VECTORS / identity)
+  return directory / "attempts", directory / "test-resume-attempted"
+
+
+def legacy_consumed_hash(root):
+  guard = confined(root, GUARD)
+  if not guard.exists():
+    return None
+  boot_id = guard.read_text().strip()
+  if re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", boot_id) is None:
+    raise ValueError("Legacy test-resume guard is malformed")
+  attempt = confined(root, ATTEMPTS / boot_id / "attempt.json")
+  if not attempt.is_file():
+    raise ValueError("Legacy test-resume guard has no matching attempt evidence")
+  try:
+    record = json.loads(attempt.read_text())
+  except json.JSONDecodeError as error:
+    raise ValueError("Legacy test-resume attempt evidence is malformed") from error
+  if record.get("boot_id") != boot_id:
+    raise ValueError("Legacy test-resume attempt names a different boot")
+  return candidate_hash(record.get("candidate_uki_sha256"))
+
+
 def preflight(root, candidate_directory, inspector=VERIFIER.inspect):
   boot = inspector(root, candidate_directory)
+  identity = candidate_hash(boot.get("candidate_uki_sha256"))
   power = confined(root, POWER)
   required = ("state", "disk", "pm_test", "pm_trace", "resume", "resume_offset", "pm_async")
   for name in required:
@@ -130,13 +163,17 @@ def preflight(root, candidate_directory, inspector=VERIFIER.inspect):
   file_swaps = [fields for fields in swaps if len(fields) >= 2 and fields[1] == "file"]
   if len(file_swaps) != 1:
     raise ValueError("Exactly one active swap file is required")
-  if confined(root, GUARD).exists():
+  if legacy_consumed_hash(root) == identity:
+    raise ValueError("The candidate test-resume attempt was already consumed by the legacy guard")
+  _attempts, guard = vector_paths(root, boot)
+  if guard.exists():
     raise ValueError("The candidate test-resume attempt was already consumed")
   _directory, wifi_marker = WIFI.state_paths(root)
   if wifi_marker.exists():
     raise ValueError("A prior Wi-Fi isolation cleanup is pending")
   return {
     **boot,
+    "transition_vector": identity,
     "resume": (power / "resume").read_text().strip(),
     "resume_offset": resume_offset,
     "swap_file": file_swaps[0][0],
@@ -178,7 +215,8 @@ def execute(
     raise ValueError("Physical keyboard and trackpad confirmation is required")
   evidence = preflight(root, candidate_directory, inspector)
   boot_id = evidence["boot_id"]
-  attempt_directory = confined(root, ATTEMPTS / boot_id)
+  attempts, guard = vector_paths(root, evidence)
+  attempt_directory = attempts / boot_id
   attempt_directory.mkdir(parents=True, mode=0o700)
   attempt = attempt_directory / "attempt.json"
   record = {
@@ -215,7 +253,7 @@ def execute(
     )
     sync()
 
-    create_guard(confined(root, GUARD), boot_id)
+    create_guard(guard, boot_id)
     transition_started = True
     power_writer(power / "state", "disk")
     print("omarchy-t2-hibernation-candidate: test-resume returned", flush=True)
