@@ -19,6 +19,8 @@ import tempfile
 
 HERE = Path(__file__).resolve().parent
 CONFIG = HERE / "hibernate-candidate-mkinitcpio.conf"
+CANDIDATE_HOOKS = HERE / "hibernate-candidate-initcpio"
+CANDIDATE_BLUETOOTH_HELPER = HERE / "hibernate-candidate-bluetooth.py"
 MODULES = {
   "brcmfmac": "drivers/net/wireless/broadcom/brcm80211/brcmfmac/brcmfmac.ko",
   "brcmfmac-bca": "drivers/net/wireless/broadcom/brcm80211/brcmfmac/bca/brcmfmac-bca.ko",
@@ -32,8 +34,10 @@ MODULES = {
   "t2bce_ave": "drivers/staging/t2bce/t2bce_ave/t2bce_ave.ko",
 }
 EARLY_MODULES = tuple(name for name in MODULES if name != "t2bce_ave")
-FORBIDDEN_INITRD_FILES = (
+REQUIRED_INITRD_FILES = (
   "etc/modprobe.d/t2-bluetooth-order.conf",
+  "hooks/omarchy-t2-candidate-bluetooth",
+  "usr/lib/omarchy-t2-hibernation-candidate/bluetooth-after-wifi.py",
 )
 CRITICAL_CMDLINE_KEYS = {
   "cryptdevice",
@@ -155,6 +159,10 @@ def prepare_module_root(work, candidate, release, expected):
 def build_initrd(work, module_root, release, expected):
   initrd = work / "candidate.initrd"
   run((
+    "env",
+    "MKINITCPIO_HOOKS=" + str(CANDIDATE_HOOKS / "hooks") + ":/etc/initcpio/hooks:/usr/lib/initcpio/hooks",
+    "MKINITCPIO_INSTALL=" + str(CANDIDATE_HOOKS / "install") + ":/etc/initcpio/install:/usr/lib/initcpio/install",
+    "OMARCHY_T2_CANDIDATE_BLUETOOTH_HELPER=" + str(CANDIDATE_BLUETOOTH_HELPER),
     "mkinitcpio",
     "--config",
     CONFIG,
@@ -178,9 +186,15 @@ def build_initrd(work, module_root, release, expected):
   for name in required:
     if not (extracted / name).exists():
       raise ValueError("Candidate initramfs omitted boot-critical file: " + name)
-  for name in FORBIDDEN_INITRD_FILES:
-    if (extracted / name).exists():
-      raise ValueError("Candidate initramfs retained host-only policy: " + name)
+  for name in REQUIRED_INITRD_FILES:
+    if not (extracted / name).is_file():
+      raise ValueError("Candidate initramfs omitted candidate boot policy: " + name)
+  blacklist = (extracted / "etc/modprobe.d/t2-bluetooth-order.conf").read_text()
+  if not re.search(r"^\s*blacklist\s+hci_bcm4377(?:\s|$)", blacklist, re.M):
+    raise ValueError("Candidate initramfs Bluetooth blacklist is inactive")
+  build_config = (extracted / "config").read_text()
+  if "omarchy-t2-candidate-bluetooth" not in build_config:
+    raise ValueError("Candidate initramfs late hook is not scheduled")
 
   initrd_modules = {}
   for name in EARLY_MODULES:
@@ -195,7 +209,6 @@ def build_initrd(work, module_root, release, expected):
   runtime.mkdir()
   run(("lsinitcpio", "--early", "--extract", initrd), cwd=runtime)
   run(("lsinitcpio", "--cpio", "--extract", initrd), cwd=runtime)
-  bluetooth = runtime / initrd_modules["hci_bcm4377"]
   resolution = run((
     "modprobe",
     "--config",
@@ -211,11 +224,8 @@ def build_initrd(work, module_root, release, expected):
   if resolution.stderr.strip():
     raise ValueError("Candidate initramfs cannot resolve hci_bcm4377 dependencies: " + resolution.stderr.strip())
   loaded = [Path(line.split()[1]) for line in resolution.stdout.splitlines() if line.startswith("insmod ")]
-  selected = [path for path in loaded if path.name == "hci_bcm4377.ko"]
-  if len(selected) != 1 or selected[0].resolve() != bluetooth.resolve():
-    raise ValueError("Candidate initramfs blacklist suppresses hci_bcm4377")
-  if digest(bluetooth) != expected["hci_bcm4377"]["sha256"]:
-    raise ValueError("Candidate initramfs resolves the wrong hci_bcm4377 module")
+  if any(path.name == "hci_bcm4377.ko" for path in loaded):
+    raise ValueError("Candidate initramfs would load hci_bcm4377 before Wi-Fi readiness")
   return initrd, initrd_modules
 
 
