@@ -52,7 +52,13 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-hook-") as directory:
   helper.parent.mkdir(parents=True)
   helper.write_bytes(builder.CANDIDATE_BLUETOOTH_HELPER.read_bytes())
   subprocess.run(
-    ["bash", "-c", 'source "$1"; run_latehook', "bash", str(runtime_hook)],
+    [
+      "bash",
+      "-c",
+      'before=$(umask); source "$1"; run_latehook; [[ $(umask) == "$before" ]]',
+      "bash",
+      str(runtime_hook),
+    ],
     check=True,
     env={"PATH": "/usr/bin", "OMARCHY_T2_CANDIDATE_ROOT": str(root)},
     capture_output=True,

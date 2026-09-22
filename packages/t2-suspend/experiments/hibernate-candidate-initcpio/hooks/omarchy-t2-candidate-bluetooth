@@ -1,6 +1,6 @@
 # This file is sourced by mkinitcpio's ash runtime, not executed directly.
 
-run_latehook() {
+run_latehook() (
   candidate_root=${OMARCHY_T2_CANDIDATE_ROOT:-}
   candidate_release=$(cat "$candidate_root/proc/sys/kernel/osrelease") || return 1
   candidate_module=$(find "$candidate_root/usr/lib/modules/$candidate_release" -type f -name hci_bcm4377.ko) || return 1
@@ -39,4 +39,4 @@ ExecStart=/usr/bin/python3 /run/omarchy-t2-hibernation-candidate/bluetooth-after
 EOF
   chmod 644 "$candidate_dropin/50-hibernation-candidate.conf" || return 1
   echo "omarchy-t2-candidate: private Bluetooth module staged for post-Wi-Fi loading"
-}
+)
