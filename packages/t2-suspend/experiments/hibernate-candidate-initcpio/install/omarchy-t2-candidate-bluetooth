@@ -6,6 +6,7 @@ build() {
     error "Missing candidate Bluetooth userspace gate"
     exit 1
   fi
+  add_binary find || exit 1
   add_runscript || exit 1
   add_file "$helper" /usr/lib/omarchy-t2-hibernation-candidate/bluetooth-after-wifi.py 700 || exit 1
 }

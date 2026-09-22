@@ -37,6 +37,7 @@ EARLY_MODULES = tuple(name for name in MODULES if name != "t2bce_ave")
 REQUIRED_INITRD_FILES = (
   "etc/modprobe.d/t2-bluetooth-order.conf",
   "hooks/omarchy-t2-candidate-bluetooth",
+  "usr/bin/find",
   "usr/lib/omarchy-t2-hibernation-candidate/bluetooth-after-wifi.py",
 )
 CRITICAL_CMDLINE_KEYS = {

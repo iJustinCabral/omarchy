@@ -29,11 +29,14 @@ assert set(builder.EARLY_MODULES) == set(builder.MODULES) - {"t2bce_ave"}
 assert builder.REQUIRED_INITRD_FILES == (
   "etc/modprobe.d/t2-bluetooth-order.conf",
   "hooks/omarchy-t2-candidate-bluetooth",
+  "usr/bin/find",
   "usr/lib/omarchy-t2-hibernation-candidate/bluetooth-after-wifi.py",
 )
 assert builder.CANDIDATE_HOOKS.is_dir()
 assert builder.CANDIDATE_BLUETOOTH_HELPER.is_file()
 assert builder.CANDIDATE_BLUETOOTH_HELPER.stat().st_mode & 0o111
+install_hook = builder.CANDIDATE_HOOKS / "install/omarchy-t2-candidate-bluetooth"
+assert "add_binary find || exit 1" in install_hook.read_text()
 
 runtime_hook = builder.CANDIDATE_HOOKS / "hooks/omarchy-t2-candidate-bluetooth"
 with tempfile.TemporaryDirectory(prefix="t2-candidate-hook-") as directory:
