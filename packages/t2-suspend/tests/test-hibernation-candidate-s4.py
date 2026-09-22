@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the guarded real-S4 runner without touching power or EFI hardware."""
 
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -62,7 +63,7 @@ def platform_preflight(_root, _candidate):
   }
 
 
-def proof_verifier(_root, _evidence, _post_input):
+def proof_verifier(_root, _evidence, _post_input, _candidate, _proof_candidate):
   return {
     "test_resume_boot_id": PROOF_BOOT_ID,
     "test_resume_attempt": "/proof/test-resume.json",
@@ -137,6 +138,7 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-s4-") as directory:
   result = s4.preflight(
     root,
     candidate,
+    candidate,
     Path("proof/post-input.json"),
     Path("proof/pre-s4-input.json"),
     platform_preflight,
@@ -149,6 +151,7 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-s4-") as directory:
 
   result = s4.execute(
     root,
+    candidate,
     candidate,
     Path("proof/post-input.json"),
     Path("proof/pre-s4-input.json"),
@@ -181,6 +184,7 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-s4-") as directory:
   try:
     s4.preflight(
       root,
+      candidate,
       candidate,
       Path("proof/post-input.json"),
       Path("proof/pre-s4-input.json"),
@@ -232,6 +236,7 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-s4-failure-") as directory
     s4.execute(
       root,
       candidate,
+      candidate,
       Path("proof/post-input.json"),
       Path("proof/pre-s4-input.json"),
       platform_preflight,
@@ -259,17 +264,69 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-s4-failure-") as directory
   assert record["real_s4_attempted"] is True
 
 with tempfile.TemporaryDirectory(prefix="t2-candidate-s4-proof-") as directory:
-  root = fixture(Path(directory))
+  base = Path(directory)
+  root = fixture(base)
+  candidate = base / "candidate"
+  proof_candidate = base / "proof-candidate"
+  candidate.mkdir()
+  proof_candidate.mkdir()
+  (candidate / "mba-t2-hibernation-candidate.efi").write_bytes(b"isolated candidate")
+  (proof_candidate / "mba-t2-hibernation-candidate.efi").write_bytes(b"successful proof candidate")
+  candidate_hash = hashlib.sha256((candidate / "mba-t2-hibernation-candidate.efi").read_bytes()).hexdigest()
+  proof_hash = hashlib.sha256((proof_candidate / "mba-t2-hibernation-candidate.efi").read_bytes()).hexdigest()
+  candidate_entry = s4.STAGER.entry_id(candidate_hash)
+  proof_entry = s4.STAGER.entry_id(proof_hash)
+  modules = {
+    name: {
+      "source": "modules/" + name + ".ko",
+      "sha256": hashlib.sha256(name.encode()).hexdigest(),
+      "srcversion": "SRC_" + name,
+      "vermagic": "7.2.6-test-t2 SMP preempt mod_unload",
+    }
+    for name in s4.RUNTIME_MODULES
+  }
+  sections = {
+    ".linux": "1" * 64,
+    ".cmdline": "2" * 64,
+    ".uname": "3" * 64,
+    ".osrel": "4" * 64,
+    ".text": "7" * 64,
+    ".rodata": "8" * 64,
+    ".data": "9" * 64,
+    ".sbat": "a" * 64,
+    ".sdmagic": "b" * 64,
+    ".reloc": "c" * 64,
+  }
+  shared_provenance = {
+    "candidate": "mba-t2-hibernation-module-overlay",
+    "cmdline": "resume=/dev/mapper/root resume_offset=42",
+    "kernel_release": "7.2.6-test-t2",
+    "modules": modules,
+    "production_uki_sha256": "5" * 64,
+    "source_provenance_sha256": "6" * 64,
+    "unchanged_production_sections_sha256": sections,
+  }
+  candidate_provenance = {
+    **shared_provenance,
+    "candidate_uki_sha256": candidate_hash,
+    "pre_restore_module_policy": "root-only-no-t2-radio",
+  }
+  proof_provenance = {**shared_provenance, "candidate_uki_sha256": proof_hash}
+  (candidate / "provenance.json").write_text(json.dumps(candidate_provenance))
+  (proof_candidate / "provenance.json").write_text(json.dumps(proof_provenance))
+
   evidence = platform_preflight(root, Path("candidate"))
-  attempts, guard = s4.TEST.vector_paths(root, evidence)
+  evidence["candidate_uki_sha256"] = candidate_hash
+  evidence["entry_id"] = candidate_entry
+  attempts, guard = s4.TEST.vector_paths(root, {"candidate_uki_sha256": proof_hash})
   write(guard, PROOF_BOOT_ID + "\n")
   write(
     attempts / PROOF_BOOT_ID / "attempt.json",
     json.dumps({
       "boot_id": PROOF_BOOT_ID,
-      "entry_id": ENTRY_ID,
-      "candidate_uki_sha256": CANDIDATE_HASH,
-      "transition_vector": CANDIDATE_HASH,
+      "entry_id": proof_entry,
+      "candidate_uki_sha256": proof_hash,
+      "transition_vector": proof_hash,
       "state": "returned-and-cleaned",
       "hibernate_attempted": True,
       "physical_input_confirmed": True,
@@ -279,7 +336,7 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-s4-proof-") as directory:
     root / "proof/post-input.json",
     json.dumps({
       "boot_id": PROOF_BOOT_ID,
-      "entry_id": ENTRY_ID,
+      "entry_id": proof_entry,
       "keyboard_seen": True,
       "trackpad_seen": True,
     }),
@@ -288,13 +345,21 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-s4-proof-") as directory:
     root / "proof/pre-s4-input.json",
     json.dumps({
       "boot_id": BOOT_ID,
-      "entry_id": ENTRY_ID,
+      "entry_id": candidate_entry,
       "keyboard_seen": True,
       "trackpad_seen": True,
     }),
   )
-  proof = s4.verify_test_resume_proof(root, evidence, Path("proof/post-input.json"))
+  proof = s4.verify_test_resume_proof(
+    root,
+    evidence,
+    Path("proof/post-input.json"),
+    candidate,
+    proof_candidate,
+  )
   assert proof["test_resume_boot_id"] == PROOF_BOOT_ID
+  assert proof["test_resume_candidate_uki_sha256"] == proof_hash
+  assert proof["test_resume_runtime_stack_sha256"] == s4.runtime_stack_identity(candidate_provenance)
   assert PROOF_BOOT_ID != BOOT_ID
   current = s4.verify_current_input(root, evidence, Path("proof/pre-s4-input.json"))
   assert current["pre_s4_input"].endswith("proof/pre-s4-input.json")
@@ -302,7 +367,7 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-s4-proof-") as directory:
     root / "proof/pre-s4-input.json",
     json.dumps({
       "boot_id": PROOF_BOOT_ID,
-      "entry_id": ENTRY_ID,
+      "entry_id": candidate_entry,
       "keyboard_seen": True,
       "trackpad_seen": True,
     }),
@@ -313,4 +378,35 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-s4-proof-") as directory:
   except ValueError as error:
     assert "another boot or entry" in str(error)
 
-print("PASS: real-S4 runner arms exact resume UKI, executes once and restores isolated devices")
+  no_policy = json.loads((candidate / "provenance.json").read_text())
+  del no_policy["pre_restore_module_policy"]
+  (candidate / "provenance.json").write_text(json.dumps(no_policy))
+  try:
+    s4.verify_test_resume_proof(
+      root,
+      evidence,
+      Path("proof/post-input.json"),
+      candidate,
+      proof_candidate,
+    )
+    raise AssertionError("runner accepted cross-image proof without isolated pre-restore policy")
+  except ValueError as error:
+    assert "requires the isolated pre-restore policy" in str(error)
+  (candidate / "provenance.json").write_text(json.dumps(candidate_provenance))
+
+  changed_proof = json.loads((proof_candidate / "provenance.json").read_text())
+  changed_proof["modules"]["t2bce_core"]["sha256"] = "f" * 64
+  (proof_candidate / "provenance.json").write_text(json.dumps(changed_proof))
+  try:
+    s4.verify_test_resume_proof(
+      root,
+      evidence,
+      Path("proof/post-input.json"),
+      candidate,
+      proof_candidate,
+    )
+    raise AssertionError("runner accepted test_resume proof from a different runtime stack")
+  except ValueError as error:
+    assert "different runtime stack" in str(error)
+
+print("PASS: real-S4 runner accepts only exact runtime-stack proof, arms exact resume UKI and executes once")

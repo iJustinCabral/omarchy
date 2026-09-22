@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Run one guarded real-S4 attempt after a successful candidate test_resume.
+"""Run one guarded real-S4 attempt after an exact runtime-stack test_resume.
 
-The resume boot is armed to the exact same candidate UKI immediately before
-entering ACPI S4. Limine consumes that one-shot before loading the image, so a
-failed resume falls back to the unchanged production default on the next boot.
+The resume boot is armed to the exact running candidate UKI immediately before
+entering ACPI S4. A prior candidate may supply test_resume proof only when its
+kernel, command line, production PE sections and complete module stack are
+identical. Limine consumes the one-shot before loading the image, so a failed
+resume falls back to the unchanged production default on the next boot.
 """
 
 import argparse
+import hashlib
 from importlib.machinery import SourceFileLoader
 import importlib.util
 import json
@@ -32,6 +35,30 @@ STAGER = TEST.STAGER
 WIFI = TEST.WIFI
 S4_VECTORS = STAGER.STATE / "s4-vectors"
 REQUIRED_SERVICES = ("NetworkManager.service", "bluetooth.service", "systemd-logind.service", "display-manager.service", "bolt.service")
+RUNTIME_MODULES = frozenset((
+  "brcmfmac",
+  "brcmfmac-bca",
+  "brcmfmac-cyw",
+  "brcmfmac-wcc",
+  "hci_bcm4377",
+  "t2bce_dma",
+  "t2bce_core",
+  "t2bce_vhci",
+  "t2bce_audio",
+  "t2bce_ave",
+))
+RUNTIME_SECTIONS = frozenset((
+  ".text",
+  ".rodata",
+  ".data",
+  ".sbat",
+  ".sdmagic",
+  ".reloc",
+  ".uname",
+  ".osrel",
+  ".cmdline",
+  ".linux",
+))
 
 
 def confined(root, relative):
@@ -67,8 +94,56 @@ def vector_paths(root, evidence):
   return directory / "attempts", directory / "s4-attempted"
 
 
-def verify_test_resume_proof(root, evidence, post_input_path):
-  attempts, guard = TEST.vector_paths(root, evidence)
+def runtime_stack_identity(provenance):
+  modules = provenance.get("modules")
+  sections = provenance.get("unchanged_production_sections_sha256")
+  if not isinstance(modules, dict) or set(modules) != RUNTIME_MODULES:
+    raise ValueError("Candidate provenance has an incomplete runtime module stack")
+  if not isinstance(sections, dict) or set(sections) != RUNTIME_SECTIONS:
+    raise ValueError("Candidate provenance has an incomplete production PE identity")
+  if not all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) for value in sections.values()):
+    raise ValueError("Candidate production PE identity is malformed")
+  normalized_modules = {}
+  for name, metadata in modules.items():
+    if not isinstance(metadata, dict):
+      raise ValueError("Candidate runtime module metadata is malformed: " + name)
+    normalized = {key: metadata.get(key) for key in ("source", "sha256", "srcversion", "vermagic")}
+    if not all(isinstance(value, str) and value for value in normalized.values()):
+      raise ValueError("Candidate runtime module metadata is incomplete: " + name)
+    if re.fullmatch(r"[0-9a-f]{64}", normalized["sha256"]) is None:
+      raise ValueError("Candidate runtime module hash is malformed: " + name)
+    normalized_modules[name] = normalized
+  descriptor = {
+    "cmdline": provenance.get("cmdline"),
+    "kernel_release": provenance.get("kernel_release"),
+    "modules": normalized_modules,
+    "production_sections": sections,
+    "production_uki_sha256": provenance.get("production_uki_sha256"),
+    "source_provenance_sha256": provenance.get("source_provenance_sha256"),
+  }
+  for name in ("cmdline", "kernel_release", "production_uki_sha256", "source_provenance_sha256"):
+    if not isinstance(descriptor[name], str) or not descriptor[name]:
+      raise ValueError("Candidate runtime identity omits: " + name)
+  encoded = json.dumps(descriptor, separators=(",", ":"), sort_keys=True).encode()
+  return hashlib.sha256(encoded).hexdigest()
+
+
+def verify_test_resume_proof(root, evidence, post_input_path, candidate_directory, proof_candidate_directory):
+  current_provenance = VERIFIER.load_provenance(candidate_directory)
+  proof_provenance = VERIFIER.load_provenance(proof_candidate_directory)
+  current_hash = TEST.candidate_hash(evidence.get("candidate_uki_sha256"))
+  proof_hash = TEST.candidate_hash(proof_provenance.get("candidate_uki_sha256"))
+  if current_provenance.get("candidate_uki_sha256") != current_hash:
+    raise ValueError("Running candidate differs from its runtime-stack provenance")
+  current_stack = runtime_stack_identity(current_provenance)
+  proof_stack = runtime_stack_identity(proof_provenance)
+  if proof_stack != current_stack:
+    raise ValueError("test_resume proof candidate has a different runtime stack")
+  if proof_hash != current_hash and current_provenance.get("pre_restore_module_policy") != "root-only-no-t2-radio":
+    raise ValueError("Cross-image test_resume proof requires the isolated pre-restore policy")
+
+  proof_evidence = {"candidate_uki_sha256": proof_hash}
+  attempts, guard = TEST.vector_paths(root, proof_evidence)
   if guard.is_symlink() or not guard.is_file():
     raise ValueError("Successful test_resume guard is missing or symlinked")
   proof_boot_id = guard.read_text().strip()
@@ -76,11 +151,12 @@ def verify_test_resume_proof(root, evidence, post_input_path):
     raise ValueError("Successful test_resume guard has a malformed boot ID")
   attempt = attempts / proof_boot_id / "attempt.json"
   record = load_json_file(attempt, "test_resume attempt evidence")
+  proof_entry_id = STAGER.entry_id(proof_hash)
   expected = {
     "boot_id": proof_boot_id,
-    "entry_id": evidence["entry_id"],
-    "candidate_uki_sha256": evidence["candidate_uki_sha256"],
-    "transition_vector": evidence["candidate_uki_sha256"],
+    "entry_id": proof_entry_id,
+    "candidate_uki_sha256": proof_hash,
+    "transition_vector": proof_hash,
     "state": "returned-and-cleaned",
     "hibernate_attempted": True,
     "physical_input_confirmed": True,
@@ -90,13 +166,15 @@ def verify_test_resume_proof(root, evidence, post_input_path):
       raise ValueError("test_resume proof mismatch: " + key)
 
   post_input = load_json_file(supplied_path(root, post_input_path), "post-test_resume input evidence")
-  if post_input.get("boot_id") != proof_boot_id or post_input.get("entry_id") != evidence["entry_id"]:
+  if post_input.get("boot_id") != proof_boot_id or post_input.get("entry_id") != proof_entry_id:
     raise ValueError("Post-test_resume input evidence names another boot or entry")
   if post_input.get("keyboard_seen") is not True or post_input.get("trackpad_seen") is not True:
     raise ValueError("Post-test_resume input evidence is incomplete")
   return {
     "test_resume_boot_id": proof_boot_id,
+    "test_resume_candidate_uki_sha256": proof_hash,
     "test_resume_attempt": str(attempt),
+    "test_resume_runtime_stack_sha256": proof_stack,
     "post_test_resume_input": str(supplied_path(root, post_input_path)),
   }
 
@@ -130,6 +208,7 @@ def verify_staging(root, evidence):
 def preflight(
   root,
   candidate_directory,
+  proof_candidate_directory,
   post_input_path,
   pre_s4_input_path,
   platform_preflight=TEST.platform_preflight,
@@ -145,7 +224,7 @@ def preflight(
   if TEST.selected_value(power / "disk") != "platform":
     raise ValueError("Platform hibernation is not selected")
   staging_verifier(root, evidence)
-  proof = proof_verifier(root, evidence, post_input_path)
+  proof = proof_verifier(root, evidence, post_input_path, candidate_directory, proof_candidate_directory)
   current_input = current_input_verifier(root, evidence, pre_s4_input_path)
   attempts, guard = vector_paths(root, evidence)
   if guard.exists():
@@ -195,6 +274,7 @@ def clear_resume_entry(root, entry_id, runner=run):
 def execute(
   root,
   candidate_directory,
+  proof_candidate_directory,
   post_input_path,
   pre_s4_input_path,
   platform_preflight=TEST.platform_preflight,
@@ -214,6 +294,7 @@ def execute(
   evidence = preflight(
     root,
     candidate_directory,
+    proof_candidate_directory,
     post_input_path,
     pre_s4_input_path,
     platform_preflight,
@@ -340,6 +421,7 @@ def execute(
 def main():
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--candidate-source", type=Path, required=True)
+  parser.add_argument("--test-resume-proof-source", type=Path)
   parser.add_argument("--post-resume-input-evidence", type=Path, required=True)
   parser.add_argument("--pre-s4-input-evidence", type=Path, required=True)
   parser.add_argument("--validate-only", action="store_true")
@@ -350,11 +432,13 @@ def main():
   if os.geteuid() != 0:
     raise SystemExit("Root required")
   try:
+    proof_candidate = (args.test_resume_proof_source or args.candidate_source).resolve()
     if args.validate_only:
       verify_services()
       result = preflight(
         Path("/"),
         args.candidate_source.resolve(),
+        proof_candidate,
         args.post_resume_input_evidence,
         args.pre_s4_input_evidence,
       )
@@ -362,6 +446,7 @@ def main():
       result = execute(
         Path("/"),
         args.candidate_source.resolve(),
+        proof_candidate,
         args.post_resume_input_evidence,
         args.pre_s4_input_evidence,
       )
