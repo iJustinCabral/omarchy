@@ -1,0 +1,115 @@
+diff --git a/drivers/staging/t2bce/t2bce_core/t2bce.h b/drivers/staging/t2bce/t2bce_core/t2bce.h
+--- a/drivers/staging/t2bce/t2bce_core/t2bce.h
++++ b/drivers/staging/t2bce/t2bce_core/t2bce.h
+@@ -33,6 +33,8 @@ struct t2bce_device {
+     bool no_state_rebuild_failed;
+     bool mailbox_channel_active;
+     bool pci_dma_restore_failed;
++    bool queue_dma_blocked;
++    bool queue_dma_was_master;
+     unsigned long pci_master_mask;
+     unsigned long pci_async_suspend_mask;
+     struct mutex pm_lock;
+diff --git a/drivers/staging/t2bce/t2bce_core/t2bce_main.c b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
+--- a/drivers/staging/t2bce/t2bce_core/t2bce_main.c
++++ b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
+@@ -631,11 +631,50 @@ static int bce_pm_resume_stateful(struct t2bce_device *bce)
+     return 0;
+ }
+ 
++static void bce_pm_restore_queue_dma(struct t2bce_device *bce)
++{
++    if (!bce->queue_dma_blocked)
++        return;
++
++    if (bce->queue_dma_was_master)
++        pci_set_master(bce->pci);
++    bce->queue_dma_blocked = false;
++    bce->queue_dma_was_master = false;
++}
++
++static int bce_pm_block_queue_dma(struct t2bce_device *bce)
++{
++    u16 command;
++
++    if (bce->queue_dma_blocked) {
++        bce_pm_restore_queue_dma(bce);
++        return -EBUSY;
++    }
++    bce->queue_dma_was_master = false;
++    if (pci_read_config_word(bce->pci, PCI_COMMAND, &command))
++        return -EIO;
++
++    bce->queue_dma_was_master = command & PCI_COMMAND_MASTER;
++    pci_clear_master(bce->pci);
++    if (pci_read_config_word(bce->pci, PCI_COMMAND, &command) ||
++            command & PCI_COMMAND_MASTER) {
++        if (bce->queue_dma_was_master)
++            pci_set_master(bce->pci);
++        bce->queue_dma_was_master = false;
++        pr_err("t2bce_core: failed to block BCE queue DMA before teardown\n");
++        return -EIO;
++    }
++
++    bce->queue_dma_blocked = true;
++    pr_info("t2bce_core: blocked BCE queue DMA before teardown\n");
++    return 0;
++}
++
+ static void bce_pm_drop_no_state_queue_graph(struct t2bce_device *bce)
+ {
+-    /* SLEEP_NO_STATE has stopped the remote producer.  Drain any handler that
+-     * entered before the sleep request, then free host objects without asking
+-     * the now-stateless firmware to unregister them.
++    /* Bus mastering is already disabled.  Drain any handler that entered
++     * before the gate, then free host objects without asking the now-stateless
++     * firmware to unregister them.
+      */
+     synchronize_irq(pci_irq_vector(bce->pci, 4));
+     bce->dma.is_being_removed = true;
+@@ -694,6 +733,10 @@ static int bce_pm_suspend_no_state(struct t2bce_device *bce)
+     if (status)
+         return status;
+ 
++    status = bce_pm_block_queue_dma(bce);
++    if (status)
++        return status;
++
+     bce_pm_drop_no_state_queue_graph(bce);
+     bce->no_state_fallback = true;
+     bce->no_state_resume = true;
+@@ -782,6 +825,7 @@ static int t2bce_resume_mode(struct device *dev, bool allow_cold_boot)
+     pr_info("t2bce_core: resume: entry\n");
+     mutex_lock(&bce->pm_lock);
+ 
++    bce_pm_restore_queue_dma(bce);
+     pci_set_master(bce->pci);
+     pci_set_master(bce->pci0);
+ 
+@@ -870,6 +914,8 @@ static int t2bce_suspend_noirq(struct device *dev)
+ 
+     bce->pci_dma_restore_failed = false;
+     bce->pci_master_mask = 0;
++    if (bce->queue_dma_blocked && bce->queue_dma_was_master)
++        master_mask |= BIT(1);
+     for (i = 0; i < ARRAY_SIZE(functions); i++) {
+         if (pci_read_config_word(functions[i], PCI_COMMAND, &command))
+             goto restore;
+@@ -884,6 +930,8 @@ static int t2bce_suspend_noirq(struct device *dev)
+     if (t2bce_save_shared_pci_state(bce))
+         goto restore;
+ 
++    bce->queue_dma_blocked = false;
++    bce->queue_dma_was_master = false;
+     bce->pci_master_mask = master_mask;
+     pr_info("t2bce_core: noirq: blocked shared-link DMA and saved disabled state mask=%#lx\n",
+             master_mask);
+@@ -894,6 +942,8 @@ restore:
+         if (master_mask & BIT(i))
+             pci_set_master(functions[i]);
+     t2bce_save_shared_pci_state(bce);
++    bce->queue_dma_blocked = false;
++    bce->queue_dma_was_master = false;
+     bce->pci_master_mask = 0;
+     pr_err("t2bce_core: noirq: failed to block shared-link DMA\n");
+     return -EIO;

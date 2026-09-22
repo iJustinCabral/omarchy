@@ -29,6 +29,8 @@ def function(source, name, return_type="int"):
   return source[match.start():index] + "\n"
 
 
+restore_queue_dma = function(core, "bce_pm_restore_queue_dma", "void")
+block_queue_dma = function(core, "bce_pm_block_queue_dma")
 drop_graph = function(core, "bce_pm_drop_no_state_queue_graph", "void")
 rebuild_graph = function(core, "bce_pm_rebuild_no_state_queue_graph")
 suspend_no_state = function(core, "bce_pm_suspend_no_state")
@@ -48,7 +50,9 @@ assert "t2bce_resume_mode(dev, true)" in restore
 assert "t2bce_resume(dev)" in resume_wrapper
 assert suspend_no_state.index("pm_can_rebuild_no_state") < suspend_no_state.index("pm_prepare_no_state")
 assert suspend_no_state.index("pm_prepare_no_state") < suspend_no_state.index("bce_pm_suspend_fallback_no_state")
-assert suspend_no_state.index("bce_pm_suspend_fallback_no_state") < suspend_no_state.index("bce_pm_drop_no_state_queue_graph")
+assert suspend_no_state.index("bce_pm_suspend_fallback_no_state") < suspend_no_state.index("bce_pm_block_queue_dma")
+assert suspend_no_state.index("bce_pm_block_queue_dma") < suspend_no_state.index("bce_pm_drop_no_state_queue_graph")
+assert block_queue_dma.index("pci_clear_master") < block_queue_dma.rindex("pci_read_config_word")
 assert drop_graph.index("synchronize_irq") < drop_graph.index("pm_drop_no_state_queues")
 assert drop_graph.index("pm_drop_no_state_queues") < drop_graph.index("bce_free_command_queues")
 assert rebuild_graph.index("bce_fw_version_handshake") < rebuild_graph.index("bce_create_command_queues")
@@ -87,12 +91,16 @@ harness = r'''
 #include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
+#define PCI_COMMAND 4
+#define PCI_COMMAND_MASTER 4
 #define pr_info(...) ((void)0)
 #define pr_err(...) ((void)0)
 #define pr_debug(...) ((void)0)
 
-struct pci_dev { void *data; int masters; };
+typedef uint16_t u16;
+struct pci_dev { void *data; u16 command; int reads; bool fail_clear; };
 struct device { struct pci_dev *pdev; };
 struct t2bce_dma_engine { bool is_being_removed; };
 struct bce_xhci_pm { int unused; };
@@ -107,11 +115,13 @@ struct t2bce_device {
   bool no_state_resume;
   bool no_state_queues_dropped;
   bool no_state_rebuild_failed;
+  bool queue_dma_blocked;
+  bool queue_dma_was_master;
 };
 
 enum event {
   EV_RESET, EV_PREPARE, EV_SUSPEND_PREPARE, EV_CAN_REBUILD,
-  EV_PREPARE_NO_STATE, EV_SLEEP_NO_STATE, EV_SYNC_IRQ, EV_DROP_CLIENTS,
+  EV_PREPARE_NO_STATE, EV_SLEEP_NO_STATE, EV_BLOCK_DMA, EV_SYNC_IRQ, EV_DROP_CLIENTS,
   EV_FREE_COMMANDS, EV_MARK_RESUME, EV_SUSPEND_ABORT, EV_CLIENT_ABORT,
   EV_RESTORE_NO_STATE, EV_RESUME_FINISH, EV_XHCI_INITIAL, EV_CHANNEL_RESUME,
   EV_HANDSHAKE, EV_CREATE_COMMANDS, EV_REBUILD_CLIENTS, EV_STATEFUL_SAVE,
@@ -149,7 +159,18 @@ static void reset_controls(void) {
 
 static struct pci_dev *to_pci_dev(struct device *dev) { return dev->pdev; }
 static void *pci_get_drvdata(struct pci_dev *pdev) { return pdev->data; }
-static void pci_set_master(struct pci_dev *pdev) { pdev->masters++; }
+static int pci_read_config_word(struct pci_dev *pdev, int where, u16 *value) {
+  assert(where == PCI_COMMAND);
+  pdev->reads++;
+  *value = pdev->command;
+  return 0;
+}
+static void pci_clear_master(struct pci_dev *pdev) {
+  record(EV_BLOCK_DMA);
+  if (!pdev->fail_clear)
+    pdev->command &= ~PCI_COMMAND_MASTER;
+}
+static void pci_set_master(struct pci_dev *pdev) { pdev->command |= PCI_COMMAND_MASTER; }
 static int pci_irq_vector(struct pci_dev *pdev, unsigned int nr) {
   (void)pdev; assert(nr == 4); return 44;
 }
@@ -183,12 +204,12 @@ static void bce_pm_resume_finish(struct t2bce_device *bce) { (void)bce; record(E
 static void bce_xhci_pm_start(struct bce_xhci_pm *pm, bool initial) { (void)pm; assert(initial); record(EV_XHCI_INITIAL); }
 static void bce_pm_channel_resume(struct t2bce_device *bce) { (void)bce; record(EV_CHANNEL_RESUME); }
 '''
-harness += drop_graph + rebuild_graph + suspend_no_state + suspend_common + resume_mode
+harness += restore_queue_dma + block_queue_dma + drop_graph + rebuild_graph + suspend_no_state + suspend_common + resume_mode
 harness += r'''
 static void init_device(struct t2bce_device *bce, struct pci_dev functions[2], struct device *dev) {
   *bce = (struct t2bce_device){0};
-  functions[0] = (struct pci_dev){0};
-  functions[1] = (struct pci_dev){0};
+  functions[0] = (struct pci_dev){.command = PCI_COMMAND_MASTER};
+  functions[1] = (struct pci_dev){.command = PCI_COMMAND_MASTER};
   bce->pci = &functions[0];
   bce->pci0 = &functions[1];
   functions[0].data = bce;
@@ -205,8 +226,11 @@ int main(void) {
   assert(t2bce_suspend_common(&dev, true) == 0);
   assert(bce.no_state_queues_dropped && bce.no_state_resume && bce.no_state_fallback);
   assert(find_event(EV_PREPARE_NO_STATE) < find_event(EV_SLEEP_NO_STATE));
-  assert(find_event(EV_SLEEP_NO_STATE) < find_event(EV_SYNC_IRQ));
+  assert(find_event(EV_SLEEP_NO_STATE) < find_event(EV_BLOCK_DMA));
+  assert(find_event(EV_BLOCK_DMA) < find_event(EV_SYNC_IRQ));
   assert(find_event(EV_DROP_CLIENTS) < find_event(EV_FREE_COMMANDS));
+  assert(bce.queue_dma_blocked && bce.queue_dma_was_master);
+  assert(!(functions[0].command & PCI_COMMAND_MASTER));
 
   /* Linux snapshots the queue-absent state, thaws the source kernel, then
    * freezes it again for either PMSG_QUIESCE (test-resume/image restore) or
@@ -243,6 +267,14 @@ int main(void) {
   assert(t2bce_suspend_common(&dev, true) == -EIO);
   assert(find_event(EV_DROP_CLIENTS) < 0);
   assert(find_event(EV_SUSPEND_ABORT) >= 0 && find_event(EV_CLIENT_ABORT) >= 0);
+
+  reset_controls(); init_device(&bce, functions, &dev); functions[0].fail_clear = true;
+  assert(t2bce_suspend_common(&dev, true) == -EIO);
+  assert(find_event(EV_SLEEP_NO_STATE) < find_event(EV_BLOCK_DMA));
+  assert(find_event(EV_DROP_CLIENTS) < 0 && find_event(EV_FREE_COMMANDS) < 0);
+  assert(find_event(EV_SUSPEND_ABORT) >= 0 && find_event(EV_CLIENT_ABORT) >= 0);
+  assert(!bce.queue_dma_blocked && !bce.queue_dma_was_master);
+  assert(functions[0].command & PCI_COMMAND_MASTER);
 
   reset_controls(); init_device(&bce, functions, &dev);
   bce.no_state_queues_dropped = true; bce.no_state_resume = true;

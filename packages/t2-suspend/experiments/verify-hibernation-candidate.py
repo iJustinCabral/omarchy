@@ -25,6 +25,7 @@ PATCHES = (
   "0006-t2bce-rebuild-queues-for-hibernation.patch",
   "0007-t2-serialize-shared-pci-pm.patch",
   "0009-t2bce-ave-hibernation-idle.patch",
+  "0010-t2bce-block-dma-before-queue-drop.patch",
 )
 
 

@@ -24,6 +24,8 @@ def function(source, name, return_type="int"):
   return source[match.start():index] + "\n"
 
 
+bce_restore_queue_dma = function(bce_source, "bce_pm_restore_queue_dma", "void")
+bce_block_queue_dma = function(bce_source, "bce_pm_block_queue_dma")
 bce_block = function(bce_source, "t2bce_block_shared_dma", "void")
 bce_save = function(bce_source, "t2bce_save_shared_pci_state")
 bce_suspend = function(bce_source, "t2bce_suspend_noirq")
@@ -33,7 +35,11 @@ bce_resume_wrapper = function(bce_source, "t2bce_resume_with_shared_dma")
 bce_image_restore = function(bce_source, "t2bce_restore")
 assert "struct pci_dev *pci, *pci0, *pci2, *pci3;" in bce_header
 assert "bool pci_dma_restore_failed;" in bce_header
+assert "bool queue_dma_blocked;" in bce_header
+assert "bool queue_dma_was_master;" in bce_header
 assert "unsigned long pci_master_mask;" in bce_header
+assert bce_block_queue_dma.index("pci_clear_master") < bce_block_queue_dma.rindex("pci_read_config_word")
+assert bce_block_queue_dma.index("pci_clear_master") < bce_block_queue_dma.index("queue_dma_blocked = true")
 assert "{ bce->pci0, bce->pci, bce->pci2, bce->pci3 }" in bce_suspend
 assert bce_suspend.index("pci_read_config_word") < bce_suspend.index("pci_clear_master")
 assert bce_suspend.index("pci_clear_master") < bce_suspend.index("t2bce_save_shared_pci_state")
@@ -74,6 +80,8 @@ struct pci_dev {
 struct t2bce_device {
   struct pci_dev *pci, *pci0, *pci2, *pci3;
   bool pci_dma_restore_failed;
+  bool queue_dma_blocked;
+  bool queue_dma_was_master;
   unsigned long pci_master_mask;
 };
 struct device { struct pci_dev *pdev; };
@@ -103,7 +111,7 @@ static int pci_save_state(struct pci_dev *pdev) {
   return 0;
 }
 '''
-bce_harness += bce_block + bce_save + bce_suspend + bce_resume_noirq + bce_restore_dma
+bce_harness += bce_restore_queue_dma + bce_block_queue_dma + bce_block + bce_save + bce_suspend + bce_resume_noirq + bce_restore_dma
 bce_harness += r'''
 static void test_two_pass_image_restore(void) {
   struct pci_dev functions[4] = {
@@ -119,8 +127,14 @@ static void test_two_pass_image_restore(void) {
   struct pci_dev owner = {.data = &bce};
   struct device dev = {.pdev = &owner};
 
-  /* The first noirq pass is part of the saved image. */
+  /* Queue teardown blocks BCE first.  The first noirq pass carries that
+   * original master state into the shared-link snapshot.
+   */
+  assert(bce_pm_block_queue_dma(&bce) == 0);
+  assert(bce.queue_dma_blocked && bce.queue_dma_was_master);
+  assert(!(functions[1].command & PCI_COMMAND_MASTER));
   assert(t2bce_suspend_noirq(&dev) == 0);
+  assert(!bce.queue_dma_blocked && !bce.queue_dma_was_master);
   snapshot_bce = bce;
   memcpy(snapshot_functions, functions, sizeof(functions));
   assert(snapshot_bce.pci_master_mask == 7);
@@ -170,7 +184,10 @@ int main(void) {
 
   test_two_pass_image_restore();
 
+  assert(bce_pm_block_queue_dma(&bce) == 0);
+  assert(bce.queue_dma_blocked && bce.queue_dma_was_master);
   assert(t2bce_suspend_noirq(&dev) == 0);
+  assert(!bce.queue_dma_blocked && !bce.queue_dma_was_master);
   assert(bce.pci_master_mask == 7);
   for (int i = 0; i < 4; i++) {
     assert(!(functions[i].command & PCI_COMMAND_MASTER));
@@ -187,13 +204,45 @@ int main(void) {
   assert((functions[2].command & PCI_COMMAND_MASTER));
   assert(!(functions[3].command & PCI_COMMAND_MASTER));
 
+  functions[1].reads = 0;
+  functions[1].fail_read_at = 1;
+  assert(bce_pm_block_queue_dma(&bce) == -EIO);
+  assert(!bce.queue_dma_blocked && !bce.queue_dma_was_master);
+  assert(functions[1].command & PCI_COMMAND_MASTER);
+  functions[1].fail_read_at = 0;
+
+  functions[1].reads = 0;
+  functions[1].fail_clear = 1;
+  assert(bce_pm_block_queue_dma(&bce) == -EIO);
+  assert(!bce.queue_dma_blocked && !bce.queue_dma_was_master);
+  assert(functions[1].command & PCI_COMMAND_MASTER);
+  functions[1].fail_clear = 0;
+
+  functions[1].reads = 0;
+  functions[1].fail_read_at = 2;
+  assert(bce_pm_block_queue_dma(&bce) == -EIO);
+  assert(!bce.queue_dma_blocked && !bce.queue_dma_was_master);
+  assert(functions[1].command & PCI_COMMAND_MASTER);
+  functions[1].fail_read_at = 0;
+
+  functions[1].command = 0;
+  functions[1].reads = 0;
+  assert(bce_pm_block_queue_dma(&bce) == 0);
+  assert(bce.queue_dma_blocked && !bce.queue_dma_was_master);
+  bce_pm_restore_queue_dma(&bce);
+  assert(!bce.queue_dma_blocked && !bce.queue_dma_was_master);
+  assert(!(functions[1].command & PCI_COMMAND_MASTER));
+  functions[1].command = PCI_COMMAND_MASTER;
+
   for (int i = 0; i < 4; i++) {
     functions[i].reads = 0;
     functions[i].saves = 0;
   }
+  assert(bce_pm_block_queue_dma(&bce) == 0);
   functions[2].fail_clear = 1;
   assert(t2bce_suspend_noirq(&dev) == -EIO);
   assert(bce.pci_master_mask == 0);
+  assert(!bce.queue_dma_blocked && !bce.queue_dma_was_master);
   assert((functions[0].command & PCI_COMMAND_MASTER));
   assert((functions[1].command & PCI_COMMAND_MASTER));
   assert((functions[2].command & PCI_COMMAND_MASTER));
