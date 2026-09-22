@@ -69,6 +69,10 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-hook-") as directory:
   assert (state / "bluetooth-after-wifi.py").read_bytes() == helper.read_bytes()
   assert (state / "hci_bcm4377.sha256").read_text().strip() == builder.digest(module)
   dropin = root / "run/systemd/system/bluetooth-after-wifi.service.d/50-hibernation-candidate.conf"
+  assert state.stat().st_mode & 0o777 == 0o700
+  assert (root / "run/systemd").stat().st_mode & 0o777 == 0o755
+  assert (root / "run/systemd/system").stat().st_mode & 0o777 == 0o755
+  assert dropin.parent.stat().st_mode & 0o777 == 0o755
   assert dropin.read_text() == (
     "[Service]\n"
     "ExecStart=\n"

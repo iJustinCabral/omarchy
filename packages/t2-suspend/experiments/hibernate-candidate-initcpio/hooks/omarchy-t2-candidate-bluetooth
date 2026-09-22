@@ -12,7 +12,9 @@ run_latehook() (
 
   candidate_source=$1
   candidate_state=$candidate_root/run/omarchy-t2-hibernation-candidate
-  candidate_dropin=$candidate_root/run/systemd/system/bluetooth-after-wifi.service.d
+  candidate_systemd=$candidate_root/run/systemd
+  candidate_system=$candidate_systemd/system
+  candidate_dropin=$candidate_system/bluetooth-after-wifi.service.d
   candidate_helper=$candidate_root/usr/lib/omarchy-t2-hibernation-candidate/bluetooth-after-wifi.py
   if [ ! -f "$candidate_helper" ]; then
     echo "omarchy-t2-candidate: userspace Bluetooth gate is missing" >&2
@@ -21,6 +23,7 @@ run_latehook() (
 
   umask 077
   mkdir -p "$candidate_state" "$candidate_dropin" || return 1
+  chmod 755 "$candidate_systemd" "$candidate_system" "$candidate_dropin" || return 1
   cp "$candidate_source" "$candidate_state/hci_bcm4377.ko" || return 1
   cp "$candidate_helper" "$candidate_state/bluetooth-after-wifi.py" || return 1
   candidate_source_hash=$(sha256sum "$candidate_source" | awk '{print $1}') || return 1
