@@ -148,9 +148,23 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-boot-") as directory:
     assert "unknown files" in str(error)
   unknown.unlink()
   backup_path.unlink()
+  legacy_guard = root / candidate_boot.STATE / "test-resume-attempted"
+  legacy_attempts = root / candidate_boot.STATE / "test-resume-attempts"
+  vector_attempts = root / candidate_boot.STATE / "test-resume-vectors"
+  legacy_guard.write_text("11111111-2222-3333-4444-555555555555\n")
+  legacy_attempts.mkdir()
+  vector_attempts.mkdir()
   assert candidate_boot.clear_rolled_back(root)["state"] == "cleared"
   assert not receipt_path.exists()
-  assert not (root / candidate_boot.STATE).exists()
+  assert legacy_guard.is_file()
+  assert legacy_attempts.is_dir()
+  assert vector_attempts.is_dir()
+  evidence_restaged = candidate_boot.stage(root, candidate)
+  assert evidence_restaged["state"] == "staged"
+  assert legacy_guard.is_file()
+  assert candidate_boot.rollback(root)["state"] == "rolled-back"
+  assert candidate_boot.clear_rolled_back(root)["state"] == "cleared"
+  assert legacy_guard.is_file()
 
   original_writer = candidate_boot.atomic_write
   for fail_at in (1, 2, 3, 4, 5):

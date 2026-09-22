@@ -31,6 +31,8 @@ SELECTED = Path("sys/firmware/efi/efivars/LoaderEntrySelected-" + EFI_GUID)
 ENTRIES = Path("sys/firmware/efi/efivars/LoaderEntries-" + EFI_GUID)
 BEGIN = "# BEGIN omarchy T2 hibernation candidate"
 END = "# END omarchy T2 hibernation candidate"
+EVIDENCE_FILES = {"test-resume-attempted"}
+EVIDENCE_DIRECTORIES = {"test-resume-attempts", "test-resume-vectors"}
 
 
 def digest(path):
@@ -79,6 +81,29 @@ def fsync_directory(path):
 
 def unlink_path(path):
   path.unlink()
+
+
+def validate_preserved_evidence(state, transaction_names=()):
+  allowed = EVIDENCE_FILES | EVIDENCE_DIRECTORIES | set(transaction_names)
+  unexpected = sorted(path.name for path in state.iterdir() if path.name not in allowed)
+  if unexpected:
+    raise ValueError("Candidate transaction state contains unknown files: " + ", ".join(unexpected))
+  for name in EVIDENCE_FILES:
+    path = state / name
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+      raise ValueError("Candidate test evidence is not a real file: " + name)
+  for name in EVIDENCE_DIRECTORIES:
+    path = state / name
+    if path.is_symlink() or (path.exists() and not path.is_dir()):
+      raise ValueError("Candidate test evidence is not a real directory: " + name)
+
+
+def remove_state_if_empty(state):
+  if any(state.iterdir()):
+    validate_preserved_evidence(state)
+    return
+  state.rmdir()
+  fsync_directory(state.parent)
 
 
 def read_efi_string(path):
@@ -231,20 +256,25 @@ def clean_unpublished_stage(root, receipt):
     backup.unlink()
     fsync_directory(backup.parent)
   state = rooted(root, STATE)
-  state.rmdir()
-  fsync_directory(state.parent)
+  remove_state_if_empty(state)
 
 
 def stage(root, candidate_directory):
   state = rooted(root, STATE)
-  if state.exists() or rooted(root, IMAGE).exists():
+  receipt_path = rooted(root, RECEIPT)
+  backup = rooted(root, BACKUP)
+  if receipt_path.exists() or backup.exists() or rooted(root, IMAGE).exists():
     raise ValueError("Candidate boot transaction already exists")
+  if state.exists():
+    if not state.is_dir() or state.is_symlink():
+      raise ValueError("Candidate transaction state is not a real directory")
+    validate_preserved_evidence(state)
   image_data, provenance = load_candidate(candidate_directory)
   limine, production, original = validate_production(root, provenance)
   if BEGIN in original or END in original or f"/{ENTRY_PREFIX}" in original:
     raise ValueError("Unowned candidate entry already exists")
 
-  state.mkdir(parents=True, mode=0o700)
+  state.mkdir(parents=True, mode=0o700, exist_ok=True)
   state.chmod(0o700)
   image_sha256 = hashlib.sha256(image_data).hexdigest()
   image_blake2 = hashlib.blake2b(image_data).hexdigest()
@@ -364,16 +394,12 @@ def clear_rolled_back(root, unlink=unlink_path):
 
   receipt_path = rooted(root, RECEIPT)
   backup = rooted(root, BACKUP)
-  allowed = {receipt_path.name, backup.name}
-  unexpected = sorted(path.name for path in state.iterdir() if path.name not in allowed)
-  if unexpected:
-    raise ValueError("Candidate transaction state contains unknown files: " + ", ".join(unexpected))
+  validate_preserved_evidence(state, (receipt_path.name, backup.name))
 
   if not receipt_path.exists():
     if backup.exists():
       raise ValueError("Candidate transaction backup remains without a receipt")
-    state.rmdir()
-    fsync_directory(state.parent)
+    remove_state_if_empty(state)
     return {"state": "cleared"}
 
   receipt = load_receipt(root)
@@ -387,8 +413,7 @@ def clear_rolled_back(root, unlink=unlink_path):
     fsync_directory(state)
   unlink(receipt_path)
   fsync_directory(state)
-  state.rmdir()
-  fsync_directory(state.parent)
+  remove_state_if_empty(state)
   return {**receipt, "state": "cleared"}
 
 
