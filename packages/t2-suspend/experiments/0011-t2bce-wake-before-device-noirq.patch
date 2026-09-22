@@ -1,0 +1,216 @@
+Subject: [PATCH] t2bce: wake no-state firmware before device noirq resume
+
+The first candidate that blocked BCE DMA before freeing its queue graph made
+it through atomic image restoration, but reset after the first durable
+dpm_resume_noirq completion.  RESTORE_NO_STATE currently waits until the
+ordinary device restore callback, leaving bridgeOS asleep throughout syscore
+resume and the complete device noirq pass.  The recovered firmware includes
+an extended quiesce watchdog, so that ordering can reset the host before the
+BCE device callback is reached.
+
+Add an interrupt-independent mailbox transaction and issue RESTORE_NO_STATE
+from a syscore resume callback.  Syscore resume runs after platform/IOMMU
+state is restored but before dpm_resume_noirq.  PCI bus mastering remains
+blocked, so waking bridgeOS cannot expose the freed queue graph.  The ordinary
+restore callback consumes the saved result, reopens the mailbox channel and
+rebuilds queues as before.  A failed early transaction remains eligible for
+the restore-only cold-epoch fallback; thaw and ordinary resume still fail
+closed.
+
+diff --git a/drivers/staging/t2bce/t2bce_core/mailbox.h b/drivers/staging/t2bce/t2bce_core/mailbox.h
+index 8a16bd36..c0ad48ad 100644
+--- a/drivers/staging/t2bce/t2bce_core/mailbox.h
++++ b/drivers/staging/t2bce/t2bce_core/mailbox.h
+@@ -43,6 +43,8 @@ int bce_mailbox_send_timeout(struct bce_mailbox *mb, u64 msg, u64 *recv, unsigne
+ int bce_mailbox_send_no_reply(struct bce_mailbox *mb, u64 msg);
+ int bce_mailbox_send_locked(struct bce_mailbox *mb, u64 msg, u64 *recv);
+ int bce_mailbox_send_locked_timeout(struct bce_mailbox *mb, u64 msg, u64 *recv, unsigned int timeout_ms);
++int bce_mailbox_send_locked_poll(struct bce_mailbox *mb, u64 msg, u64 *recv,
++        unsigned int timeout_us);
+ int bce_mailbox_send_no_reply_locked(struct bce_mailbox *mb, u64 msg);
+ 
+ int bce_mailbox_handle_interrupt(struct bce_mailbox *mb);
+diff --git a/drivers/staging/t2bce/t2bce_core/mailbox.c b/drivers/staging/t2bce/t2bce_core/mailbox.c
+index 45aa999f..d58cc25a 100644
+--- a/drivers/staging/t2bce/t2bce_core/mailbox.c
++++ b/drivers/staging/t2bce/t2bce_core/mailbox.c
+@@ -1,5 +1,6 @@
+ #include "mailbox.h"
+ #include <linux/atomic.h>
++#include <linux/iopoll.h>
+ #include "t2bce.h"
+ #include <linux/version.h>
+ 
+@@ -10,6 +11,8 @@
+ 
+ #define BCE_MBOX_TIMEOUT_MS 1000
+ 
++static int bce_mailbox_retrive_response(struct bce_mailbox *mb);
++
+ void bce_mailbox_init(struct bce_mailbox *mb, void __iomem *reg_mb)
+ {
+     mb->reg_mb = reg_mb;
+@@ -86,6 +89,34 @@ int bce_mailbox_send_locked(struct bce_mailbox *mb, u64 msg, u64 *recv)
+     return bce_mailbox_send_locked_timeout(mb, msg, recv, BCE_MBOX_TIMEOUT_MS);
+ }
+ 
++int bce_mailbox_send_locked_poll(struct bce_mailbox *mb, u64 msg, u64 *recv,
++        unsigned int timeout_us)
++{
++    u32 __iomem *regb;
++    u32 reply_counter;
++    int status;
++
++    if (atomic_cmpxchg(&mb->mb_status, 0, 1) != 0)
++        return -EEXIST;
++
++    regb = (u32 *)((u8 *)mb->reg_mb + REG_MBOX_OUT_BASE);
++    iowrite32((u32)msg, regb);
++    iowrite32((u32)(msg >> 32), regb + 1);
++    iowrite32(0, regb + 2);
++    iowrite32(0, regb + 3);
++
++    status = readl_poll_timeout_atomic(
++            (u8 *)mb->reg_mb + REG_MBOX_REPLY_COUNTER,
++            reply_counter, (reply_counter >> 20) & 0xf, 10, timeout_us);
++    if (!status)
++        status = bce_mailbox_retrive_response(mb);
++    if (!status)
++        *recv = mb->mb_result;
++
++    atomic_set(&mb->mb_status, 0);
++    return status;
++}
++
+ int bce_mailbox_send_no_reply_locked(struct bce_mailbox *mb, u64 msg)
+ {
+     u32 __iomem *regb;
+diff --git a/drivers/staging/t2bce/t2bce_core/t2bce.h b/drivers/staging/t2bce/t2bce_core/t2bce.h
+index 9a2c2041..39d2b60a 100644
+--- a/drivers/staging/t2bce/t2bce_core/t2bce.h
++++ b/drivers/staging/t2bce/t2bce_core/t2bce.h
+@@ -31,6 +31,8 @@ struct t2bce_device {
+     bool no_state_resume;
+     bool no_state_queues_dropped;
+     bool no_state_rebuild_failed;
++    bool no_state_early_wake_attempted;
++    int no_state_early_wake_status;
+     bool mailbox_channel_active;
+     bool pci_dma_restore_failed;
+     bool queue_dma_blocked;
+diff --git a/drivers/staging/t2bce/t2bce_core/t2bce_main.c b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
+index fb8eb8e5..caf8096f 100644
+--- a/drivers/staging/t2bce/t2bce_core/t2bce_main.c
++++ b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
+@@ -3,6 +3,7 @@
+ #include <linux/crc32.h>
+ #include <linux/delay.h>
+ #include <linux/interrupt.h>
++#include <linux/syscore_ops.h>
+ #include <linux/version.h>
+ 
+ /*
+@@ -31,6 +32,8 @@ static dev_t bce_chrdev;
+ static struct class *bce_class;
+ static const bool bce_use_stateful_sleep = true;
+ 
++#define BCE_SYSCORE_WAKE_TIMEOUT_US 1000000
++
+ struct t2bce_device *global_bce;
+ 
+ static int bce_create_command_queues(struct t2bce_device *bce);
+@@ -51,6 +54,56 @@ static int bce_pm_suspend_prepare(struct t2bce_device *bce);
+ static void bce_pm_suspend_abort(struct t2bce_device *bce);
+ static void bce_pm_resume_finish(struct t2bce_device *bce);
+ 
++static void t2bce_syscore_resume(void *data)
++{
++    struct t2bce_device *bce = READ_ONCE(global_bce);
++    struct pci_dev *functions[4];
++    u64 response = 0;
++    u16 command;
++    size_t i;
++    int status;
++
++    (void)data;
++    if (!bce || !bce->no_state_resume || !bce->no_state_queues_dropped ||
++            bce->no_state_early_wake_attempted)
++        return;
++
++    bce->no_state_early_wake_attempted = true;
++    functions[0] = bce->pci0;
++    functions[1] = bce->pci;
++    functions[2] = bce->pci2;
++    functions[3] = bce->pci3;
++    for (i = 0; i < ARRAY_SIZE(functions); i++) {
++        if (pci_read_config_word(functions[i], PCI_COMMAND, &command) ||
++                command & PCI_COMMAND_MASTER) {
++            status = -EIO;
++            goto out;
++        }
++    }
++
++    status = bce_mailbox_send_locked_poll(&bce->mbox,
++            BCE_MB_MSG(BCE_MB_RESTORE_NO_STATE, 0), &response,
++            BCE_SYSCORE_WAKE_TIMEOUT_US);
++    if (!status && BCE_MB_TYPE(response) != BCE_MB_RESTORE_NO_STATE)
++        status = -EINVAL;
++
++out:
++    bce->no_state_early_wake_status = status;
++
++    if (status)
++        pr_warn("t2bce_core: syscore no-state wake failed: %d\n", status);
++    else
++        pr_info("t2bce_core: syscore no-state wake complete\n");
++}
++
++static const struct syscore_ops t2bce_syscore_ops = {
++    .resume = t2bce_syscore_resume,
++};
++
++static struct syscore t2bce_syscore = {
++    .ops = &t2bce_syscore_ops,
++};
++
+ static const struct t2bce_dma_engine_ops t2bce_dma_ops = {
+     .register_queue = t2bce_dma_register_queue,
+     .unregister_queue = t2bce_dma_unregister_queue,
+@@ -758,6 +793,8 @@ static int t2bce_suspend_common(struct device *dev, bool force_no_state)
+     bce->no_state_resume = false;
+     bce->no_state_queues_dropped = false;
+     bce->no_state_rebuild_failed = false;
++    bce->no_state_early_wake_attempted = false;
++    bce->no_state_early_wake_status = 0;
+     t2bce_core_clients_pm_reset(bce);
+     status = t2bce_core_clients_pm_prepare(bce);
+     if (status) {
+@@ -849,7 +886,10 @@ static int t2bce_resume_mode(struct device *dev, bool allow_cold_boot)
+         goto out_unlock;
+     }
+ 
+-    wake_status = bce_pm_resume_no_state(bce);
++    if (bce->no_state_early_wake_attempted)
++        wake_status = bce->no_state_early_wake_status;
++    else
++        wake_status = bce_pm_resume_no_state(bce);
+     if (wake_status && !allow_cold_boot) {
+         status = wake_status;
+         bce->no_state_rebuild_failed = true;
+@@ -1113,6 +1153,8 @@ static int __init t2bce_module_init(void)
+     if (result)
+         goto fail_drv;
+ 
++    register_syscore(&t2bce_syscore);
++
+     pr_info("t2bce_core: module initialized\n");
+     return 0;
+ 
+@@ -1129,6 +1171,7 @@ fail_chrdev:
+ }
+ static void __exit t2bce_module_exit(void)
+ {
++    unregister_syscore(&t2bce_syscore);
+     pci_unregister_driver(&t2bce_pci_driver);
+ 
+     class_destroy(bce_class);

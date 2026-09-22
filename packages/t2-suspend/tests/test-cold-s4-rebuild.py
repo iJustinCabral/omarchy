@@ -58,6 +58,8 @@ assert drop_graph.index("pm_drop_no_state_queues") < drop_graph.index("bce_free_
 assert rebuild_graph.index("bce_fw_version_handshake") < rebuild_graph.index("bce_create_command_queues")
 assert rebuild_graph.index("bce_create_command_queues") < rebuild_graph.index("pm_rebuild_no_state_queues")
 assert "wake_status && !allow_cold_boot" in resume_mode
+assert "if (bce->no_state_early_wake_attempted)" in resume_mode
+assert resume_mode.index("no_state_early_wake_status") < resume_mode.index("bce_pm_resume_no_state(bce)")
 assert resume_mode.index("wake_status && !allow_cold_boot") < resume_mode.index("bce_xhci_pm_start")
 assert "!bce->no_state_rebuild_failed" in core
 
@@ -115,6 +117,8 @@ struct t2bce_device {
   bool no_state_resume;
   bool no_state_queues_dropped;
   bool no_state_rebuild_failed;
+  bool no_state_early_wake_attempted;
+  int no_state_early_wake_status;
   bool queue_dma_blocked;
   bool queue_dma_was_master;
 };
@@ -257,6 +261,29 @@ int main(void) {
   assert(count_event_between(EV_REBUILD_CLIENTS, first_freeze_end, first_thaw_end) == 1);
   assert(count_event_between(EV_DROP_CLIENTS, first_thaw_end, second_freeze_end) == 1);
   assert(count_event_between(EV_REBUILD_CLIENTS, second_freeze_end, event_count) == 1);
+
+  reset_controls(); init_device(&bce, functions, &dev);
+  bce.no_state_queues_dropped = true; bce.no_state_resume = true;
+  bce.no_state_early_wake_attempted = true;
+  assert(t2bce_resume_mode(&dev, false) == 0);
+  assert(find_event(EV_RESTORE_NO_STATE) < 0);
+  assert(find_event(EV_RESUME_FINISH) < find_event(EV_HANDSHAKE));
+
+  reset_controls(); init_device(&bce, functions, &dev);
+  bce.no_state_queues_dropped = true; bce.no_state_resume = true;
+  bce.no_state_early_wake_attempted = true;
+  bce.no_state_early_wake_status = -ETIMEDOUT;
+  assert(t2bce_resume_mode(&dev, false) == -ETIMEDOUT);
+  assert(find_event(EV_RESTORE_NO_STATE) < 0);
+  assert(find_event(EV_XHCI_INITIAL) < 0 && bce.no_state_rebuild_failed);
+
+  reset_controls(); init_device(&bce, functions, &dev);
+  bce.no_state_queues_dropped = true; bce.no_state_resume = true;
+  bce.no_state_early_wake_attempted = true;
+  bce.no_state_early_wake_status = -ETIMEDOUT;
+  assert(t2bce_resume_mode(&dev, true) == 0);
+  assert(find_event(EV_RESTORE_NO_STATE) < 0);
+  assert(find_event(EV_XHCI_INITIAL) < find_event(EV_CHANNEL_RESUME));
 
   reset_controls(); init_device(&bce, functions, &dev); can_rebuild = false;
   assert(t2bce_suspend_common(&dev, true) == -EOPNOTSUPP);

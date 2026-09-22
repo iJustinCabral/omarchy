@@ -26,6 +26,7 @@ PATCHES = (
   "0007-t2-serialize-shared-pci-pm.patch",
   "0009-t2bce-ave-hibernation-idle.patch",
   "0010-t2bce-block-dma-before-queue-drop.patch",
+  "0011-t2bce-wake-before-device-noirq.patch",
 )
 
 
@@ -133,6 +134,7 @@ def run_candidate_regressions(candidate):
     ("test-bce-audio-hibernate-pm.py", audio),
     ("test-dma-quiesce.py", core, header, bluetooth),
     ("test-cold-s4-rebuild.py", candidate),
+    ("test-syscore-early-wake.py", candidate),
     ("test-shared-pci-pm-serialization.py", candidate),
     ("test-ave-hibernation-idle.py", candidate),
     ("test-wifi-hibernate-isolation.py",),
