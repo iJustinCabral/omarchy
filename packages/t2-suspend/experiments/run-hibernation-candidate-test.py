@@ -135,7 +135,7 @@ def legacy_consumed_hash(root):
   return candidate_hash(record.get("candidate_uki_sha256"))
 
 
-def preflight(root, candidate_directory, inspector=VERIFIER.inspect):
+def platform_preflight(root, candidate_directory, inspector=VERIFIER.inspect):
   boot = inspector(root, candidate_directory)
   identity = candidate_hash(boot.get("candidate_uki_sha256"))
   power = confined(root, POWER)
@@ -163,11 +163,6 @@ def preflight(root, candidate_directory, inspector=VERIFIER.inspect):
   file_swaps = [fields for fields in swaps if len(fields) >= 2 and fields[1] == "file"]
   if len(file_swaps) != 1:
     raise ValueError("Exactly one active swap file is required")
-  if legacy_consumed_hash(root) == identity:
-    raise ValueError("The candidate test-resume attempt was already consumed by the legacy guard")
-  _attempts, guard = vector_paths(root, boot)
-  if guard.exists():
-    raise ValueError("The candidate test-resume attempt was already consumed")
   _directory, wifi_marker = WIFI.state_paths(root)
   if wifi_marker.exists():
     raise ValueError("A prior Wi-Fi isolation cleanup is pending")
@@ -181,6 +176,17 @@ def preflight(root, candidate_directory, inspector=VERIFIER.inspect):
     "disk_before": selected_value(power / "disk"),
     "pm_trace_before": (power / "pm_trace").read_text().strip(),
   }
+
+
+def preflight(root, candidate_directory, inspector=VERIFIER.inspect):
+  evidence = platform_preflight(root, candidate_directory, inspector)
+  identity = candidate_hash(evidence.get("candidate_uki_sha256"))
+  if legacy_consumed_hash(root) == identity:
+    raise ValueError("The candidate test-resume attempt was already consumed by the legacy guard")
+  _attempts, guard = vector_paths(root, evidence)
+  if guard.exists():
+    raise ValueError("The candidate test-resume attempt was already consumed")
+  return evidence
 
 
 def arm_recovery_timer(runner=run):

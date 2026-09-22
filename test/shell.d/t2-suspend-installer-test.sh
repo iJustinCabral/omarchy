@@ -9,6 +9,7 @@ python3 "$ROOT/packages/t2-suspend/tests/test-hibernation-candidate-bluetooth.py
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernation-candidate-boot.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernation-candidate-boot-verifier.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernation-candidate-runner.py"
+python3 "$ROOT/packages/t2-suspend/tests/test-hibernation-candidate-s4.py"
 pass "T2 suspend source and installer transactions"
 
 test_tmp=$(mktemp -d)

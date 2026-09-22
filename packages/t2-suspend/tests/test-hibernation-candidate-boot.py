@@ -151,14 +151,17 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-boot-") as directory:
   legacy_guard = root / candidate_boot.STATE / "test-resume-attempted"
   legacy_attempts = root / candidate_boot.STATE / "test-resume-attempts"
   vector_attempts = root / candidate_boot.STATE / "test-resume-vectors"
+  s4_vectors = root / candidate_boot.STATE / "s4-vectors"
   legacy_guard.write_text("11111111-2222-3333-4444-555555555555\n")
   legacy_attempts.mkdir()
   vector_attempts.mkdir()
+  s4_vectors.mkdir()
   assert candidate_boot.clear_rolled_back(root)["state"] == "cleared"
   assert not receipt_path.exists()
   assert legacy_guard.is_file()
   assert legacy_attempts.is_dir()
   assert vector_attempts.is_dir()
+  assert s4_vectors.is_dir()
   evidence_restaged = candidate_boot.stage(root, candidate)
   assert evidence_restaged["state"] == "staged"
   assert legacy_guard.is_file()

@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""Run one guarded real-S4 attempt after a successful candidate test_resume.
+
+The resume boot is armed to the exact same candidate UKI immediately before
+entering ACPI S4. Limine consumes that one-shot before loading the image, so a
+failed resume falls back to the unchanged production default on the next boot.
+"""
+
+import argparse
+from importlib.machinery import SourceFileLoader
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+
+
+HERE = Path(__file__).resolve().parent
+
+
+def import_path(name, path):
+  spec = importlib.util.spec_from_loader(name, SourceFileLoader(name, str(path)))
+  module = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(module)
+  return module
+
+
+TEST = import_path("candidate_test_resume_runner", HERE / "run-hibernation-candidate-test.py")
+VERIFIER = TEST.VERIFIER
+STAGER = TEST.STAGER
+WIFI = TEST.WIFI
+S4_VECTORS = STAGER.STATE / "s4-vectors"
+REQUIRED_SERVICES = ("NetworkManager.service", "bluetooth.service", "systemd-logind.service", "display-manager.service", "bolt.service")
+
+
+def confined(root, relative):
+  return VERIFIER.confined(root, relative)
+
+
+def run(arguments, check=True, capture=False):
+  return subprocess.run(
+    [str(argument) for argument in arguments],
+    check=check,
+    text=True,
+    capture_output=capture,
+  )
+
+
+def supplied_path(root, path):
+  relative = path.relative_to("/") if path.is_absolute() else path
+  return confined(root, relative)
+
+
+def load_json_file(path, description):
+  if path.is_symlink() or not path.is_file():
+    raise ValueError(description + " is missing or symlinked")
+  try:
+    return json.loads(path.read_text())
+  except json.JSONDecodeError as error:
+    raise ValueError(description + " is malformed") from error
+
+
+def vector_paths(root, evidence):
+  identity = TEST.candidate_hash(evidence.get("candidate_uki_sha256"))
+  directory = confined(root, S4_VECTORS / identity)
+  return directory / "attempts", directory / "s4-attempted"
+
+
+def verify_test_resume_proof(root, evidence, post_input_path):
+  attempts, guard = TEST.vector_paths(root, evidence)
+  boot_id = evidence["boot_id"]
+  if guard.is_symlink() or not guard.is_file() or guard.read_text().strip() != boot_id:
+    raise ValueError("Successful test_resume guard does not match this boot")
+  attempt = attempts / boot_id / "attempt.json"
+  record = load_json_file(attempt, "test_resume attempt evidence")
+  expected = {
+    "boot_id": boot_id,
+    "entry_id": evidence["entry_id"],
+    "candidate_uki_sha256": evidence["candidate_uki_sha256"],
+    "transition_vector": evidence["candidate_uki_sha256"],
+    "state": "returned-and-cleaned",
+    "hibernate_attempted": True,
+    "physical_input_confirmed": True,
+  }
+  for key, value in expected.items():
+    if record.get(key) != value:
+      raise ValueError("test_resume proof mismatch: " + key)
+
+  post_input = load_json_file(supplied_path(root, post_input_path), "post-test_resume input evidence")
+  if post_input.get("boot_id") != boot_id or post_input.get("entry_id") != evidence["entry_id"]:
+    raise ValueError("Post-test_resume input evidence names another boot or entry")
+  if post_input.get("keyboard_seen") is not True or post_input.get("trackpad_seen") is not True:
+    raise ValueError("Post-test_resume input evidence is incomplete")
+  return {
+    "test_resume_attempt": str(attempt),
+    "post_test_resume_input": str(supplied_path(root, post_input_path)),
+  }
+
+
+def verify_staging(root, evidence):
+  receipt = STAGER.load_receipt(root)
+  if receipt.get("state") != "arming":
+    raise ValueError("Candidate staging receipt is not in the consumed-arm state")
+  STAGER.verify_staged(root, receipt)
+  if receipt.get("entry_id") != evidence["entry_id"]:
+    raise ValueError("Staged entry differs from the running candidate")
+  if receipt.get("candidate_uki_sha256") != evidence["candidate_uki_sha256"]:
+    raise ValueError("Staged UKI differs from the running candidate")
+  if STAGER.rooted(root, STAGER.ONESHOT).exists():
+    raise ValueError("Another one-shot boot is already armed")
+  if STAGER.rooted(root, STAGER.DEFAULT).exists():
+    raise ValueError("Persistent LoaderEntryDefault would weaken production fallback")
+  return receipt
+
+
+def preflight(
+  root,
+  candidate_directory,
+  post_input_path,
+  platform_preflight=TEST.platform_preflight,
+  proof_verifier=verify_test_resume_proof,
+  staging_verifier=verify_staging,
+):
+  evidence = platform_preflight(root, candidate_directory)
+  identity = TEST.candidate_hash(evidence.get("candidate_uki_sha256"))
+  power = confined(root, TEST.POWER)
+  if not TEST.available(power / "disk", "platform"):
+    raise ValueError("Kernel does not advertise platform hibernation")
+  if TEST.selected_value(power / "disk") != "platform":
+    raise ValueError("Platform hibernation is not selected")
+  staging_verifier(root, evidence)
+  proof = proof_verifier(root, evidence, post_input_path)
+  attempts, guard = vector_paths(root, evidence)
+  if guard.exists():
+    raise ValueError("The candidate real-S4 attempt was already consumed")
+  return {
+    **evidence,
+    **proof,
+    "transition_vector": identity,
+    "s4_attempts": str(attempts),
+    "real_s4_attempted": False,
+  }
+
+
+def service_active(name, runner=run):
+  result = runner(("systemctl", "is-active", name), check=False, capture=True)
+  return result.returncode == 0 and result.stdout.strip() == "active"
+
+
+def verify_services(runner=run):
+  inactive = [name for name in REQUIRED_SERVICES if not service_active(name, runner)]
+  if inactive:
+    raise ValueError("Required services are not active: " + ", ".join(inactive))
+
+
+def arm_resume_entry(root, entry_id, runner=run, sync=os.sync):
+  one_shot = STAGER.rooted(root, STAGER.ONESHOT)
+  if one_shot.exists():
+    raise ValueError("Another one-shot boot is already armed")
+  sync()
+  runner(("bootctl", "set-oneshot", entry_id))
+  if not one_shot.is_file() or STAGER.read_efi_string(one_shot) != entry_id:
+    raise ValueError("Resume LoaderEntryOneShot verification failed")
+
+
+def clear_resume_entry(root, entry_id, runner=run):
+  one_shot = STAGER.rooted(root, STAGER.ONESHOT)
+  if not one_shot.exists():
+    return
+  if not one_shot.is_file() or STAGER.read_efi_string(one_shot) != entry_id:
+    raise ValueError("Refusing to clear an unknown LoaderEntryOneShot")
+  runner(("bootctl", "set-oneshot", ""))
+  if one_shot.exists():
+    raise ValueError("Owned LoaderEntryOneShot was not cleared")
+
+
+def execute(
+  root,
+  candidate_directory,
+  post_input_path,
+  platform_preflight=TEST.platform_preflight,
+  proof_verifier=verify_test_resume_proof,
+  staging_verifier=verify_staging,
+  wifi_prepare=WIFI.prepare,
+  wifi_restore=WIFI.restore,
+  power_writer=TEST.write_power,
+  runner=run,
+  sync=os.sync,
+  sleeper=TEST.time.sleep,
+  resume_armer=arm_resume_entry,
+  resume_clearer=clear_resume_entry,
+  services_verifier=verify_services,
+):
+  evidence = preflight(
+    root,
+    candidate_directory,
+    post_input_path,
+    platform_preflight,
+    proof_verifier,
+    staging_verifier,
+  )
+  services_verifier(runner)
+  boot_id = evidence["boot_id"]
+  attempts, guard = vector_paths(root, evidence)
+  attempt_directory = attempts / boot_id
+  attempt_directory.mkdir(parents=True, mode=0o700)
+  attempt = attempt_directory / "attempt.json"
+  record = {
+    **evidence,
+    "state": "preparing",
+    "physical_input_confirmed": True,
+    "hibernate_attempted": False,
+    "real_s4_attempted": False,
+    "hardware_qualified": False,
+  }
+  TEST.save_attempt(attempt, record)
+
+  power = confined(root, TEST.POWER)
+  bluetooth_was_powered = None
+  bolt_was_active = False
+  wifi_prepare_started = False
+  resume_armed = False
+  transition_started = False
+  try:
+    bolt_was_active = service_active("bolt.service", runner)
+    if bolt_was_active:
+      runner(("systemctl", "stop", "bolt.service"))
+    bluetooth_was_powered = TEST.bluetooth_powered(runner)
+    if bluetooth_was_powered:
+      TEST.set_bluetooth(False, runner, sleeper)
+    wifi_prepare_started = True
+    wifi_prepare(root)
+    power_writer(power / "pm_test", "none")
+    power_writer(power / "disk", "platform")
+    power_writer(power / "pm_trace", "1")
+    record["state"] = "isolated"
+    TEST.save_attempt(attempt, record)
+
+    resume_armer(root, evidence["entry_id"], runner, sync)
+    resume_armed = True
+    record["state"] = "resume-entry-armed"
+    TEST.save_attempt(attempt, record)
+    print(
+      "omarchy-t2-hibernation-candidate: starting guarded real S4 "
+      f"boot={boot_id} entry={evidence['entry_id']}",
+      flush=True,
+    )
+    sync()
+    TEST.create_guard(guard, boot_id)
+    transition_started = True
+    record["hibernate_attempted"] = True
+    record["real_s4_attempted"] = True
+    record["state"] = "transition-armed"
+    TEST.save_attempt(attempt, record)
+    sync()
+    power_writer(power / "state", "disk")
+    print("omarchy-t2-hibernation-candidate: real S4 returned", flush=True)
+    record["state"] = "returned"
+    TEST.save_attempt(attempt, record)
+
+    one_shot = STAGER.rooted(root, STAGER.ONESHOT)
+    if one_shot.exists():
+      raise RuntimeError("Resume LoaderEntryOneShot was not consumed")
+    selected = STAGER.rooted(root, STAGER.SELECTED)
+    if not selected.is_file() or STAGER.read_efi_string(selected) != evidence["entry_id"]:
+      raise RuntimeError("Resume boot did not select the exact candidate entry")
+  except Exception as error:
+    record["state"] = "transition-failed" if transition_started else "preflight-cleanup"
+    record["hibernate_attempted"] = transition_started
+    record["real_s4_attempted"] = transition_started
+    record["error"] = str(error)
+    TEST.save_attempt(attempt, record)
+    raise
+  finally:
+    cleanup_errors = []
+    if resume_armed and STAGER.rooted(root, STAGER.ONESHOT).exists():
+      try:
+        resume_clearer(root, evidence["entry_id"], runner)
+      except Exception as error:
+        cleanup_errors.append("resume-entry: " + str(error))
+    for name, value in (
+      ("pm_test", evidence["pm_test_before"]),
+      ("disk", evidence["disk_before"]),
+      ("pm_trace", evidence["pm_trace_before"]),
+    ):
+      try:
+        power_writer(power / name, value)
+      except Exception as error:
+        cleanup_errors.append(f"{name}: {error}")
+    if wifi_prepare_started:
+      try:
+        wifi_restore(root)
+      except Exception as error:
+        cleanup_errors.append("wifi: " + str(error))
+    if bluetooth_was_powered:
+      try:
+        TEST.set_bluetooth(True, runner, sleeper)
+      except Exception as error:
+        cleanup_errors.append("bluetooth: " + str(error))
+    if bolt_was_active:
+      try:
+        runner(("systemctl", "start", "bolt.service"))
+      except Exception as error:
+        cleanup_errors.append("bolt: " + str(error))
+    if cleanup_errors:
+      record["cleanup_errors"] = cleanup_errors
+      record["state"] = "cleanup-failed"
+      TEST.save_attempt(attempt, record)
+
+  if record.get("cleanup_errors"):
+    raise RuntimeError("Real S4 returned but cleanup failed: " + "; ".join(record["cleanup_errors"]))
+  record["state"] = "returned-and-cleaned"
+  TEST.save_attempt(attempt, record)
+  print("omarchy-t2-hibernation-candidate: real S4 cleanup complete", flush=True)
+  return record
+
+
+def main():
+  parser = argparse.ArgumentParser(description=__doc__)
+  parser.add_argument("--candidate-source", type=Path, required=True)
+  parser.add_argument("--post-resume-input-evidence", type=Path, required=True)
+  parser.add_argument("--validate-only", action="store_true")
+  parser.add_argument("--execute", action="store_true")
+  args = parser.parse_args()
+  if args.validate_only == args.execute:
+    parser.error("select exactly one of --validate-only or --execute")
+  if os.geteuid() != 0:
+    raise SystemExit("Root required")
+  try:
+    if args.validate_only:
+      verify_services()
+      result = preflight(Path("/"), args.candidate_source.resolve(), args.post_resume_input_evidence)
+    else:
+      result = execute(Path("/"), args.candidate_source.resolve(), args.post_resume_input_evidence)
+  except (OSError, RuntimeError, ValueError) as error:
+    raise SystemExit("Candidate real-S4 refused: " + str(error)) from error
+  print(json.dumps(result, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+  main()

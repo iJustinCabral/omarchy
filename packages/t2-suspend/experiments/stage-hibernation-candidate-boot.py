@@ -32,7 +32,7 @@ ENTRIES = Path("sys/firmware/efi/efivars/LoaderEntries-" + EFI_GUID)
 BEGIN = "# BEGIN omarchy T2 hibernation candidate"
 END = "# END omarchy T2 hibernation candidate"
 EVIDENCE_FILES = {"test-resume-attempted"}
-EVIDENCE_DIRECTORIES = {"test-resume-attempts", "test-resume-vectors"}
+EVIDENCE_DIRECTORIES = {"test-resume-attempts", "test-resume-vectors", "s4-vectors"}
 
 
 def digest(path):
