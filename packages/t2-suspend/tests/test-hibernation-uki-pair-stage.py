@@ -118,6 +118,32 @@ def fixture(directory):
   return root, source, restore, limine, original
 
 
+with tempfile.TemporaryDirectory(prefix="t2-hibernation-pair-rejected-") as temporary:
+  rejected_hash = "974246c01bdc329917651b35f5dbe0b80e2f5e4125987f7c0050e20e4fc39ffd"
+  root, source, restore, _limine, _original = fixture(Path(temporary) / "rejected-stage")
+  original_loader = stage.AUDIT.load_candidate
+
+  def rejected_loader(directory, role):
+    report = original_loader(directory, role)
+    if role == "source":
+      report["candidate_uki_sha256"] = rejected_hash
+    return report
+
+  stage.AUDIT.load_candidate = rejected_loader
+  try:
+    rejects(lambda: stage.stage(root, source, restore), "failed ordinary root mount")
+  finally:
+    stage.AUDIT.load_candidate = original_loader
+  assert not (root / stage.RECEIPT).exists()
+
+  root, source, restore, _limine, _original = fixture(Path(temporary) / "rejected-arm")
+  receipt = stage.stage(root, source, restore)
+  receipt["images"]["source"]["sha256"] = rejected_hash
+  stage.save_receipt(root, receipt)
+  rejects(lambda: stage.arm_source(root), "failed ordinary root mount")
+  assert not (root / stage.SINGLE.ONESHOT).exists()
+
+
 with tempfile.TemporaryDirectory(prefix="t2-hibernation-pair-stage-") as temporary:
   base = Path(temporary)
   root, source, restore, limine, original = fixture(base / "happy")

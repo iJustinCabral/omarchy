@@ -41,6 +41,10 @@ BEGIN = "# BEGIN omarchy T2 hibernation pair"
 END = "# END omarchy T2 hibernation pair"
 EVIDENCE_DIRECTORIES = {"test-resume-vectors", "s4-vectors"}
 BOOT_ID = Path("proc/sys/kernel/random/boot_id")
+REJECTED_SOURCE_SHA256 = {
+  # Booted to an emergency shell before /dev/mapper/root could be mounted.
+  "974246c01bdc329917651b35f5dbe0b80e2f5e4125987f7c0050e20e4fc39ffd",
+}
 atomic_write = SINGLE.atomic_write
 
 
@@ -65,6 +69,11 @@ def entry_id(role, image_hash):
   return "MBA-T2-hibernation-" + role + "-" + image_hash[:16]
 
 
+def reject_failed_source(image_hash):
+  if image_hash in REJECTED_SOURCE_SHA256:
+    raise ValueError("Source UKI failed ordinary root mount and must not be armed again: " + image_hash)
+
+
 def entry_block(role, image_hash, image_blake2):
   identifier = entry_id(role, image_hash)
   return (
@@ -87,6 +96,7 @@ def stage_block(images):
 def load_pair(source_directory, restore_directory):
   source = AUDIT.load_candidate(source_directory, "source")
   restore = AUDIT.load_candidate(restore_directory, "restore")
+  reject_failed_source(source.get("candidate_uki_sha256"))
   pair = AUDIT.audit(source, restore)
   if source.get("candidate") != "mba-t2-hibernation-early-source":
     raise ValueError("Source is not a newly built early-source UKI")
@@ -327,6 +337,7 @@ def arm_source(root, runner=subprocess.run, sync=os.sync):
   receipt = load_receipt(root)
   if receipt.get("state") != "staged":
     raise ValueError("Pair transaction is not staged for source arming")
+  reject_failed_source(receipt["images"]["source"]["sha256"])
   SINGLE.validate_production(root, receipt)
   verify_staged(root, receipt)
   advertised_entries(root, receipt)
