@@ -27,7 +27,7 @@ def import_path(name, path):
 
 PAIR = import_path("hibernation_pair_stage", HERE / "stage-hibernation-uki-pair.py")
 LEGACY = import_path("hibernation_candidate_verifier", HERE / "verify-hibernation-candidate-boot.py")
-MOUNTS = Path("proc/mounts")
+MOUNTS = Path("proc/self/mounts")
 
 
 def verify_primary_root(root):

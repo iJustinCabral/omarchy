@@ -139,6 +139,7 @@ with tempfile.TemporaryDirectory(prefix="t2-pair-source-verify-") as temporary:
   write(root / legacy.OSRELEASE, release + "\n")
   write(root / legacy.CMDLINE, cmdline + "\n")
   write(root / verifier.MOUNTS, "/dev/mapper/root / btrfs rw,subvol=/@ 0 0\n")
+  (root / "proc/mounts").symlink_to("self/mounts")
   write(root / legacy.INPUT_DEVICES, (
     'N: Name="Apple Inc. Apple Internal Keyboard / Trackpad"\n'
     "P: Phys=usb-t2bce_vhci-5/input1\n\n"
