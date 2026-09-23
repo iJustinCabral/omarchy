@@ -19,6 +19,7 @@ python3 "$ROOT/packages/t2-suspend/tests/test-hibernation-kernel-repack.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernation-uki-pair-stage.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernation-uki-pair-source-verifier.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-efi-stage-marker.py"
+python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-rtc-stage-marker.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernation-uki-pair-s4.py"
 pass "T2 suspend source and installer transactions"
 
