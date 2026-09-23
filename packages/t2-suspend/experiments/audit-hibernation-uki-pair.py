@@ -80,8 +80,8 @@ def audit(source, restore):
     raise ValueError("Source initramfs does not select the complete T2/radio module set")
   if any(not isinstance(path, str) or not path.startswith("usr/lib/modules/") for path in source_modules.values()):
     raise ValueError("Source initramfs module paths are malformed")
-  if source.get("pre_restore_module_policy") is not None:
-    raise ValueError("Source image unexpectedly uses the isolated restore policy")
+  if source.get("pre_restore_module_policy") not in (None, "early-t2-radio"):
+    raise ValueError("Source image has an unknown or isolated pre-restore policy")
 
   if restore.get("pre_restore_module_policy") != "root-only-no-t2-radio":
     raise ValueError("Restore image lacks the isolated pre-restore policy")

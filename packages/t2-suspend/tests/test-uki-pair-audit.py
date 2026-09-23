@@ -50,6 +50,7 @@ def provenance(role):
       name: "usr/lib/modules/test-kernel/" + name + ".ko"
       for name in audit.SOURCE_INITRD_MODULES
     }
+    result["pre_restore_module_policy"] = "early-t2-radio"
   else:
     result.update({
       "initrd_module_selection": {},
@@ -105,6 +106,10 @@ with tempfile.TemporaryDirectory(prefix="t2-uki-pair-") as temporary:
   changed = copy.deepcopy(source)
   changed["initrd_module_selection"].pop("t2bce_core")
   rejects(changed, restore, "complete T2/radio module set")
+
+  changed = copy.deepcopy(source)
+  changed["pre_restore_module_policy"] = "root-only-no-t2-radio"
+  rejects(changed, restore, "unknown or isolated")
 
   changed = copy.deepcopy(restore)
   changed["initrd_module_selection"] = {"t2bce_core": "usr/lib/modules/test-kernel/t2bce_core.ko"}

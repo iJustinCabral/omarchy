@@ -1,0 +1,20 @@
+#!/bin/bash
+
+build() {
+  local helper=${OMARCHY_T2_CANDIDATE_BLUETOOTH_HELPER:-}
+  local marker=${OMARCHY_T2_SOURCE_EXPERIMENT_MARKER:-}
+  if [[ -z $helper || ! -f $helper || -z $marker || ! -f $marker ]]; then
+    error "Missing source-image Bluetooth gate or experiment marker"
+    exit 1
+  fi
+  add_binary find || exit 1
+  add_binary sha256sum || exit 1
+  add_binary awk || exit 1
+  add_runscript || exit 1
+  add_file "$helper" /usr/lib/omarchy-t2-hibernation-candidate/bluetooth-after-wifi.py 700 || exit 1
+  add_file "$marker" /usr/lib/omarchy-t2-hibernation-candidate/source-experiment-id 600 || exit 1
+}
+
+help() {
+  echo "Carry the private source-boot Bluetooth driver through /run for loading after Wi-Fi readiness."
+}
