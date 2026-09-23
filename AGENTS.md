@@ -11,6 +11,10 @@ matching guide before starting:
 - [`agents/skills/visual-verification.md`](agents/skills/visual-verification.md) - verifying any change with a visual effect in the running UI
 - [`agents/skills/migrations.md`](agents/skills/migrations.md) - creating or changing migrations under `migrations/`
 
+# T2 Hibernation Hardware Safety
+
+Before touching the MacBookAir9,1 boot image or power state, reconcile the current boot with `/home/jjc/.local/state/codex-mba-autonomous/handoff.json` and the evidence in [`docs/t2-suspend/HIBERNATION.md`](docs/t2-suspend/HIBERNATION.md). Replacement `.linux` kernels have repeatedly failed to mount the physical `/dev/mapper/root` even when offline and VM checks passed. Never reboot into or restage the failed marker-source UKI SHA-256 `974246c01bdc329917651b35f5dbe0b80e2f5e4125987f7c0050e20e4fc39ffd`, the earlier rejected v1/v2 images, or another replacement-kernel image under the current boot design. Any private UKI must preserve the production `.linux` and `.cmdline` sections byte-for-byte; the pair stager enforces the production-kernel policy. A successful ordinary boot of source and restore images does not establish that S4 or cold image restoration is safe. Preserve consumed PM guards and do not repeat a failed hardware vector.
+
 # Documentation Layout
 
 Three documentation trees, split by genre and audience:
