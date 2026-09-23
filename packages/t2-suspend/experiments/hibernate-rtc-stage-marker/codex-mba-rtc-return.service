@@ -1,0 +1,15 @@
+[Unit]
+Description=Capture guarded MacBookAir9,1 S4 RTC evidence and repair the clock
+After=systemd-journald.service systemd-timesyncd.service
+ConditionPathExists=/var/lib/omarchy-t2-hibernation-pair/rtc-active.json
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/libexec/omarchy-t2-rtc-stage-marker/boot_recovery.py
+Restart=on-failure
+RestartSec=30s
+TimeoutStartSec=120s
+
+[Install]
+WantedBy=multi-user.target
