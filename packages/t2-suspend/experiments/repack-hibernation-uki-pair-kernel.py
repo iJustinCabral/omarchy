@@ -10,6 +10,7 @@ import hashlib
 from importlib.machinery import SourceFileLoader
 import importlib.util
 import json
+import mmap
 import os
 from pathlib import Path
 import re
@@ -41,6 +42,56 @@ def digest(path):
     for block in iter(lambda: stream.read(1024 * 1024), b""):
       value.update(block)
   return value.hexdigest()
+
+
+def verify_linked_kernel(kernel, build_source, expected_hash):
+  """Verify the completed x86 image without querying Kbuild's phony target."""
+  if re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None:
+    raise ValueError("Expected kernel image SHA-256 is malformed")
+  kernel_hash = digest(kernel)
+  if kernel_hash != expected_hash:
+    raise ValueError("Kernel image differs from its pinned SHA-256")
+
+  boot = build_source / "arch/x86/boot"
+  setup = boot / "setup.bin"
+  payload = boot / "vmlinux.bin"
+  command = boot / ".bzImage.cmd"
+  vmlinux = build_source / "vmlinux"
+  hibernate_object = build_source / "kernel/power/hibernate.o"
+  config = build_source / ".config"
+  for path in (setup, payload, command, vmlinux, hibernate_object, config):
+    if path.is_symlink() or not path.is_file():
+      raise ValueError("Kernel build component is missing or symlinked: " + str(path))
+    if path.stat().st_mtime_ns > kernel.stat().st_mtime_ns:
+      raise ValueError("Kernel image predates build component: " + str(path))
+
+  expected_command = (
+    "savedcmd_arch/x86/boot/bzImage := "
+    "(dd if=arch/x86/boot/setup.bin bs=4k conv=sync status=none; "
+    "cat arch/x86/boot/vmlinux.bin) >arch/x86/boot/bzImage"
+  )
+  if command.read_text().strip() != expected_command:
+    raise ValueError("Kernel build command differs from the reviewed x86 assembly")
+  assembled = hashlib.sha256()
+  setup_bytes = setup.read_bytes()
+  assembled.update(setup_bytes)
+  assembled.update(bytes(-len(setup_bytes) % 4096))
+  with payload.open("rb") as stream:
+    for block in iter(lambda: stream.read(1024 * 1024), b""):
+      assembled.update(block)
+  if assembled.hexdigest() != kernel_hash:
+    raise ValueError("Kernel image does not match its setup and compressed payload")
+  with kernel.open("rb") as stream:
+    stream.seek(0x1fe)
+    if stream.read(2) != b"\x55\xaa":
+      raise ValueError("Kernel image lacks the x86 boot signature")
+    stream.seek(0x202)
+    if stream.read(4) != b"HdrS":
+      raise ValueError("Kernel image lacks the x86 setup header")
+  with vmlinux.open("rb") as stream, mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as linked:
+    if linked.find(b"t2_hibernate_efi_marker") < 0 or linked.find("OmarchyT2HibernateStage".encode("utf-16-le")) < 0:
+      raise ValueError("Linked kernel lacks the opt-in EFI marker")
+  return kernel_hash
 
 
 def section_details(image):
@@ -140,6 +191,7 @@ def main():
   parser.add_argument("--expected-restore-uki-sha256", required=True)
   parser.add_argument("--kernel-image", required=True, type=Path)
   parser.add_argument("--kernel-build-source", required=True, type=Path)
+  parser.add_argument("--expected-kernel-image-sha256", required=True)
   parser.add_argument("--output", required=True, type=Path, help="new private directory outside the ESP")
   args = parser.parse_args()
 
@@ -158,8 +210,6 @@ def main():
     raise ValueError("Kernel image is missing or implausibly small")
   if kernel != build_source / "arch/x86/boot/bzImage":
     raise ValueError("Kernel image must be the exact bzImage from the supplied build tree")
-  if subprocess.run(("make", "-q", "bzImage"), cwd=build_source, capture_output=True).returncode != 0:
-    raise ValueError("Kernel bzImage is not an up-to-date result of the supplied build tree")
   release = subprocess.run(("make", "-s", "kernelrelease"), cwd=build_source, check=True, text=True, capture_output=True).stdout.strip()
   source_report = AUDIT.load_candidate(source, "source")
   restore_report = AUDIT.load_candidate(restore, "restore")
@@ -177,7 +227,7 @@ def main():
   source_text = (build_source / "kernel/power/hibernate.c").read_text()
   if "t2_hibernate_efi_marker" not in source_text or "OmarchyT2HibernateStage" not in source_text:
     raise ValueError("Build source lacks the opt-in EFI marker implementation")
-  kernel_hash = digest(kernel)
+  kernel_hash = verify_linked_kernel(kernel, build_source, args.expected_kernel_image_sha256)
   patch_hash = digest(PATCH)
   if source_report["unchanged_production_sections_sha256"][".linux"] != restore_report["unchanged_production_sections_sha256"][".linux"]:
     raise ValueError("Input UKIs do not contain the same baseline kernel")

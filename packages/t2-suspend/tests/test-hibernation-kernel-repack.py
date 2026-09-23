@@ -115,4 +115,45 @@ with tempfile.TemporaryDirectory(prefix="t2-kernel-repack-test-") as temporary:
   new_identity = repack.AUDIT.audit(outputs["source"], outputs["restore"])["runtime_stack_sha256"]
   assert new_identity != original_identity
 
-print("PASS: kernel-only PE repack preserves both initramfs images and creates a distinct pair identity")
+with tempfile.TemporaryDirectory(prefix="t2-kernel-link-test-") as temporary:
+  build = Path(temporary)
+  boot = build / "arch/x86/boot"
+  boot.mkdir(parents=True)
+  (build / "kernel/power").mkdir(parents=True)
+  setup = bytearray(1024)
+  setup[0x1fe:0x200] = b"\x55\xaa"
+  setup[0x202:0x206] = b"HdrS"
+  (boot / "setup.bin").write_bytes(setup)
+  (boot / "vmlinux.bin").write_bytes(b"compressed-kernel")
+  (boot / ".bzImage.cmd").write_text(
+    "savedcmd_arch/x86/boot/bzImage := "
+    "(dd if=arch/x86/boot/setup.bin bs=4k conv=sync status=none; "
+    "cat arch/x86/boot/vmlinux.bin) >arch/x86/boot/bzImage\n"
+  )
+  (build / "vmlinux").write_bytes(
+    b"t2_hibernate_efi_marker" + "OmarchyT2HibernateStage".encode("utf-16-le")
+  )
+  (build / "kernel/power/hibernate.o").write_bytes(b"compiled marker")
+  (build / ".config").write_bytes(b"CONFIG_EFI=y\n")
+  kernel = boot / "bzImage"
+  contents = bytes(setup) + bytes(4096 - len(setup)) + b"compressed-kernel"
+  kernel.write_bytes(contents)
+  expected = repack.digest(kernel)
+  assert repack.verify_linked_kernel(kernel, build, expected) == expected
+
+  try:
+    repack.verify_linked_kernel(kernel, build, "0" * 64)
+  except ValueError as error:
+    assert "pinned SHA-256" in str(error)
+  else:
+    raise AssertionError("Wrong kernel hash was accepted")
+
+  (boot / "vmlinux.bin").write_bytes(b"changed payload")
+  try:
+    repack.verify_linked_kernel(kernel, build, expected)
+  except ValueError as error:
+    assert "predates build component" in str(error)
+  else:
+    raise AssertionError("Kernel predating its compressed payload was accepted")
+
+print("PASS: kernel-only PE repack preserves both initramfs images; linked-kernel provenance checks reject stale inputs")
