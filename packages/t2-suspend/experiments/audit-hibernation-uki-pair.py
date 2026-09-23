@@ -14,6 +14,8 @@ import importlib.util
 import json
 from pathlib import Path
 import re
+import subprocess
+import tempfile
 
 
 HERE = Path(__file__).resolve().parent
@@ -64,6 +66,29 @@ def load_candidate(directory, label):
   for field in ("installed", "boot_entry_created", "hardware_qualified", "production_modified"):
     if provenance.get(field) is not False:
       raise ValueError(label + " is not an offline private build: " + field)
+  if provenance.get("modified_sections_sha256") is not None:
+    modified = provenance["modified_sections_sha256"]
+    if not isinstance(modified, dict) or set(modified) != {".linux"}:
+      raise ValueError(label + " kernel override section list is invalid")
+    override = provenance.get("kernel_override")
+    if not isinstance(override, dict) or type(override.get("unpadded_size")) is not int or override["unpadded_size"] <= 0:
+      raise ValueError(label + " raw kernel size is invalid")
+    with tempfile.TemporaryDirectory(prefix="t2-pair-audit-") as temporary:
+      for section, expected in ((".linux", modified[".linux"]), (".initrd", provenance["candidate_initrd_sha256"])):
+        extracted = Path(temporary) / section.lstrip(".")
+        try:
+          subprocess.run(("objcopy", "-O", "binary", "--only-section=" + section, str(image), str(extracted)), check=True, capture_output=True)
+        except subprocess.CalledProcessError as error:
+          raise ValueError(label + " UKI " + section + " could not be extracted") from error
+        if sha256(extracted) != expected:
+          raise ValueError(label + " UKI " + section + " differs from provenance")
+        if section == ".linux":
+          contents = extracted.read_bytes()
+          size = override["unpadded_size"]
+          if size > len(contents) or len(contents) - size >= 4096 or any(contents[size:]):
+            raise ValueError(label + " UKI .linux has unexpected padding")
+          if hashlib.sha256(contents[:size]).hexdigest() != override.get("sha256"):
+            raise ValueError(label + " UKI raw kernel differs from provenance")
   return provenance
 
 

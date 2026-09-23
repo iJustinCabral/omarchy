@@ -97,11 +97,29 @@ def vector_paths(root, evidence):
 
 def runtime_stack_identity(provenance):
   modules = provenance.get("modules")
-  sections = provenance.get("unchanged_production_sections_sha256")
+  unchanged = provenance.get("unchanged_production_sections_sha256")
+  modified = provenance.get("modified_sections_sha256")
   if not isinstance(modules, dict) or set(modules) != RUNTIME_MODULES:
     raise ValueError("Candidate provenance has an incomplete runtime module stack")
-  if not isinstance(sections, dict) or set(sections) != RUNTIME_SECTIONS:
+  if not isinstance(unchanged, dict):
     raise ValueError("Candidate provenance has an incomplete production PE identity")
+  if modified is None:
+    if set(unchanged) != RUNTIME_SECTIONS:
+      raise ValueError("Candidate provenance has an incomplete production PE identity")
+    sections = unchanged
+  else:
+    if not isinstance(modified, dict) or set(modified) != {".linux"} or set(unchanged) != RUNTIME_SECTIONS - {".linux"}:
+      raise ValueError("Candidate provenance has an invalid kernel-only PE override")
+    override = provenance.get("kernel_override")
+    if not isinstance(override, dict) or set(override) != {"sha256", "pe_section_sha256", "unpadded_size", "baseline_linux_sha256", "patch_sha256", "kernel_release"} or override.get("pe_section_sha256") != modified[".linux"] or override.get("kernel_release") != provenance.get("kernel_release"):
+      raise ValueError("Candidate kernel override metadata is inconsistent")
+    if not isinstance(override["sha256"], str) or re.fullmatch(r"[0-9a-f]{64}", override["sha256"]) is None or type(override["unpadded_size"]) is not int or override["unpadded_size"] <= 0:
+      raise ValueError("Candidate raw kernel identity is malformed")
+    if not isinstance(override.get("baseline_linux_sha256"), str) or re.fullmatch(r"[0-9a-f]{64}", override["baseline_linux_sha256"]) is None:
+      raise ValueError("Candidate kernel baseline identity is malformed")
+    if not isinstance(override.get("patch_sha256"), str) or re.fullmatch(r"[0-9a-f]{64}", override["patch_sha256"]) is None:
+      raise ValueError("Candidate kernel patch identity is malformed")
+    sections = {**unchanged, **modified}
   if not all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) for value in sections.values()):
     raise ValueError("Candidate production PE identity is malformed")
   normalized_modules = {}
@@ -122,6 +140,8 @@ def runtime_stack_identity(provenance):
     "production_uki_sha256": provenance.get("production_uki_sha256"),
     "source_provenance_sha256": provenance.get("source_provenance_sha256"),
   }
+  if modified is not None:
+    descriptor["kernel_override"] = override
   for name in ("cmdline", "kernel_release", "production_uki_sha256", "source_provenance_sha256"):
     if not isinstance(descriptor[name], str) or not descriptor[name]:
       raise ValueError("Candidate runtime identity omits: " + name)

@@ -99,6 +99,33 @@ with tempfile.TemporaryDirectory(prefix="t2-uki-pair-") as temporary:
   assert len(result["source_initrd_modules"]) == 9
   assert len(result["restore_pre_restore_excluded_modules"]) == 10
 
+  marker_source = copy.deepcopy(source)
+  marker_restore = copy.deepcopy(restore)
+  marker_hash = digest(b"marker-enabled-kernel")
+  for report in (marker_source, marker_restore):
+    baseline = report["unchanged_production_sections_sha256"].pop(".linux")
+    report["modified_sections_sha256"] = {".linux": marker_hash}
+    report["kernel_override"] = {
+      "sha256": digest(b"raw-marker-kernel"),
+      "pe_section_sha256": marker_hash,
+      "unpadded_size": 17,
+      "baseline_linux_sha256": baseline,
+      "patch_sha256": digest(b"marker-patch"),
+      "kernel_release": "test-kernel",
+    }
+  marker_result = audit.audit(marker_source, marker_restore)
+  assert marker_result["runtime_stack_sha256"] != result["runtime_stack_sha256"]
+  rejects(marker_source, restore, "different kernel/cmdline/module stack identities")
+  malformed = copy.deepcopy(marker_restore)
+  malformed["kernel_override"]["pe_section_sha256"] = digest(b"wrong-kernel")
+  rejects(marker_source, malformed, "kernel override metadata is inconsistent")
+  malformed = copy.deepcopy(marker_restore)
+  malformed["kernel_override"]["baseline_linux_sha256"] = digest(b"wrong-baseline")
+  rejects(marker_source, malformed, "different kernel/cmdline/module stack identities")
+  malformed = copy.deepcopy(marker_restore)
+  malformed["unchanged_production_sections_sha256"][".linux"] = digest(b"incorrectly-unchanged")
+  rejects(marker_source, malformed, "invalid kernel-only PE override")
+
   changed = copy.deepcopy(restore)
   changed["modules"]["t2bce_core"]["sha256"] = "c" * 64
   rejects(source, changed, "different kernel/cmdline/module stack identities")
@@ -118,6 +145,15 @@ with tempfile.TemporaryDirectory(prefix="t2-uki-pair-") as temporary:
   changed = copy.deepcopy(restore)
   changed["pre_restore_excluded_modules"].remove("t2bce_core")
   rejects(source, changed, "does not exclude the complete")
+
+  (restore_dir / "provenance.json").write_text(json.dumps(marker_restore))
+  try:
+    audit.load_candidate(restore_dir, "restore")
+  except ValueError as error:
+    assert "UKI .linux" in str(error), error
+  else:
+    raise AssertionError("Kernel override accepted an image without a matching PE section")
+  (restore_dir / "provenance.json").write_text(json.dumps(restore))
 
   (restore_dir / "mba-t2-hibernation-candidate.initrd").write_bytes(b"tampered")
   try:
