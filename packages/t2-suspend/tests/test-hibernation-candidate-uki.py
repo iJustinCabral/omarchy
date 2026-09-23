@@ -2,6 +2,7 @@
 """Check the pure safety invariants of the private candidate UKI builder."""
 
 import importlib.util
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -26,6 +27,29 @@ assert set(builder.MODULES) == {
   "t2bce_ave",
 }
 assert set(builder.PRE_RESTORE_EXCLUDED_MODULES) == set(builder.MODULES)
+assert builder.validate_experiment_id("shutdown-cold-v11") == "shutdown-cold-v11"
+assert builder.validate_experiment_id(None) is None
+for invalid in ("", "Shutdown-v11", "../shutdown", "a" * 65):
+  try:
+    builder.validate_experiment_id(invalid)
+    raise AssertionError("builder accepted an invalid experiment ID")
+  except ValueError:
+    pass
+
+with tempfile.TemporaryDirectory(prefix="t2-candidate-experiment-id-") as directory:
+  root = Path(directory)
+  source = root / "source"
+  source.mkdir()
+  expected = {}
+  for name, relative in builder.MODULES.items():
+    module = source / relative
+    module.parent.mkdir(parents=True, exist_ok=True)
+    module.write_bytes(name.encode())
+    expected[name] = {"sha256": builder.digest(module), "srcversion": "test-" + name}
+  payload, _modules = builder.prepare_payload(root, source, "7.2.6-test-t2", expected, "shutdown-cold-v11")
+  manifest = json.loads((payload / "manifest.json").read_text())
+  assert manifest["experiment_id"] == "shutdown-cold-v11"
+  assert manifest["policy"] == "post-switch-root-only"
 assert builder.REQUIRED_INITRD_FILES == (
   "hooks/omarchy-t2-candidate-modules",
   "usr/lib/omarchy-t2-hibernation-candidate/load-modules.py",

@@ -226,6 +226,8 @@ sudo python3 packages/t2-suspend/experiments/build-hibernation-candidate-uki.py 
 
 The private build passed against the healthy `7.2.6-arch2-Watanare-T2-2-t2` production image. `bootctl kernel-inspect` identifies the result as a UKI with the exact production kernel version and encrypted-root command line. The builder records `production_modified: false`, `installed: false`, `boot_entry_created: false` and `hardware_qualified: false`. It does not copy the result to the ESP, edit Limine, set `LoaderEntryOneShot`, reboot or run a PM transition.
 
+For a materially different one-use diagnostic that retains an identical runtime kernel and module stack, `--experiment-id shutdown-cold-v11` embeds a validated lowercase label in the initramfs payload manifest and records it in provenance. This creates a distinct UKI-hash guard without changing a driver or the production kernel. The private v11 shutdown image has SHA-256 `e81077476ec29e9aa6a2a110cf4514b915c6a9a8ea78a284761127b331af8800`; independent extraction confirmed the live root key, root-critical modules, candidate-module exclusion, hook ordering and all ten unchanged non-initramfs production PE sections. It is not staged or hardware-qualified.
+
 Hardware testing remains paused. The earlier diagnostic boots repeatedly returned unusable machines and forced the operator to power off and manually choose the production image. Do not install this candidate, create another diagnostic image, reboot, or run a PM transition without a separately reviewed cold-power recovery design and explicit operator approval.
 
 ## Recovery-safe candidate boot staging

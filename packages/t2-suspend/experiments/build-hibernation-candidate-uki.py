@@ -56,6 +56,12 @@ def digest(path):
   return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def validate_experiment_id(value):
+  if value is not None and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", value) is None:
+    raise ValueError("Experiment ID must be a short lowercase ASCII label")
+  return value
+
+
 def run(arguments, cwd=None, capture=False):
   command = [str(argument) for argument in arguments]
   print("+ " + " ".join(command), flush=True)
@@ -158,7 +164,7 @@ def prepare_module_root(work, candidate, release, expected):
   return module_root, selected
 
 
-def prepare_payload(work, candidate, release, expected):
+def prepare_payload(work, candidate, release, expected, experiment_id=None):
   payload = work / "candidate-payload"
   payload.mkdir()
   modules = {}
@@ -177,6 +183,8 @@ def prepare_payload(work, candidate, release, expected):
     "modules": modules,
     "policy": "post-switch-root-only",
   }
+  if experiment_id is not None:
+    manifest["experiment_id"] = experiment_id
   (payload / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
   (payload / "manifest.json").chmod(0o600)
   (payload / "hci_bcm4377.sha256").write_text(expected["hci_bcm4377"]["sha256"] + "\n")
@@ -184,7 +192,7 @@ def prepare_payload(work, candidate, release, expected):
   return payload, modules
 
 
-def build_initrd(work, module_root, payload, release, expected):
+def build_initrd(work, module_root, payload, release, expected, experiment_id=None):
   initrd = work / "candidate.initrd"
   run((
     "env",
@@ -238,6 +246,8 @@ def build_initrd(work, module_root, payload, release, expected):
   payload_manifest = json.loads((payload_root / "manifest.json").read_text())
   if payload_manifest.get("policy") != "post-switch-root-only":
     raise ValueError("Candidate initramfs payload policy mismatch")
+  if payload_manifest.get("experiment_id") != experiment_id:
+    raise ValueError("Candidate initramfs experiment ID mismatch")
   bluetooth_digest = payload_root / "hci_bcm4377.sha256"
   if bluetooth_digest.read_text().strip() != expected["hci_bcm4377"]["sha256"]:
     raise ValueError("Candidate initramfs Bluetooth digest mismatch")
@@ -353,10 +363,12 @@ def main():
   parser.add_argument("--production-uki", type=Path, default=Path("/boot/EFI/Linux/omarchy_linux-t2.efi"))
   parser.add_argument("--output", type=Path, required=True, help="new private output directory outside the ESP")
   parser.add_argument("--kernel-release", default=os.uname().release)
+  parser.add_argument("--experiment-id", help="embed a bounded diagnostic ID in the private initramfs")
   args = parser.parse_args()
 
   if os.geteuid() != 0:
     raise SystemExit("Run as root so the root-unlock key retains protected handling")
+  experiment_id = validate_experiment_id(args.experiment_id)
   output = args.output.absolute()
   if output.exists():
     raise ValueError("Output already exists; choose a new directory")
@@ -371,8 +383,8 @@ def main():
     work = Path(directory)
     provenance_path, expected = validate_candidate(candidate_source, args.kernel_release)
     module_root, selected = prepare_module_root(work, candidate_source, args.kernel_release, expected)
-    payload, payload_modules = prepare_payload(work, candidate_source, args.kernel_release, expected)
-    initrd, staged_payload = build_initrd(work, module_root, payload, args.kernel_release, expected)
+    payload, payload_modules = prepare_payload(work, candidate_source, args.kernel_release, expected, experiment_id)
+    initrd, staged_payload = build_initrd(work, module_root, payload, args.kernel_release, expected, experiment_id)
     uki, cmdline, sections, production_hash = build_uki(work, production, initrd)
 
     publish = work / "publish"
@@ -386,6 +398,7 @@ def main():
       "production_uki_sha256": production_hash,
       "candidate_uki_sha256": digest(publish / "mba-t2-hibernation-candidate.efi"),
       "candidate_initrd_sha256": digest(publish / "mba-t2-hibernation-candidate.initrd"),
+      "experiment_id": experiment_id,
       "cmdline": cmdline,
       "unchanged_production_sections_sha256": {name: value for name, value in sections.items() if name != ".initrd"},
       "source_provenance_sha256": digest(provenance_path),
