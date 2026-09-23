@@ -33,9 +33,9 @@ def efi_strings(values):
   return b"\x06\x00\x00\x00" + "".join(value + "\x00" for value in values).encode("utf-16-le")
 
 
-def rejects(root, source, restore, expected):
+def rejects(root, source, restore, expected, role="source"):
   try:
-    verifier.inspect(root, source, restore)
+    verifier.inspect(root, source, restore, role)
   except ValueError as error:
     assert expected in str(error), error
   else:
@@ -191,6 +191,11 @@ with tempfile.TemporaryDirectory(prefix="t2-pair-source-verify-") as temporary:
   receipt_path.write_text(json.dumps(changed_receipt))
   rejects(root, source, restore, "arming boot ID is missing or malformed")
   receipt_path.write_text(original_receipt)
+  changed_receipt = json.loads(original_receipt)
+  changed_receipt.pop("kernel_policy")
+  receipt_path.write_text(json.dumps(changed_receipt))
+  rejects(root, source, restore, "production-kernel boot policy")
+  receipt_path.write_text(original_receipt)
   assert verifier.inspect(root, source, restore)["qualification"] == "pair-source-ordinary-boot-preflight-passed"
 
   runner_path = script.parent / "run-hibernation-uki-pair-s4.py"
@@ -212,4 +217,25 @@ with tempfile.TemporaryDirectory(prefix="t2-pair-source-verify-") as temporary:
   assert platform["restore_uki_sha256"] == receipt["images"]["restore"]["sha256"]
   assert platform["resume_offset"] == 42
 
-print("PASS: pair source verifier binds private images, exact boot and live T2 devices without claiming PM success")
+  rejects(root, source, restore, "restore one-shot was not armed", role="restore")
+
+  def restore_bootctl(arguments, check):
+    assert arguments == ["bootctl", "set-oneshot", receipt["images"]["restore"]["entry_id"]] and check
+    (root / pair_stage.SINGLE.ONESHOT).write_bytes(efi_string(arguments[2]))
+
+  pair_stage.arm_restore(root, runner=restore_bootctl, sync=lambda: None)
+  rejects(root, source, restore, "not consumed", role="restore")
+  (root / pair_stage.SINGLE.ONESHOT).unlink()
+  selected.write_bytes(efi_string(receipt["images"]["restore"]["entry_id"]))
+  write(root / pair_stage.BOOT_ID, "ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb\n")
+  restore_result = verifier.inspect(root, source, restore, role="restore")
+  assert restore_result["qualification"] == "pair-restore-ordinary-boot-preflight-passed"
+  assert restore_result["restore_armed_from_boot_id"] == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+  assert restore_result["primary_root"]["subvolume"] == "/@"
+  assert restore_result["physical_input_confirmed"] is False
+  assert restore_result["hibernate_attempted"] is False
+  assert restore_result["hardware_qualified"] is False
+  selected.write_bytes(efi_string(receipt["images"]["source"]["entry_id"]))
+  rejects(root, source, restore, "not the exact restore entry", role="restore")
+
+print("PASS: pair boot verifier binds source and restore images, exact boots and live T2 devices without claiming PM success")
