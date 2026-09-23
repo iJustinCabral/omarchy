@@ -163,6 +163,7 @@ def exercise(root, intercept, header_changed=False):
 with tempfile.TemporaryDirectory(prefix="t2-pre-write-") as directory:
   base = Path(directory)
   success = fixture(base / "success")
+  assert check(success)["physical_input_confirmed"] is True
   result, events = exercise(success, True)
   attempts, guard = probe.vector_paths(success, result)
   assert result["state"] == "returned-and-cleaned"

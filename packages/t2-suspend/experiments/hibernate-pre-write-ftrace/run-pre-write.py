@@ -133,6 +133,7 @@ def preflight(
     **proof,
     **current_input,
     **module,
+    "physical_input_confirmed": True,
     "swap_header_before": header,
     "pre_write_attempts": str(attempts),
     "requested_disk_mode": "test_resume",
