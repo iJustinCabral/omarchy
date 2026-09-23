@@ -51,6 +51,11 @@ grep -Fq 'omarchy-hw-t2' "$ROOT/install/hardware/pacman.sh" ||
   fail "the arch-mact2 repo drop-in no longer greps lspci"
 pass "T2 install paths share one sysfs helper"
 
+grep -Fq '[[ ! -e /etc/modules-load.d/t2.conf && ! -L /etc/modules-load.d/t2.conf ]]' \
+  "$ROOT/install/hardware/apple/fix-t2.sh" ||
+  fail "an existing T2 module list is left alone"
+pass "an existing T2 module list is left alone"
+
 # Hold the vendor read after both attributes were checked, then remove the
 # device ID before completing the vendor read: deterministic hot-unplug race.
 write_pci 0x106b:0x1801:0x068000
