@@ -3,9 +3,9 @@
 
 The source and restore entries must be distinct private UKIs with the same
 runtime stack. Validation is read-only. Execution consumes a pair-wide durable
-guard before arming the restore one-shot; a failed attempt cannot be retried by
-switching hibernation mode. A returned runner is not proof of usable input or
-unattended cold-start recovery.
+guard and pre-arms an opt-in EFI stage marker before arming the restore
+one-shot; a failed attempt cannot be retried by switching hibernation mode.
+A returned runner is not proof of usable input or unattended cold-start recovery.
 """
 
 import argparse
@@ -30,6 +30,7 @@ def import_path(name, path):
 SOURCE = import_path("hibernation_pair_source_verifier", HERE / "verify-hibernation-uki-pair-source.py")
 PAIR = SOURCE.PAIR
 S4 = import_path("hibernation_candidate_s4_runner", HERE / "run-hibernation-candidate-s4.py")
+MARKER = import_path("hibernation_efi_stage_marker", HERE / "hibernate-efi-stage-marker/marker.py")
 TEST = S4.TEST
 WIFI = S4.WIFI
 VECTORS = PAIR.STATE / "s4-vectors"
@@ -71,6 +72,7 @@ def preflight(
   platform_preflight=source_platform_preflight,
   proof_verifier=S4.verify_test_resume_proof,
   current_input_verifier=S4.verify_current_input,
+  require_efi_marker=False,
 ):
   if disk_mode not in ("platform", "shutdown"):
     raise ValueError("Unsupported cold-boot hibernation mode")
@@ -102,6 +104,10 @@ def preflight(
   attempts, guard = vector_paths(root, vector)
   if guard.exists() or attempts.exists():
     raise ValueError("The pair-wide S4 vector already has an attempt or guard")
+  if require_efi_marker:
+    MARKER.require_kernel_available(root)
+    if MARKER.inspect(root, vector) is not None:
+      raise ValueError("An EFI stage marker already exists; preserve it and do not retry")
   return {
     **evidence,
     **proof,
@@ -140,6 +146,7 @@ def execute(
     root, source_directory, restore_directory, proof_directory,
     post_input_path, pre_s4_input_path, disk_mode,
     platform_preflight, proof_verifier, current_input_verifier,
+    require_efi_marker=True,
   )
   if TEST.candidate_hash(expected_pair_vector) != evidence["transition_vector"]:
     raise ValueError("Explicit pair-wide vector does not match the staged images")
@@ -186,6 +193,10 @@ def execute(
     guard_consumed = True
     record["state"] = "guard-consumed"
     TEST.save_attempt(attempt, record)
+    MARKER.enable(root)
+    record["efi_stage_marker"] = MARKER.prearm(root, evidence["transition_vector"])
+    record["state"] = "efi-marker-armed"
+    TEST.save_attempt(attempt, record)
     restore_arm_started = True
     restore_armer(root, runner=runner, sync=sync)
     record["state"] = "restore-entry-armed"
@@ -204,7 +215,10 @@ def execute(
     sync()
     power_writer(power / "state", "disk")
     record["state"] = "returned"
+    record["efi_stage"] = MARKER.inspect(root, evidence["transition_vector"])
     TEST.save_attempt(attempt, record)
+    if record["efi_stage"] != 2:
+      raise RuntimeError("Returned S4 without the source snapshot EFI stage marker")
     if PAIR.rooted(root, PAIR.SINGLE.ONESHOT).exists():
       raise RuntimeError("Restore LoaderEntryOneShot was not consumed")
     if PAIR.selected_entry(root) != evidence["restore_entry_id"]:

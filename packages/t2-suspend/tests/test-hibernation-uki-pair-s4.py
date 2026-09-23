@@ -94,6 +94,8 @@ def fixture(directory):
   write(power / "resume", "254:0\n")
   write(power / "resume_offset", "42\n")
   write(power / "pm_async", "0\n")
+  write(root / pair_s4.MARKER.KERNEL_PARAMETER, "N\n")
+  (root / pair_s4.MARKER.VARIABLE).parent.mkdir(parents=True, exist_ok=True)
   return root, source, restore, proof, receipt, power
 
 
@@ -160,7 +162,7 @@ def fake_runner(root, events, bluetooth, bolt):
   return run
 
 
-def power_writer(root, receipt, events, fail_state=False):
+def power_writer(root, receipt, events, fail_state=False, marker_stage=2):
   def write_power(path, value):
     events.append(("power", path.name, value))
     if path.name == "disk":
@@ -171,9 +173,12 @@ def power_writer(root, receipt, events, fail_state=False):
       assert guard.read_text().strip() == BOOT_ID
       record = json.loads((guard.parent / "attempts" / BOOT_ID / "attempt.json").read_text())
       assert record["state"] == "transition-armed"
+      assert pair_s4.MARKER.inspect(root, vector) == 0
       assert pair.SINGLE.read_efi_string(root / pair.SINGLE.ONESHOT) == receipt["images"]["restore"]["entry_id"]
       if fail_state:
         raise OSError("synthetic S4 failure")
+      if marker_stage is not None:
+        (root / pair_s4.MARKER.VARIABLE).write_bytes(pair_s4.MARKER.ATTRIBUTES + pair_s4.MARKER.payload(vector, marker_stage))
       (root / pair.SINGLE.ONESHOT).unlink()
       write_efi(root / pair.SINGLE.SELECTED, receipt["images"]["restore"]["entry_id"])
 
@@ -189,6 +194,23 @@ with tempfile.TemporaryDirectory(prefix="t2-pair-s4-") as temporary:
   assert result["transition_vector"] == vector
   assert result["physical_input_confirmed"] is True
   assert result["real_s4_attempted"] is False
+  marker_parameter = root / pair_s4.MARKER.KERNEL_PARAMETER
+  marker_parameter.unlink()
+  try:
+    pair_s4.execute(*inputs, vector, platform_preflight, proof_verifier, input_verifier)
+    raise AssertionError("Execution accepted a kernel without the EFI marker patch")
+  except ValueError as error:
+    assert "no T2 EFI stage-marker parameter" in str(error)
+  write(marker_parameter, "N\n")
+  marker_variable = root / pair_s4.MARKER.VARIABLE
+  marker_variable.write_bytes(pair_s4.MARKER.ATTRIBUTES + pair_s4.MARKER.payload(vector, 2))
+  try:
+    pair_s4.execute(*inputs, vector, platform_preflight, proof_verifier, input_verifier)
+    raise AssertionError("Execution accepted a stale EFI marker")
+  except ValueError as error:
+    assert "already exists" in str(error)
+  assert not (root / pair_s4.VECTORS / vector).exists()
+  marker_variable.unlink()
   events = []
   bluetooth = [True]
   bolt = [True]
@@ -216,10 +238,12 @@ with tempfile.TemporaryDirectory(prefix="t2-pair-s4-") as temporary:
   assert result["state"] == "returned-and-cleaned"
   assert result["hibernate_attempted"] is True
   assert result["hardware_qualified"] is False
+  assert result["efi_stage"] == 2
   assert bluetooth == [True] and bolt == [True]
   assert not (root / pair.SINGLE.ONESHOT).exists()
   arm_event = ("command", ("bootctl", "set-oneshot", receipt["images"]["restore"]["entry_id"]))
   assert events.index(("wifi", "prepare")) < events.index(arm_event)
+  assert pair_s4.MARKER.inspect(root, vector) == 2
   assert events.index(arm_event) < events.index(("power", "state", "disk"))
   assert events.index(("power", "state", "disk")) < events.index(("wifi", "restore"))
   try:
@@ -227,6 +251,30 @@ with tempfile.TemporaryDirectory(prefix="t2-pair-s4-") as temporary:
     raise AssertionError("Consumed pair vector was accepted")
   except ValueError as error:
     assert "consumed source-arm state" in str(error) or "already has an attempt or guard" in str(error)
+
+  root, source, restore, proof, receipt, _power = fixture(base / "missing-return-marker")
+  vector = pair_s4.pair_vector(receipt)
+  inputs = (root, source, restore, proof, Path("proof/post-input.json"), Path("proof/pre-input.json"), "platform")
+  events = []
+  try:
+    pair_s4.execute(
+      *inputs, vector, platform_preflight, proof_verifier, input_verifier,
+      wifi_prepare=lambda _root: None, wifi_restore=lambda _root: None,
+      power_writer=power_writer(root, receipt, events, marker_stage=None),
+      runner=fake_runner(root, events, [True], [True]),
+      sync=lambda: None, sleeper=lambda _seconds: None,
+      services_verifier=lambda _runner: None,
+    )
+    raise AssertionError("Returned S4 without snapshot marker was accepted")
+  except RuntimeError as error:
+    assert "without the source snapshot EFI stage marker" in str(error)
+  assert pair_s4.MARKER.inspect(root, vector) == 0
+  assert not (root / pair.SINGLE.ONESHOT).exists()
+  missing_guard = root / pair_s4.VECTORS / vector / "s4-attempted"
+  assert missing_guard.read_text().strip() == BOOT_ID
+  missing_attempt = json.loads((missing_guard.parent / "attempts" / BOOT_ID / "attempt.json").read_text())
+  assert missing_attempt["state"] == "transition-failed"
+  assert missing_attempt["real_s4_attempted"] is True
 
   root, source, restore, proof, receipt, _power = fixture(base / "failure")
   vector = pair_s4.pair_vector(receipt)
@@ -260,6 +308,41 @@ with tempfile.TemporaryDirectory(prefix="t2-pair-s4-") as temporary:
       raise AssertionError("Pair mode switch bypassed the failed guard")
     except ValueError as error:
       assert "consumed source-arm state" in str(error) or "already has an attempt or guard" in str(error)
+
+  root, source, restore, proof, receipt, _power = fixture(base / "marker-failure")
+  vector = pair_s4.pair_vector(receipt)
+  inputs = (root, source, restore, proof, Path("proof/post-input.json"), Path("proof/pre-input.json"), "platform")
+  events = []
+  original_prearm = pair_s4.MARKER.prearm
+
+  def failed_marker_readback(host, identity):
+    original_prearm(host, identity)
+    raise RuntimeError("injected EFI readback failure")
+
+  pair_s4.MARKER.prearm = failed_marker_readback
+  try:
+    try:
+      pair_s4.execute(
+        *inputs, vector, platform_preflight, proof_verifier, input_verifier,
+        wifi_prepare=lambda _root: None, wifi_restore=lambda _root: None,
+        power_writer=power_writer(root, receipt, events),
+        runner=fake_runner(root, events, [True], [True]),
+        sync=lambda: None, sleeper=lambda _seconds: None,
+        services_verifier=lambda _runner: None,
+      )
+      raise AssertionError("EFI marker failure was hidden")
+    except RuntimeError as error:
+      assert "injected EFI readback failure" in str(error)
+  finally:
+    pair_s4.MARKER.prearm = original_prearm
+  assert pair_s4.MARKER.inspect(root, vector) == 0
+  assert not (root / pair.SINGLE.ONESHOT).exists()
+  assert not any(event == ("power", "state", "disk") for event in events)
+  marker_guard = root / pair_s4.VECTORS / vector / "s4-attempted"
+  assert marker_guard.read_text().strip() == BOOT_ID
+  marker_attempt = json.loads((marker_guard.parent / "attempts" / BOOT_ID / "attempt.json").read_text())
+  assert marker_attempt["state"] == "guard-consumed-pretransition-failure"
+  assert marker_attempt["real_s4_attempted"] is False
 
   root, source, restore, proof, receipt, _power = fixture(base / "arm-failure")
   vector = pair_s4.pair_vector(receipt)
