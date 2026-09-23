@@ -1,0 +1,25 @@
+[Unit]
+Description=Recover BCM4377 Wi-Fi firmware stalls on supported T2 Macs
+After=NetworkManager.service bluetooth.service
+Wants=NetworkManager.service
+Before=systemd-user-sessions.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+Environment=OMARCHY_PATH=/usr/share/omarchy
+ExecStart=/usr/bin/omarchy-t2-wifi-recovery
+TimeoutStartSec=40
+TimeoutStopSec=10
+Restart=no
+RuntimeDirectory=omarchy-t2-wifi-recovery
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/sys/kernel/debug /run/lock
+
+[Install]
+WantedBy=multi-user.target
