@@ -240,6 +240,7 @@ def preflight(
     **evidence,
     **proof,
     **current_input,
+    "physical_input_confirmed": True,
     "transition_vector": identity,
     "requested_disk_mode": disk_mode,
     "s4_attempts": str(attempts),

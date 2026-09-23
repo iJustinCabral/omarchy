@@ -150,6 +150,7 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-s4-") as directory:
   )
   assert result["transition_vector"] == CANDIDATE_HASH
   assert result["real_s4_attempted"] is False
+  assert result["physical_input_confirmed"] is True
 
   result = s4.execute(
     root,
