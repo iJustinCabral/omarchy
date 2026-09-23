@@ -3,7 +3,7 @@
 
 The source and restore entries must be distinct private UKIs with the same
 runtime stack. Validation is read-only. Execution consumes a pair-wide durable
-guard and pre-arms an opt-in EFI stage marker before arming the restore
+guard and pre-arms an opt-in stage marker before arming the restore
 one-shot; a failed attempt cannot be retried by switching hibernation mode.
 A returned runner is not proof of usable input or unattended cold-start recovery.
 """
@@ -31,6 +31,7 @@ SOURCE = import_path("hibernation_pair_source_verifier", HERE / "verify-hibernat
 PAIR = SOURCE.PAIR
 S4 = import_path("hibernation_candidate_s4_runner", HERE / "run-hibernation-candidate-s4.py")
 MARKER = import_path("hibernation_efi_stage_marker", HERE / "hibernate-efi-stage-marker/marker.py")
+RTC = import_path("hibernation_rtc_stage_runtime", HERE / "hibernate-rtc-stage-marker/runtime.py")
 TEST = S4.TEST
 WIFI = S4.WIFI
 VECTORS = PAIR.STATE / "s4-vectors"
@@ -73,6 +74,7 @@ def preflight(
   proof_verifier=S4.verify_test_resume_proof,
   current_input_verifier=S4.verify_current_input,
   require_efi_marker=False,
+  marker_backend=MARKER,
 ):
   if disk_mode not in ("platform", "shutdown"):
     raise ValueError("Unsupported cold-boot hibernation mode")
@@ -105,9 +107,9 @@ def preflight(
   if guard.exists() or attempts.exists():
     raise ValueError("The pair-wide S4 vector already has an attempt or guard")
   if require_efi_marker:
-    MARKER.require_kernel_available(root)
-    if MARKER.inspect(root, vector) is not None:
-      raise ValueError("An EFI stage marker already exists; preserve it and do not retry")
+    marker_backend.require_kernel_available(root)
+    if marker_backend.inspect(root, vector) is not None:
+      raise ValueError("A stage marker already exists; preserve it and do not retry")
   return {
     **evidence,
     **proof,
@@ -141,12 +143,14 @@ def execute(
   services_verifier=S4.verify_services,
   restore_armer=PAIR.arm_restore,
   restore_disarmer=PAIR.disarm_restore,
+  marker_backend=MARKER,
 ):
   evidence = preflight(
     root, source_directory, restore_directory, proof_directory,
     post_input_path, pre_s4_input_path, disk_mode,
     platform_preflight, proof_verifier, current_input_verifier,
     require_efi_marker=True,
+    marker_backend=marker_backend,
   )
   if TEST.candidate_hash(expected_pair_vector) != evidence["transition_vector"]:
     raise ValueError("Explicit pair-wide vector does not match the staged images")
@@ -172,6 +176,7 @@ def execute(
   guard_consumed = False
   restore_arm_started = False
   transition_started = False
+  marker_started = False
   try:
     bolt_was_active = S4.service_active("bolt.service", runner)
     if bolt_was_active:
@@ -185,7 +190,7 @@ def execute(
     power_writer(power / "disk", disk_mode)
     if TEST.selected_value(power / "disk") != disk_mode:
       raise RuntimeError("Requested hibernation mode did not select")
-    power_writer(power / "pm_trace", "1")
+    power_writer(power / "pm_trace", getattr(marker_backend, "PM_TRACE_VALUE", "1"))
     record["state"] = "isolated"
     TEST.save_attempt(attempt, record)
 
@@ -193,9 +198,15 @@ def execute(
     guard_consumed = True
     record["state"] = "guard-consumed"
     TEST.save_attempt(attempt, record)
-    MARKER.enable(root)
-    record["efi_stage_marker"] = MARKER.prearm(root, evidence["transition_vector"])
-    record["state"] = "efi-marker-armed"
+    marker_started = True
+    before_arm = getattr(marker_backend, "before_arm", None)
+    if before_arm is not None:
+      before_arm(root, evidence["transition_vector"], boot_id, attempt_directory)
+    marker_backend.enable(root)
+    marker_path = marker_backend.prearm(root, evidence["transition_vector"])
+    backend_name = getattr(marker_backend, "NAME", "efi")
+    record[backend_name + "_stage_marker"] = marker_path
+    record["state"] = backend_name + "-marker-armed"
     TEST.save_attempt(attempt, record)
     restore_arm_started = True
     restore_armer(root, runner=runner, sync=sync)
@@ -215,10 +226,12 @@ def execute(
     sync()
     power_writer(power / "state", "disk")
     record["state"] = "returned"
-    record["efi_stage"] = MARKER.inspect(root, evidence["transition_vector"])
+    backend_name = getattr(marker_backend, "NAME", "efi")
+    returned_stage = marker_backend.inspect(root, evidence["transition_vector"])
+    record[backend_name + "_stage"] = returned_stage
     TEST.save_attempt(attempt, record)
-    if record["efi_stage"] != 2:
-      raise RuntimeError("Returned S4 without the source snapshot EFI stage marker")
+    if returned_stage is None or returned_stage < getattr(marker_backend, "MIN_RETURN_STAGE", 2):
+      raise RuntimeError("Returned S4 without the source snapshot " + backend_name.upper() + " stage marker")
     if PAIR.rooted(root, PAIR.SINGLE.ONESHOT).exists():
       raise RuntimeError("Restore LoaderEntryOneShot was not consumed")
     if PAIR.selected_entry(root) != evidence["restore_entry_id"]:
@@ -267,6 +280,12 @@ def execute(
         runner(("systemctl", "start", "bolt.service"))
       except Exception as error:
         cleanup_errors.append("bolt: " + str(error))
+    cleanup_marker = getattr(marker_backend, "cleanup", None)
+    if marker_started and cleanup_marker is not None:
+      try:
+        cleanup_marker(root, evidence["transition_vector"], boot_id, attempt_directory)
+      except Exception as error:
+        cleanup_errors.append("stage-marker: " + str(error))
     if cleanup_errors:
       record["cleanup_errors"] = cleanup_errors
       record["state"] = "cleanup-failed"
@@ -291,11 +310,22 @@ def main():
   parser.add_argument("--validate-only", action="store_true")
   parser.add_argument("--execute", action="store_true")
   parser.add_argument("--expected-pair-vector")
+  parser.add_argument("--marker-backend", choices=("efi", "rtc"), default="efi")
+  parser.add_argument("--rtc-marker-module", type=Path)
+  parser.add_argument("--expected-rtc-marker-sha256")
   arguments = parser.parse_args()
   if arguments.validate_only == arguments.execute:
     parser.error("select exactly one of --validate-only or --execute")
   if arguments.execute and arguments.expected_pair_vector is None:
     parser.error("--execute requires --expected-pair-vector")
+  if arguments.marker_backend == "rtc":
+    if arguments.rtc_marker_module is None or arguments.expected_rtc_marker_sha256 is None:
+      parser.error("RTC backend requires --rtc-marker-module and --expected-rtc-marker-sha256")
+    marker_backend = RTC.RTCBackend(arguments.rtc_marker_module, arguments.expected_rtc_marker_sha256)
+  else:
+    if arguments.rtc_marker_module is not None or arguments.expected_rtc_marker_sha256 is not None:
+      parser.error("RTC module arguments require --marker-backend rtc")
+    marker_backend = MARKER
   if os.geteuid() != 0:
     raise SystemExit("Root required")
   try:
@@ -307,9 +337,9 @@ def main():
     )
     if arguments.validate_only:
       S4.verify_services()
-      result = preflight(*paths)
+      result = preflight(*paths, require_efi_marker=arguments.marker_backend == "rtc", marker_backend=marker_backend)
     else:
-      result = execute(*paths, arguments.expected_pair_vector)
+      result = execute(*paths, arguments.expected_pair_vector, marker_backend=marker_backend)
   except (OSError, RuntimeError, ValueError) as error:
     raise SystemExit("Pair cold-boot hibernation refused: " + str(error)) from error
   print(json.dumps(result, indent=2, sort_keys=True))

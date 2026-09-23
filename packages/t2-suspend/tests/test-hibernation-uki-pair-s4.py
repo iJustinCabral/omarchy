@@ -381,4 +381,66 @@ with tempfile.TemporaryDirectory(prefix="t2-pair-s4-") as temporary:
   assert arm_attempt["state"] == "guard-consumed-pretransition-failure"
   assert arm_attempt["real_s4_attempted"] is False
 
+  root, source, restore, proof, receipt, power = fixture(base / "rtc-backend-order")
+  vector = pair_s4.pair_vector(receipt)
+  inputs = (root, source, restore, proof, Path("proof/post-input.json"), Path("proof/pre-input.json"), "platform")
+  events = []
+
+  class RTCMarker:
+    NAME = "rtc"
+    PM_TRACE_VALUE = "0"
+    MIN_RETURN_STAGE = 2
+
+    def __init__(self):
+      self.stage = None
+
+    def require_kernel_available(self, _root):
+      events.append(("rtc", "preflight"))
+
+    def inspect(self, _root, _vector):
+      return self.stage
+
+    def before_arm(self, host, identity, boot, directory):
+      assert identity == vector and boot == BOOT_ID
+      assert (directory.parent.parent / "s4-attempted").read_text().strip() == BOOT_ID
+      events.append(("rtc", "pointer"))
+
+    def enable(self, _root):
+      events.append(("rtc", "loaded"))
+
+    def prearm(self, _root, _vector):
+      self.stage = 0
+      events.append(("rtc", "armed"))
+      return "/sys/module/synthetic/armed"
+
+    def cleanup(self, _root, _vector, _boot, _directory):
+      events.append(("rtc", "cleaned"))
+
+  rtc = RTCMarker()
+
+  def rtc_writer(path, value):
+    events.append(("power", path.name, value))
+    if path.name == "disk":
+      write(path, "[platform] shutdown reboot suspend test_resume\n")
+    if path.name == "state":
+      assert rtc.stage == 0
+      assert pair.SINGLE.read_efi_string(root / pair.SINGLE.ONESHOT) == receipt["images"]["restore"]["entry_id"]
+      rtc.stage = 2
+      (root / pair.SINGLE.ONESHOT).unlink()
+      write_efi(root / pair.SINGLE.SELECTED, receipt["images"]["restore"]["entry_id"])
+
+  result = pair_s4.execute(
+    *inputs, vector, platform_preflight, proof_verifier, input_verifier,
+    wifi_prepare=lambda _root: events.append(("wifi", "prepare")),
+    wifi_restore=lambda _root: events.append(("wifi", "restore")),
+    power_writer=rtc_writer,
+    runner=fake_runner(root, events, [False], [False]),
+    sync=lambda: None, sleeper=lambda _seconds: None,
+    services_verifier=lambda _runner: None, marker_backend=rtc,
+  )
+  assert result["state"] == "returned-and-cleaned" and result["rtc_stage"] == 2
+  assert events.index(("rtc", "pointer")) < events.index(("rtc", "armed"))
+  assert events.index(("rtc", "armed")) < events.index(("command", ("bootctl", "set-oneshot", receipt["images"]["restore"]["entry_id"])))
+  assert events.index(("rtc", "cleaned")) > events.index(("wifi", "restore"))
+
 print("PASS: pair S4 runner binds proof and pair-wide guard, arms only restore, and clears a failed one-shot")
