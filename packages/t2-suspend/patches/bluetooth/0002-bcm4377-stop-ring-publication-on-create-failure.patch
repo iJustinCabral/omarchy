@@ -1,0 +1,21 @@
+--- a/drivers/bluetooth/hci_bcm4377.c
++++ b/drivers/bluetooth/hci_bcm4377.c
+@@ -886,6 +886,9 @@
+ 	int ret, msgid;
+ 	DECLARE_COMPLETION_ONSTACK(event);
+ 
++	if (READ_ONCE(bcm4377->resume_config_failed))
++		return -EIO;
++
+ 	if (len > ring->payload_size && len > ring->mapped_payload_size) {
+ 		dev_warn(
+ 			&bcm4377->pdev->dev,
+@@ -1071,6 +1074,8 @@
+ 
+ 	ret = bcm4377_enqueue(bcm4377, &bcm4377->control_h2d_ring, &msg,
+ 			      sizeof(msg), true);
++	if (ret)
++		return ret;
+ 
+ 	spin_lock_irqsave(&ring->lock, spinlock_flags);
+ 

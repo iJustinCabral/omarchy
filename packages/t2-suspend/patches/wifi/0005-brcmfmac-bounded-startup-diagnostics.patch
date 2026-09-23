@@ -1,0 +1,79 @@
+Subject: [PATCH 5/5] wifi: brcmfmac: add bounded diagnostic lifecycle summaries
+
+Diagnostic-only: report transport, firmware flags, doorbell offsets and IRQ
+counters at preinit and setup success/failure. No per-interrupt logging or
+additional MMIO reads. Counters reset on IRQ setup. Not intended upstream.
+
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+@@ -343,6 +343,9 @@
+ 	bool have_msi;
+ 	bool msgbuf_ready;
+ 	atomic_t irq_status;
++	atomic_t diag_irqs;
++	atomic_t diag_zero_status;
++	atomic_t diag_drains;
+ 	struct pci_dev *pdev;
+ 	char fw_name[BRCMF_FW_NAME_LEN];
+ 	char nvram_name[BRCMF_FW_NAME_LEN];
+@@ -1000,12 +1003,30 @@
+ 				       brcmf_pcie_h2d_doorbell(devinfo, true), 1);
+ }
+ 
++/* One line per lifecycle boundary, never one line per interrupt. */
++static void brcmf_pcie_diag(struct brcmf_pciedev_info *devinfo,
++			    const char *phase, int result)
++{
++	dev_info(&devinfo->pdev->dev,
++		 "t2mb-diag %s rc=%d flags=%08x ctl=%u msi=%u ready=%u db=%x/%x irq=%d zero=%d drains=%d\n",
++		 phase, result, devinfo->shared.flags, devinfo->shared.mb_via_ctl,
++		 devinfo->have_msi, READ_ONCE(devinfo->msgbuf_ready),
++		 brcmf_pcie_h2d_doorbell(devinfo, false),
++		 brcmf_pcie_h2d_doorbell(devinfo, true),
++		 atomic_read(&devinfo->diag_irqs),
++		 atomic_read(&devinfo->diag_zero_status),
++		 atomic_read(&devinfo->diag_drains));
++}
++
+ static irqreturn_t brcmf_pcie_quick_check_isr(int irq, void *arg)
+ {
+ 	struct brcmf_pciedev_info *devinfo = arg;
+ 	u32 status;
+ 
+ 	status = brcmf_pcie_read_pcie32(devinfo, devinfo->reginfo->mailboxint);
++	atomic_inc(&devinfo->diag_irqs);
++	if (!status)
++		atomic_inc(&devinfo->diag_zero_status);
+ 	if (!status && !devinfo->have_msi)
+ 		return IRQ_NONE;
+ 
+@@ -1035,8 +1056,10 @@
+ 	    devinfo->state == BRCMFMAC_PCIE_STATE_UP) {
+ 		if (status & devinfo->reginfo->int_fn0)
+ 			brcmf_pcie_poll_mb_data(devinfo);
+-		if (devinfo->have_msi || status & devinfo->reginfo->int_d2h_db)
++		if (devinfo->have_msi || status & devinfo->reginfo->int_d2h_db) {
++			atomic_inc(&devinfo->diag_drains);
+ 			brcmf_proto_msgbuf_rx_trigger(&devinfo->pdev->dev);
++		}
+ 		brcmf_pcie_bus_console_read(devinfo, false);
+ 		brcmf_pcie_intr_enable(devinfo);
+ 	}
+@@ -1055,6 +1078,9 @@
+ 	brcmf_dbg(PCIE, "Enter\n");
+ 
+ 	atomic_set(&devinfo->irq_status, 0);
++	atomic_set(&devinfo->diag_irqs, 0);
++	atomic_set(&devinfo->diag_zero_status, 0);
++	atomic_set(&devinfo->diag_drains, 0);
+ 	devinfo->have_msi = pci_enable_msi(pdev) >= 0;
+ 	if (request_threaded_irq(pdev->irq, brcmf_pcie_quick_check_isr,
+ 				 brcmf_pcie_isr_thread, IRQF_SHARED,
+@@ -1558,6 +1584,7 @@
+ 	smp_store_release(&buspub->devinfo->msgbuf_ready, true);
+ 	brcmf_pcie_intr_enable(buspub->devinfo);
+ 	brcmf_pcie_hostready(buspub->devinfo);
++	brcmf_pcie_diag(buspub->devinfo, "preinit", 0);
+ 
+ 	return 0;
+ }

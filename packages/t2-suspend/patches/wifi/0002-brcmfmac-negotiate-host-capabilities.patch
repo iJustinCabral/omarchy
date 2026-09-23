@@ -1,0 +1,63 @@
+Subject: [PATCH 2/2] wifi: brcmfmac: negotiate host capabilities for ring mailboxes
+
+Adapt the host-capability negotiation in AsahiLinux/linux
+77cb8f24c2381a8abb7272d7bbdec548d6426a8a. The firmware autonomous
+DS handshake requires a device-wake protocol this driver does not implement.
+Advertise DS_NO_OOB_DW and the existing host-ready support before activation.
+Do not advertise in-band wake or DAR, which this patch does not implement.
+Limit the new contract to firmware selected for control-ring mailboxes.
+
+This is a follow-up hypothesis after a failed candidate boot, not a proven
+firmware-crash fix. D3 system suspend remains available.
+
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+@@ -220,6 +220,11 @@
+ #define BRCMF_PCIE_SHARED_DMA_INDEX		0x10000
+ #define BRCMF_PCIE_SHARED_DMA_2B_IDX		0x100000
+ #define BRCMF_PCIE_SHARED_USE_MAILBOX		0x02000000
++#define BRCMF_HOSTCAP_H2D_ENABLE_HOSTRDY		0x00000400
++#define BRCMF_HOSTCAP_DS_NO_OOB_DW		0x00001000
++#define BRCMF_SHARED_HOST_CAP_OFFSET		84
++#define BRCMF_SHARED_HOST_CAP2_OFFSET		112
++
+ #define BRCMF_PCIE_SHARED_HOSTRDY_DB1		0x10000000
+ 
+ #define BRCMF_PCIE_FLAGS_HTOD_SPLIT		0x4000
+@@ -1648,6 +1653,27 @@
+ }
+ 
+ 
++static void brcmf_pcie_init_host_caps(struct brcmf_pciedev_info *devinfo)
++{
++	struct brcmf_pcie_shared_info *shared = &devinfo->shared;
++	u32 host_cap;
++
++	/* Leave the legacy mailbox firmware contract unchanged. */
++	if (shared->version < 6 || !shared->mb_via_ctl)
++		return;
++
++	/* Firmware DS needs a device-wake protocol we do not implement. */
++	host_cap = shared->version | BRCMF_HOSTCAP_DS_NO_OOB_DW;
++	if (shared->flags & BRCMF_PCIE_SHARED_HOSTRDY_DB1)
++		host_cap |= BRCMF_HOSTCAP_H2D_ENABLE_HOSTRDY;
++
++	brcmf_pcie_write_tcm32(devinfo, shared->tcm_base_address +
++			       BRCMF_SHARED_HOST_CAP_OFFSET, host_cap);
++	brcmf_pcie_write_tcm32(devinfo, shared->tcm_base_address +
++			       BRCMF_SHARED_HOST_CAP2_OFFSET, 0);
++}
++
++
+ static int
+ brcmf_pcie_init_share_ram_info(struct brcmf_pciedev_info *devinfo,
+ 			       u32 sharedram_addr)
+@@ -1703,6 +1729,8 @@
+ 
+ 	brcmf_pcie_bus_console_init(devinfo);
+ 	brcmf_pcie_bus_console_read(devinfo, false);
++
++	brcmf_pcie_init_host_caps(devinfo);
+ 
+ 	return 0;
+ }

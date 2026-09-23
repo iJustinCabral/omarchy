@@ -1,0 +1,23 @@
+#!/bin/bash
+# omarchy:summary=Install or restore automatic T2 suspend drivers
+# omarchy:args=[--verify|--rollback]
+# omarchy:requires-sudo=true
+set -euo pipefail
+case "${1:-}" in
+  "") action=install ;;
+  --verify) action=verify ;;
+  --rollback) action=rollback ;;
+  -h|--help)
+    echo "Usage: omarchy setup t2-suspend [--verify|--rollback]"
+    echo "MacBookAir9,1 BCM4377; changes apply at next boot. No radio restart or reboot."
+    exit 0 ;;
+  *) echo "Unknown option: $1" >&2; exit 2 ;;
+esac
+(( $# <= 1 )) || exit 2
+manager=$OMARCHY_PATH/packages/t2-suspend/installer/manage.py
+if [[ $action == "install" ]]; then
+  python3 "$manager" supported || { echo "Unsupported T2 suspend hardware" >&2; exit 1; }
+  omarchy-pkg-add dkms linux-t2-headers gcc make patch
+  omarchy-setup-t2-bluetooth
+fi
+sudo /usr/bin/python3 "$manager" "$action"
