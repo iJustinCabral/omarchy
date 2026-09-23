@@ -475,6 +475,40 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-s4-proof-") as directory:
   except ValueError as error:
     assert "another boot or entry" in str(error)
 
+  early_selection = {
+    name: "usr/lib/modules/7.2.6-test-t2/" + name + ".ko"
+    for name in s4.RUNTIME_MODULES - {"t2bce_ave"}
+  }
+  early_source = {
+    **candidate_provenance,
+    "pre_restore_module_policy": "early-t2-radio",
+    "initrd_module_selection": early_selection,
+  }
+  early_proof = {**proof_provenance, "initrd_module_selection": early_selection}
+  (candidate / "provenance.json").write_text(json.dumps(early_source))
+  (proof_candidate / "provenance.json").write_text(json.dumps(early_proof))
+  assert s4.verify_test_resume_proof(
+    root, evidence, Path("proof/post-input.json"), candidate, proof_candidate,
+    allow_matching_early_source=True,
+  )["test_resume_boot_id"] == PROOF_BOOT_ID
+  try:
+    s4.verify_test_resume_proof(root, evidence, Path("proof/post-input.json"), candidate, proof_candidate)
+    raise AssertionError("legacy runner accepted early-source proof without an explicit opt-in")
+  except ValueError as error:
+    assert "isolated pre-restore policy" in str(error)
+  changed_selection = {**early_proof, "initrd_module_selection": {**early_selection, "t2bce_ave": "unexpected"}}
+  (proof_candidate / "provenance.json").write_text(json.dumps(changed_selection))
+  try:
+    s4.verify_test_resume_proof(
+      root, evidence, Path("proof/post-input.json"), candidate, proof_candidate,
+      allow_matching_early_source=True,
+    )
+    raise AssertionError("pair proof accepted a different initramfs module selection")
+  except ValueError as error:
+    assert "identical complete initramfs module selection" in str(error)
+  (proof_candidate / "provenance.json").write_text(json.dumps(proof_provenance))
+  (candidate / "provenance.json").write_text(json.dumps(candidate_provenance))
+
   no_policy = json.loads((candidate / "provenance.json").read_text())
   del no_policy["pre_restore_module_policy"]
   (candidate / "provenance.json").write_text(json.dumps(no_policy))

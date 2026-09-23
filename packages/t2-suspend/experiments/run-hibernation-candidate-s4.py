@@ -129,7 +129,7 @@ def runtime_stack_identity(provenance):
   return hashlib.sha256(encoded).hexdigest()
 
 
-def verify_test_resume_proof(root, evidence, post_input_path, candidate_directory, proof_candidate_directory):
+def verify_test_resume_proof(root, evidence, post_input_path, candidate_directory, proof_candidate_directory, allow_matching_early_source=False):
   current_provenance = VERIFIER.load_provenance(candidate_directory)
   proof_provenance = VERIFIER.load_provenance(proof_candidate_directory)
   current_hash = TEST.candidate_hash(evidence.get("candidate_uki_sha256"))
@@ -140,8 +140,17 @@ def verify_test_resume_proof(root, evidence, post_input_path, candidate_director
   proof_stack = runtime_stack_identity(proof_provenance)
   if proof_stack != current_stack:
     raise ValueError("test_resume proof candidate has a different runtime stack")
-  if proof_hash != current_hash and current_provenance.get("pre_restore_module_policy") != "root-only-no-t2-radio":
-    raise ValueError("Cross-image test_resume proof requires the isolated pre-restore policy")
+  if proof_hash != current_hash:
+    policy = current_provenance.get("pre_restore_module_policy")
+    if policy == "root-only-no-t2-radio":
+      pass
+    elif allow_matching_early_source and policy == "early-t2-radio":
+      selection = current_provenance.get("initrd_module_selection")
+      proof_selection = proof_provenance.get("initrd_module_selection")
+      if not isinstance(selection, dict) or set(selection) != RUNTIME_MODULES - {"t2bce_ave"} or selection != proof_selection:
+        raise ValueError("Cross-image early-source proof requires identical complete initramfs module selection")
+    else:
+      raise ValueError("Cross-image test_resume proof requires the isolated pre-restore policy")
 
   proof_evidence = {"candidate_uki_sha256": proof_hash}
   attempts, guard = TEST.vector_paths(root, proof_evidence)

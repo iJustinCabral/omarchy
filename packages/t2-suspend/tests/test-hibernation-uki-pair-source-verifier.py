@@ -192,4 +192,23 @@ with tempfile.TemporaryDirectory(prefix="t2-pair-source-verify-") as temporary:
   receipt_path.write_text(original_receipt)
   assert verifier.inspect(root, source, restore)["qualification"] == "pair-source-ordinary-boot-preflight-passed"
 
+  runner_path = script.parent / "run-hibernation-uki-pair-s4.py"
+  runner_spec = importlib.util.spec_from_file_location("pair_s4_platform_adapter", runner_path)
+  pair_runner = importlib.util.module_from_spec(runner_spec)
+  runner_spec.loader.exec_module(pair_runner)
+  power = root / pair_runner.TEST.POWER
+  write(power / "state", "freeze mem disk\n")
+  write(power / "disk", "[platform] shutdown test_resume\n")
+  write(power / "pm_test", "[none] core processors platform devices freezer\n")
+  write(power / "pm_trace", "0\n")
+  write(power / "resume", "254:0\n")
+  write(power / "resume_offset", "42\n")
+  write(power / "pm_async", "0\n")
+  write(root / pair_runner.TEST.SWAPS, "Filename Type Size Used Priority\n/swap/swapfile file 4096 0 -2\n")
+  platform = pair_runner.source_platform_preflight(root, source, restore)
+  assert platform["entry_id"] == receipt["images"]["source"]["entry_id"]
+  assert platform["candidate_uki_sha256"] == receipt["images"]["source"]["sha256"]
+  assert platform["restore_uki_sha256"] == receipt["images"]["restore"]["sha256"]
+  assert platform["resume_offset"] == 42
+
 print("PASS: pair source verifier binds private images, exact boot and live T2 devices without claiming PM success")
