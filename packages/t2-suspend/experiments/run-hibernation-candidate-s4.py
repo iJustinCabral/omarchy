@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Run one guarded real-S4 attempt after an exact runtime-stack test_resume.
+"""Run one guarded cold-boot hibernation attempt after a runtime-stack test_resume.
 
 The resume boot is armed to the exact running candidate UKI immediately before
-entering ACPI S4. A prior candidate may supply test_resume proof only when its
-kernel, command line, production PE sections and complete module stack are
-identical. Limine consumes the one-shot before loading the image, so a failed
-resume falls back to the unchanged production default on the next boot.
+entering the selected platform or shutdown mode. A prior candidate may supply
+test_resume proof only when its kernel, command line, production PE sections
+and complete module stack are identical. Limine consumes the one-shot before
+loading the image, so a failed resume falls back to the unchanged production
+default on the next boot.
 """
 
 import argparse
@@ -215,13 +216,19 @@ def preflight(
   proof_verifier=verify_test_resume_proof,
   current_input_verifier=verify_current_input,
   staging_verifier=verify_staging,
+  disk_mode="platform",
 ):
+  if disk_mode not in ("platform", "shutdown"):
+    raise ValueError("Unsupported cold-boot hibernation mode")
   evidence = platform_preflight(root, candidate_directory)
   identity = TEST.candidate_hash(evidence.get("candidate_uki_sha256"))
   power = confined(root, TEST.POWER)
-  if not TEST.available(power / "disk", "platform"):
-    raise ValueError("Kernel does not advertise platform hibernation")
-  if TEST.selected_value(power / "disk") != "platform":
+  if not TEST.available(power / "disk", disk_mode):
+    raise ValueError("Kernel does not advertise requested hibernation mode")
+  selected_disk_mode = TEST.selected_value(power / "disk")
+  if selected_disk_mode != "platform" and selected_disk_mode != "shutdown":
+    raise ValueError("Unexpected initial hibernation mode")
+  if disk_mode == "platform" and selected_disk_mode != "platform":
     raise ValueError("Platform hibernation is not selected")
   staging_verifier(root, evidence)
   proof = proof_verifier(root, evidence, post_input_path, candidate_directory, proof_candidate_directory)
@@ -234,6 +241,7 @@ def preflight(
     **proof,
     **current_input,
     "transition_vector": identity,
+    "requested_disk_mode": disk_mode,
     "s4_attempts": str(attempts),
     "real_s4_attempted": False,
   }
@@ -290,6 +298,7 @@ def execute(
   resume_armer=arm_resume_entry,
   resume_clearer=clear_resume_entry,
   services_verifier=verify_services,
+  disk_mode="platform",
 ):
   evidence = preflight(
     root,
@@ -301,6 +310,7 @@ def execute(
     proof_verifier,
     current_input_verifier,
     staging_verifier,
+    disk_mode,
   )
   services_verifier(runner)
   boot_id = evidence["boot_id"]
@@ -334,7 +344,9 @@ def execute(
     wifi_prepare_started = True
     wifi_prepare(root)
     power_writer(power / "pm_test", "none")
-    power_writer(power / "disk", "platform")
+    power_writer(power / "disk", disk_mode)
+    if TEST.selected_value(power / "disk") != disk_mode:
+      raise RuntimeError("Requested hibernation mode did not select")
     power_writer(power / "pm_trace", "1")
     record["state"] = "isolated"
     TEST.save_attempt(attempt, record)
@@ -344,8 +356,8 @@ def execute(
     record["state"] = "resume-entry-armed"
     TEST.save_attempt(attempt, record)
     print(
-      "omarchy-t2-hibernation-candidate: starting guarded real S4 "
-      f"boot={boot_id} entry={evidence['entry_id']}",
+      "omarchy-t2-hibernation-candidate: starting guarded cold-boot hibernation "
+      f"boot={boot_id} entry={evidence['entry_id']} mode={disk_mode}",
       flush=True,
     )
     sync()
@@ -357,7 +369,7 @@ def execute(
     TEST.save_attempt(attempt, record)
     sync()
     power_writer(power / "state", "disk")
-    print("omarchy-t2-hibernation-candidate: real S4 returned", flush=True)
+    print("omarchy-t2-hibernation-candidate: cold-boot hibernation returned", flush=True)
     record["state"] = "returned"
     TEST.save_attempt(attempt, record)
 
@@ -411,10 +423,10 @@ def execute(
       TEST.save_attempt(attempt, record)
 
   if record.get("cleanup_errors"):
-    raise RuntimeError("Real S4 returned but cleanup failed: " + "; ".join(record["cleanup_errors"]))
+    raise RuntimeError("Cold-boot hibernation returned but cleanup failed: " + "; ".join(record["cleanup_errors"]))
   record["state"] = "returned-and-cleaned"
   TEST.save_attempt(attempt, record)
-  print("omarchy-t2-hibernation-candidate: real S4 cleanup complete", flush=True)
+  print("omarchy-t2-hibernation-candidate: cold-boot hibernation cleanup complete", flush=True)
   return record
 
 
@@ -424,6 +436,7 @@ def main():
   parser.add_argument("--test-resume-proof-source", type=Path)
   parser.add_argument("--post-resume-input-evidence", type=Path, required=True)
   parser.add_argument("--pre-s4-input-evidence", type=Path, required=True)
+  parser.add_argument("--disk-mode", choices=("platform", "shutdown"), default="platform")
   parser.add_argument("--validate-only", action="store_true")
   parser.add_argument("--execute", action="store_true")
   args = parser.parse_args()
@@ -441,6 +454,7 @@ def main():
         proof_candidate,
         args.post_resume_input_evidence,
         args.pre_s4_input_evidence,
+        disk_mode=args.disk_mode,
       )
     else:
       result = execute(
@@ -449,9 +463,10 @@ def main():
         proof_candidate,
         args.post_resume_input_evidence,
         args.pre_s4_input_evidence,
+        disk_mode=args.disk_mode,
       )
   except (OSError, RuntimeError, ValueError) as error:
-    raise SystemExit("Candidate real-S4 refused: " + str(error)) from error
+    raise SystemExit("Candidate cold-boot hibernation refused: " + str(error)) from error
   print(json.dumps(result, indent=2, sort_keys=True))
 
 

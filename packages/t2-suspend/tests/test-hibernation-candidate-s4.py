@@ -127,6 +127,8 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-s4-") as directory:
 
   def power_writer(path, value):
     events.append(("power", path.name, value))
+    if path.name == "disk":
+      write(path, " ".join("[" + mode + "]" if mode == value else mode for mode in ("platform", "shutdown", "reboot", "suspend", "test_resume")) + "\n")
     if path.name == "state":
       assert (vector / "s4-attempted").read_text().strip() == BOOT_ID
       armed = json.loads((vector / "attempts" / BOOT_ID / "attempt.json").read_text())
@@ -196,6 +198,22 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-s4-") as directory:
     raise AssertionError("runner accepted a consumed real-S4 vector")
   except ValueError as error:
     assert "already consumed" in str(error)
+  try:
+    s4.preflight(
+      root,
+      candidate,
+      candidate,
+      Path("proof/post-input.json"),
+      Path("proof/pre-s4-input.json"),
+      platform_preflight,
+      proof_verifier,
+      current_input_verifier,
+      staging_verifier,
+      disk_mode="shutdown",
+    )
+    raise AssertionError("runner allowed a consumed UKI to switch cold-boot mode")
+  except ValueError as error:
+    assert "already consumed" in str(error)
 
 with tempfile.TemporaryDirectory(prefix="t2-candidate-s4-failure-") as directory:
   base = Path(directory)
@@ -229,6 +247,8 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-s4-failure-") as directory
     raise AssertionError("unexpected command: " + repr(arguments))
 
   def fail_state(path, value):
+    if path.name == "disk":
+      write(path, " ".join("[" + mode + "]" if mode == value else mode for mode in ("platform", "shutdown", "reboot", "suspend", "test_resume")) + "\n")
     if path.name == "state":
       raise OSError("synthetic transition failure")
 
@@ -262,6 +282,82 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-s4-failure-") as directory
   assert record["state"] == "transition-failed"
   assert record["hibernate_attempted"] is True
   assert record["real_s4_attempted"] is True
+
+with tempfile.TemporaryDirectory(prefix="t2-candidate-shutdown-") as directory:
+  base = Path(directory)
+  root = fixture(base)
+  candidate = base / "candidate"
+  candidate.mkdir()
+  vector = root / s4.S4_VECTORS / CANDIDATE_HASH
+  modes_written = []
+
+  def runner(arguments, check=True, capture=False):
+    arguments = tuple(arguments)
+    if arguments[:2] == ("systemctl", "is-active"):
+      return Result("active\n")
+    if arguments[:2] in (("systemctl", "stop"), ("systemctl", "start")):
+      return Result()
+    if "bluetoothctl" in arguments and "show" in arguments:
+      return Result("\tPowered: no\n")
+    if arguments[:2] == ("bootctl", "set-oneshot"):
+      if arguments[-1]:
+        write_efi(root / s4.STAGER.ONESHOT, arguments[-1])
+      else:
+        (root / s4.STAGER.ONESHOT).unlink()
+      return Result()
+    raise AssertionError("unexpected command: " + repr(arguments))
+
+  def power_writer(path, value):
+    if path.name == "disk":
+      modes_written.append(value)
+      write(path, " ".join("[" + mode + "]" if mode == value else mode for mode in ("platform", "shutdown", "reboot", "suspend", "test_resume")) + "\n")
+    if path.name == "state":
+      assert s4.TEST.selected_value(root / s4.TEST.POWER / "disk") == "shutdown"
+      assert (vector / "s4-attempted").read_text().strip() == BOOT_ID
+      (root / s4.STAGER.ONESHOT).unlink()
+
+  result = s4.preflight(
+    root, candidate, candidate, Path("proof/post-input.json"), Path("proof/pre-s4-input.json"),
+    platform_preflight, proof_verifier, current_input_verifier, staging_verifier, disk_mode="shutdown",
+  )
+  assert result["requested_disk_mode"] == "shutdown"
+  write(root / s4.TEST.POWER / "disk", "[platform] reboot suspend test_resume\n")
+  try:
+    s4.preflight(
+      root, candidate, candidate, Path("proof/post-input.json"), Path("proof/pre-s4-input.json"),
+      platform_preflight, proof_verifier, current_input_verifier, staging_verifier, disk_mode="shutdown",
+    )
+    raise AssertionError("runner accepted unavailable shutdown hibernation")
+  except ValueError as error:
+    assert "does not advertise requested" in str(error)
+  write(root / s4.TEST.POWER / "disk", "[platform] shutdown reboot suspend test_resume\n")
+
+  try:
+    s4.execute(
+      root, candidate, candidate, Path("proof/post-input.json"), Path("proof/pre-s4-input.json"),
+      platform_preflight, proof_verifier, current_input_verifier, staging_verifier,
+      lambda _root: None, lambda _root: None, lambda _path, _value: None, runner,
+      sync=lambda: None, sleeper=lambda _seconds: None, services_verifier=lambda _runner: None,
+      disk_mode="shutdown",
+    )
+    raise AssertionError("runner accepted a shutdown mode that did not select")
+  except RuntimeError as error:
+    assert "did not select" in str(error)
+  assert not (vector / "s4-attempted").exists()
+
+  root = fixture(base / "verified-mode")
+  vector = root / s4.S4_VECTORS / CANDIDATE_HASH
+  result = s4.execute(
+    root, candidate, candidate, Path("proof/post-input.json"), Path("proof/pre-s4-input.json"),
+    platform_preflight, proof_verifier, current_input_verifier, staging_verifier,
+    lambda _root: None, lambda _root: None, power_writer, runner,
+    sync=lambda: None, sleeper=lambda _seconds: None, services_verifier=lambda _runner: None,
+    disk_mode="shutdown",
+  )
+  assert result["state"] == "returned-and-cleaned"
+  assert result["requested_disk_mode"] == "shutdown"
+  assert modes_written == ["shutdown", "platform"]
+  assert s4.TEST.selected_value(root / s4.TEST.POWER / "disk") == "platform"
 
 with tempfile.TemporaryDirectory(prefix="t2-candidate-s4-proof-") as directory:
   base = Path(directory)
