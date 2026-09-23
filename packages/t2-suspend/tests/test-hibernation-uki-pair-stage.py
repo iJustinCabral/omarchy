@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 
 
@@ -35,12 +36,18 @@ def rejects(action, expected):
     raise AssertionError("Unsafe pair action accepted: " + expected)
 
 
-def publish(directory, role, production_hash):
+def objcopy(*arguments):
+  subprocess.run(("objcopy", *map(str, arguments)), check=True, capture_output=True)
+
+
+def publish(directory, role, production):
   directory.mkdir()
-  image = (role + "-private-uki").encode()
   initrd = (role + "-private-initrd").encode()
-  (directory / "mba-t2-hibernation-candidate.efi").write_bytes(image)
-  (directory / "mba-t2-hibernation-candidate.initrd").write_bytes(initrd)
+  initrd_path = directory / "mba-t2-hibernation-candidate.initrd"
+  image_path = directory / "mba-t2-hibernation-candidate.efi"
+  initrd_path.write_bytes(initrd)
+  objcopy("--add-section=.initrd=" + str(initrd_path), production, image_path)
+  image = image_path.read_bytes()
   modules = {
     name: {
       "source": "drivers/" + name + ".ko",
@@ -58,7 +65,7 @@ def publish(directory, role, production_hash):
     "cmdline": "root=/dev/mapper/root resume=/dev/mapper/root",
     "kernel_release": "test-kernel",
     "modules": modules,
-    "production_uki_sha256": production_hash,
+    "production_uki_sha256": sha(production.read_bytes()),
     "source_provenance_sha256": "b" * 64,
     "unchanged_production_sections_sha256": {
       section: sha(section.encode()) for section in stage.AUDIT.S4.RUNTIME_SECTIONS
@@ -93,7 +100,16 @@ def fixture(directory):
   root = directory / "root"
   production = root / "boot/EFI/Linux/omarchy_linux-t2.efi"
   production.parent.mkdir(parents=True)
-  production.write_bytes(b"healthy production uki")
+  kernel = directory / "kernel"
+  cmdline = directory / "cmdline"
+  kernel.write_bytes(b"healthy production kernel")
+  cmdline.write_bytes(b"root=/dev/mapper/root resume=/dev/mapper/root\x00")
+  objcopy(
+    "--add-section=.linux=" + str(kernel),
+    "--add-section=.cmdline=" + str(cmdline),
+    "/usr/lib/systemd/boot/efi/linuxx64.efi.stub",
+    production,
+  )
   limine = root / stage.SINGLE.LIMINE
   original = (
     "timeout: 3\n"
@@ -113,8 +129,8 @@ def fixture(directory):
   boot_id.write_text("11111111-2222-3333-4444-555555555555\n")
   source = directory / "source"
   restore = directory / "restore"
-  publish(source, "source", sha(production.read_bytes()))
-  publish(restore, "restore", sha(production.read_bytes()))
+  publish(source, "source", production)
+  publish(restore, "restore", production)
   return root, source, restore, limine, original
 
 
@@ -151,6 +167,24 @@ with tempfile.TemporaryDirectory(prefix="t2-hibernation-pair-rejected-") as temp
   finally:
     stage.AUDIT.load_candidate = original_loader
   assert not (root / stage.RECEIPT).exists()
+
+  for role in ("source", "restore"):
+    for section in (".linux", ".cmdline"):
+      root, source, restore, limine, original = fixture(Path(temporary) / ("actual-" + role + "-" + section[1:]))
+      directory = source if role == "source" else restore
+      replacement_section = directory / "changed-section"
+      replacement_section.write_bytes(b"different physical boot section")
+      image = directory / "mba-t2-hibernation-candidate.efi"
+      replacement_image = directory / "replacement.efi"
+      objcopy("--update-section=" + section + "=" + str(replacement_section), image, replacement_image)
+      replacement_image.replace(image)
+      report_path = directory / "provenance.json"
+      report = json.loads(report_path.read_text())
+      report["candidate_uki_sha256"] = sha(image.read_bytes())
+      report_path.write_text(json.dumps(report))
+      rejects(lambda: stage.stage(root, source, restore), role + " UKI " + section + " differs from production")
+      assert limine.read_text() == original
+      assert not (root / stage.RECEIPT).exists()
 
   root, source, restore, _limine, _original = fixture(Path(temporary) / "rejected-arm")
   receipt = stage.stage(root, source, restore)

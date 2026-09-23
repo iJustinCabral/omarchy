@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 
 
@@ -42,12 +43,18 @@ def rejects(root, source, restore, expected, role="source"):
     raise AssertionError("Unsafe pair source boot passed: " + expected)
 
 
-def publish(directory, role, production_hash, release, cmdline):
+def objcopy(*arguments):
+  subprocess.run(("objcopy", *map(str, arguments)), check=True, capture_output=True)
+
+
+def publish(directory, role, production, release, cmdline):
   directory.mkdir()
-  image = (role + "-uki").encode()
   initrd = (role + "-initrd").encode()
-  (directory / "mba-t2-hibernation-candidate.efi").write_bytes(image)
-  (directory / "mba-t2-hibernation-candidate.initrd").write_bytes(initrd)
+  initrd_path = directory / "mba-t2-hibernation-candidate.initrd"
+  image_path = directory / "mba-t2-hibernation-candidate.efi"
+  initrd_path.write_bytes(initrd)
+  objcopy("--add-section=.initrd=" + str(initrd_path), production, image_path)
+  image = image_path.read_bytes()
   modules = {
     name: {
       "source": "drivers/" + name + ".ko",
@@ -65,7 +72,7 @@ def publish(directory, role, production_hash, release, cmdline):
     "cmdline": cmdline,
     "kernel_release": release,
     "modules": modules,
-    "production_uki_sha256": production_hash,
+    "production_uki_sha256": digest(production.read_bytes()),
     "source_provenance_sha256": "b" * 64,
     "unchanged_production_sections_sha256": {
       section: digest(section.encode()) for section in pair_stage.AUDIT.S4.RUNTIME_SECTIONS
@@ -102,7 +109,16 @@ with tempfile.TemporaryDirectory(prefix="t2-pair-source-verify-") as temporary:
   root = base / "root"
   production = root / "boot/EFI/Linux/omarchy_linux-t2.efi"
   production.parent.mkdir(parents=True)
-  production.write_bytes(b"healthy production uki")
+  kernel = base / "kernel"
+  embedded_cmdline = base / "embedded-cmdline"
+  kernel.write_bytes(b"healthy production kernel")
+  embedded_cmdline.write_bytes(b"root=/dev/mapper/root resume=/dev/mapper/root\x00")
+  objcopy(
+    "--add-section=.linux=" + str(kernel),
+    "--add-section=.cmdline=" + str(embedded_cmdline),
+    "/usr/lib/systemd/boot/efi/linuxx64.efi.stub",
+    production,
+  )
   write(root / pair_stage.SINGLE.LIMINE, (
     "timeout: 3\n"
     "default_entry: 2\n"
@@ -120,8 +136,8 @@ with tempfile.TemporaryDirectory(prefix="t2-pair-source-verify-") as temporary:
   cmdline = "cryptdevice=PARTUUID=test:root root=/dev/mapper/root rootflags=subvol=@ rw rootfstype=btrfs resume=/dev/mapper/root resume_offset=42 cryptkey=rootfs:/key"
   source = base / "source"
   restore = base / "restore"
-  source_report = publish(source, "source", digest(production.read_bytes()), release, cmdline)
-  publish(restore, "restore", digest(production.read_bytes()), release, cmdline)
+  source_report = publish(source, "source", production, release, cmdline)
+  publish(restore, "restore", production, release, cmdline)
   receipt = pair_stage.stage(root, source, restore)
   entries = root / pair_stage.SINGLE.ENTRIES
   entries.write_bytes(efi_strings(("Omarchy.linux-t2", receipt["images"]["source"]["entry_id"], receipt["images"]["restore"]["entry_id"])))

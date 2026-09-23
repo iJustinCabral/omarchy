@@ -66,14 +66,17 @@ def fixture(directory):
   }
   runtime = hashlib.sha256(b"common stack").hexdigest()
   original_load_pair = pair.load_pair
+  original_verify_sections = pair.verify_production_boot_sections
   pair.load_pair = lambda _source, _restore: (
     {"runtime_stack_sha256": runtime}, images,
     {"production_uki_sha256": hashlib.sha256(production.read_bytes()).hexdigest()},
   )
+  pair.verify_production_boot_sections = lambda _production, _images, _expected: hashlib.sha256(production.read_bytes()).hexdigest()
   try:
     receipt = pair.stage(root, source, restore)
   finally:
     pair.load_pair = original_load_pair
+    pair.verify_production_boot_sections = original_verify_sections
   entries = root / pair.SINGLE.ENTRIES
   entries.parent.mkdir(parents=True, exist_ok=True)
   entries.write_bytes(efi_strings(("Omarchy.linux-t2", receipt["images"]["source"]["entry_id"], receipt["images"]["restore"]["entry_id"])))

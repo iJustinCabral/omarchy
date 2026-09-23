@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 
 
 HERE = Path(__file__).resolve().parent
@@ -78,6 +79,43 @@ def require_production_kernel(provenance, role):
   sections = provenance.get("unchanged_production_sections_sha256")
   if provenance.get("modified_sections_sha256") is not None or not isinstance(sections, dict) or ".linux" not in sections:
     raise ValueError(role + " UKI replaces the production kernel; physical root boot is unqualified")
+
+
+def verify_production_boot_sections(production, private_images, expected_production_hash):
+  """Compare the exact buffered UKIs to the current production boot sections."""
+  production_data = production.read_bytes()
+  production_hash = hashlib.sha256(production_data).hexdigest()
+  if production_hash != expected_production_hash:
+    raise ValueError("Production UKI changed before pair staging")
+  images = {"production": production_data}
+  images.update({role: private_images[role]["data"] for role in IMAGES})
+  with tempfile.TemporaryDirectory(prefix="t2-pair-boot-sections-") as temporary:
+    paths = {}
+    for role, data in images.items():
+      image = Path(temporary) / (role + ".efi")
+      image.write_bytes(data)
+      image.chmod(0o600)
+      paths[role] = image
+    for section in (".linux", ".cmdline"):
+      actual = {}
+      for role, image in paths.items():
+        output = Path(temporary) / (role + section)
+        try:
+          subprocess.run(
+            ("objcopy", "-O", "binary", "--only-section=" + section, str(image), str(output)),
+            check=True,
+            capture_output=True,
+          )
+        except (OSError, subprocess.CalledProcessError) as error:
+          raise ValueError(role + " UKI " + section + " cannot be extracted") from error
+        data = output.read_bytes()
+        if not data:
+          raise ValueError(role + " UKI lacks a nonempty " + section + " section")
+        actual[role] = data
+      for role in ("source", "restore"):
+        if actual[role] != actual["production"]:
+          raise ValueError(role + " UKI " + section + " differs from production; physical root boot is unqualified")
+  return production_hash
 
 
 def entry_block(role, image_hash, image_blake2):
@@ -264,6 +302,7 @@ def stage(root, source_directory, restore_directory):
 
   pair, images, source = load_pair(source_directory, restore_directory)
   limine, production, original = SINGLE.validate_production(root, source)
+  production_hash = verify_production_boot_sections(production, images, source["production_uki_sha256"])
   if BEGIN in original or END in original or SINGLE.BEGIN in original or SINGLE.END in original:
     raise ValueError("An unowned candidate or pair block already exists")
   if "/MBA-T2-hibernation-" in original:
@@ -279,7 +318,7 @@ def stage(root, source_directory, restore_directory):
     "source_armed_from_boot_id": None,
     "restore_armed_from_boot_id": None,
     "runtime_stack_sha256": pair["runtime_stack_sha256"],
-    "production_uki_sha256": digest(production),
+    "production_uki_sha256": production_hash,
     "original_limine_sha256": hashlib.sha256(original.encode()).hexdigest(),
     "staged_limine_sha256": hashlib.sha256(staged).hexdigest(),
     "images": {
