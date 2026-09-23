@@ -13,6 +13,7 @@ python3 "$ROOT/packages/t2-suspend/tests/test-hibernation-candidate-runner.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernation-candidate-s4.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-pre-write-ftrace.py" "$ROOT/packages/t2-suspend/experiments/hibernate-pre-write-ftrace/mba_hibernate_pre_write_ftrace.c"
 python3 "$ROOT/packages/t2-suspend/tests/test-pre-write-runner.py"
+python3 "$ROOT/packages/t2-suspend/tests/test-uki-pair-audit.py"
 pass "T2 suspend source and installer transactions"
 
 test_tmp=$(mktemp -d)
