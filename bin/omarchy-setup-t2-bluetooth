@@ -1,0 +1,17 @@
+#!/bin/bash
+# omarchy:summary=Install or restore T2 Bluetooth startup ordering for the next boot
+# omarchy:args=[--verify|--rollback]
+# omarchy:requires-sudo=true
+set -euo pipefail
+case "${1:-}" in
+  "") action=install ;;
+  --verify) action=verify ;;
+  --rollback) action=rollback ;;
+  -h|--help)
+    echo "Usage: omarchy setup t2-bluetooth [--verify|--rollback]"
+    echo "Supports MacBookAir9,1 with BCM4377b; does not restart Bluetooth or reboot."
+    exit 0 ;;
+  *) echo "Unknown option: $1" >&2; exit 2 ;;
+esac
+(( $# <= 1 )) || exit 2
+sudo /usr/bin/python3 "$OMARCHY_PATH/install/hardware/apple/t2-bluetooth/manage.py" "$action"
