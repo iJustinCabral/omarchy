@@ -1,0 +1,89 @@
+diff --git a/kernel/power/hibernate.c b/kernel/power/hibernate.c
+--- a/kernel/power/hibernate.c
++++ b/kernel/power/hibernate.c
+@@ -19,6 +19,7 @@
+ #include <linux/export.h>
+ #include <linux/suspend.h>
+ #include <linux/reboot.h>
++#include <linux/efi.h>
+ #include <linux/string.h>
+ #include <linux/device.h>
+ #include <linux/async.h>
+@@ -78,6 +79,56 @@ static int hibernation_mode = HIBERNATION_SHUTDOWN;
+ 
+ bool freezer_test_done;
+ 
++/* Diagnostic only: persist the last completed source-side S4 boundary. */
++#ifdef CONFIG_EFI
++static bool t2_hibernate_efi_marker;
++module_param_named(t2_hibernate_efi_marker, t2_hibernate_efi_marker, bool, 0600);
++MODULE_PARM_DESC(t2_hibernate_efi_marker,
++                 "Require a pre-armed EFI stage marker before T2 hibernation");
++
++static efi_guid_t t2_hibernate_marker_guid =
++  EFI_GUID(0x96234839, 0x90c9, 0x4cd5, 0x97, 0xb2, 0x7b, 0xa6, 0x90, 0xf0, 0xaf, 0x02);
++
++#define T2_HIBERNATE_MARKER_ATTRS (EFI_VARIABLE_NON_VOLATILE | \
++                                   EFI_VARIABLE_BOOTSERVICE_ACCESS | \
++                                   EFI_VARIABLE_RUNTIME_ACCESS)
++#define T2_HIBERNATE_MARKER_SIZE 17
++
++static int t2_hibernate_mark(u8 expected, u8 next)
++{
++  efi_char16_t name[] = L"OmarchyT2HibernateStage";
++  u8 value[T2_HIBERNATE_MARKER_SIZE];
++  unsigned long size = sizeof(value);
++  u32 attrs = 0;
++  efi_status_t status;
++
++  if (!t2_hibernate_efi_marker)
++    return 0;
++  if (!efi_rt_services_supported(EFI_RT_SUPPORTED_GET_VARIABLE |
++                                 EFI_RT_SUPPORTED_SET_VARIABLE))
++    return -EOPNOTSUPP;
++
++  status = efi.get_variable(name, &t2_hibernate_marker_guid,
++                            &attrs, &size, value);
++  if (status != EFI_SUCCESS || size != sizeof(value) ||
++      attrs != T2_HIBERNATE_MARKER_ATTRS || value[16] != expected ||
++      memcmp(value, "MBA9", 4))
++    return -EINVAL;
++
++  value[16] = next;
++  status = efi.set_variable(name, &t2_hibernate_marker_guid,
++                            T2_HIBERNATE_MARKER_ATTRS, sizeof(value), value);
++  if (status != EFI_SUCCESS)
++    return -EIO;
++  return 0;
++}
++#else
++static int t2_hibernate_mark(u8 expected, u8 next)
++{
++  return 0;
++}
++#endif
++
+ static const struct platform_hibernation_ops *hibernation_ops;
+ 
+ static atomic_t hibernate_atomic = ATOMIC_INIT(1);
+@@ -825,6 +878,10 @@ int hibernate(void)
+ 
+ 	pr_info("hibernation entry\n");
+ 	pm_prepare_console();
++	error = t2_hibernate_mark(0, 1);
++	if (error)
++		goto Restore;
++
+ 	error = pm_notifier_call_chain_robust(PM_HIBERNATION_PREPARE, PM_POST_HIBERNATION);
+ 	if (error)
+ 		goto Restore;
+@@ -854,4 +908,9 @@ int hibernate(void)
+ 	if (in_suspend) {
+ 		unsigned int flags = 0;
+ 
++		/* No image has been written. An EFI failure aborts this source path. */
++		error = t2_hibernate_mark(1, 2);
++		if (error)
++			goto Free_bitmaps;
++
+ 		if (hibernation_mode == HIBERNATION_PLATFORM)
