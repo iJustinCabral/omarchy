@@ -1,0 +1,15 @@
+[Unit]
+Description=Capture physical input for the RTC-marker stock-kernel T2 source boot
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/libexec/codex-mba-physical-input-v8 --entry-id MBA-T2-hibernation-source-ea2ffa90ec101375 --output /var/lib/codex-mba-physical-input-rtc-source/evidence.json
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/codex-mba-physical-input-rtc-source
+
+[Install]
+WantedBy=multi-user.target
