@@ -1,0 +1,99 @@
+--- a/drivers/bluetooth/hci_bcm4377.c
++++ b/drivers/bluetooth/hci_bcm4377.c
+@@ -563,6 +563,7 @@
+  *                         corresponding completion ring
+  */
+ struct bcm4377_data {
++	bool resume_config_failed;
+ 	struct pci_dev *pdev;
+ 	struct hci_dev *hdev;
+ 
+@@ -614,6 +615,9 @@
+ 				  u16 val)
+ {
+ 	u32 db = 0;
++
++	if (READ_ONCE(bcm4377->resume_config_failed))
++		return;
+ 
+ 	db |= FIELD_PREP(BCM4377_BAR0_DOORBELL_VALUE, val);
+ 	db |= FIELD_PREP(BCM4377_BAR0_DOORBELL_IDX, doorbell);
+@@ -839,6 +843,9 @@
+ {
+ 	struct bcm4377_data *bcm4377 = data;
+ 	u32 bootstage, rti_status;
++
++	if (READ_ONCE(bcm4377->resume_config_failed))
++		return IRQ_HANDLED;
+ 
+ 	bootstage = ioread32(bcm4377->bar2 + bcm4377->hw->bar2_offset + BCM4377_BAR2_BOOTSTAGE);
+ 	rti_status = ioread32(bcm4377->bar2 + bcm4377->hw->bar2_offset + BCM4377_BAR2_RTI_STATUS);
+@@ -2437,13 +2444,67 @@
+ 	struct pci_dev *pdev = to_pci_dev(dev);
+ 	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
+ 
++	if (READ_ONCE(bcm4377->resume_config_failed))
++		return -EIO;
++
+ 	iowrite32(BCM4377_BAR0_SLEEP_CONTROL_UNQUIESCE,
+ 		  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
+ 
+ 	return hci_resume_dev(bcm4377->hdev);
+ }
+ 
+-static DEFINE_SIMPLE_DEV_PM_OPS(bcm4377_ops, bcm4377_suspend, bcm4377_resume);
++/* PCI core has restored the standard header; restore vendor mappings
++ * before device interrupts and the normal unquiesce/HCI resume callback.
++ */
++static int bcm4377_resume_noirq(struct device *dev)
++{
++	struct pci_dev *pdev = to_pci_dev(dev);
++	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
++	static const u16 offsets[] = { 0x70, 0x74, 0x80, 0x84, 0x88 };
++	u32 before[ARRAY_SIZE(offsets)], after, expected[ARRAY_SIZE(offsets)];
++	int ret, i;
++
++	if (bcm4377->hw->id != 0x4377)
++		return 0;
++
++	WRITE_ONCE(bcm4377->resume_config_failed, true);
++	for (i = 0; i < ARRAY_SIZE(offsets); i++) {
++		ret = pci_read_config_dword(pdev, offsets[i], &before[i]);
++		if (ret)
++			goto pci_error;
++	}
++	expected[0] = bcm4377->hw->bar0_window2;
++	expected[1] = BCM4377_PCIECFG_BAR0_CORE2_WINDOW1_DEFAULT;
++	expected[2] = bcm4377->hw->bar0_window1;
++	expected[3] = BCM4377_PCIECFG_BAR2_WINDOW_DEFAULT;
++	expected[4] = before[4] | BIT(16);
++	ret = bcm4377_init_cfg(bcm4377);
++	if (ret)
++		goto pci_error;
++	for (i = 0; i < ARRAY_SIZE(offsets); i++) {
++		ret = pci_read_config_dword(pdev, offsets[i], &after);
++		if (ret)
++			goto pci_error;
++		if (after != expected[i]) {
++			dev_err(dev, "Vendor config %#x readback %#x != %#x\n",
++				offsets[i], after, expected[i]);
++			return -EIO;
++		}
++	}
++	WRITE_ONCE(bcm4377->resume_config_failed, false);
++	dev_info(dev, "t2bt-resume: restored vendor windows (before %08x %08x %08x %08x %08x)\n",
++		 before[0], before[1], before[2], before[3], before[4]);
++	return 0;
++
++pci_error:
++	dev_err(dev, "Vendor configuration restore failed: %d\n", ret);
++	return pcibios_err_to_errno(ret);
++}
++
++static const struct dev_pm_ops bcm4377_ops = {
++	SYSTEM_SLEEP_PM_OPS(bcm4377_suspend, bcm4377_resume)
++	.resume_noirq = bcm4377_resume_noirq,
++};
+ 
+ static const struct dmi_system_id bcm4377_dmi_board_table[] = {
+ 	{

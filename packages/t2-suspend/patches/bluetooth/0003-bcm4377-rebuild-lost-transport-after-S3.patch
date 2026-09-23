@@ -1,0 +1,453 @@
+Subject: [PATCH] Bluetooth: bcm4377: rebuild transport after S3 window loss
+
+Recover BCM4377 through the HCI core close/open lifecycle.
+Use PCIe FLR, retain DMA storage on failure, reload firmware and RTI,
+and rerun PTB setup. Preserve an initially powered-off controller.
+Hardware suspend validation is pending; do not merge as a proven fix.
+
+---
+--- a/drivers/bluetooth/hci_bcm4377.c
++++ b/drivers/bluetooth/hci_bcm4377.c
+@@ -564,6 +564,13 @@
+  */
+ struct bcm4377_data {
+ 	bool resume_config_failed;
++	bool transport_lost;
++	bool irq_blocked;
++	bool pm_blocked;
++	bool setup_needed;
++	void *firmware_buffer;
++	dma_addr_t firmware_dma;
++	size_t firmware_size;
+ 	struct pci_dev *pdev;
+ 	struct hci_dev *hdev;
+ 
+@@ -616,7 +623,8 @@
+ {
+ 	u32 db = 0;
+ 
+-	if (READ_ONCE(bcm4377->resume_config_failed))
++	if (READ_ONCE(bcm4377->resume_config_failed) ||
++	    READ_ONCE(bcm4377->transport_lost))
+ 		return;
+ 
+ 	db |= FIELD_PREP(BCM4377_BAR0_DOORBELL_VALUE, val);
+@@ -844,7 +852,8 @@
+ 	struct bcm4377_data *bcm4377 = data;
+ 	u32 bootstage, rti_status;
+ 
+-	if (READ_ONCE(bcm4377->resume_config_failed))
++	if (READ_ONCE(bcm4377->resume_config_failed) ||
++	    READ_ONCE(bcm4377->irq_blocked))
+ 		return IRQ_HANDLED;
+ 
+ 	bootstage = ioread32(bcm4377->bar2 + bcm4377->hw->bar2_offset + BCM4377_BAR2_BOOTSTAGE);
+@@ -856,9 +865,9 @@
+ 			"bootstage = %d -> %d, rti state = %d -> %d\n",
+ 			bcm4377->bootstage, bootstage, bcm4377->rti_status,
+ 			rti_status);
+-		complete(&bcm4377->event);
+ 		bcm4377->bootstage = bootstage;
+ 		bcm4377->rti_status = rti_status;
++		complete(&bcm4377->event);
+ 	}
+ 
+ 	if (rti_status > 2)
+@@ -886,7 +895,8 @@
+ 	int ret, msgid;
+ 	DECLARE_COMPLETION_ONSTACK(event);
+ 
+-	if (READ_ONCE(bcm4377->resume_config_failed))
++	if (READ_ONCE(bcm4377->resume_config_failed) ||
++	    READ_ONCE(bcm4377->transport_lost))
+ 		return -EIO;
+ 
+ 	if (len > ring->payload_size && len > ring->mapped_payload_size) {
+@@ -1316,7 +1326,9 @@
+ 	return 0;
+ }
+ 
+-static int bcm4377_hci_open(struct hci_dev *hdev)
++static int bcm4377_recover_transport(struct bcm4377_data *bcm4377);
++
++static int bcm4377_hci_create_rings(struct hci_dev *hdev)
+ {
+ 	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
+ 	int ret;
+@@ -1386,9 +1398,38 @@
+ 	return ret;
+ }
+ 
++static int bcm4377_hci_open(struct hci_dev *hdev)
++{
++	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
++	int ret;
++
++	if (READ_ONCE(bcm4377->pm_blocked))
++		return -EBUSY;
++	if (READ_ONCE(bcm4377->transport_lost)) {
++		ret = bcm4377_recover_transport(bcm4377);
++		if (ret)
++			return ret;
++	}
++	ret = bcm4377_hci_create_rings(hdev);
++	if (ret && bcm4377->hw->id == 0x4377) {
++		/* A timed-out create may have reached firmware. Require FLR
++		 * before reusing those rings, even on the next manual open.
++		 */
++		WRITE_ONCE(bcm4377->transport_lost, true);
++		WRITE_ONCE(bcm4377->irq_blocked, true);
++		synchronize_irq(pci_irq_vector(bcm4377->pdev, 0));
++		pci_clear_master(bcm4377->pdev);
++	}
++	return ret;
++}
++
+ static int bcm4377_hci_close(struct hci_dev *hdev)
+ {
+ 	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
++
++	/* HCI core has drained requests. Dead firmware cannot ACK destroys. */
++	if (READ_ONCE(bcm4377->transport_lost))
++		return 0;
+ 
+ 	dev_dbg(&bcm4377->pdev->dev, "destroying rings in hci_close\n");
+ 
+@@ -1459,6 +1500,9 @@
+ 	const struct firmware *fw;
+ 	int ret;
+ 
++	if (bcm4377->hw->id == 0x4377 && !bcm4377->setup_needed)
++		return 0;
++
+ 	if (bcm4377->hw->send_calibration) {
+ 		ret = bcm4377->hw->send_calibration(bcm4377);
+ 		if (ret)
+@@ -1476,7 +1520,10 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	return bcm4377_check_bdaddr(bcm4377);
++	ret = bcm4377_check_bdaddr(bcm4377);
++	if (!ret)
++		bcm4377->setup_needed = false;
++	return ret;
+ }
+ 
+ static int bcm4377_hci_send_frame(struct hci_dev *hdev, struct sk_buff *skb)
+@@ -1836,6 +1883,22 @@
+ 	return 0;
+ }
+ 
++static int bcm4377_prepare_firmware_buffer(struct bcm4377_data *bcm4377)
++{
++	const struct firmware *fw;
++
++	if (bcm4377->hw->id != 0x4377)
++		return 0;
++	fw = bcm4377_request_blob(bcm4377, "bin");
++	if (!fw)
++		return -ENOENT;
++	bcm4377->firmware_size = fw->size;
++	bcm4377->firmware_buffer = dmam_alloc_coherent(&bcm4377->pdev->dev,
++		fw->size, &bcm4377->firmware_dma, GFP_KERNEL);
++	release_firmware(fw);
++	return bcm4377->firmware_buffer ? 0 : -ENOMEM;
++}
++
+ static int bcm4377_boot(struct bcm4377_data *bcm4377)
+ {
+ 	const struct firmware *fw;
+@@ -1865,8 +1928,17 @@
+ 		return -ENOENT;
+ 	}
+ 
+-	bfr = dma_alloc_coherent(&bcm4377->pdev->dev, fw->size, &fw_dma,
+-				 GFP_KERNEL);
++	if (bcm4377->firmware_buffer) {
++		if (fw->size != bcm4377->firmware_size) {
++			ret = -EINVAL;
++			goto out_release_fw;
++		}
++		bfr = bcm4377->firmware_buffer;
++		fw_dma = bcm4377->firmware_dma;
++	} else {
++		bfr = dma_alloc_coherent(&bcm4377->pdev->dev, fw->size,
++					 &fw_dma, GFP_KERNEL);
++	}
+ 	if (!bfr) {
+ 		ret = -ENOMEM;
+ 		goto out_release_fw;
+@@ -1910,7 +1982,8 @@
+ 	ret = 0;
+ 
+ out_dma_free:
+-	dma_free_coherent(&bcm4377->pdev->dev, fw->size, bfr, fw_dma);
++	if (!bcm4377->firmware_buffer)
++		dma_free_coherent(&bcm4377->pdev->dev, fw->size, bfr, fw_dma);
+ out_release_fw:
+ 	release_firmware(fw);
+ 	return ret;
+@@ -2270,9 +2343,161 @@
+ 				   PCI_EXP_LNKCTL_ASPMC);
+ }
+ 
++/* Called only after HCI core has drained its queues and FLR stopped DMA. */
++static void bcm4377_reset_rings(struct bcm4377_data *bcm4377)
++{
++	struct bcm4377_transfer_ring *transfer[] = {
++		&bcm4377->control_h2d_ring, &bcm4377->hci_h2d_ring,
++		&bcm4377->hci_d2h_ring, &bcm4377->sco_h2d_ring,
++		&bcm4377->sco_d2h_ring, &bcm4377->acl_h2d_ring,
++		&bcm4377->acl_d2h_ring,
++	};
++	struct bcm4377_completion_ring *completion[] = {
++		&bcm4377->control_ack_ring, &bcm4377->hci_acl_ack_ring,
++		&bcm4377->hci_acl_event_ring, &bcm4377->sco_ack_ring,
++		&bcm4377->sco_event_ring,
++	};
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(transfer); i++) {
++		struct bcm4377_transfer_ring *ring = transfer[i];
++
++		ring->enabled = false;
++		ring->generation++;
++		bitmap_zero(ring->msgids, BCM4377_MAX_RING_SIZE);
++		if (ring->events)
++			memset(ring->events, 0,
++			       ring->n_entries * sizeof(*ring->events));
++		if (ring->ring)
++			memset(ring->ring, 0, ring->n_entries *
++			       (ring->payload_size + sizeof(struct bcm4377_xfer_ring_entry)));
++		if (ring->payloads)
++			memset(ring->payloads, 0,
++			       ring->n_entries * ring->mapped_payload_size);
++	}
++	for (i = 0; i < ARRAY_SIZE(completion); i++) {
++		struct bcm4377_completion_ring *ring = completion[i];
++
++		ring->enabled = false;
++		memset(ring->ring, 0, ring->n_entries *
++		       (ring->payload_size + sizeof(struct bcm4377_completion_ring_entry)));
++	}
++	memset(bcm4377->ring_state, 0, sizeof(*bcm4377->ring_state));
++	bcm4377->bootstage = 0;
++	bcm4377->rti_status = 0;
++	reinit_completion(&bcm4377->event);
++}
++
++/* HCI open owns request serialization; never acquire the PCI device mutex
++ * here (PM takes that mutex before entering HCI). Removal drains HCI work
++ * before releasing IRQ or DMA resources. pm_blocked excludes opens during PM.
++ */
++static int bcm4377_verify_cfg(struct bcm4377_data *bcm4377)
++{
++	static const u16 offsets[] = { 0x70, 0x74, 0x80, 0x84 };
++	u32 expected[] = { bcm4377->hw->bar0_window2,
++		BCM4377_PCIECFG_BAR0_CORE2_WINDOW1_DEFAULT,
++		bcm4377->hw->bar0_window1, BCM4377_PCIECFG_BAR2_WINDOW_DEFAULT };
++	u32 value;
++	int i, ret;
++
++	for (i = 0; i < ARRAY_SIZE(offsets); i++) {
++		ret = pci_read_config_dword(bcm4377->pdev, offsets[i], &value);
++		if (ret)
++			return pcibios_err_to_errno(ret);
++		if (value != expected[i])
++			return -EIO;
++	}
++	ret = pci_read_config_dword(bcm4377->pdev, 0x88, &value);
++	if (ret)
++		return pcibios_err_to_errno(ret);
++	return value & BIT(16) ? 0 : -EIO;
++}
++
++static int bcm4377_recover_transport(struct bcm4377_data *bcm4377)
++{
++	struct pci_dev *pdev = bcm4377->pdev;
++	int irq = pci_irq_vector(pdev, 0);
++	int ret;
++
++	/* Explicit FLR only: never fall back to a reset of the shared bus. */
++	ret = pcie_reset_flr(pdev, true);
++	if (ret)
++		goto failed;
++
++	WRITE_ONCE(bcm4377->irq_blocked, true);
++	disable_irq(irq);
++	pci_cfg_access_lock(pdev);
++	/* Save a bus-master-disabled image; keep DMA off through ring reset. */
++	pci_clear_master(pdev);
++	ret = pci_save_state(pdev);
++	if (ret)
++		goto unlock;
++	dev_info(&pdev->dev, "t2bt-recovery: starting Bluetooth FLR\n");
++	ret = pcie_reset_flr(pdev, false);
++	pci_restore_state(pdev);
++	if (ret)
++		goto unlock;
++
++	/* Same post-reset settling interval as probe. */
++	msleep(100);
++	ret = bcm4377_init_cfg(bcm4377);
++	if (ret) {
++		ret = pcibios_err_to_errno(ret);
++		goto unlock;
++	}
++	ret = bcm4377_verify_cfg(bcm4377);
++	if (ret)
++		goto unlock;
++	if (bcm4377->hw->disable_aspm)
++		bcm4377_disable_aspm(bcm4377);
++	bcm4377_reset_rings(bcm4377);
++	dma_wmb();
++	WRITE_ONCE(bcm4377->resume_config_failed, false);
++	pci_set_master(pdev);
++	pci_cfg_access_unlock(pdev);
++	WRITE_ONCE(bcm4377->irq_blocked, false);
++	enable_irq(irq);
++
++	ret = bcm4377_boot(bcm4377);
++	if (ret)
++		goto failed;
++	ret = bcm4377_setup_rti(bcm4377);
++	if (ret)
++		goto failed;
++
++	bcm4377->setup_needed = true;
++	WRITE_ONCE(bcm4377->transport_lost, false);
++	dev_info(&pdev->dev, "t2bt-recovery: firmware and RTI ready; rebuilding HCI\n");
++	return 0;
++
++unlock:
++	pci_cfg_access_unlock(pdev);
++	enable_irq(irq);
++failed:
++	/* Retain all DMA allocations, including the firmware download buffer.
++	 * An unsuccessful reset/boot never permits reusing or freeing them.
++	 */
++	WRITE_ONCE(bcm4377->irq_blocked, true);
++	synchronize_irq(irq);
++	pci_clear_master(pdev);
++	WRITE_ONCE(bcm4377->resume_config_failed, true);
++	dev_err(&pdev->dev, "t2bt-recovery: failed (%d); transport remains blocked\n", ret);
++	return ret;
++}
++
+ static void bcm4377_pci_free_irq_vectors(void *data)
+ {
+ 	pci_free_irq_vectors(data);
++}
++
++static void bcm4377_stop_dma(void *data)
++{
++	struct bcm4377_data *bcm4377 = data;
++
++	WRITE_ONCE(bcm4377->irq_blocked, true);
++	synchronize_irq(pci_irq_vector(bcm4377->pdev, 0));
++	pci_clear_master(bcm4377->pdev);
+ }
+ 
+ static void bcm4377_hci_free_dev(void *data)
+@@ -2367,6 +2592,10 @@
+ 	 * the interrupt mask and status registers for these chips are.
+ 	 * MSIs are acked automatically instead.
+ 	 */
++	ret = bcm4377_prepare_firmware_buffer(bcm4377);
++	if (ret)
++		return ret;
++
+ 	ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI);
+ 	if (ret < 0)
+ 		return -ENODEV;
+@@ -2388,6 +2617,10 @@
+ 	if (!hdev)
+ 		return -ENOMEM;
+ 	ret = devm_add_action_or_reset(&pdev->dev, bcm4377_hci_free_dev, hdev);
++	if (ret)
++		return ret;
++
++	ret = devm_add_action_or_reset(&pdev->dev, bcm4377_stop_dma, bcm4377);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -2399,6 +2632,10 @@
+ 	hdev->send = bcm4377_hci_send_frame;
+ 	hdev->set_bdaddr = bcm4377_hci_set_bdaddr;
+ 	hdev->setup = bcm4377_hci_setup;
++	if (bcm4377->hw->id == 0x4377) {
++		bcm4377->setup_needed = true;
++		hci_set_quirk(hdev, HCI_QUIRK_NON_PERSISTENT_SETUP);
++	}
+ 
+ 	if (bcm4377->hw->broken_mws_transport_config)
+ 		hci_set_quirk(hdev, HCI_QUIRK_BROKEN_MWS_TRANSPORT_CONFIG);
+@@ -2434,9 +2671,14 @@
+ 	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
+ 	int ret;
+ 
++	WRITE_ONCE(bcm4377->pm_blocked, true);
+ 	ret = hci_suspend_dev(bcm4377->hdev);
+ 	if (ret)
+ 		return ret;
++
++	if (READ_ONCE(bcm4377->resume_config_failed) ||
++	    READ_ONCE(bcm4377->transport_lost))
++		return 0;
+ 
+ 	iowrite32(BCM4377_BAR0_SLEEP_CONTROL_QUIESCE,
+ 		  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
+@@ -2452,8 +2694,9 @@
+ 	if (READ_ONCE(bcm4377->resume_config_failed))
+ 		return -EIO;
+ 
+-	iowrite32(BCM4377_BAR0_SLEEP_CONTROL_UNQUIESCE,
+-		  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
++	if (!READ_ONCE(bcm4377->transport_lost))
++		iowrite32(BCM4377_BAR0_SLEEP_CONTROL_UNQUIESCE,
++			  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
+ 
+ 	return hci_resume_dev(bcm4377->hdev);
+ }
+@@ -2483,6 +2726,13 @@
+ 	expected[2] = bcm4377->hw->bar0_window1;
+ 	expected[3] = BCM4377_PCIECFG_BAR2_WINDOW_DEFAULT;
+ 	expected[4] = before[4] | BIT(16);
++	for (i = 0; i < ARRAY_SIZE(offsets); i++) {
++		if (before[i] != expected[i]) {
++			WRITE_ONCE(bcm4377->transport_lost, true);
++			WRITE_ONCE(bcm4377->irq_blocked, true);
++			break;
++		}
++	}
+ 	ret = bcm4377_init_cfg(bcm4377);
+ 	if (ret)
+ 		goto pci_error;
+@@ -2506,9 +2756,26 @@
+ 	return pcibios_err_to_errno(ret);
+ }
+ 
++/* Queue the core-owned close/open only after the PCI resume phase ends.
++ * An initially off controller stays off and recovers lazily on its next open.
++ */
++static void bcm4377_complete(struct device *dev)
++{
++	struct bcm4377_data *bcm4377 = pci_get_drvdata(to_pci_dev(dev));
++	int ret;
++
++	WRITE_ONCE(bcm4377->pm_blocked, false);
++	if (!READ_ONCE(bcm4377->transport_lost) ||
++	    !test_bit(HCI_UP, &bcm4377->hdev->flags))
++		return;
++	ret = hci_reset_dev(bcm4377->hdev);
++	dev_info(dev, "t2bt-recovery: queued HCI core reset (%d)\n", ret);
++}
++
+ static const struct dev_pm_ops bcm4377_ops = {
+ 	SYSTEM_SLEEP_PM_OPS(bcm4377_suspend, bcm4377_resume)
+ 	.resume_noirq = bcm4377_resume_noirq,
++	.complete = bcm4377_complete,
+ };
+ 
+ static const struct dmi_system_id bcm4377_dmi_board_table[] = {

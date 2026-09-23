@@ -1,0 +1,326 @@
+Subject: [PATCH] wifi: brcmfmac: support firmware control-ring mailboxes
+
+Adapt Asahi Linux mailbox protocol support by Hector Martin to Linux
+v7.2.4. Select transport from firmware version and capability flags.
+Initialize reserved bytes, encode H2D payload little-endian, and unwind
+D3 entry immediately if mailbox submission fails.
+
+Based on AsahiLinux/linux 77cb8f24c2381a8abb7272d7bbdec548d6426a8a;
+msgbuf support originated in 257528b63ec808104d246f00c9aea19cee0328b7.
+Experimental: offline validation only; not hardware validated.
+
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+@@ -219,6 +219,7 @@
+ #define BRCMF_PCIE_SHARED_VERSION_MASK		0x00FF
+ #define BRCMF_PCIE_SHARED_DMA_INDEX		0x10000
+ #define BRCMF_PCIE_SHARED_DMA_2B_IDX		0x100000
++#define BRCMF_PCIE_SHARED_USE_MAILBOX		0x02000000
+ #define BRCMF_PCIE_SHARED_HOSTRDY_DB1		0x10000000
+ 
+ #define BRCMF_PCIE_FLAGS_HTOD_SPLIT		0x4000
+@@ -297,6 +298,7 @@
+ };
+ 
+ struct brcmf_pcie_shared_info {
++	bool mb_via_ctl;
+ 	u32 tcm_base_address;
+ 	u32 flags;
+ 	struct brcmf_pcie_ringbuf *commonrings[BRCMF_NROF_COMMON_MSGRINGS];
+@@ -769,6 +771,19 @@
+ 	u32 i;
+ 
+ 	shared = &devinfo->shared;
++
++	if (shared->mb_via_ctl) {
++		struct pci_dev *pdev = devinfo->pdev;
++		struct brcmf_bus *bus = dev_get_drvdata(&pdev->dev);
++		int ret;
++
++		ret = brcmf_msgbuf_h2d_mb_write(bus->drvr, htod_mb_data);
++		if (ret < 0)
++			brcmf_err(bus, "Failed to send H2D mailbox data (%d)\n",
++				  ret);
++		return ret;
++	}
++
+ 	addr = shared->htod_mb_data_addr;
+ 	cur_htod_mb_data = brcmf_pcie_read_tcm32(devinfo, addr);
+ 
+@@ -796,8 +811,29 @@
+ 	return 0;
+ }
+ 
+-
+-static void brcmf_pcie_handle_mb_data(struct brcmf_pciedev_info *devinfo)
++static void brcmf_pcie_handle_mb_data(struct brcmf_pciedev_info *devinfo, u32 data)
++{
++	brcmf_dbg(PCIE, "D2H_MB_DATA: 0x%04x\n", data);
++	if (data & BRCMF_D2H_DEV_DS_ENTER_REQ)  {
++		brcmf_dbg(PCIE, "D2H_MB_DATA: DEEP SLEEP REQ\n");
++		brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_DS_ACK);
++		brcmf_dbg(PCIE, "D2H_MB_DATA: sent DEEP SLEEP ACK\n");
++	}
++	if (data & BRCMF_D2H_DEV_DS_EXIT_NOTE)
++		brcmf_dbg(PCIE, "D2H_MB_DATA: DEEP SLEEP EXIT\n");
++	if (data & BRCMF_D2H_DEV_D3_ACK) {
++		brcmf_dbg(PCIE, "D2H_MB_DATA: D3 ACK\n");
++		devinfo->mbdata_completed = true;
++		wake_up(&devinfo->mbdata_resp_wait);
++	}
++	if (data & BRCMF_D2H_DEV_FWHALT) {
++		brcmf_dbg(PCIE, "D2H_MB_DATA: FW HALT\n");
++		brcmf_fw_crashed(&devinfo->pdev->dev);
++	}
++}
++
++
++static void brcmf_pcie_poll_mb_data(struct brcmf_pciedev_info *devinfo)
+ {
+ 	struct brcmf_pcie_shared_info *shared;
+ 	u32 addr;
+@@ -812,23 +848,16 @@
+ 
+ 	brcmf_pcie_write_tcm32(devinfo, addr, 0);
+ 
+-	brcmf_dbg(PCIE, "D2H_MB_DATA: 0x%04x\n", dtoh_mb_data);
+-	if (dtoh_mb_data & BRCMF_D2H_DEV_DS_ENTER_REQ)  {
+-		brcmf_dbg(PCIE, "D2H_MB_DATA: DEEP SLEEP REQ\n");
+-		brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_DS_ACK);
+-		brcmf_dbg(PCIE, "D2H_MB_DATA: sent DEEP SLEEP ACK\n");
+-	}
+-	if (dtoh_mb_data & BRCMF_D2H_DEV_DS_EXIT_NOTE)
+-		brcmf_dbg(PCIE, "D2H_MB_DATA: DEEP SLEEP EXIT\n");
+-	if (dtoh_mb_data & BRCMF_D2H_DEV_D3_ACK) {
+-		brcmf_dbg(PCIE, "D2H_MB_DATA: D3 ACK\n");
+-		devinfo->mbdata_completed = true;
+-		wake_up(&devinfo->mbdata_resp_wait);
+-	}
+-	if (dtoh_mb_data & BRCMF_D2H_DEV_FWHALT) {
+-		brcmf_dbg(PCIE, "D2H_MB_DATA: FW HALT\n");
+-		brcmf_fw_crashed(&devinfo->pdev->dev);
+-	}
++	brcmf_pcie_handle_mb_data(devinfo, dtoh_mb_data);
++}
++
++
++static void brcmf_pcie_d2h_mb_rx(struct device *dev, u32 data)
++{
++	struct brcmf_bus *bus_if = dev_get_drvdata(dev);
++	struct brcmf_pciedev *buspub = bus_if->bus_priv.pcie;
++
++	brcmf_pcie_handle_mb_data(buspub->devinfo, data);
+ }
+ 
+ 
+@@ -950,7 +979,7 @@
+ 		brcmf_pcie_write_reg32(devinfo, devinfo->reginfo->mailboxint,
+ 				       status);
+ 		if (status & devinfo->reginfo->int_fn0)
+-			brcmf_pcie_handle_mb_data(devinfo);
++			brcmf_pcie_poll_mb_data(devinfo);
+ 		if (status & devinfo->reginfo->int_d2h_db) {
+ 			if (devinfo->state == BRCMFMAC_PCIE_STATE_UP)
+ 				brcmf_proto_msgbuf_rx_trigger(
+@@ -1582,6 +1611,7 @@
+ }
+ 
+ static const struct brcmf_bus_ops brcmf_pcie_bus_ops = {
++	.d2h_mb_rx = brcmf_pcie_d2h_mb_rx,
+ 	.preinit = brcmf_pcie_preinit,
+ 	.txdata = brcmf_pcie_tx,
+ 	.stop = brcmf_pcie_down,
+@@ -1638,6 +1668,10 @@
+ 			  shared->version);
+ 		return -EINVAL;
+ 	}
++
++	/* Revision 6 introduced mailbox messages on the control rings. */
++	shared->mb_via_ctl = shared->version >= 6 &&
++		!(shared->flags & BRCMF_PCIE_SHARED_USE_MAILBOX);
+ 
+ 	/* check firmware support dma indicies */
+ 	if (shared->flags & BRCMF_PCIE_SHARED_DMA_INDEX) {
+@@ -2637,6 +2671,7 @@
+ {
+ 	struct brcmf_pciedev_info *devinfo;
+ 	struct brcmf_bus *bus;
++	int err;
+ 
+ 	brcmf_dbg(PCIE, "Enter\n");
+ 
+@@ -2647,7 +2682,12 @@
+ 	brcmf_bus_change_state(bus, BRCMF_BUS_DOWN);
+ 
+ 	devinfo->mbdata_completed = false;
+-	brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_D3_INFORM);
++	err = brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_D3_INFORM);
++	if (err) {
++		brcmf_bus_change_state(bus, BRCMF_BUS_UP);
++		brcmf_pcie_fwcon_timer(devinfo, true);
++		return err;
++	}
+ 
+ 	wait_event_timeout(devinfo->mbdata_resp_wait, devinfo->mbdata_completed,
+ 			   BRCMF_PCIE_MBDATA_TIMEOUT);
+@@ -2679,10 +2719,11 @@
+ 	/* Check if device is still up and running, if so we are ready */
+ 	if (brcmf_pcie_read_reg32(devinfo, devinfo->reginfo->intmask) != 0) {
+ 		brcmf_dbg(PCIE, "Try to wakeup device....\n");
++		/* Ring callbacks must be available for the D0 mailbox message. */
++		devinfo->state = BRCMFMAC_PCIE_STATE_UP;
+ 		if (brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_D0_INFORM))
+ 			goto cleanup;
+ 		brcmf_dbg(PCIE, "Hot resume, continue....\n");
+-		devinfo->state = BRCMFMAC_PCIE_STATE_UP;
+ 		brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
+ 		brcmf_bus_change_state(bus, BRCMF_BUS_UP);
+ 		brcmf_pcie_intr_enable(devinfo);
+@@ -2692,6 +2733,7 @@
+ 	}
+ 
+ cleanup:
++	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
+ 	brcmf_chip_detach(devinfo->ci);
+ 	devinfo->ci = NULL;
+ 	pdev = devinfo->pdev;
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/msgbuf.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/msgbuf.c
+@@ -48,6 +48,9 @@
+ #define MSGBUF_TYPE_LPBK_DMAXFER		0x13
+ #define MSGBUF_TYPE_LPBK_DMAXFER_CMPLT		0x14
+ 
++#define MSGBUF_TYPE_H2D_MAILBOX_DATA		0x23
++#define MSGBUF_TYPE_D2H_MAILBOX_DATA		0x24
++
+ #define NR_TX_PKTIDS				2048
+ #define NR_RX_PKTIDS				1024
+ 
+@@ -216,6 +219,19 @@
+ 	struct msgbuf_common_hdr	msg;
+ 	struct msgbuf_completion_hdr	compl_hdr;
+ 	__le32				rsvd0[3];
++};
++
++struct msgbuf_h2d_mailbox_data {
++	struct msgbuf_common_hdr	msg;
++	__le32				data;
++	__le32				rsvd0[7];
++};
++
++struct msgbuf_d2h_mailbox_data {
++	struct msgbuf_common_hdr	msg;
++	struct msgbuf_completion_hdr	compl_hdr;
++	__le32				data;
++	__le32				rsvd0[2];
+ };
+ 
+ struct brcmf_msgbuf_work_item {
+@@ -1282,6 +1298,16 @@
+ 		  status);
+ 
+ 	brcmf_msgbuf_remove_flowring(msgbuf, flowid);
++}
++
++
++static void brcmf_msgbuf_process_d2h_mailbox_data(struct brcmf_msgbuf *msgbuf,
++						  void *buf)
++{
++	struct msgbuf_d2h_mailbox_data *d2h_mb_data = buf;
++	struct brcmf_pub *drvr = msgbuf->drvr;
++
++	brcmf_bus_d2h_mb_rx(drvr->bus_if, le32_to_cpu(d2h_mb_data->data));
+ }
+ 
+ 
+@@ -1327,6 +1353,9 @@
+ 		brcmf_dbg(MSGBUF, "MSGBUF_TYPE_RX_CMPLT\n");
+ 		brcmf_msgbuf_process_rx_complete(msgbuf, buf);
+ 		break;
++	case MSGBUF_TYPE_D2H_MAILBOX_DATA:
++		brcmf_msgbuf_process_d2h_mailbox_data(msgbuf, buf);
++		break;
+ 	default:
+ 		bphy_err(drvr, "Unsupported msgtype %d\n", msg->msgtype);
+ 		break;
+@@ -1464,6 +1493,36 @@
+ 		brcmf_msgbuf_remove_flowring(msgbuf, flowid);
+ 	}
+ }
++
++int brcmf_msgbuf_h2d_mb_write(struct brcmf_pub *drvr, u32 data)
++{
++	struct brcmf_msgbuf *msgbuf = (struct brcmf_msgbuf *)drvr->proto->pd;
++	struct brcmf_commonring *commonring;
++	struct msgbuf_h2d_mailbox_data *request;
++	void *ret_ptr;
++	int err;
++
++	commonring = msgbuf->commonrings[BRCMF_H2D_MSGRING_CONTROL_SUBMIT];
++	brcmf_commonring_lock(commonring);
++	ret_ptr = brcmf_commonring_reserve_for_write(commonring);
++	if (!ret_ptr) {
++		bphy_err(drvr, "Failed to reserve space in commonring\n");
++		brcmf_commonring_unlock(commonring);
++		return -ENOMEM;
++	}
++
++	request = (struct msgbuf_h2d_mailbox_data *)ret_ptr;
++	memset(request, 0, sizeof(*request));
++	request->msg.msgtype = MSGBUF_TYPE_H2D_MAILBOX_DATA;
++	request->msg.ifidx = -1;
++	request->data = cpu_to_le32(data);
++
++	err = brcmf_commonring_write_complete(commonring);
++	brcmf_commonring_unlock(commonring);
++
++	return err;
++}
++
+ 
+ #ifdef DEBUG
+ static int brcmf_msgbuf_stats_read(struct seq_file *seq, void *data)
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/bus.h
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/bus.h
+@@ -87,6 +87,7 @@
+  * @get_memdump: obtain device memory dump in provided buffer.
+  * @get_blob: obtain a firmware blob.
+  * @remove: initiate unbind of the device.
++ * @d2h_mb_rx: receive firmware mailbox data (optional).
+  *
+  * This structure provides an abstract interface towards the
+  * bus specific driver. For control messages to common driver
+@@ -108,6 +109,7 @@
+ 	void (*debugfs_create)(struct device *dev);
+ 	int (*reset)(struct device *dev);
+ 	void (*remove)(struct device *dev);
++	void (*d2h_mb_rx)(struct device *dev, u32 data);
+ };
+ 
+ 
+@@ -292,6 +294,15 @@
+ 	bus->ops->remove(bus->dev);
+ }
+ 
++static inline
++void brcmf_bus_d2h_mb_rx(struct brcmf_bus *bus, u32 data)
++{
++	if (!bus->ops->d2h_mb_rx)
++		return;
++
++	bus->ops->d2h_mb_rx(bus->dev, data);
++}
++
+ /*
+  * interface functions from common layer
+  */
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/msgbuf.h
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/msgbuf.h
+@@ -28,6 +28,7 @@
+ 	__le32		high_addr;
+ };
+ 
++int brcmf_msgbuf_h2d_mb_write(struct brcmf_pub *drvr, u32 data);
+ int brcmf_proto_msgbuf_rx_trigger(struct device *dev);
+ void brcmf_msgbuf_delete_flowring(struct brcmf_pub *drvr, u16 flowid);
+ int brcmf_proto_msgbuf_attach(struct brcmf_pub *drvr);

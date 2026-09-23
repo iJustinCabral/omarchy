@@ -1,0 +1,3 @@
+# Unified-diff context includes a leading space before kernel tabs/blank lines.
+# Preserve exact patch bytes; source parity is checked by prepare-source.py.
+*.patch -whitespace

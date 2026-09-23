@@ -1,0 +1,38 @@
+Subject: [EXPERIMENT] wifi: brcmfmac: propagate transport failure from netdev open
+
+The post-S3 Wi-Fi enable trace records toe_ol timing out with -EIO,
+followed immediately by brcmf_netdev_open returning success. The retained
+cfg->dongle_up state lets cfg80211_up skip firmware initialization.
+
+Keep optional TOE firmware rejection (-EBADE) compatible with the successful
+awake toggle. Return transport errors instead of advertising successful open.
+This addresses false success only. It does not repair the stalled firmware or
+make the later Wi-Fi watchdog reset safe for its Bluetooth sibling.
+Not hardware tested; no deployment or complete suspend-fix claim.
+
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c
+@@ -604,6 +604,7 @@
+ 	struct brcmf_pub *drvr = ifp->drvr;
+ 	struct brcmf_bus *bus_if = drvr->bus_if;
+ 	u32 toe_ol;
++	int err;
+ 
+ 	brcmf_dbg(TRACE, "Enter, bsscfgidx=%d\n", ifp->bsscfgidx);
+ 
+@@ -616,8 +617,13 @@
+ 	atomic_set(&ifp->pend_8021x_cnt, 0);
+ 
+ 	/* Get current TOE mode from dongle */
+-	if (brcmf_fil_iovar_int_get(ifp, "toe_ol", &toe_ol) >= 0
+-	    && (toe_ol & TOE_TX_CSUM_OL) != 0)
++	err = brcmf_fil_iovar_int_get(ifp, "toe_ol", &toe_ol);
++	/* FWIL maps a firmware rejection to EBADE. Other failures do not
++	 * establish a working transport, even though TOE is optional.
++	 */
++	if (err < 0 && err != -EBADE)
++		return err;
++	if (!err && (toe_ol & TOE_TX_CSUM_OL) != 0)
+ 		ndev->features |= NETIF_F_IP_CSUM;
+ 	else
+ 		ndev->features &= ~NETIF_F_IP_CSUM;

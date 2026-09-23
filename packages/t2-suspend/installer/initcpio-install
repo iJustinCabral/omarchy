@@ -1,0 +1,44 @@
+#!/bin/bash
+# A failed DKMS build must not silently put stock radio drivers into a new image.
+build() {
+  [[ $KERNELVERSION == *-t2 ]] || return 0
+  local module selected built expected actual vermagic
+  local root=${_optmoduleroot%/}
+  # Apple board-specific firmware is requested dynamically and is absent from
+  # MODULE_FIRMWARE metadata. Wi-Fi probes before the real root is mounted.
+  local firmware suffix
+  for suffix in .bin -SPPR-m.txt -SPPR-u.txt .clm_blob .txcap_blob; do
+    firmware=$root/usr/lib/firmware/brcm/brcmfmac4377b3-pcie.apple,formosa$suffix
+    [[ -s $firmware ]] || { error "Missing Apple Wi-Fi firmware: $firmware"; exit 1; }
+  done
+  for firmware in "$root"/usr/lib/firmware/brcm/brcmfmac4377b3-*; do
+    [[ -f $firmware ]] || continue
+    add_file "$firmware" "${firmware#"$root"}" || exit 1
+  done
+  for module in brcmfmac brcmfmac-wcc brcmfmac-cyw brcmfmac-bca hci_bcm4377; do
+    selected=$(modinfo -b "${root:-/}" -k "$KERNELVERSION" -n "$module") || exit 1
+    built=$root/var/lib/dkms/omarchy-t2-radio/1.0/$KERNELVERSION/x86_64/module/$module.ko
+    # DKMS may compress its stored modules to match the target kernel.
+    if [[ ! -f $built ]]; then
+      for actual in "$built.xz" "$built.zst" "$built.gz"; do
+        if [[ -f $actual ]]; then built=$actual; break; fi
+      done
+    fi
+    [[ -f $built ]] || { error "Missing T2 DKMS build for $module / $KERNELVERSION"; exit 1; }
+    expected=$(modinfo -F srcversion "$built") || exit 1
+    actual=$(modinfo -F srcversion "$selected") || exit 1
+    vermagic=$(modinfo -F vermagic "$selected") || exit 1
+    [[ ${vermagic%% *} == "$KERNELVERSION" ]] || { error "Wrong T2 module ABI: $module"; exit 1; }
+    [[ -n $expected && $expected == "$actual" ]] || { error "Stock/conflicting T2 module selected: $module"; exit 1; }
+  done
+  add_file "$root/usr/src/omarchy-t2-radio-1.0/provenance.json" /etc/omarchy-t2-radio-source.json || exit 1
+  # Include Wi-Fi; Bluetooth stays on the root filesystem and loads through its gate.
+  add_module brcmfmac || exit 1
+  add_module brcmfmac-wcc || exit 1
+  add_module brcmfmac-cyw || exit 1
+  add_module brcmfmac-bca || exit 1
+  (( _builderrors == 0 )) || { error "T2 initramfs dependency errors; preserving existing image"; exit 1; }
+}
+help() {
+  echo "Verify the T2 radio DKMS modules and include Wi-Fi without early Bluetooth loading."
+}
