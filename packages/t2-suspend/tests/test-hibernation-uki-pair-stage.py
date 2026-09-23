@@ -136,11 +136,34 @@ with tempfile.TemporaryDirectory(prefix="t2-hibernation-pair-rejected-") as temp
     stage.AUDIT.load_candidate = original_loader
   assert not (root / stage.RECEIPT).exists()
 
+  root, source, restore, _limine, _original = fixture(Path(temporary) / "replaced-kernel")
+
+  def replaced_kernel_loader(directory, role):
+    report = original_loader(directory, role)
+    if role == "source":
+      report["modified_sections_sha256"] = {".linux": "c" * 64}
+      report["unchanged_production_sections_sha256"].pop(".linux")
+    return report
+
+  stage.AUDIT.load_candidate = replaced_kernel_loader
+  try:
+    rejects(lambda: stage.stage(root, source, restore), "replaces the production kernel")
+  finally:
+    stage.AUDIT.load_candidate = original_loader
+  assert not (root / stage.RECEIPT).exists()
+
   root, source, restore, _limine, _original = fixture(Path(temporary) / "rejected-arm")
   receipt = stage.stage(root, source, restore)
   receipt["images"]["source"]["sha256"] = rejected_hash
   stage.save_receipt(root, receipt)
   rejects(lambda: stage.arm_source(root), "failed ordinary root mount")
+  assert not (root / stage.SINGLE.ONESHOT).exists()
+
+  root, source, restore, _limine, _original = fixture(Path(temporary) / "missing-kernel-policy")
+  receipt = stage.stage(root, source, restore)
+  receipt.pop("kernel_policy")
+  stage.save_receipt(root, receipt)
+  rejects(lambda: stage.arm_source(root), "production-kernel boot policy")
   assert not (root / stage.SINGLE.ONESHOT).exists()
 
 

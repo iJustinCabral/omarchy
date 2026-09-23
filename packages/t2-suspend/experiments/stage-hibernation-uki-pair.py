@@ -74,6 +74,12 @@ def reject_failed_source(image_hash):
     raise ValueError("Source UKI failed ordinary root mount and must not be armed again: " + image_hash)
 
 
+def require_production_kernel(provenance, role):
+  sections = provenance.get("unchanged_production_sections_sha256")
+  if provenance.get("modified_sections_sha256") is not None or not isinstance(sections, dict) or ".linux" not in sections:
+    raise ValueError(role + " UKI replaces the production kernel; physical root boot is unqualified")
+
+
 def entry_block(role, image_hash, image_blake2):
   identifier = entry_id(role, image_hash)
   return (
@@ -97,6 +103,8 @@ def load_pair(source_directory, restore_directory):
   source = AUDIT.load_candidate(source_directory, "source")
   restore = AUDIT.load_candidate(restore_directory, "restore")
   reject_failed_source(source.get("candidate_uki_sha256"))
+  require_production_kernel(source, "source")
+  require_production_kernel(restore, "restore")
   pair = AUDIT.audit(source, restore)
   if source.get("candidate") != "mba-t2-hibernation-early-source":
     raise ValueError("Source is not a newly built early-source UKI")
@@ -267,6 +275,7 @@ def stage(root, source_directory, restore_directory):
   staged = original.encode() + block
   receipt = {
     "state": "preparing",
+    "kernel_policy": "production-linux-unchanged",
     "source_armed_from_boot_id": None,
     "restore_armed_from_boot_id": None,
     "runtime_stack_sha256": pair["runtime_stack_sha256"],
@@ -338,6 +347,8 @@ def arm_source(root, runner=subprocess.run, sync=os.sync):
   if receipt.get("state") != "staged":
     raise ValueError("Pair transaction is not staged for source arming")
   reject_failed_source(receipt["images"]["source"]["sha256"])
+  if receipt.get("kernel_policy") != "production-linux-unchanged":
+    raise ValueError("Pair source lacks the production-kernel boot policy")
   SINGLE.validate_production(root, receipt)
   verify_staged(root, receipt)
   advertised_entries(root, receipt)
