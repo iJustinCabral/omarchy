@@ -16,6 +16,7 @@ python3 "$ROOT/packages/t2-suspend/tests/test-pre-write-ftrace.py" "$ROOT/packag
 python3 "$ROOT/packages/t2-suspend/tests/test-pre-write-runner.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-uki-pair-audit.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernation-uki-pair-stage.py"
+python3 "$ROOT/packages/t2-suspend/tests/test-hibernation-uki-pair-source-verifier.py"
 pass "T2 suspend source and installer transactions"
 
 test_tmp=$(mktemp -d)
