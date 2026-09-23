@@ -60,4 +60,7 @@ with tempfile.TemporaryDirectory(prefix="t2-efi-stage-marker-") as temporary:
   parameter.symlink_to(variable)
   refused(lambda: marker.prearm(root, VECTOR), "no T2 EFI stage-marker parameter")
 
-print("PASS: EFI marker binds guarded vector and refuses stale, corrupt or symlinked evidence")
+kernel_patch = (script.parents[1] / "0012-hibernate-efi-stage-marker.patch").read_text()
+assert "+\t\terror = t2_hibernate_mark(1, 2);\n+\t\tif (error) {\n+\t\t\tswsusp_free();\n+\t\t\tin_suspend = 0;\n+\t\t\tpm_restore_gfp_mask();\n+\t\t\tgoto Free_bitmaps;\n+\t\t}" in kernel_patch
+
+print("PASS: EFI marker binds guarded vector, refuses stale evidence and cleans a failed source snapshot")

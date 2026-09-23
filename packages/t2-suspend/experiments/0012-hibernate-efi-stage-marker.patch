@@ -77,13 +77,17 @@ diff --git a/kernel/power/hibernate.c b/kernel/power/hibernate.c
  	error = pm_notifier_call_chain_robust(PM_HIBERNATION_PREPARE, PM_POST_HIBERNATION);
  	if (error)
  		goto Restore;
-@@ -854,4 +908,9 @@ int hibernate(void)
+@@ -854,4 +908,13 @@ int hibernate(void)
  	if (in_suspend) {
  		unsigned int flags = 0;
  
 +		/* No image has been written. An EFI failure aborts this source path. */
 +		error = t2_hibernate_mark(1, 2);
-+		if (error)
++		if (error) {
++			swsusp_free();
++			in_suspend = 0;
++			pm_restore_gfp_mask();
 +			goto Free_bitmaps;
++		}
 +
  		if (hibernation_mode == HIBERNATION_PLATFORM)
