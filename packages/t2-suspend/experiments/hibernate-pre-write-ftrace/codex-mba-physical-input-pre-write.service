@@ -1,0 +1,15 @@
+[Unit]
+Description=Capture physical input for the MBA T2 pre-write candidate
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/libexec/codex-mba-physical-input-v8 --entry-id MBA-T2-hibernation-candidate-e81077476ec29e9a --output /var/lib/codex-mba-physical-input-pre-write/evidence.json
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/codex-mba-physical-input-pre-write
+
+[Install]
+WantedBy=multi-user.target
