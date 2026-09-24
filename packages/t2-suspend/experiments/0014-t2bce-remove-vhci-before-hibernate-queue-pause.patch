@@ -1,0 +1,55 @@
+diff --git a/drivers/staging/t2bce/t2bce_core/t2bce_main.c b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
+--- a/drivers/staging/t2bce/t2bce_core/t2bce_main.c
++++ b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
+@@ -772,7 +772,7 @@ static int bce_pm_rebuild_no_state_queue_graph(struct t2bce_device *bce)
+     return status;
+ }
+ 
+-static int bce_pm_suspend_no_state(struct t2bce_device *bce)
++static int bce_pm_suspend_no_state(struct t2bce_device *bce, bool no_state_prepared)
+ {
+     int status;
+ 
+@@ -781,7 +781,8 @@ static int bce_pm_suspend_no_state(struct t2bce_device *bce)
+         return -EOPNOTSUPP;
+     }
+ 
+-    t2bce_core_clients_pm_prepare_no_state(bce);
++    if (!no_state_prepared)
++        t2bce_core_clients_pm_prepare_no_state(bce);
+     status = bce_pm_suspend_fallback_no_state(bce);
+     if (status)
+         return status;
+@@ -814,6 +815,15 @@ static int t2bce_suspend_common(struct device *dev, bool force_no_state)
+     bce->no_state_early_wake_attempted = false;
+     bce->no_state_early_wake_status = 0;
+     t2bce_core_clients_pm_reset(bce);
++    if (force_no_state) {
++        if (!t2bce_core_clients_pm_can_rebuild_no_state(bce)) {
++            pr_err("t2bce_core: hibernation refused: a client cannot rebuild queues\n");
++            status = -EOPNOTSUPP;
++            goto out_unlock;
++        }
++        /* Command replies still need the system event queue during HCD removal. */
++        t2bce_core_clients_pm_prepare_no_state(bce);
++    }
+     status = t2bce_core_clients_pm_prepare(bce);
+     if (status) {
+         t2bce_core_clients_pm_abort(bce);
+@@ -827,7 +837,7 @@ static int t2bce_suspend_common(struct device *dev, bool force_no_state)
+     }
+ 
+     if (force_no_state || !bce_stateful_supported(bce)) {
+-        status = bce_pm_suspend_no_state(bce);
++        status = bce_pm_suspend_no_state(bce, force_no_state);
+         if (status) {
+             bce_pm_suspend_abort(bce);
+             t2bce_core_clients_pm_abort(bce);
+@@ -848,6 +858,6 @@ static int t2bce_suspend_common(struct device *dev, bool force_no_state)
+     /* bridgeOS can reject state save; fall back to the no-state path then. */
+     pr_debug("t2bce_core: suspend: stateful path not ready, falling back to no-state\n");
+-    status = bce_pm_suspend_no_state(bce);
++    status = bce_pm_suspend_no_state(bce, false);
+     if (status) {
+         bce_pm_suspend_abort(bce);
+         t2bce_core_clients_pm_abort(bce);

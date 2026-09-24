@@ -28,6 +28,7 @@ PATCHES = (
   "0010-t2bce-block-dma-before-queue-drop.patch",
   "0011-t2bce-wake-before-device-noirq.patch",
   "0013-t2bce-quarantine-vhci-command-timeout.patch",
+  "0014-t2bce-remove-vhci-before-hibernate-queue-pause.patch",
 )
 
 

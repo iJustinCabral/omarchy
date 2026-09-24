@@ -50,6 +50,9 @@ assert "t2bce_resume_mode(dev, true)" in restore
 assert "t2bce_resume(dev)" in resume_wrapper
 assert suspend_no_state.index("pm_can_rebuild_no_state") < suspend_no_state.index("pm_prepare_no_state")
 assert suspend_no_state.index("pm_prepare_no_state") < suspend_no_state.index("bce_pm_suspend_fallback_no_state")
+assert suspend_common.index("pm_can_rebuild_no_state") < suspend_common.index("pm_prepare_no_state")
+assert suspend_common.index("pm_prepare_no_state") < suspend_common.index("pm_prepare(bce)")
+assert "bce_pm_suspend_no_state(bce, force_no_state)" in suspend_common
 assert suspend_no_state.index("bce_pm_suspend_fallback_no_state") < suspend_no_state.index("bce_pm_block_queue_dma")
 assert suspend_no_state.index("bce_pm_block_queue_dma") < suspend_no_state.index("bce_pm_drop_no_state_queue_graph")
 assert block_queue_dma.index("pci_clear_master") < block_queue_dma.rindex("pci_read_config_word")
@@ -71,6 +74,12 @@ for callback in ("pm_abort", "pm_drop_no_state_queues", "pm_rebuild_no_state_que
 
 vhci_drop = function(vhci, "bce_vhci_pm_drop_no_state_queues", "void")
 vhci_rebuild = function(vhci, "bce_vhci_pm_rebuild_no_state_queues")
+vhci_prepare = function(vhci, "bce_vhci_pm_prepare")
+vhci_no_state = function(vhci, "bce_vhci_pm_prepare_no_state", "void")
+vhci_system_event = function(vhci, "bce_vhci_handle_system_event", "void")
+assert "bce_vhci_pause_event_queues(vhci)" in vhci_prepare
+assert "bce_vhci_remove_hcd(vhci)" in vhci_no_state
+assert "bce_vhci_command_queue_deliver_completion" in vhci_system_event
 assert vhci_drop.index("cancel_work_sync") < vhci_drop.index("destroy_event_queues")
 assert vhci_drop.index("destroy_event_queues") < vhci_drop.index("destroy_message_queues")
 assert vhci_rebuild.index("create_message_queues") < vhci_rebuild.index("create_event_queues")
@@ -229,6 +238,7 @@ int main(void) {
   reset_controls(); init_device(&bce, functions, &dev);
   assert(t2bce_suspend_common(&dev, true) == 0);
   assert(bce.no_state_queues_dropped && bce.no_state_resume && bce.no_state_fallback);
+  assert(find_event(EV_PREPARE_NO_STATE) < find_event(EV_PREPARE));
   assert(find_event(EV_PREPARE_NO_STATE) < find_event(EV_SLEEP_NO_STATE));
   assert(find_event(EV_SLEEP_NO_STATE) < find_event(EV_BLOCK_DMA));
   assert(find_event(EV_BLOCK_DMA) < find_event(EV_SYNC_IRQ));
@@ -288,7 +298,8 @@ int main(void) {
   reset_controls(); init_device(&bce, functions, &dev); can_rebuild = false;
   assert(t2bce_suspend_common(&dev, true) == -EOPNOTSUPP);
   assert(find_event(EV_SLEEP_NO_STATE) < 0 && find_event(EV_DROP_CLIENTS) < 0);
-  assert(find_event(EV_SUSPEND_ABORT) >= 0 && find_event(EV_CLIENT_ABORT) >= 0);
+  assert(find_event(EV_PREPARE_NO_STATE) < 0 && find_event(EV_PREPARE) < 0);
+  assert(find_event(EV_SUSPEND_ABORT) < 0 && find_event(EV_CLIENT_ABORT) < 0);
 
   reset_controls(); init_device(&bce, functions, &dev); sleep_status = -EIO;
   assert(t2bce_suspend_common(&dev, true) == -EIO);
