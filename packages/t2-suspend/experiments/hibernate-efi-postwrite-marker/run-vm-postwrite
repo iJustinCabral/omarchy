@@ -1,0 +1,59 @@
+#!/bin/bash
+
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+kernel=/usr/lib/modules/7.2.6-arch2-Watanare-T2-2-t2/vmlinuz
+ovmf_code=/usr/share/edk2/x64/OVMF_CODE.4m.fd
+ovmf_vars=/usr/share/edk2/x64/OVMF_VARS.4m.fd
+
+[[ $(sha256sum "$kernel" | cut -d ' ' -f1) == "b6b9d3e9572089c973334fa5faa811328e5efe33e4c00e3d6a69d6c1cf9cc64c" ]] || exit 1
+[[ $(sha256sum "$ovmf_code" | cut -d ' ' -f1) == "2febd26c0b4cf95a636a941afa37d64a552723443ed9ac72f763f6840da98cb4" ]] || exit 1
+[[ $(sha256sum "$ovmf_vars" | cut -d ' ' -f1) == "5d2ac383371b408398accee7ec27c8c09ea5b74a0de0ceea6513388b15be5d1e" ]] || exit 1
+
+work=$(mktemp -d /tmp/mba-postwrite-vm.XXXXXX)
+root=$work/root
+mkdir -p "$root"/dev "$root"/proc "$root"/sys "$work/module-build"
+cp "$script_dir/Kbuild" "$script_dir/mba_hibernate_efi_postwrite_marker.c" "$work/module-build/"
+make -C /usr/lib/modules/7.2.6-arch2-Watanare-T2-2-t2/build M="$work/module-build" W=1 modules
+cc -std=c11 -Wall -Wextra -Werror -static -O2 -o "$root/init" "$script_dir/vm-postwrite-init.c"
+cp "$work/module-build/mba_hibernate_efi_postwrite_marker.ko" "$root/marker.ko"
+cp "$ovmf_vars" "$work/OVMF_VARS.4m.fd"
+truncate -s 4G "$work/swap.img"
+chmod 0600 "$work/swap.img"
+mkswap "$work/swap.img" >/dev/null
+(cd "$root" && find . -print0 | cpio --null -o --format=newc 2>/dev/null) | gzip -1 >"$work/initrd.img"
+printf 'Disposable guest files: %s\n' "$work"
+
+set +e
+timeout --signal=TERM --kill-after=5s 180s qemu-system-x86_64 \
+  -machine q35,accel=kvm -cpu host -smp 2 -m 2048 \
+  -display none -serial stdio -monitor none -no-reboot \
+  -drive if=pflash,format=raw,readonly=on,file="$ovmf_code" \
+  -drive if=pflash,format=raw,file="$work/OVMF_VARS.4m.fd" \
+  -drive if=virtio,format=raw,file="$work/swap.img" \
+  -kernel "$kernel" -initrd "$work/initrd.img" \
+  -append 'console=ttyS0 loglevel=5 rdinit=/init mba_vm_postwrite=1' 2>&1 | tee "$work/source.log"
+source_status=${PIPESTATUS[0]}
+set -e
+if (( source_status != 0 )) || ! rg -q '^MBA_VM_POSTWRITE_ENTER\r?$' "$work/source.log" ||
+   rg -q '^MBA_VM_POSTWRITE_(UNEXPECTED_RETURN|RESULT)=.*' "$work/source.log"; then
+  printf 'VM source shutdown failed; evidence retained at %s\n' "$work/source.log" >&2
+  exit 1
+fi
+
+set +e
+timeout --signal=TERM --kill-after=5s 120s qemu-system-x86_64 \
+  -machine q35,accel=kvm -cpu host -smp 2 -m 2048 \
+  -display none -serial stdio -monitor none -no-reboot \
+  -drive if=pflash,format=raw,readonly=on,file="$ovmf_code" \
+  -drive if=pflash,format=raw,file="$work/OVMF_VARS.4m.fd" \
+  -drive if=virtio,format=raw,file="$work/swap.img" \
+  -kernel "$kernel" -initrd "$work/initrd.img" \
+  -append 'console=ttyS0 loglevel=5 rdinit=/init mba_vm_postwrite=1 mba_vm_postwrite_verify=1' 2>&1 | tee "$work/return.log"
+return_status=${PIPESTATUS[0]}
+set -e
+if (( return_status != 0 )) || ! rg -q '^MBA_VM_POSTWRITE_RESULT=pass\r?$' "$work/return.log"; then
+  printf 'VM cold-boot marker verification failed; evidence retained at %s\n' "$work/return.log" >&2
+  exit 1
+fi
