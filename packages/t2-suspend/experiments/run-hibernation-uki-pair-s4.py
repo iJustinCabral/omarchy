@@ -2,9 +2,10 @@
 """Validate or run one guarded source-to-restore UKI hibernation transition.
 
 The source and restore entries must be distinct private UKIs with the same
-runtime stack. Validation is read-only. Execution consumes a pair-wide durable
-guard and pre-arms an opt-in stage marker before arming the restore
-one-shot; a failed attempt cannot be retried by switching hibernation mode.
+runtime stack, and the test_resume proof must name this exact pair source.
+Validation is read-only. Execution consumes a pair-wide durable guard and
+pre-arms an opt-in stage marker before arming the restore one-shot; a failed
+attempt cannot be retried by switching hibernation mode.
 A returned runner is not proof of usable input or unattended cold-start recovery.
 """
 
@@ -15,6 +16,8 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
+import stat
 
 
 HERE = Path(__file__).resolve().parent
@@ -63,6 +66,71 @@ def source_platform_preflight(root, source_directory, restore_directory):
   return TEST.platform_preflight(root, source_directory, inspector=inspect_pair)
 
 
+def private_evidence(path, root, description):
+  if path.is_symlink() or not path.is_file():
+    raise ValueError(description + " is missing or symlinked")
+  metadata = path.stat()
+  expected_uid = 0 if Path(root).resolve() == Path("/") else os.geteuid()
+  if metadata.st_uid != expected_uid or stat.S_IMODE(metadata.st_mode) != 0o600:
+    raise ValueError(description + " has an unsafe owner or mode")
+  return S4.load_json_file(path, description)
+
+
+def verify_pair_test_resume_proof(root, evidence, post_input_path, source_directory, proof_source_directory, allow_matching_early_source=False):
+  if Path(source_directory).resolve() != Path(proof_source_directory).resolve():
+    raise ValueError("Pair test_resume proof must name this exact source image")
+  source_hash = TEST.candidate_hash(evidence.get("source_uki_sha256"))
+  if evidence.get("candidate_uki_sha256") != source_hash:
+    raise ValueError("Running source differs from pair test_resume proof identity")
+  directory = S4.confined(root, PAIR.STATE / "test-resume-vectors" / source_hash)
+  guard = directory / "test-resume-attempted"
+  if guard.is_symlink() or not guard.is_file():
+    raise ValueError("Pair test_resume guard is missing or symlinked")
+  guard_metadata = guard.stat()
+  expected_uid = 0 if Path(root).resolve() == Path("/") else os.geteuid()
+  if guard_metadata.st_uid != expected_uid or stat.S_IMODE(guard_metadata.st_mode) != 0o600:
+    raise ValueError("Pair test_resume guard has an unsafe owner or mode")
+  proof_boot_id = guard.read_text().strip()
+  if re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", proof_boot_id) is None:
+    raise ValueError("Pair test_resume guard has a malformed boot ID")
+  attempt = directory / "attempts" / proof_boot_id / "attempt.json"
+  record = private_evidence(attempt, root, "Pair test_resume attempt")
+  expected = {
+    "boot_id": proof_boot_id,
+    "entry_id": evidence["source_entry_id"],
+    "candidate_uki_sha256": source_hash,
+    "source_uki_sha256": source_hash,
+    "restore_uki_sha256": evidence["restore_uki_sha256"],
+    "runtime_stack_sha256": evidence["runtime_stack_sha256"],
+    "cmdline_sha256": evidence["cmdline_sha256"],
+    "kernel_release": evidence["kernel_release"],
+    "transition_vector": source_hash,
+    "qualification": "pair-source-ordinary-boot-preflight-passed",
+    "state": "returned-and-cleaned",
+    "hibernate_attempted": True,
+    "physical_input_confirmed": True,
+    "hardware_qualified": False,
+  }
+  for key, value in expected.items():
+    if record.get(key) != value:
+      raise ValueError("Pair test_resume proof mismatch: " + key)
+  if record.get("cleanup_errors"):
+    raise ValueError("Pair test_resume proof has cleanup errors")
+  post_path = S4.supplied_path(root, post_input_path)
+  post_input = private_evidence(post_path, root, "Post-test_resume input evidence")
+  if post_input.get("boot_id") != proof_boot_id or post_input.get("entry_id") != evidence["source_entry_id"]:
+    raise ValueError("Post-test_resume input evidence names another boot or entry")
+  if post_input.get("keyboard_seen") is not True or post_input.get("trackpad_seen") is not True:
+    raise ValueError("Post-test_resume input evidence is incomplete")
+  return {
+    "test_resume_boot_id": proof_boot_id,
+    "test_resume_source_uki_sha256": source_hash,
+    "test_resume_attempt": str(attempt),
+    "test_resume_runtime_stack_sha256": evidence["runtime_stack_sha256"],
+    "post_test_resume_input": str(post_path),
+  }
+
+
 def preflight(
   root,
   source_directory,
@@ -72,7 +140,7 @@ def preflight(
   pre_s4_input_path,
   disk_mode,
   platform_preflight=source_platform_preflight,
-  proof_verifier=S4.verify_test_resume_proof,
+  proof_verifier=verify_pair_test_resume_proof,
   current_input_verifier=S4.verify_current_input,
   require_efi_marker=False,
   marker_backend=MARKER,
@@ -133,7 +201,7 @@ def execute(
   disk_mode,
   expected_pair_vector,
   platform_preflight=source_platform_preflight,
-  proof_verifier=S4.verify_test_resume_proof,
+  proof_verifier=verify_pair_test_resume_proof,
   current_input_verifier=S4.verify_current_input,
   wifi_prepare=WIFI.prepare,
   wifi_restore=WIFI.restore,

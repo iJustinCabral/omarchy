@@ -113,6 +113,9 @@ def platform_preflight(root, _source, _restore):
     "source_uki_sha256": receipt["images"]["source"]["sha256"],
     "restore_entry_id": receipt["images"]["restore"]["entry_id"],
     "restore_uki_sha256": receipt["images"]["restore"]["sha256"],
+    "runtime_stack_sha256": receipt["runtime_stack_sha256"],
+    "cmdline_sha256": hashlib.sha256(b"synthetic-cmdline").hexdigest(),
+    "kernel_release": "7.2.6-arch2-Watanare-T2-2-t2",
     "pm_test_before": "none",
     "disk_before": "platform",
     "pm_trace_before": "0",
@@ -190,6 +193,85 @@ def power_writer(root, receipt, events, fail_state=False, marker_stage=2):
 
 with tempfile.TemporaryDirectory(prefix="t2-pair-s4-") as temporary:
   base = Path(temporary)
+  root, source, restore, proof, receipt, _power = fixture(base / "pair-proof")
+  evidence = platform_preflight(root, source, restore)
+  source_hash = evidence["source_uki_sha256"]
+  proof_directory = root / pair.STATE / "test-resume-vectors" / source_hash
+  guard = proof_directory / "test-resume-attempted"
+  write(guard, BOOT_ID + "\n")
+  guard.chmod(0o600)
+  attempt = proof_directory / "attempts" / BOOT_ID / "attempt.json"
+  proof_record = {
+    "boot_id": BOOT_ID,
+    "entry_id": evidence["source_entry_id"],
+    "candidate_uki_sha256": source_hash,
+    "source_uki_sha256": source_hash,
+    "restore_uki_sha256": evidence["restore_uki_sha256"],
+    "runtime_stack_sha256": evidence["runtime_stack_sha256"],
+    "cmdline_sha256": evidence["cmdline_sha256"],
+    "kernel_release": evidence["kernel_release"],
+    "transition_vector": source_hash,
+    "qualification": "pair-source-ordinary-boot-preflight-passed",
+    "state": "returned-and-cleaned",
+    "hibernate_attempted": True,
+    "physical_input_confirmed": True,
+    "hardware_qualified": False,
+  }
+  write(attempt, json.dumps(proof_record))
+  attempt.chmod(0o600)
+  post = Path("proof/post-input.json")
+  post_path = root / post
+  write(post_path, json.dumps({
+    "boot_id": BOOT_ID,
+    "entry_id": evidence["source_entry_id"],
+    "keyboard_seen": True,
+    "trackpad_seen": True,
+  }))
+  post_path.chmod(0o600)
+  verified = pair_s4.verify_pair_test_resume_proof(root, evidence, post, source, source, True)
+  assert verified["test_resume_boot_id"] == BOOT_ID
+  assert verified["test_resume_attempt"] == str(attempt)
+  full = pair_s4.preflight(
+    root, source, restore, source, post, Path("proof/pre-input.json"), "platform",
+    platform_preflight=platform_preflight, current_input_verifier=input_verifier,
+  )
+  assert full["test_resume_boot_id"] == BOOT_ID
+  try:
+    pair_s4.verify_pair_test_resume_proof(root, evidence, post, source, proof, True)
+    raise AssertionError("A different proof source was accepted")
+  except ValueError as error:
+    assert "exact source image" in str(error)
+  proof_record["state"] = "transition-failed"
+  write(attempt, json.dumps(proof_record))
+  try:
+    pair_s4.verify_pair_test_resume_proof(root, evidence, post, source, source, True)
+    raise AssertionError("A failed pair test_resume was accepted")
+  except ValueError as error:
+    assert "proof mismatch: state" in str(error)
+  proof_record["state"] = "returned-and-cleaned"
+  proof_record["restore_uki_sha256"] = "0" * 64
+  write(attempt, json.dumps(proof_record))
+  try:
+    pair_s4.verify_pair_test_resume_proof(root, evidence, post, source, source, True)
+    raise AssertionError("A changed restore UKI was accepted")
+  except ValueError as error:
+    assert "proof mismatch: restore_uki_sha256" in str(error)
+  proof_record["restore_uki_sha256"] = evidence["restore_uki_sha256"]
+  write(attempt, json.dumps(proof_record))
+  post_path.chmod(0o644)
+  try:
+    pair_s4.verify_pair_test_resume_proof(root, evidence, post, source, source, True)
+    raise AssertionError("World-readable input evidence was accepted")
+  except ValueError as error:
+    assert "unsafe owner or mode" in str(error)
+  post_path.chmod(0o600)
+  guard.unlink()
+  try:
+    pair_s4.verify_pair_test_resume_proof(root, evidence, post, source, source, True)
+    raise AssertionError("Missing pair guard was accepted")
+  except ValueError as error:
+    assert "guard is missing" in str(error)
+
   root, source, restore, proof, receipt, _power = fixture(base / "success")
   vector = pair_s4.pair_vector(receipt)
   inputs = (root, source, restore, proof, Path("proof/post-input.json"), Path("proof/pre-input.json"), "platform")
