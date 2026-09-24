@@ -59,6 +59,9 @@ class RTCBackend:
   NAME = "rtc"
   PM_TRACE_VALUE = "0"
   MIN_RETURN_STAGE = 2
+  # The MBA9,1 firmware rewrote the RTC across the guarded forced-power return.
+  # Stage 0 worked in one boot, but it did not survive as a usable breadcrumb.
+  EXECUTION_QUALIFIED = False
 
   def __init__(self, module_path, expected_sha256, command=command_output, kernel_release=None):
     self.module_path = Path(module_path)

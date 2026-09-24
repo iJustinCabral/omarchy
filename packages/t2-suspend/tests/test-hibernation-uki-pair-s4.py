@@ -390,6 +390,7 @@ with tempfile.TemporaryDirectory(prefix="t2-pair-s4-") as temporary:
     NAME = "rtc"
     PM_TRACE_VALUE = "0"
     MIN_RETURN_STAGE = 2
+    EXECUTION_QUALIFIED = True
 
     def __init__(self):
       self.stage = None
@@ -417,6 +418,26 @@ with tempfile.TemporaryDirectory(prefix="t2-pair-s4-") as temporary:
       events.append(("rtc", "cleaned"))
 
   rtc = RTCMarker()
+
+  rtc.EXECUTION_QUALIFIED = False
+  try:
+    pair_s4.execute(
+      *inputs, vector, platform_preflight, proof_verifier, input_verifier,
+      wifi_prepare=lambda _root: events.append(("wifi", "prepare")),
+      wifi_restore=lambda _root: events.append(("wifi", "restore")),
+      power_writer=lambda _path, _value: events.append(("power", "unexpected")),
+      runner=fake_runner(root, events, [False], [False]),
+      sync=lambda: None, sleeper=lambda _seconds: None,
+      services_verifier=lambda _runner: None, marker_backend=rtc,
+    )
+    raise AssertionError("Unqualified RTC backend entered the S4 transaction")
+  except ValueError as error:
+    assert "cannot qualify another S4 execution" in str(error)
+  assert not (root / pair_s4.VECTORS / vector).exists()
+  assert not (root / pair.SINGLE.ONESHOT).exists()
+  assert ("wifi", "prepare") not in events and ("power", "unexpected") not in events
+  rtc.EXECUTION_QUALIFIED = True
+  events.clear()
 
   def rtc_writer(path, value):
     events.append(("power", path.name, value))

@@ -152,6 +152,8 @@ def execute(
     require_efi_marker=True,
     marker_backend=marker_backend,
   )
+  if getattr(marker_backend, "NAME", None) == "rtc" and not getattr(marker_backend, "EXECUTION_QUALIFIED", False):
+    raise ValueError("RTC marker did not survive the MacBookAir9,1 forced-power return; this backend cannot qualify another S4 execution")
   if TEST.candidate_hash(expected_pair_vector) != evidence["transition_vector"]:
     raise ValueError("Explicit pair-wide vector does not match the staged images")
   services_verifier(runner)
