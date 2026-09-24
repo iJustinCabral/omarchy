@@ -46,6 +46,7 @@ RESUME_DEVICE = Path("/dev/mapper/root")
 SWAP_FILE = Path("/swap/swapfile")
 RESUME_OFFSET = 1923214
 KIND = "stock-efi-pre-write-boundary-v1"
+PREPARED_HEAD = "e6cd2b2c2b3c546b8dfd511684ffb3188dd5963c"
 
 
 def run(*arguments):
@@ -185,8 +186,8 @@ def validate_armed_live():
   COMMON.require_live_stock(root, allow_marker_module=True, allow_stage_marker=True)
   COMMON.require_live_arm_preflight(root)
   arm = COMMON.load_json(root / STATE / "armed.json", root)
-  if arm["boot_id"] != COMMON.boot_id(root) or arm["head"] != run("git", "-C", str(HELPER.parents[1]), "rev-parse", "HEAD"):
-    raise ValueError("Boundary arm differs from current stock boot or checkpoint")
+  if arm["boot_id"] != COMMON.boot_id(root) or arm["head"] != PREPARED_HEAD:
+    raise ValueError("Boundary arm differs from the prepared stock boot or pinned source checkpoint")
   if COMMON.read_regular(MARKER.marker_path(root)) != expected(arm, 0):
     raise ValueError("EFI stage-0 marker differs; preserve it")
   expected(arm, 1)

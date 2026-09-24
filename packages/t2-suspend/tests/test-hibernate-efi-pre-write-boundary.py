@@ -44,6 +44,7 @@ source = script.read_text()
 armed_validation = source.split("def validate_armed_live():", 1)[1].split("\ndef execute_live(", 1)[0]
 execute = source.split("def execute_live(", 1)[1].split("\ndef main():", 1)[0]
 assert 'allow_stage_marker=True' in armed_validation
+assert 'arm["head"] != PREPARED_HEAD' in armed_validation
 assert armed_validation.index('COMMON.read_regular(MARKER.marker_path(root)) != expected(arm, 0)') < armed_validation.index('"pm-attempted.json"')
 assert 'arm = validate_armed_live()' in execute
 assert execute.index('"pm-attempted.json"') < execute.index('subprocess.run(["insmod", str(MARKER_MODULE)]')
