@@ -20,7 +20,8 @@ assert 'memcmp(actual, expected, sizeof(actual))' in module
 assert 'attrs != MARKER_ATTRS' in module and 'size != sizeof(actual)' in module
 assert 'efivar_get_variable(marker_name, &marker_guid, &attrs, &size, actual)' in module
 assert 'efivar_trylock()' in module
-assert re.search(r'efivar_set_variable_locked\(marker_name, &marker_guid,\s*MARKER_ATTRS, sizeof\(value\), value, true\)', module)
+assert re.search(r'efivar_set_variable_locked\(name, guid, MARKER_ATTRS,\s*MARKER_SIZE, value, true\)', module)
+assert 'return mba_write_variable(marker_name, &marker_guid, value);' in module
 assert 'efivar_unlock();' in module
 assert 'efi.set_variable_nonblocking' in module and 'efi.query_variable_info_nonblocking' in module
 assert 'WRITE_ONCE(armed, false);' in module

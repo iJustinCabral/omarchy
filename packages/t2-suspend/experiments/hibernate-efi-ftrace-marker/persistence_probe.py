@@ -42,7 +42,7 @@ def command_output(*arguments):
   return subprocess.run(arguments, check=True, capture_output=True, text=True).stdout
 
 
-def require_live_stock(root):
+def require_live_stock(root, *, allow_marker_module=False):
   if os.geteuid() != 0:
     raise ValueError("Live EFI probe requires root")
   if command_output("findmnt", "-no", "SOURCE,FSTYPE", "/").strip() != "/dev/mapper/root[/@] btrfs":
@@ -56,7 +56,7 @@ def require_live_stock(root):
   for name in ("LoaderEntryOneShot", "LoaderEntryDefault"):
     if read_regular(root / "sys/firmware/efi/efivars" / f"{name}-{EFI_GLOBAL_GUID}") is not None:
       raise ValueError("An EFI boot-entry override exists")
-  if (root / MARKER_MODULE).exists() or (root / MARKER_MODULE).is_symlink():
+  if not allow_marker_module and ((root / MARKER_MODULE).exists() or (root / MARKER_MODULE).is_symlink()):
     raise ValueError("Experimental EFI marker module is loaded")
   if read_regular(root / STAGE_VARIABLE) is not None:
     raise ValueError("A real S4 EFI stage marker exists")
