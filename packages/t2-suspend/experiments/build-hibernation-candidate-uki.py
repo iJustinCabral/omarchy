@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 
@@ -22,6 +23,12 @@ CONFIG = HERE / "hibernate-candidate-mkinitcpio.conf"
 CANDIDATE_HOOKS = HERE / "hibernate-candidate-initcpio"
 CANDIDATE_MODULE_HELPER = HERE / "hibernate-candidate-modules.py"
 CANDIDATE_BLUETOOTH_HELPER = HERE / "hibernate-candidate-bluetooth.py"
+RESTORE_MARKER_FILES = (
+  "hooks/omarchy-t2-restore-marker",
+  "usr/lib/omarchy-t2-restore-marker/marker.ko",
+  "usr/lib/omarchy-t2-restore-marker/marker.sha256",
+  "usr/lib/omarchy-t2-restore-marker/marker.srcversion",
+)
 MODULES = {
   "brcmfmac": "drivers/net/wireless/broadcom/brcm80211/brcmfmac/brcmfmac.ko",
   "brcmfmac-bca": "drivers/net/wireless/broadcom/brcm80211/brcmfmac/bca/brcmfmac-bca.ko",
@@ -96,6 +103,38 @@ def module_metadata(path):
     "sha256": digest(path),
     "srcversion": run(("modinfo", "-F", "srcversion", path), capture=True).stdout.strip(),
     "vermagic": run(("modinfo", "-F", "vermagic", path), capture=True).stdout.strip(),
+  }
+
+
+def prepare_restore_marker(work, path, expected_sha256, expected_srcversion, release):
+  if path is None and expected_sha256 is None and expected_srcversion is None:
+    return None
+  if path is None or expected_sha256 is None or expected_srcversion is None:
+    raise ValueError("Restore marker requires exact path, SHA-256 and source version together")
+  if (not path.is_absolute() or path.is_symlink() or not path.is_file() or
+      under(path, Path("/boot")) or under(path, Path("/efi"))):
+    raise ValueError("Restore marker must be a private regular file outside boot storage")
+  metadata = path.stat()
+  if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) != 0o600:
+    raise ValueError("Restore marker must be root-owned mode 0600")
+  if re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None or digest(path) != expected_sha256:
+    raise ValueError("Restore marker differs from its explicit SHA-256")
+  identity = module_metadata(path)
+  if (not expected_srcversion or identity["srcversion"] != expected_srcversion or
+      identity["vermagic"].split()[0] != release):
+    raise ValueError("Restore marker source version or kernel ABI differs")
+  sha_file = work / "restore-marker.sha256"
+  srcversion_file = work / "restore-marker.srcversion"
+  sha_file.write_text(expected_sha256 + "\n")
+  srcversion_file.write_text(expected_srcversion + "\n")
+  sha_file.chmod(0o600)
+  srcversion_file.chmod(0o600)
+  return {
+    "module": path,
+    "sha256": expected_sha256,
+    "srcversion": expected_srcversion,
+    "sha_file": sha_file,
+    "srcversion_file": srcversion_file,
   }
 
 
@@ -192,15 +231,24 @@ def prepare_payload(work, candidate, release, expected, experiment_id=None):
   return payload, modules
 
 
-def build_initrd(work, module_root, payload, release, expected, experiment_id=None):
+def build_initrd(work, module_root, payload, release, expected, experiment_id=None, restore_marker=None):
   initrd = work / "candidate.initrd"
-  run((
+  environment = [
     "env",
     "MKINITCPIO_HOOKS=" + str(CANDIDATE_HOOKS / "hooks") + ":/etc/initcpio/hooks:/usr/lib/initcpio/hooks",
     "MKINITCPIO_INSTALL=" + str(CANDIDATE_HOOKS / "install") + ":/etc/initcpio/install:/usr/lib/initcpio/install",
     "OMARCHY_T2_CANDIDATE_PAYLOAD=" + str(payload),
     "OMARCHY_T2_CANDIDATE_MODULE_HELPER=" + str(CANDIDATE_MODULE_HELPER),
     "OMARCHY_T2_CANDIDATE_BLUETOOTH_HELPER=" + str(CANDIDATE_BLUETOOTH_HELPER),
+    "OMARCHY_T2_RESTORE_MARKER_MODULE=" + (str(restore_marker["module"]) if restore_marker is not None else ""),
+  ]
+  if restore_marker is not None:
+    environment.extend((
+      "OMARCHY_T2_RESTORE_MARKER_SHA256_FILE=" + str(restore_marker["sha_file"]),
+      "OMARCHY_T2_RESTORE_MARKER_SRCVERSION_FILE=" + str(restore_marker["srcversion_file"]),
+    ))
+  run((
+    *environment,
     "mkinitcpio",
     "--config",
     CONFIG,
@@ -231,6 +279,25 @@ def build_initrd(work, module_root, payload, release, expected, experiment_id=No
   build_config = (extracted / "config").read_text()
   if "omarchy-t2-candidate-modules" not in build_config:
     raise ValueError("Candidate initramfs late hook is not scheduled")
+  if restore_marker is not None:
+    for name in RESTORE_MARKER_FILES:
+      if not (extracted / name).is_file():
+        raise ValueError("Candidate initramfs omitted restore marker file: " + name)
+    embedded = extracted / "usr/lib/omarchy-t2-restore-marker"
+    if digest(extracted / "hooks/omarchy-t2-restore-marker") != digest(CANDIDATE_HOOKS / "hooks/omarchy-t2-restore-marker"):
+      raise ValueError("Candidate initramfs restore marker hook differs from source")
+    if digest(embedded / "marker.ko") != restore_marker["sha256"]:
+      raise ValueError("Candidate initramfs restore marker module differs")
+    if (embedded / "marker.sha256").read_text().strip() != restore_marker["sha256"]:
+      raise ValueError("Candidate initramfs restore marker SHA identity differs")
+    if (embedded / "marker.srcversion").read_text().strip() != restore_marker["srcversion"]:
+      raise ValueError("Candidate initramfs restore marker source version differs")
+    hooks_line = re.search(r'^HOOKS="([^"]*)"$', build_config, re.M)
+    if hooks_line is None:
+      raise ValueError("Candidate initramfs lacks resolved runtime hooks")
+    hooks = hooks_line.group(1).split()
+    if hooks.count("omarchy-t2-restore-marker") != 1 or hooks.count("resume") != 1 or hooks.index("omarchy-t2-restore-marker") + 1 != hooks.index("resume"):
+      raise ValueError("Restore marker must run immediately before resume")
 
   module_tree = extracted / "usr/lib/modules" / release
   for name in PRE_RESTORE_EXCLUDED_MODULES:
@@ -364,6 +431,9 @@ def main():
   parser.add_argument("--output", type=Path, required=True, help="new private output directory outside the ESP")
   parser.add_argument("--kernel-release", default=os.uname().release)
   parser.add_argument("--experiment-id", help="embed a bounded diagnostic ID in the private initramfs")
+  parser.add_argument("--restore-marker-module", type=Path, help="private disarmed cold-restore marker module")
+  parser.add_argument("--expected-restore-marker-sha256")
+  parser.add_argument("--expected-restore-marker-srcversion")
   args = parser.parse_args()
 
   if os.geteuid() != 0:
@@ -384,7 +454,9 @@ def main():
     provenance_path, expected = validate_candidate(candidate_source, args.kernel_release)
     module_root, selected = prepare_module_root(work, candidate_source, args.kernel_release, expected)
     payload, payload_modules = prepare_payload(work, candidate_source, args.kernel_release, expected, experiment_id)
-    initrd, staged_payload = build_initrd(work, module_root, payload, args.kernel_release, expected, experiment_id)
+    restore_marker = prepare_restore_marker(work, args.restore_marker_module, args.expected_restore_marker_sha256,
+                                            args.expected_restore_marker_srcversion, args.kernel_release)
+    initrd, staged_payload = build_initrd(work, module_root, payload, args.kernel_release, expected, experiment_id, restore_marker)
     uki, cmdline, sections, production_hash = build_uki(work, production, initrd)
 
     publish = work / "publish"
@@ -409,6 +481,13 @@ def main():
       "pre_restore_excluded_modules": list(PRE_RESTORE_EXCLUDED_MODULES),
       "post_switch_root_payload": staged_payload,
       "payload_modules": payload_modules,
+      "restore_marker": None if restore_marker is None else {
+        "sha256": restore_marker["sha256"],
+        "srcversion": restore_marker["srcversion"],
+        "efi_variable": "OmarchyT2RestoreStage-5e17d2ad-021f-4d45-a8e5-f4c191983e27",
+        "pre_resume_hook": "omarchy-t2-restore-marker",
+        "hook_sha256": digest(CANDIDATE_HOOKS / "hooks/omarchy-t2-restore-marker"),
+      },
       "production_modified": False,
       "installed": False,
       "boot_entry_created": False,

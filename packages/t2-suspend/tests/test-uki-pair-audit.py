@@ -99,6 +99,54 @@ with tempfile.TemporaryDirectory(prefix="t2-uki-pair-") as temporary:
   assert len(result["source_initrd_modules"]) == 9
   assert len(result["restore_pre_restore_excluded_modules"]) == 10
 
+  marker = {
+    "sha256": digest(b"private-marker"),
+    "srcversion": "ABC123",
+    "efi_variable": audit.RESTORE_MARKER_VARIABLE,
+    "pre_resume_hook": audit.RESTORE_MARKER_HOOK,
+    "hook_sha256": audit.sha256(audit.RESTORE_MARKER_HOOK_SOURCE),
+  }
+  extracted = root / "marker-initrd"
+  hooks = extracted / "hooks"
+  hooks.mkdir(parents=True)
+  (hooks / audit.RESTORE_MARKER_HOOK).write_bytes(audit.RESTORE_MARKER_HOOK_SOURCE.read_bytes())
+  marker_dir = extracted / "usr/lib/omarchy-t2-restore-marker"
+  marker_dir.mkdir(parents=True)
+  (marker_dir / "marker.ko").write_bytes(b"private-marker")
+  (marker_dir / "marker.sha256").write_text(marker["sha256"] + "\n")
+  (marker_dir / "marker.srcversion").write_text(marker["srcversion"] + "\n")
+  (extracted / "config").write_text('HOOKS="udev encrypt omarchy-t2-restore-marker resume"\n')
+  audit.verify_restore_marker_tree(extracted, marker)
+  instrumented_restore = copy.deepcopy(restore)
+  instrumented_restore["restore_marker"] = marker
+  assert audit.audit(source, instrumented_restore)["restore_marker"] == marker
+  instrumented_source = copy.deepcopy(source)
+  instrumented_source["restore_marker"] = marker
+  rejects(instrumented_source, restore, "Source image must not contain")
+  (extracted / "config").write_text('HOOKS="udev encrypt resume omarchy-t2-restore-marker"\n')
+  try:
+    audit.verify_restore_marker_tree(extracted, marker)
+  except ValueError as error:
+    assert "immediately before resume" in str(error), error
+  else:
+    raise AssertionError("Late restore marker was accepted")
+  (extracted / "config").write_text('HOOKS="udev encrypt omarchy-t2-restore-marker resume"\n')
+  (hooks / audit.RESTORE_MARKER_HOOK).write_text("run_hook() { :; }\n")
+  try:
+    audit.verify_restore_marker_tree(extracted, marker)
+  except ValueError as error:
+    assert "hook differs" in str(error), error
+  else:
+    raise AssertionError("Altered restore hook was accepted")
+  (hooks / audit.RESTORE_MARKER_HOOK).write_bytes(audit.RESTORE_MARKER_HOOK_SOURCE.read_bytes())
+  (marker_dir / "marker.ko").write_bytes(b"wrong-marker")
+  try:
+    audit.verify_restore_marker_tree(extracted, marker)
+  except ValueError as error:
+    assert "module differs" in str(error), error
+  else:
+    raise AssertionError("Altered restore marker was accepted")
+
   marker_source = copy.deepcopy(source)
   marker_restore = copy.deepcopy(restore)
   marker_hash = digest(b"marker-enabled-kernel")

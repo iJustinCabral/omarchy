@@ -177,6 +177,17 @@ def preflight(
   if guard.exists() or attempts.exists():
     raise ValueError("The pair-wide S4 vector already has an attempt or guard")
   if require_efi_marker:
+    if isinstance(marker_backend, POSTWRITE.PostwriteEfiBackend):
+      restore_private = PAIR.AUDIT.load_candidate(Path(restore_directory), "restore")
+      marker = restore_private.get("restore_marker")
+      restore_marker_sha256 = getattr(marker_backend, "restore_module_sha256", None)
+      if restore_marker_sha256 is None:
+        if marker is not None:
+          raise ValueError("Instrumented restore UKI requires the paired EFI restore marker backend")
+      elif (not isinstance(marker, dict) or
+            marker.get("sha256") != restore_marker_sha256 or
+            marker.get("srcversion") != marker_backend.restore_module_srcversion):
+        raise ValueError("Private restore UKI does not embed the exact EFI restore marker")
     marker_backend.require_kernel_available(root)
     if marker_backend.inspect(root, vector) is not None:
       raise ValueError("A stage marker already exists; preserve it and do not retry")
@@ -292,6 +303,9 @@ def execute(
     marker_path = marker_backend.prearm(root, evidence["transition_vector"])
     backend_name = getattr(marker_backend, "NAME", "efi")
     record[backend_name + "_stage_marker"] = marker_path
+    restore_marker_path = getattr(marker_backend, "restore_marker_path", None)
+    if restore_marker_path is not None:
+      record["restore-efi_stage_marker"] = restore_marker_path
     record["state"] = backend_name + "-marker-armed"
     TEST.save_attempt(attempt, record)
     restore_arm_started = True
@@ -315,6 +329,9 @@ def execute(
     backend_name = getattr(marker_backend, "NAME", "efi")
     returned_stage = marker_backend.inspect(root, evidence["transition_vector"])
     record[backend_name + "_stage"] = returned_stage
+    inspect_restore = getattr(marker_backend, "inspect_restore", None)
+    if inspect_restore is not None:
+      record["restore-efi_stage"] = inspect_restore(root, evidence["transition_vector"])
     TEST.save_attempt(attempt, record)
     if returned_stage is None or returned_stage < getattr(marker_backend, "MIN_RETURN_STAGE", 2):
       raise RuntimeError("Returned S4 without the source snapshot " + backend_name.upper() + " stage marker")
@@ -406,6 +423,9 @@ def main():
   parser.add_argument("--postwrite-efi-marker-module", type=Path)
   parser.add_argument("--expected-postwrite-efi-marker-sha256")
   parser.add_argument("--expected-postwrite-efi-marker-srcversion")
+  parser.add_argument("--restore-efi-marker-module", type=Path)
+  parser.add_argument("--expected-restore-efi-marker-sha256")
+  parser.add_argument("--expected-restore-efi-marker-srcversion")
   arguments = parser.parse_args()
   if arguments.validate_only == arguments.execute:
     parser.error("select exactly one of --validate-only or --execute")
@@ -430,11 +450,26 @@ def main():
         arguments.expected_postwrite_efi_marker_sha256 is None or
         arguments.expected_postwrite_efi_marker_srcversion is None):
       parser.error("Post-write EFI backend requires exact module path, SHA-256 and source version")
-    marker_backend = POSTWRITE.PostwriteEfiBackend(
-      arguments.postwrite_efi_marker_module,
-      arguments.expected_postwrite_efi_marker_sha256,
-      arguments.expected_postwrite_efi_marker_srcversion,
+    restore_options = (
+      arguments.restore_efi_marker_module,
+      arguments.expected_restore_efi_marker_sha256,
+      arguments.expected_restore_efi_marker_srcversion,
     )
+    if all(value is None for value in restore_options):
+      marker_backend = POSTWRITE.PostwriteEfiBackend(
+        arguments.postwrite_efi_marker_module,
+        arguments.expected_postwrite_efi_marker_sha256,
+        arguments.expected_postwrite_efi_marker_srcversion,
+      )
+    elif all(value is not None for value in restore_options):
+      marker_backend = POSTWRITE.PostwriteRestoreEfiBackend(
+        arguments.postwrite_efi_marker_module,
+        arguments.expected_postwrite_efi_marker_sha256,
+        arguments.expected_postwrite_efi_marker_srcversion,
+        *restore_options,
+      )
+    else:
+      parser.error("Restore EFI backend requires exact module path, SHA-256 and source version together")
   else:
     marker_backend = MARKER
   if arguments.marker_backend != "rtc" and (arguments.rtc_marker_module is not None or arguments.expected_rtc_marker_sha256 is not None):
@@ -443,6 +478,8 @@ def main():
     parser.error("Ftrace EFI module arguments require --marker-backend ftrace-efi")
   if arguments.marker_backend != "postwrite-efi" and (arguments.postwrite_efi_marker_module is not None or arguments.expected_postwrite_efi_marker_sha256 is not None or arguments.expected_postwrite_efi_marker_srcversion is not None):
     parser.error("Post-write EFI module arguments require --marker-backend postwrite-efi")
+  if arguments.marker_backend != "postwrite-efi" and (arguments.restore_efi_marker_module is not None or arguments.expected_restore_efi_marker_sha256 is not None or arguments.expected_restore_efi_marker_srcversion is not None):
+    parser.error("Restore EFI module arguments require --marker-backend postwrite-efi")
   if arguments.operator_attended and arguments.marker_backend != "postwrite-efi":
     parser.error("--operator-attended is reserved for the post-write EFI backend")
   if os.geteuid() != 0:

@@ -615,4 +615,113 @@ with tempfile.TemporaryDirectory(prefix="t2-pair-s4-") as temporary:
   assert events.index(("rtc", "accepted")) < events.index(("rtc", "pointer"))
   assert events.index(("rtc", "pointer")) < events.index(("command", ("bootctl", "set-oneshot", receipt["images"]["restore"]["entry_id"])))
 
+  root, source, restore, proof, receipt, _power = fixture(base / "dual-efi-boundary")
+  vector = pair_s4.pair_vector(receipt)
+  inputs = (root, source, restore, proof, Path("proof/post-input.json"), Path("proof/pre-input.json"), "platform")
+  source_module = root / "private-source-marker.ko"
+  restore_module = root / "private-restore-marker.ko"
+  source_module.write_bytes(b"source EFI module")
+  restore_module.write_bytes(b"restore EFI module")
+  source_hash = hashlib.sha256(source_module.read_bytes()).hexdigest()
+  restore_hash = hashlib.sha256(restore_module.read_bytes()).hexdigest()
+  source_version = "ECA3A5319ADB6686DD0BD88"
+  restore_version = "3119365A09AED2D4CD65DD6"
+  parameters = root / pair_s4.POSTWRITE.PARAMETERS
+  events = []
+
+  def marker_command(arguments):
+    events.append(("marker-command", tuple(arguments)))
+    if arguments[:3] == ("modinfo", "-F", "vermagic"):
+      return "7.2.6-arch2-Watanare-T2-2-t2 SMP preempt mod_unload\n"
+    if arguments[:3] == ("modinfo", "-F", "srcversion"):
+      return (restore_version if arguments[3] == str(restore_module) else source_version) + "\n"
+    if arguments == ("insmod", str(source_module)):
+      write(parameters / "arm_vector", "0\n")
+      write(parameters / "stage", "0\n")
+      write(parameters / "last_efi_status", "0\n")
+      return ""
+    if arguments == ("rmmod", pair_s4.POSTWRITE.MODULE_NAME):
+      for path in parameters.iterdir():
+        path.unlink()
+      parameters.rmdir()
+      return ""
+    raise AssertionError("Unexpected marker command: " + repr(arguments))
+
+  def arm_parameter(_root, identity):
+    assert identity == vector
+    write(parameters / "arm_vector", "1\n")
+
+  marker = pair_s4.POSTWRITE.PostwriteRestoreEfiBackend(
+    source_module, source_hash, source_version,
+    restore_module, restore_hash, restore_version,
+    command=marker_command, kernel_release="7.2.6-arch2-Watanare-T2-2-t2",
+    parameter_writer=arm_parameter,
+  )
+  acceptance = {
+    "kind": "postwrite-restore-efi-attended-s4-v1",
+    "boot_id": BOOT_ID,
+    "transition_vector": vector,
+    "module_sha256": source_hash,
+    "restore_module_sha256": restore_hash,
+    "production_uki_sha256": receipt["production_uki_sha256"],
+    "method": "operator-attended-cold-power",
+    "accepted": True,
+  }
+  acceptance_path = root / pair_s4.POSTWRITE.ACCEPTANCE
+  write(acceptance_path, json.dumps(acceptance))
+  acceptance_path.chmod(0o600)
+  original_load_candidate = pair_s4.PAIR.AUDIT.load_candidate
+  pair_s4.PAIR.AUDIT.load_candidate = lambda directory, role: {
+    "restore_marker": {"sha256": restore_hash, "srcversion": restore_version}
+  } if directory == restore and role == "restore" else None
+
+  standalone = pair_s4.POSTWRITE.PostwriteEfiBackend(
+    source_module, source_hash, source_version,
+    command=marker_command, kernel_release="7.2.6-arch2-Watanare-T2-2-t2",
+    parameter_writer=arm_parameter,
+  )
+  try:
+    pair_s4.preflight(
+      *inputs, platform_preflight, proof_verifier, input_verifier,
+      require_efi_marker=True, marker_backend=standalone,
+    )
+    raise AssertionError("Instrumented restore UKI accepted the source-only marker backend")
+  except ValueError as error:
+    assert "requires the paired EFI restore marker backend" in str(error)
+
+  def dual_marker_writer(path, value):
+    events.append(("power", path.name, value))
+    if path.name == "disk":
+      write(path, "[platform] shutdown reboot suspend test_resume\n")
+    if path.name == "state":
+      source_efi = root / pair_s4.POSTWRITE.VARIABLE
+      restore_efi = root / pair_s4.POSTWRITE.RESTORE_VARIABLE
+      assert source_efi.read_bytes()[-1] == 0 and restore_efi.read_bytes()[-1] == 0
+      assert pair.SINGLE.read_efi_string(root / pair.SINGLE.ONESHOT) == receipt["images"]["restore"]["entry_id"]
+      source_efi.write_bytes(source_efi.read_bytes()[:-1] + b"\x04")
+      restore_efi.write_bytes(restore_efi.read_bytes()[:-1] + b"\x07")
+      (root / pair.SINGLE.ONESHOT).unlink()
+      write_efi(root / pair.SINGLE.SELECTED, receipt["images"]["restore"]["entry_id"])
+
+  try:
+    result = pair_s4.execute(
+      *inputs, vector, platform_preflight, proof_verifier, input_verifier,
+      wifi_prepare=lambda _root: events.append(("wifi", "prepare")),
+      wifi_restore=lambda _root: events.append(("wifi", "restore")),
+      power_writer=dual_marker_writer,
+      runner=fake_runner(root, events, [False], [False]),
+      sync=lambda: None, sleeper=lambda _seconds: None,
+      services_verifier=lambda _runner: None, marker_backend=marker,
+      operator_attended=True,
+    )
+  finally:
+    pair_s4.PAIR.AUDIT.load_candidate = original_load_candidate
+  assert result["state"] == "returned-and-cleaned"
+  assert result["postwrite-efi_stage"] == 4
+  assert result["restore-efi_stage"] == 7
+  assert result["restore-efi_stage_marker"] == str(root / pair_s4.POSTWRITE.RESTORE_VARIABLE)
+  assert (root / pair_s4.POSTWRITE.RESTORE_VARIABLE).is_file()
+  assert events.index(("marker-command", ("insmod", str(source_module)))) < events.index(
+    ("command", ("bootctl", "set-oneshot", receipt["images"]["restore"]["entry_id"])))
+
 print("PASS: pair S4 runner binds proof and pair-wide guard, arms only restore, and clears a failed one-shot")

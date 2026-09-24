@@ -31,6 +31,9 @@ def import_path(name, path):
 S4 = import_path("candidate_s4_runner", HERE / "run-hibernation-candidate-s4.py")
 HASH = re.compile(r"[0-9a-f]{64}\Z")
 SOURCE_INITRD_MODULES = S4.RUNTIME_MODULES - {"t2bce_ave"}
+RESTORE_MARKER_VARIABLE = "OmarchyT2RestoreStage-5e17d2ad-021f-4d45-a8e5-f4c191983e27"
+RESTORE_MARKER_HOOK = "omarchy-t2-restore-marker"
+RESTORE_MARKER_HOOK_SOURCE = HERE / "hibernate-candidate-initcpio/hooks" / RESTORE_MARKER_HOOK
 
 
 def sha256(path):
@@ -39,6 +42,41 @@ def sha256(path):
     for chunk in iter(lambda: stream.read(1024 * 1024), b""):
       digest.update(chunk)
   return digest.hexdigest()
+
+
+def validate_restore_marker_metadata(marker):
+  if not isinstance(marker, dict) or set(marker) != {"sha256", "srcversion", "efi_variable", "pre_resume_hook", "hook_sha256"}:
+    raise ValueError("Restore marker metadata is missing or malformed")
+  if (not isinstance(marker["sha256"], str) or HASH.fullmatch(marker["sha256"]) is None or
+      not isinstance(marker["srcversion"], str) or re.fullmatch(r"[0-9A-F]+", marker["srcversion"]) is None or
+      marker["efi_variable"] != RESTORE_MARKER_VARIABLE or marker["pre_resume_hook"] != RESTORE_MARKER_HOOK or
+      marker["hook_sha256"] != sha256(RESTORE_MARKER_HOOK_SOURCE)):
+    raise ValueError("Restore marker identity differs from the pinned diagnostic")
+
+
+def verify_restore_marker_tree(extracted, marker):
+  validate_restore_marker_metadata(marker)
+  directory = extracted / "usr/lib/omarchy-t2-restore-marker"
+  for path in (extracted / "hooks" / RESTORE_MARKER_HOOK,
+               directory / "marker.ko", directory / "marker.sha256", directory / "marker.srcversion"):
+    if path.is_symlink() or not path.is_file():
+      raise ValueError("Restore marker initramfs file is absent or symlinked: " + path.name)
+  if sha256(directory / "marker.ko") != marker["sha256"]:
+    raise ValueError("Restore marker initramfs module differs from provenance")
+  if sha256(extracted / "hooks" / RESTORE_MARKER_HOOK) != marker["hook_sha256"]:
+    raise ValueError("Restore marker initramfs hook differs from audited source")
+  if (directory / "marker.sha256").read_text().strip() != marker["sha256"]:
+    raise ValueError("Restore marker initramfs SHA identity differs")
+  if (directory / "marker.srcversion").read_text().strip() != marker["srcversion"]:
+    raise ValueError("Restore marker initramfs source version differs")
+  config = (extracted / "config").read_text()
+  hooks_line = re.search(r'^HOOKS="([^"]*)"$', config, re.M)
+  if hooks_line is None:
+    raise ValueError("Restore marker initramfs lacks resolved hook order")
+  hooks = hooks_line.group(1).split()
+  if (hooks.count(RESTORE_MARKER_HOOK) != 1 or hooks.count("resume") != 1 or
+      hooks.index(RESTORE_MARKER_HOOK) + 1 != hooks.index("resume")):
+    raise ValueError("Restore marker does not run immediately before resume")
 
 
 def load_candidate(directory, label):
@@ -66,6 +104,17 @@ def load_candidate(directory, label):
   for field in ("installed", "boot_entry_created", "hardware_qualified", "production_modified"):
     if provenance.get(field) is not False:
       raise ValueError(label + " is not an offline private build: " + field)
+  marker = provenance.get("restore_marker")
+  if marker is not None:
+    if label != "restore":
+      raise ValueError("Source image must not load the cold-restore marker")
+    with tempfile.TemporaryDirectory(prefix="t2-restore-marker-audit-") as temporary:
+      try:
+        subprocess.run(("lsinitcpio", "--cpio", "--extract", str(initrd)), cwd=temporary,
+                       check=True, capture_output=True)
+      except subprocess.CalledProcessError as error:
+        raise ValueError("Restore marker initramfs could not be extracted") from error
+      verify_restore_marker_tree(Path(temporary), marker)
   if provenance.get("modified_sections_sha256") is not None:
     modified = provenance["modified_sections_sha256"]
     if not isinstance(modified, dict) or set(modified) != {".linux"}:
@@ -93,6 +142,11 @@ def load_candidate(directory, label):
 
 
 def audit(source, restore):
+  if source.get("restore_marker") is not None:
+    raise ValueError("Source image must not contain the cold-restore marker")
+  marker = restore.get("restore_marker")
+  if marker is not None:
+    validate_restore_marker_metadata(marker)
   source_stack = S4.runtime_stack_identity(source)
   restore_stack = S4.runtime_stack_identity(restore)
   if source_stack != restore_stack:
@@ -128,6 +182,7 @@ def audit(source, restore):
     "runtime_stack_sha256": source_stack,
     "source_initrd_modules": sorted(source_modules),
     "restore_pre_restore_excluded_modules": sorted(excluded),
+    "restore_marker": marker,
   }
 
 

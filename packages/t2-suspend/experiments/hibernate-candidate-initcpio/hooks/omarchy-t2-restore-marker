@@ -1,0 +1,66 @@
+# This file is sourced by mkinitcpio's ash runtime, not executed directly.
+
+write_restore_arm_prefix() {
+  printf '%s\n' "$1" > "$2"
+}
+
+arm_restore_marker() {
+  local marker_root=${OMARCHY_T2_RESTORE_MARKER_ROOT:-}
+  local marker_var=$marker_root/sys/firmware/efi/efivars/OmarchyT2RestoreStage-5e17d2ad-021f-4d45-a8e5-f4c191983e27
+  local marker_dir=$marker_root/usr/lib/omarchy-t2-restore-marker
+  local marker_module=$marker_dir/marker.ko
+  local marker_sha256=$marker_dir/marker.sha256
+  local marker_srcversion=$marker_dir/marker.srcversion
+  local marker_params=$marker_root/sys/module/mba_hibernate_efi_restore_marker
+  local marker_bytes marker_prefix expected_sha256 expected_srcversion actual_sha256 actual_srcversion armed stage
+
+  if [[ -L $marker_var || ! -f $marker_var || ! -f $marker_module || ! -f $marker_sha256 || ! -f $marker_srcversion ]]; then
+    err "omarchy-t2-restore-marker: incomplete exact marker identity"
+    return 1
+  fi
+  marker_bytes=$(hexdump -v -e '/1 "%02x"' "$marker_var") || return 1
+  if (( ${#marker_bytes} != 42 )) || [[ ${marker_bytes:0:16} != "070000004d425253" || ${marker_bytes:40:2} != "00" ]]; then
+    err "omarchy-t2-restore-marker: EFI stage 0 is malformed; preserving it"
+    return 1
+  fi
+  marker_prefix=${marker_bytes:16:24}
+  read -r expected_sha256 < "$marker_sha256" || return 1
+  read -r expected_srcversion < "$marker_srcversion" || return 1
+  actual_sha256=$(sha256sum "$marker_module") || return 1
+  actual_sha256=${actual_sha256%% *}
+  if [[ $actual_sha256 != "$expected_sha256" || -z $expected_srcversion ]]; then
+    err "omarchy-t2-restore-marker: embedded module identity differs"
+    return 1
+  fi
+
+  insmod "$marker_module" || return 1
+  read -r actual_srcversion < "$marker_params/srcversion" || return 1
+  if [[ $actual_srcversion != "$expected_srcversion" ]]; then
+    err "omarchy-t2-restore-marker: loaded module source version differs"
+    return 1
+  fi
+  write_restore_arm_prefix "$marker_prefix" "$marker_params/parameters/arm_prefix" || return 1
+  read -r armed < "$marker_params/parameters/arm_prefix" || return 1
+  read -r stage < "$marker_params/parameters/stage" || return 1
+  if [[ $armed != "1" || $stage != "0" ]]; then
+    err "omarchy-t2-restore-marker: exact stage-0 arm did not read back"
+    return 1
+  fi
+  msg "omarchy-t2-restore-marker: exact cold-restore marker armed before resume"
+}
+
+run_hook() {
+  local marker_root=${OMARCHY_T2_RESTORE_MARKER_ROOT:-}
+  local marker_var=$marker_root/sys/firmware/efi/efivars/OmarchyT2RestoreStage-5e17d2ad-021f-4d45-a8e5-f4c191983e27
+
+  if [[ ! -e $marker_var && ! -L $marker_var ]]; then
+    return 0
+  fi
+  if ! arm_restore_marker; then
+    err "omarchy-t2-restore-marker: refusing uninstrumented image resume"
+    # A hook return code is ignored by mkinitcpio. In the real initramfs this
+    # replaces PID 1 with a recovery shell before the following resume hook.
+    launch_interactive_shell --exec
+    return 1
+  fi
+}

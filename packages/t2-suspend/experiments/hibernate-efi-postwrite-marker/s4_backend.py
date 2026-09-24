@@ -13,9 +13,11 @@ import subprocess
 MODULE_NAME = "mba_hibernate_efi_postwrite_marker"
 PARAMETERS = Path("sys/module") / MODULE_NAME / "parameters"
 VARIABLE = Path("sys/firmware/efi/efivars/OmarchyT2PostwriteStage-47a2fceb-87bc-4e58-8d83-23f62ffb3393")
+RESTORE_VARIABLE = Path("sys/firmware/efi/efivars/OmarchyT2RestoreStage-5e17d2ad-021f-4d45-a8e5-f4c191983e27")
 ACCEPTANCE = Path("var/lib/omarchy-t2-postwrite-marker/recovery-acceptance.json")
 ATTRIBUTES = b"\x07\x00\x00\x00"
 MAGIC = b"MBPW"
+RESTORE_MAGIC = b"MBRS"
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z")
 
@@ -203,3 +205,123 @@ class PostwriteEfiBackend:
       if self.loaded(root):
         raise RuntimeError("Post-write EFI module remained loaded after cleanup")
     # Keep the EFI variable and guard for returned-boot fault attribution.
+
+
+class PostwriteRestoreEfiBackend(PostwriteEfiBackend):
+  """Bind a second EFI stage-0 marker for the isolated cold-resume initramfs."""
+
+  def __init__(self, module_path, expected_sha256, expected_srcversion,
+               restore_module_path, restore_module_sha256, restore_module_srcversion,
+               command=command_output, kernel_release=None, parameter_writer=None):
+    super().__init__(module_path, expected_sha256, expected_srcversion,
+                     command=command, kernel_release=kernel_release,
+                     parameter_writer=parameter_writer)
+    self.restore_module_path = Path(restore_module_path)
+    self.restore_module_sha256 = restore_module_sha256
+    self.restore_module_srcversion = restore_module_srcversion
+    self.restore_marker_path = None
+
+  def inspect_restore(self, root, vector):
+    if SHA256.fullmatch(vector) is None:
+      raise ValueError("Restore EFI marker vector is malformed")
+    path = Path(root) / RESTORE_VARIABLE
+    if path.is_symlink():
+      raise ValueError("Restore EFI marker is symlinked")
+    if not path.exists():
+      return None
+    if not path.is_file():
+      raise ValueError("Restore EFI marker is not a regular file")
+    value = path.read_bytes()
+    if (len(value) != 21 or value[:4] != ATTRIBUTES or
+        value[4:8] != RESTORE_MAGIC or value[8:20] != bytes.fromhex(vector[:24]) or
+        value[20] > 7):
+      raise ValueError("Restore EFI marker does not match the exact pair vector")
+    return value[20]
+
+  def inspect(self, root, vector):
+    source_stage = super().inspect(root, vector)
+    restore_stage = self.inspect_restore(root, vector)
+    if source_stage is None and restore_stage is not None:
+      raise ValueError("Restore EFI marker exists without its source marker")
+    return source_stage
+
+  def require_kernel_available(self, root):
+    super().require_kernel_available(root)
+    path = self.restore_module_path
+    if (SHA256.fullmatch(self.restore_module_sha256) is None or
+        not self.restore_module_srcversion or not path.is_absolute() or
+        path.is_symlink() or not path.is_file()):
+      raise ValueError("Exact private restore EFI module is required")
+    metadata = path.stat()
+    if Path(root).resolve() == Path("/") and (metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) != 0o600):
+      raise ValueError("Restore EFI module must be root-owned and private")
+    if hashlib.sha256(path.read_bytes()).hexdigest() != self.restore_module_sha256:
+      raise ValueError("Restore EFI module differs from the explicit hash")
+    vermagic = self.command(("modinfo", "-F", "vermagic", str(path))).split()
+    if not vermagic or vermagic[0] != self.kernel_release:
+      raise ValueError("Restore EFI module does not match the running kernel")
+    if self.command(("modinfo", "-F", "srcversion", str(path))).strip() != self.restore_module_srcversion:
+      raise ValueError("Restore EFI module source version differs")
+    if (Path(root) / "sys/module/mba_hibernate_efi_restore_marker").exists():
+      raise ValueError("Restore EFI module is unexpectedly loaded on the source boot")
+
+  def require_operator_acceptance(self, root, vector, boot_id, production_uki_sha256):
+    if (SHA256.fullmatch(vector) is None or UUID.fullmatch(boot_id) is None or
+        SHA256.fullmatch(production_uki_sha256) is None):
+      raise ValueError("Restore EFI recovery identity is malformed")
+    path = Path(root) / ACCEPTANCE
+    if path.is_symlink() or not path.is_file():
+      raise ValueError("Boot-bound restore EFI recovery acceptance is missing or symlinked")
+    metadata = path.stat()
+    expected_uid = 0 if Path(root).resolve() == Path("/") else os.geteuid()
+    if metadata.st_uid != expected_uid or stat.S_IMODE(metadata.st_mode) != 0o600:
+      raise ValueError("Restore EFI recovery acceptance has an unsafe owner or mode")
+    raw = path.read_bytes()
+    try:
+      record = json.loads(raw)
+    except json.JSONDecodeError as error:
+      raise ValueError("Restore EFI recovery acceptance is malformed") from error
+    expected = {
+      "kind": "postwrite-restore-efi-attended-s4-v1",
+      "boot_id": boot_id,
+      "transition_vector": vector,
+      "module_sha256": self.expected_sha256,
+      "restore_module_sha256": self.restore_module_sha256,
+      "production_uki_sha256": production_uki_sha256,
+      "method": "operator-attended-cold-power",
+      "accepted": True,
+    }
+    if record != expected:
+      raise ValueError("Restore EFI recovery acceptance differs from this boot and vector")
+    return hashlib.sha256(raw).hexdigest()
+
+  def before_arm(self, root, vector, boot_id, attempt_directory):
+    super().before_arm(root, vector, boot_id, attempt_directory)
+    if self.inspect_restore(root, vector) is not None:
+      raise ValueError("Restore EFI marker already exists; preserve it")
+    atomic_new_json(Path(attempt_directory) / "restore-efi-identity.json", {
+      "kind": "restore-efi-s4-identity-v1",
+      "vector": vector,
+      "source_boot_id": boot_id,
+      "module_sha256": self.restore_module_sha256,
+      "module_srcversion": self.restore_module_srcversion,
+      "efi_variable": RESTORE_VARIABLE.name,
+    })
+
+  def prearm(self, root, vector):
+    source_path = super().prearm(root, vector)
+    path = Path(root) / RESTORE_VARIABLE
+    if path.exists() or path.is_symlink():
+      raise ValueError("Restore EFI marker already exists; preserve it")
+    value = ATTRIBUTES + RESTORE_MAGIC + bytes.fromhex(vector[:24]) + b"\x00"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+      if os.write(descriptor, value) != len(value):
+        raise OSError("Short restore EFI stage-0 write")
+    finally:
+      os.close(descriptor)
+    if self.inspect_restore(root, vector) != 0:
+      raise ValueError("Restore EFI stage-0 readback differs")
+    self.restore_marker_path = str(path)
+    return source_path
