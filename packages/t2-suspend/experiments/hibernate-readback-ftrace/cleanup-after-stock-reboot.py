@@ -31,6 +31,9 @@ SOURCE_HEAD = "433176008e38fb34ac5f2622c82c5aa7a3c65413"
 ALT_OFFSET = 10761168
 STOCK_HEADER_SHA256 = "3a00c538e52aa2323a4efbf970fff729b857dbe6b2ef4ba7bec7803b9998ef3f"
 ALT_HEADER_SHA256 = "ecd30051cfc6ee8fb3ab0353575da6136081aa96df0db489b78e97dd7d751d65"
+RETURN_ALT_HEADER_SHA256 = "ab8bb2b214dafed4d1f3862f02d1fcd09e19d3421cf19721147bb8f1203674ba"
+RETURN_ALT_HEADER_CRC32 = 3652613935
+RETURN_ALT_FIRST_MAP_PAGE = 10761169
 EVIDENCE = {
   "prepare-intent.json": "fb86cf4ad8664cb6258df33160d41bda2dd35c96336bb0b94cee11fcc889b1bf",
   "armed.json": "a3d337b1f195884db081f115f79fc8124f71997cf4fc9d7cc8fd314508a75653",
@@ -91,8 +94,16 @@ def current_stock():
     raise ValueError("Original resume target or active swap differs")
   if HEADER.read_header(RUNNER.DEVICE, RUNNER.STOCK_OFFSET)["page_sha256"] != STOCK_HEADER_SHA256:
     raise ValueError("Stock swap header changed")
-  if HEADER.read_header(RUNNER.DEVICE, ALT_OFFSET)["page_sha256"] != ALT_HEADER_SHA256:
-    raise ValueError("Alternate swap header changed")
+  current = COMMON.boot_id(root)
+  alternate = HEADER.read_header(RUNNER.DEVICE, ALT_OFFSET)
+  if current == SOURCE_BOOT:
+    if alternate["page_sha256"] != ALT_HEADER_SHA256:
+      raise ValueError("Source-boot alternate swap header changed")
+  elif (alternate["page_sha256"] != RETURN_ALT_HEADER_SHA256 or
+        alternate["marker"] != "normal-swap-signature" or
+        alternate["flags"] != 4 or alternate["crc32"] != RETURN_ALT_HEADER_CRC32 or
+        alternate["first_map_page"] != RETURN_ALT_FIRST_MAP_PAGE):
+    raise ValueError("Returned alternate swap header differs from the finalized image evidence")
   if (RUNNER.SWAP_FILE.is_symlink() or not RUNNER.SWAP_FILE.is_file() or
       RUNNER.SWAP_FILE.stat().st_uid != 0 or RUNNER.SWAP_FILE.stat().st_mode & 0o077 or
       RUNNER.SWAP_FILE.stat().st_size != 10 * 1024**3 or
@@ -102,7 +113,7 @@ def current_stock():
     raise ValueError("Experiment module is loaded")
   if RUNNER.command("systemctl", "--failed", "--no-legend", "--plain"):
     raise ValueError("Failed systemd units exist")
-  return COMMON.boot_id(root)
+  return current
 
 
 def require_marker(arm):
@@ -156,7 +167,11 @@ def validate_return():
   return {"kind": RUNNER.KIND + "-stock-return", "source_boot_id": SOURCE_BOOT,
           "return_boot_id": current, "vector": VECTOR,
           "stage2_value_hex": value.hex(), "stage2_sha256": hashlib.sha256(value).hexdigest(),
-          "alternate_swap_active": False}
+          "alternate_swap_active": False,
+          "alternate_header_sha256": RETURN_ALT_HEADER_SHA256,
+          "alternate_header_flags": 4,
+          "alternate_header_crc32": RETURN_ALT_HEADER_CRC32,
+          "alternate_first_map_page": RETURN_ALT_FIRST_MAP_PAGE}
 
 
 def record_return():

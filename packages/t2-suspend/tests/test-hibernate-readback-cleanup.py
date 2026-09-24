@@ -21,7 +21,10 @@ assert '"timed out after 60 seconds" not in cleanup["errors"][0]' in state
 assert 'COMMON.require_live_stock(root, allow_stage_marker=True)' in stock
 assert 'COMMON.require_live_arm_preflight(root)' in stock
 assert 'HEADER.read_header(RUNNER.DEVICE, RUNNER.STOCK_OFFSET)["page_sha256"] != STOCK_HEADER_SHA256' in stock
-assert 'HEADER.read_header(RUNNER.DEVICE, ALT_OFFSET)["page_sha256"] != ALT_HEADER_SHA256' in stock
+assert 'alternate = HEADER.read_header(RUNNER.DEVICE, ALT_OFFSET)' in stock
+assert 'alternate["page_sha256"] != RETURN_ALT_HEADER_SHA256' in stock
+assert 'alternate["flags"] != 4' in stock
+assert 'alternate["first_map_page"] != RETURN_ALT_FIRST_MAP_PAGE' in stock
 assert 'RUNNER.swap_offset(RUNNER.SWAP_FILE) != ALT_OFFSET' in stock
 assert intent.index('current = current_stock()') < intent.index('"reboot-intent.json"')
 assert 'current != SOURCE_BOOT' in intent
