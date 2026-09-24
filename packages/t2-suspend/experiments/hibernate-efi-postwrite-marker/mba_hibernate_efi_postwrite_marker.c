@@ -14,7 +14,9 @@
                       EFI_VARIABLE_BOOTSERVICE_ACCESS | \
                       EFI_VARIABLE_RUNTIME_ACCESS)
 
-#ifdef MBA_POSTWRITE_SOURCE_MARKER_V2
+#ifdef MBA_POSTWRITE_SOURCE_MARKER_V3
+static efi_char16_t marker_name[] = L"OmarchyT2PostwriteStageV3";
+#elif defined(MBA_POSTWRITE_SOURCE_MARKER_V2)
 static efi_char16_t marker_name[] = L"OmarchyT2PostwriteStageV2";
 #else
 static efi_char16_t marker_name[] = L"OmarchyT2PostwriteStage";
@@ -245,7 +247,9 @@ module_exit(mba_postwrite_exit);
 
 MODULE_AUTHOR("Omarchy T2 suspend experiment");
 MODULE_DESCRIPTION("One-use EFI stages at hibernation image and power-off boundaries");
-#ifdef MBA_POSTWRITE_SOURCE_MARKER_V2
+#ifdef MBA_POSTWRITE_SOURCE_MARKER_V3
+MODULE_INFO(mba_postwrite_variable, "v3");
+#elif defined(MBA_POSTWRITE_SOURCE_MARKER_V2)
 MODULE_INFO(mba_postwrite_variable, "v2");
 #endif
 MODULE_LICENSE("GPL");

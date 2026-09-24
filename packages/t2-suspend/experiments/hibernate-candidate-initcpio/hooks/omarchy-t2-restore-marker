@@ -4,9 +4,55 @@ write_restore_arm_prefix() {
   printf '%s\n' "$1" > "$2"
 }
 
+restore_marker_variable() {
+  local marker_root=$1
+  local version_file=$marker_root/usr/lib/omarchy-t2-restore-marker/marker.version
+  local version=v1
+
+  if [[ -e $version_file || -L $version_file ]]; then
+    if [[ -L $version_file || ! -f $version_file ]]; then
+      err "omarchy-t2-restore-marker: invalid marker version file"
+      return 1
+    fi
+    read -r version < "$version_file" || return 1
+  fi
+  case $version in
+    v1) printf '%s\n' "$marker_root/sys/firmware/efi/efivars/OmarchyT2RestoreStage-5e17d2ad-021f-4d45-a8e5-f4c191983e27" ;;
+    v2) printf '%s\n' "$marker_root/sys/firmware/efi/efivars/OmarchyT2RestoreStageV2-5e17d2ad-021f-4d45-a8e5-f4c191983e27" ;;
+    *) err "omarchy-t2-restore-marker: unknown marker version"; return 1 ;;
+  esac
+}
+
+write_restore_hook_witness() {
+  local marker_root=$1
+  local marker_prefix=$2
+  local stage=$3
+  local variable=$marker_root/sys/firmware/efi/efivars/OmarchyT2RestoreHook${stage}${marker_prefix}-5e17d2ad-021f-4d45-a8e5-f4c191983e27
+  local expected actual
+
+  if [[ -e $variable || -L $variable ]]; then
+    err "omarchy-t2-restore-marker: stale ${stage} witness; preserving it"
+    return 1
+  fi
+  if [[ $stage == "Entered" ]]; then
+    expected=$(printf '\007\000\000\000MBRH%s\001' "$marker_prefix" | hexdump -v -e '/1 "%02x"') || return 1
+    (umask 077; printf '\007\000\000\000MBRH%s\001' "$marker_prefix" > "$variable") || return 1
+  elif [[ $stage == "Armed" ]]; then
+    expected=$(printf '\007\000\000\000MBRH%s\002' "$marker_prefix" | hexdump -v -e '/1 "%02x"') || return 1
+    (umask 077; printf '\007\000\000\000MBRH%s\002' "$marker_prefix" > "$variable") || return 1
+  else
+    return 1
+  fi
+  actual=$(hexdump -v -e '/1 "%02x"' "$variable") || return 1
+  if [[ $actual != "$expected" ]]; then
+    err "omarchy-t2-restore-marker: ${stage} EFI witness did not read back"
+    return 1
+  fi
+}
+
 arm_restore_marker() {
   local marker_root=${OMARCHY_T2_RESTORE_MARKER_ROOT:-}
-  local marker_var=$marker_root/sys/firmware/efi/efivars/OmarchyT2RestoreStage-5e17d2ad-021f-4d45-a8e5-f4c191983e27
+  local marker_var
   local marker_dir=$marker_root/usr/lib/omarchy-t2-restore-marker
   local marker_module=$marker_dir/marker.ko
   local marker_sha256=$marker_dir/marker.sha256
@@ -14,6 +60,7 @@ arm_restore_marker() {
   local marker_params=$marker_root/sys/module/mba_hibernate_efi_restore_marker
   local marker_bytes marker_prefix expected_sha256 expected_srcversion actual_sha256 actual_srcversion armed stage
 
+  marker_var=$(restore_marker_variable "$marker_root") || return 1
   if [[ -L $marker_var || ! -f $marker_var || ! -f $marker_module || ! -f $marker_sha256 || ! -f $marker_srcversion ]]; then
     err "omarchy-t2-restore-marker: incomplete exact marker identity"
     return 1
@@ -24,6 +71,7 @@ arm_restore_marker() {
     return 1
   fi
   marker_prefix=${marker_bytes:16:24}
+  write_restore_hook_witness "$marker_root" "$marker_prefix" Entered || return 1
   read -r expected_sha256 < "$marker_sha256" || return 1
   read -r expected_srcversion < "$marker_srcversion" || return 1
   actual_sha256=$(sha256sum "$marker_module") || return 1
@@ -46,26 +94,35 @@ arm_restore_marker() {
     err "omarchy-t2-restore-marker: exact stage-0 arm did not read back"
     return 1
   fi
+  write_restore_hook_witness "$marker_root" "$marker_prefix" Armed || return 1
   msg "omarchy-t2-restore-marker: exact cold-restore marker armed before resume"
 }
 
 run_hook() {
   local marker_root=${OMARCHY_T2_RESTORE_MARKER_ROOT:-}
-  local marker_var=$marker_root/sys/firmware/efi/efivars/OmarchyT2RestoreStage-5e17d2ad-021f-4d45-a8e5-f4c191983e27
+  local marker_var
 
+  if ! marker_var=$(restore_marker_variable "$marker_root"); then
+    restore_marker_recovery_shell
+    return 1
+  fi
   if [[ ! -e $marker_var && ! -L $marker_var ]]; then
     return 0
   fi
   if ! arm_restore_marker; then
-    # Plymouth is started before this hook. Without quitting it, the
-    # fail-closed shell is hidden behind the splash and looks like a hang.
-    if command -v plymouth >/dev/null 2>&1; then
-      plymouth quit >/dev/null 2>&1 || :
-    fi
-    err "omarchy-t2-restore-marker: refusing uninstrumented image resume"
-    # A hook return code is ignored by mkinitcpio. In the real initramfs this
-    # replaces PID 1 with a recovery shell before the following resume hook.
-    launch_interactive_shell --exec
+    restore_marker_recovery_shell
     return 1
   fi
+}
+
+restore_marker_recovery_shell() {
+  # Plymouth is started before this hook. Without quitting it, the
+  # fail-closed shell is hidden behind the splash and looks like a hang.
+  if command -v plymouth >/dev/null 2>&1; then
+    plymouth quit >/dev/null 2>&1 || :
+  fi
+  err "omarchy-t2-restore-marker: refusing uninstrumented image resume"
+  # A hook return code is ignored by mkinitcpio. In the real initramfs this
+  # replaces PID 1 with a recovery shell before the following resume hook.
+  launch_interactive_shell --exec
 }

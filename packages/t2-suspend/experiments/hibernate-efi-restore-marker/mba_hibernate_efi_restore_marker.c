@@ -14,7 +14,11 @@
                       EFI_VARIABLE_BOOTSERVICE_ACCESS | \
                       EFI_VARIABLE_RUNTIME_ACCESS)
 
+#ifdef MBA_RESTORE_MARKER_V2
+static efi_char16_t marker_name[] = L"OmarchyT2RestoreStageV2";
+#else
 static efi_char16_t marker_name[] = L"OmarchyT2RestoreStage";
+#endif
 static efi_guid_t marker_guid =
   EFI_GUID(0x5e17d2ad, 0x021f, 0x4d45, 0xa8, 0xe5, 0xf4, 0xc1, 0x91, 0x98, 0x3e, 0x27);
 static u8 marker[MARKER_SIZE];
@@ -242,5 +246,8 @@ module_exit(mba_restore_marker_exit);
 
 MODULE_AUTHOR("Omarchy T2 suspend experiment");
 MODULE_DESCRIPTION("One-use EFI stages at cold hibernation restore boundaries");
+#ifdef MBA_RESTORE_MARKER_V2
+MODULE_INFO(mba_restore_variable, "v2");
+#endif
 MODULE_LICENSE("GPL");
 MODULE_IMPORT_NS("EFIVAR");

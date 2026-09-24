@@ -14,12 +14,17 @@ MODULE_NAME = "mba_hibernate_efi_postwrite_marker"
 PARAMETERS = Path("sys/module") / MODULE_NAME / "parameters"
 VARIABLE = Path("sys/firmware/efi/efivars/OmarchyT2PostwriteStage-47a2fceb-87bc-4e58-8d83-23f62ffb3393")
 V2_VARIABLE = Path("sys/firmware/efi/efivars/OmarchyT2PostwriteStageV2-47a2fceb-87bc-4e58-8d83-23f62ffb3393")
+V3_VARIABLE = Path("sys/firmware/efi/efivars/OmarchyT2PostwriteStageV3-47a2fceb-87bc-4e58-8d83-23f62ffb3393")
 RESTORE_VARIABLE = Path("sys/firmware/efi/efivars/OmarchyT2RestoreStage-5e17d2ad-021f-4d45-a8e5-f4c191983e27")
+V2_RESTORE_VARIABLE = Path("sys/firmware/efi/efivars/OmarchyT2RestoreStageV2-5e17d2ad-021f-4d45-a8e5-f4c191983e27")
 ACCEPTANCE = Path("var/lib/omarchy-t2-postwrite-marker/recovery-acceptance.json")
 V2_ACCEPTANCE = Path("var/lib/omarchy-t2-postwrite-marker/recovery-acceptance-v2.json")
+V3_ACCEPTANCE = Path("var/lib/omarchy-t2-postwrite-marker/recovery-acceptance-v3.json")
 ATTRIBUTES = b"\x07\x00\x00\x00"
 MAGIC = b"MBPW"
 RESTORE_MAGIC = b"MBRS"
+RESTORE_HOOK_MAGIC = b"MBRH"
+RESTORE_HOOK_GUID = "5e17d2ad-021f-4d45-a8e5-f4c191983e27"
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z")
 
@@ -51,7 +56,7 @@ class PostwriteEfiBackend:
   def __init__(self, module_path, expected_sha256, expected_srcversion,
                command=command_output, kernel_release=None, parameter_writer=None,
                source_variable_version="v1"):
-    if source_variable_version not in ("v1", "v2"):
+    if source_variable_version not in ("v1", "v2", "v3"):
       raise ValueError("Unknown post-write EFI source variable version")
     self.module_path = Path(module_path)
     self.expected_sha256 = expected_sha256
@@ -60,8 +65,8 @@ class PostwriteEfiBackend:
     self.kernel_release = kernel_release or os.uname().release
     self.parameter_writer = parameter_writer
     self.source_variable_version = source_variable_version
-    self.source_variable = VARIABLE if source_variable_version == "v1" else V2_VARIABLE
-    self.acceptance_path = ACCEPTANCE if source_variable_version == "v1" else V2_ACCEPTANCE
+    self.source_variable = {"v1": VARIABLE, "v2": V2_VARIABLE, "v3": V3_VARIABLE}[source_variable_version]
+    self.acceptance_path = {"v1": ACCEPTANCE, "v2": V2_ACCEPTANCE, "v3": V3_ACCEPTANCE}[source_variable_version]
     self.vector = None
     self.source_boot_id = None
 
@@ -110,8 +115,8 @@ class PostwriteEfiBackend:
       raise ValueError("Post-write EFI module does not match the running kernel")
     if self.command(("modinfo", "-F", "srcversion", str(self.module_path))).strip() != self.expected_srcversion:
       raise ValueError("Post-write EFI module source version differs")
-    if self.source_variable_version == "v2" and self.command(("modinfo", "-F", "mba_postwrite_variable", str(self.module_path))).strip() != "v2":
-      raise ValueError("Post-write EFI module does not declare the V2 variable")
+    if self.source_variable_version in ("v2", "v3") and self.command(("modinfo", "-F", "mba_postwrite_variable", str(self.module_path))).strip() != self.source_variable_version:
+      raise ValueError("Post-write EFI module does not declare the selected variable")
     if self.loaded(root):
       raise ValueError("Post-write EFI module is already loaded")
     if (root / "sys/power/pm_trace").read_text().strip() != "0":
@@ -142,7 +147,7 @@ class PostwriteEfiBackend:
       "method": "operator-attended-cold-power",
       "accepted": True,
     }
-    if self.source_variable_version == "v2":
+    if self.source_variable_version in ("v2", "v3"):
       expected["source_efi_variable"] = self.source_variable.name
     if record != expected:
       raise ValueError("Operator recovery acceptance differs from this boot and vector")
@@ -226,7 +231,9 @@ class PostwriteRestoreEfiBackend(PostwriteEfiBackend):
   def __init__(self, module_path, expected_sha256, expected_srcversion,
                restore_module_path, restore_module_sha256, restore_module_srcversion,
                command=command_output, kernel_release=None, parameter_writer=None,
-               source_variable_version="v1"):
+               source_variable_version="v1", restore_variable_version="v1"):
+    if restore_variable_version not in ("v1", "v2"):
+      raise ValueError("Unknown restore EFI variable version")
     super().__init__(module_path, expected_sha256, expected_srcversion,
                      command=command, kernel_release=kernel_release,
                      parameter_writer=parameter_writer,
@@ -234,12 +241,37 @@ class PostwriteRestoreEfiBackend(PostwriteEfiBackend):
     self.restore_module_path = Path(restore_module_path)
     self.restore_module_sha256 = restore_module_sha256
     self.restore_module_srcversion = restore_module_srcversion
+    self.restore_variable_version = restore_variable_version
+    self.restore_variable = RESTORE_VARIABLE if restore_variable_version == "v1" else V2_RESTORE_VARIABLE
     self.restore_marker_path = None
+
+  def restore_hook_witness_path(self, root, vector, stage):
+    if SHA256.fullmatch(vector) is None or stage not in ("Entered", "Armed"):
+      raise ValueError("Restore hook witness identity is malformed")
+    return Path(root) / "sys/firmware/efi/efivars" / f"OmarchyT2RestoreHook{stage}{vector[:24]}-{RESTORE_HOOK_GUID}"
+
+  def inspect_restore_hook(self, root, vector):
+    stages = []
+    for name, stage in (("Entered", 1), ("Armed", 2)):
+      path = self.restore_hook_witness_path(root, vector, name)
+      if path.is_symlink():
+        raise ValueError("Restore hook EFI witness is symlinked")
+      if not path.exists():
+        continue
+      if not path.is_file():
+        raise ValueError("Restore hook EFI witness is not a regular file")
+      expected = ATTRIBUTES + RESTORE_HOOK_MAGIC + vector[:24].encode() + bytes((stage,))
+      if path.read_bytes() != expected:
+        raise ValueError("Restore hook EFI witness differs from exact pair vector")
+      stages.append(stage)
+    if stages == [2]:
+      raise ValueError("Restore hook armed witness exists without entry witness")
+    return max(stages) if stages else None
 
   def inspect_restore(self, root, vector):
     if SHA256.fullmatch(vector) is None:
       raise ValueError("Restore EFI marker vector is malformed")
-    path = Path(root) / RESTORE_VARIABLE
+    path = Path(root) / self.restore_variable
     if path.is_symlink():
       raise ValueError("Restore EFI marker is symlinked")
     if not path.exists():
@@ -277,6 +309,8 @@ class PostwriteRestoreEfiBackend(PostwriteEfiBackend):
       raise ValueError("Restore EFI module does not match the running kernel")
     if self.command(("modinfo", "-F", "srcversion", str(path))).strip() != self.restore_module_srcversion:
       raise ValueError("Restore EFI module source version differs")
+    if self.restore_variable_version == "v2" and self.command(("modinfo", "-F", "mba_restore_variable", str(path))).strip() != "v2":
+      raise ValueError("Restore EFI module does not declare the V2 variable")
     if (Path(root) / "sys/module/mba_hibernate_efi_restore_marker").exists():
       raise ValueError("Restore EFI module is unexpectedly loaded on the source boot")
 
@@ -306,13 +340,17 @@ class PostwriteRestoreEfiBackend(PostwriteEfiBackend):
       "method": "operator-attended-cold-power",
       "accepted": True,
     }
-    if self.source_variable_version == "v2":
+    if self.source_variable_version in ("v2", "v3"):
       expected["source_efi_variable"] = self.source_variable.name
+    if self.restore_variable_version == "v2":
+      expected["restore_efi_variable"] = self.restore_variable.name
     if record != expected:
       raise ValueError("Restore EFI recovery acceptance differs from this boot and vector")
     return hashlib.sha256(raw).hexdigest()
 
   def before_arm(self, root, vector, boot_id, attempt_directory):
+    if self.inspect_restore_hook(root, vector) is not None:
+      raise ValueError("Restore hook EFI witness already exists; preserve it")
     super().before_arm(root, vector, boot_id, attempt_directory)
     if self.inspect_restore(root, vector) is not None:
       raise ValueError("Restore EFI marker already exists; preserve it")
@@ -322,13 +360,15 @@ class PostwriteRestoreEfiBackend(PostwriteEfiBackend):
       "source_boot_id": boot_id,
       "module_sha256": self.restore_module_sha256,
       "module_srcversion": self.restore_module_srcversion,
-      "efi_variable": RESTORE_VARIABLE.name,
+      "efi_variable": self.restore_variable.name,
       "source_efi_variable": self.source_variable.name,
     })
 
   def prearm(self, root, vector):
+    if self.inspect_restore_hook(root, vector) is not None:
+      raise ValueError("Restore hook EFI witness already exists; preserve it")
     source_path = super().prearm(root, vector)
-    path = Path(root) / RESTORE_VARIABLE
+    path = Path(root) / self.restore_variable
     if path.exists() or path.is_symlink():
       raise ValueError("Restore EFI marker already exists; preserve it")
     value = ATTRIBUTES + RESTORE_MAGIC + bytes.fromhex(vector[:24]) + b"\x00"

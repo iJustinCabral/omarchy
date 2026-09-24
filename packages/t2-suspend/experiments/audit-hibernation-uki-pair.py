@@ -32,8 +32,13 @@ S4 = import_path("candidate_s4_runner", HERE / "run-hibernation-candidate-s4.py"
 HASH = re.compile(r"[0-9a-f]{64}\Z")
 SOURCE_INITRD_MODULES = S4.RUNTIME_MODULES - {"t2bce_ave"}
 RESTORE_MARKER_VARIABLE = "OmarchyT2RestoreStage-5e17d2ad-021f-4d45-a8e5-f4c191983e27"
+V2_RESTORE_MARKER_VARIABLE = "OmarchyT2RestoreStageV2-5e17d2ad-021f-4d45-a8e5-f4c191983e27"
 RESTORE_MARKER_HOOK = "omarchy-t2-restore-marker"
 RESTORE_MARKER_HOOK_SOURCE = HERE / "hibernate-candidate-initcpio/hooks" / RESTORE_MARKER_HOOK
+LEGACY_RESTORE_MARKER_HOOK_SHA256 = {
+  "6cbf3fc606eab48094e6af7d9835e538bf5e2a7e99e5695b144d7ce102ea0bc5",
+  "596148e631fbf3218fdacf5c2ea83040a3ecbffab834a25204f289242b37585d",
+}
 
 
 def sha256(path):
@@ -45,12 +50,20 @@ def sha256(path):
 
 
 def validate_restore_marker_metadata(marker):
-  if not isinstance(marker, dict) or set(marker) != {"sha256", "srcversion", "efi_variable", "pre_resume_hook", "hook_sha256"}:
+  legacy_fields = {"sha256", "srcversion", "efi_variable", "pre_resume_hook", "hook_sha256"}
+  if not isinstance(marker, dict) or set(marker) not in (legacy_fields, legacy_fields | {"version"}):
     raise ValueError("Restore marker metadata is missing or malformed")
+  version = marker.get("version", "v1")
+  if version not in ("v1", "v2") or (version == "v2" and "version" not in marker):
+    raise ValueError("Restore marker variable version is malformed")
+  expected_variable = RESTORE_MARKER_VARIABLE if version == "v1" else V2_RESTORE_MARKER_VARIABLE
+  allowed_hooks = {sha256(RESTORE_MARKER_HOOK_SOURCE)}
+  if version == "v1":
+    allowed_hooks.update(LEGACY_RESTORE_MARKER_HOOK_SHA256)
   if (not isinstance(marker["sha256"], str) or HASH.fullmatch(marker["sha256"]) is None or
       not isinstance(marker["srcversion"], str) or re.fullmatch(r"[0-9A-F]+", marker["srcversion"]) is None or
-      marker["efi_variable"] != RESTORE_MARKER_VARIABLE or marker["pre_resume_hook"] != RESTORE_MARKER_HOOK or
-      marker["hook_sha256"] != sha256(RESTORE_MARKER_HOOK_SOURCE)):
+      marker["efi_variable"] != expected_variable or marker["pre_resume_hook"] != RESTORE_MARKER_HOOK or
+      marker["hook_sha256"] not in allowed_hooks):
     raise ValueError("Restore marker identity differs from the pinned diagnostic")
 
 
@@ -69,6 +82,12 @@ def verify_restore_marker_tree(extracted, marker):
     raise ValueError("Restore marker initramfs SHA identity differs")
   if (directory / "marker.srcversion").read_text().strip() != marker["srcversion"]:
     raise ValueError("Restore marker initramfs source version differs")
+  version_file = directory / "marker.version"
+  if "version" in marker:
+    if version_file.is_symlink() or not version_file.is_file() or version_file.read_text().strip() != marker["version"]:
+      raise ValueError("Restore marker initramfs variable version differs")
+  elif version_file.exists() or version_file.is_symlink():
+    raise ValueError("Legacy restore marker unexpectedly embeds a version file")
   config = (extracted / "config").read_text()
   hooks_line = re.search(r'^HOOKS="([^"]*)"$', config, re.M)
   if hooks_line is None:

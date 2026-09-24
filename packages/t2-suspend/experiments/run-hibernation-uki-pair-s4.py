@@ -85,7 +85,7 @@ def has_both_internal_inputs(evidence):
   return isinstance(devices, dict) and devices.get("internal_input_interfaces") == 2
 
 
-def verify_pair_test_resume_proof(root, evidence, post_input_path, source_directory, proof_source_directory, allow_matching_early_source=False, input_event_waiver=False):
+def verify_pair_test_resume_proof(root, evidence, post_input_path, source_directory, proof_source_directory, allow_matching_early_source=False, input_event_waiver=False, allow_restore_only_revision=False):
   if Path(source_directory).resolve() != Path(proof_source_directory).resolve():
     raise ValueError("Pair test_resume proof must name this exact source image")
   source_hash = TEST.candidate_hash(evidence.get("source_uki_sha256"))
@@ -104,12 +104,15 @@ def verify_pair_test_resume_proof(root, evidence, post_input_path, source_direct
     raise ValueError("Pair test_resume guard has a malformed boot ID")
   attempt = directory / "attempts" / proof_boot_id / "attempt.json"
   record = private_evidence(attempt, root, "Pair test_resume attempt")
+  proof_restore_hash = TEST.candidate_hash(record.get("restore_uki_sha256"))
+  restore_only_revision = proof_restore_hash != evidence["restore_uki_sha256"]
+  if restore_only_revision and not allow_restore_only_revision:
+    raise ValueError("Pair test_resume proof mismatch: restore_uki_sha256")
   expected = {
     "boot_id": proof_boot_id,
     "entry_id": evidence["source_entry_id"],
     "candidate_uki_sha256": source_hash,
     "source_uki_sha256": source_hash,
-    "restore_uki_sha256": evidence["restore_uki_sha256"],
     "runtime_stack_sha256": evidence["runtime_stack_sha256"],
     "cmdline_sha256": evidence["cmdline_sha256"],
     "kernel_release": evidence["kernel_release"],
@@ -137,6 +140,8 @@ def verify_pair_test_resume_proof(root, evidence, post_input_path, source_direct
       "test_resume_source_uki_sha256": source_hash,
       "test_resume_attempt": str(attempt),
       "test_resume_runtime_stack_sha256": evidence["runtime_stack_sha256"],
+      "test_resume_proof_restore_uki_sha256": proof_restore_hash,
+      "restore_only_revision": restore_only_revision,
       "input_event_waiver": INPUT_EVENT_WAIVER,
     }
   if post_input_path is None:
@@ -152,6 +157,8 @@ def verify_pair_test_resume_proof(root, evidence, post_input_path, source_direct
     "test_resume_source_uki_sha256": source_hash,
     "test_resume_attempt": str(attempt),
     "test_resume_runtime_stack_sha256": evidence["runtime_stack_sha256"],
+    "test_resume_proof_restore_uki_sha256": proof_restore_hash,
+    "restore_only_revision": restore_only_revision,
     "post_test_resume_input": str(post_path),
   }
 
@@ -170,6 +177,7 @@ def preflight(
   require_efi_marker=False,
   marker_backend=MARKER,
   input_event_waiver=False,
+  allow_restore_only_revision=False,
 ):
   if disk_mode not in ("platform", "shutdown"):
     raise ValueError("Unsupported cold-boot hibernation mode")
@@ -197,15 +205,21 @@ def preflight(
       raise ValueError("Input event waiver cannot be combined with physical evidence")
     if not has_both_internal_inputs(evidence):
       raise ValueError("Input event waiver still requires both current internal interfaces")
+    if allow_restore_only_revision and not isinstance(marker_backend, POSTWRITE.PostwriteRestoreEfiBackend):
+      raise ValueError("Restore-only revision requires paired EFI restore instrumentation")
     proof = proof_verifier(
       root, evidence, post_input_path, source_directory, proof_directory,
       allow_matching_early_source=True, input_event_waiver=True,
+      **({"allow_restore_only_revision": True} if allow_restore_only_revision else {}),
     )
     current_input = {"input_event_waiver": INPUT_EVENT_WAIVER}
   else:
+    if allow_restore_only_revision and not isinstance(marker_backend, POSTWRITE.PostwriteRestoreEfiBackend):
+      raise ValueError("Restore-only revision requires paired EFI restore instrumentation")
     proof = proof_verifier(
       root, evidence, post_input_path, source_directory, proof_directory,
       allow_matching_early_source=True,
+      **({"allow_restore_only_revision": True} if allow_restore_only_revision else {}),
     )
     if pre_s4_input_path is None:
       raise ValueError("Pre-S4 input evidence is required without an explicit waiver")
@@ -224,7 +238,9 @@ def preflight(
           raise ValueError("Instrumented restore UKI requires the paired EFI restore marker backend")
       elif (not isinstance(marker, dict) or
             marker.get("sha256") != restore_marker_sha256 or
-            marker.get("srcversion") != marker_backend.restore_module_srcversion):
+            marker.get("srcversion") != marker_backend.restore_module_srcversion or
+            marker.get("version", "v1") != marker_backend.restore_variable_version or
+            marker.get("efi_variable") != marker_backend.restore_variable.name):
         raise ValueError("Private restore UKI does not embed the exact EFI restore marker")
     marker_backend.require_kernel_available(root)
     if marker_backend.inspect(root, vector) is not None:
@@ -265,6 +281,7 @@ def execute(
   marker_backend=MARKER,
   operator_attended=False,
   input_event_waiver=False,
+  allow_restore_only_revision=False,
 ):
   evidence = preflight(
     root, source_directory, restore_directory, proof_directory,
@@ -273,6 +290,7 @@ def execute(
     require_efi_marker=True,
     marker_backend=marker_backend,
     input_event_waiver=input_event_waiver,
+    allow_restore_only_revision=allow_restore_only_revision,
   )
   if getattr(marker_backend, "NAME", None) == "rtc" and not getattr(marker_backend, "EXECUTION_QUALIFIED", False):
     raise ValueError("RTC marker did not survive the MacBookAir9,1 forced-power return; this backend cannot qualify another S4 execution")
@@ -372,6 +390,9 @@ def execute(
     inspect_restore = getattr(marker_backend, "inspect_restore", None)
     if inspect_restore is not None:
       record["restore-efi_stage"] = inspect_restore(root, evidence["transition_vector"])
+    inspect_restore_hook = getattr(marker_backend, "inspect_restore_hook", None)
+    if inspect_restore_hook is not None:
+      record["restore-hook-efi_stage"] = inspect_restore_hook(root, evidence["transition_vector"])
     TEST.save_attempt(attempt, record)
     if returned_stage is None or returned_stage < getattr(marker_backend, "MIN_RETURN_STAGE", 2):
       raise RuntimeError("Returned S4 without the source snapshot " + backend_name.upper() + " stage marker")
@@ -450,6 +471,7 @@ def main():
   parser.add_argument("--post-resume-input-evidence", type=Path)
   parser.add_argument("--pre-s4-input-evidence", type=Path)
   parser.add_argument("--waive-input-events", action="store_true", help="record the operator's explicit choice to skip manual keyboard/trackpad events")
+  parser.add_argument("--allow-restore-only-revision", action="store_true", help="reuse exact source test_resume proof when only the isolated restore UKI changed")
   parser.add_argument("--disk-mode", choices=("platform", "shutdown"), required=True)
   parser.add_argument("--validate-only", action="store_true")
   parser.add_argument("--execute", action="store_true")
@@ -462,12 +484,13 @@ def main():
   parser.add_argument("--expected-ftrace-efi-marker-sha256")
   parser.add_argument("--expected-ftrace-efi-marker-srcversion")
   parser.add_argument("--postwrite-efi-marker-module", type=Path)
-  parser.add_argument("--postwrite-source-marker-version", choices=("v1", "v2"), default="v1")
+  parser.add_argument("--postwrite-source-marker-version", choices=("v1", "v2", "v3"), default="v1")
   parser.add_argument("--expected-postwrite-efi-marker-sha256")
   parser.add_argument("--expected-postwrite-efi-marker-srcversion")
   parser.add_argument("--restore-efi-marker-module", type=Path)
   parser.add_argument("--expected-restore-efi-marker-sha256")
   parser.add_argument("--expected-restore-efi-marker-srcversion")
+  parser.add_argument("--restore-efi-marker-version", choices=("v1", "v2"), default="v1")
   arguments = parser.parse_args()
   if arguments.validate_only == arguments.execute:
     parser.error("select exactly one of --validate-only or --execute")
@@ -516,6 +539,7 @@ def main():
         arguments.expected_postwrite_efi_marker_srcversion,
         *restore_options,
         source_variable_version=arguments.postwrite_source_marker_version,
+        restore_variable_version=arguments.restore_efi_marker_version,
       )
     else:
       parser.error("Restore EFI backend requires exact module path, SHA-256 and source version together")
@@ -531,6 +555,8 @@ def main():
     parser.error("Post-write source marker version requires --marker-backend postwrite-efi")
   if arguments.marker_backend != "postwrite-efi" and (arguments.restore_efi_marker_module is not None or arguments.expected_restore_efi_marker_sha256 is not None or arguments.expected_restore_efi_marker_srcversion is not None):
     parser.error("Restore EFI module arguments require --marker-backend postwrite-efi")
+  if arguments.restore_efi_marker_version != "v1" and (arguments.marker_backend != "postwrite-efi" or arguments.restore_efi_marker_module is None):
+    parser.error("V2 restore EFI variable requires the paired restore marker module")
   if arguments.operator_attended and arguments.marker_backend != "postwrite-efi":
     parser.error("--operator-attended is reserved for the post-write EFI backend")
   if os.geteuid() != 0:
@@ -544,9 +570,9 @@ def main():
     )
     if arguments.validate_only:
       S4.verify_services()
-      result = preflight(*paths, require_efi_marker=arguments.marker_backend in ("rtc", "ftrace-efi", "postwrite-efi"), marker_backend=marker_backend, input_event_waiver=arguments.waive_input_events)
+      result = preflight(*paths, require_efi_marker=arguments.marker_backend in ("rtc", "ftrace-efi", "postwrite-efi"), marker_backend=marker_backend, input_event_waiver=arguments.waive_input_events, allow_restore_only_revision=arguments.allow_restore_only_revision)
     else:
-      result = execute(*paths, arguments.expected_pair_vector, marker_backend=marker_backend, operator_attended=arguments.operator_attended, input_event_waiver=arguments.waive_input_events)
+      result = execute(*paths, arguments.expected_pair_vector, marker_backend=marker_backend, operator_attended=arguments.operator_attended, input_event_waiver=arguments.waive_input_events, allow_restore_only_revision=arguments.allow_restore_only_revision)
   except (OSError, RuntimeError, ValueError) as error:
     raise SystemExit("Pair cold-boot hibernation refused: " + str(error)) from error
   print(json.dumps(result, indent=2, sort_keys=True))

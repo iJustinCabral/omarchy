@@ -257,6 +257,30 @@ with tempfile.TemporaryDirectory(prefix="t2-pair-s4-") as temporary:
     raise AssertionError("A changed restore UKI was accepted")
   except ValueError as error:
     assert "proof mismatch: restore_uki_sha256" in str(error)
+  revised = pair_s4.verify_pair_test_resume_proof(
+    root, evidence, post, source, source, True, allow_restore_only_revision=True,
+  )
+  assert revised["restore_only_revision"] is True
+  assert revised["test_resume_proof_restore_uki_sha256"] == "0" * 64
+  try:
+    pair_s4.preflight(
+      root, source, restore, source, post, Path("proof/pre-input.json"), "platform",
+      platform_preflight=platform_preflight, current_input_verifier=input_verifier,
+      allow_restore_only_revision=True,
+    )
+    raise AssertionError("Restore-only proof relaxation accepted without paired EFI marker")
+  except ValueError as error:
+    assert "requires paired EFI restore instrumentation" in str(error)
+  proof_record["source_uki_sha256"] = "0" * 64
+  write(attempt, json.dumps(proof_record))
+  try:
+    pair_s4.verify_pair_test_resume_proof(
+      root, evidence, post, source, source, True, allow_restore_only_revision=True,
+    )
+    raise AssertionError("Restore-only allowance accepted another source UKI")
+  except ValueError as error:
+    assert "proof mismatch: source_uki_sha256" in str(error)
+  proof_record["source_uki_sha256"] = evidence["source_uki_sha256"]
   proof_record["restore_uki_sha256"] = evidence["restore_uki_sha256"]
   write(attempt, json.dumps(proof_record))
   post_path.chmod(0o644)
@@ -673,7 +697,8 @@ with tempfile.TemporaryDirectory(prefix="t2-pair-s4-") as temporary:
   acceptance_path.chmod(0o600)
   original_load_candidate = pair_s4.PAIR.AUDIT.load_candidate
   pair_s4.PAIR.AUDIT.load_candidate = lambda directory, role: {
-    "restore_marker": {"sha256": restore_hash, "srcversion": restore_version}
+    "restore_marker": {"sha256": restore_hash, "srcversion": restore_version,
+                       "efi_variable": pair_s4.POSTWRITE.RESTORE_VARIABLE.name}
   } if directory == restore and role == "restore" else None
 
   standalone = pair_s4.POSTWRITE.PostwriteEfiBackend(
@@ -699,6 +724,12 @@ with tempfile.TemporaryDirectory(prefix="t2-pair-s4-") as temporary:
       restore_efi = root / pair_s4.POSTWRITE.RESTORE_VARIABLE
       assert source_efi.read_bytes()[-1] == 0 and restore_efi.read_bytes()[-1] == 0
       assert pair.SINGLE.read_efi_string(root / pair.SINGLE.ONESHOT) == receipt["images"]["restore"]["entry_id"]
+      for name, stage in (("Entered", 1), ("Armed", 2)):
+        witness = marker.restore_hook_witness_path(root, vector, name)
+        witness.write_bytes(
+          pair_s4.POSTWRITE.ATTRIBUTES + pair_s4.POSTWRITE.RESTORE_HOOK_MAGIC +
+          vector[:24].encode() + bytes((stage,))
+        )
       source_efi.write_bytes(source_efi.read_bytes()[:-1] + b"\x04")
       restore_efi.write_bytes(restore_efi.read_bytes()[:-1] + b"\x07")
       (root / pair.SINGLE.ONESHOT).unlink()
@@ -720,6 +751,7 @@ with tempfile.TemporaryDirectory(prefix="t2-pair-s4-") as temporary:
   assert result["state"] == "returned-and-cleaned"
   assert result["postwrite-efi_stage"] == 4
   assert result["restore-efi_stage"] == 7
+  assert result["restore-hook-efi_stage"] == 2
   assert result["restore-efi_stage_marker"] == str(root / pair_s4.POSTWRITE.RESTORE_VARIABLE)
   assert (root / pair_s4.POSTWRITE.RESTORE_VARIABLE).is_file()
   assert events.index(("marker-command", ("insmod", str(source_module)))) < events.index(
@@ -731,6 +763,9 @@ with tempfile.TemporaryDirectory(prefix="t2-pair-s4-") as temporary:
   old_marker.parent.mkdir(parents=True, exist_ok=True)
   old_value = pair_s4.POSTWRITE.ATTRIBUTES + pair_s4.POSTWRITE.MAGIC + bytes.fromhex(("f" * 64)[:24]) + b"\x04"
   old_marker.write_bytes(old_value)
+  old_restore = root / pair_s4.POSTWRITE.RESTORE_VARIABLE
+  old_restore_value = pair_s4.POSTWRITE.ATTRIBUTES + pair_s4.POSTWRITE.RESTORE_MAGIC + bytes.fromhex(("e" * 64)[:24]) + b"\x00"
+  old_restore.write_bytes(old_restore_value)
   source_module = root / "v2-source-marker.ko"
   restore_module = root / "restore-marker.ko"
   source_module.write_bytes(b"source EFI module v2")
@@ -746,17 +781,20 @@ with tempfile.TemporaryDirectory(prefix="t2-pair-s4-") as temporary:
       return (restore_version if arguments[3] == str(restore_module) else "19F05361B80C3D339C2B0E4") + "\n"
     if arguments[:3] == ("modinfo", "-F", "mba_postwrite_variable"):
       return "v2\n"
+    if arguments[:3] == ("modinfo", "-F", "mba_restore_variable"):
+      return "v2\n"
     raise AssertionError("Unexpected module metadata query: " + repr(arguments))
 
   marker = pair_s4.POSTWRITE.PostwriteRestoreEfiBackend(
     source_module, source_hash, "19F05361B80C3D339C2B0E4",
     restore_module, restore_hash, restore_version,
     command=v2_module_info, kernel_release="7.2.6-arch2-Watanare-T2-2-t2",
-    source_variable_version="v2",
+    source_variable_version="v2", restore_variable_version="v2",
   )
   original_load_candidate = pair_s4.PAIR.AUDIT.load_candidate
   pair_s4.PAIR.AUDIT.load_candidate = lambda directory, role: {
-    "restore_marker": {"sha256": restore_hash, "srcversion": restore_version}
+    "restore_marker": {"sha256": restore_hash, "srcversion": restore_version,
+                       "version": "v2", "efi_variable": pair_s4.POSTWRITE.V2_RESTORE_VARIABLE.name}
   } if directory == restore and role == "restore" else None
   try:
     ready = pair_s4.preflight(
@@ -768,7 +806,39 @@ with tempfile.TemporaryDirectory(prefix="t2-pair-s4-") as temporary:
     pair_s4.PAIR.AUDIT.load_candidate = original_load_candidate
   assert ready["transition_vector"] == vector
   assert marker.inspect(root, vector) is None
+  assert marker.inspect_restore(root, vector) is None
+  assert marker.inspect_restore_hook(root, vector) is None
   assert old_marker.read_bytes() == old_value
+  assert old_restore.read_bytes() == old_restore_value
+
+  armed_only = marker.restore_hook_witness_path(root, vector, "Armed")
+  armed_only.write_bytes(pair_s4.POSTWRITE.ATTRIBUTES + pair_s4.POSTWRITE.RESTORE_HOOK_MAGIC + vector[:24].encode() + b"\x02")
+  try:
+    marker.inspect_restore_hook(root, vector)
+    raise AssertionError("Restore hook accepted an armed witness without entry")
+  except ValueError as error:
+    assert "without entry witness" in str(error)
+
+  old_v2_marker = root / pair_s4.POSTWRITE.V2_VARIABLE
+  old_v2_value = pair_s4.POSTWRITE.ATTRIBUTES + pair_s4.POSTWRITE.MAGIC + bytes.fromhex(("d" * 64)[:24]) + b"\x04"
+  old_v2_marker.write_bytes(old_v2_value)
+
+  def v3_module_info(arguments):
+    if arguments[:3] == ("modinfo", "-F", "vermagic"):
+      return "7.2.6-arch2-Watanare-T2-2-t2 SMP preempt mod_unload\n"
+    if arguments[:3] == ("modinfo", "-F", "srcversion"):
+      return "NEWV3SOURCE\n"
+    if arguments[:3] == ("modinfo", "-F", "mba_postwrite_variable"):
+      return "v3\n"
+    raise AssertionError("Unexpected V3 module metadata query: " + repr(arguments))
+
+  v3_source = pair_s4.POSTWRITE.PostwriteEfiBackend(
+    source_module, source_hash, "NEWV3SOURCE", command=v3_module_info,
+    kernel_release="7.2.6-arch2-Watanare-T2-2-t2", source_variable_version="v3",
+  )
+  v3_source.require_kernel_available(root)
+  assert v3_source.inspect(root, vector) is None
+  assert old_v2_marker.read_bytes() == old_v2_value
 
   root, source, restore, _proof, receipt, _power = fixture(base / "input-waiver")
   evidence = platform_preflight(root, source, restore)

@@ -10,6 +10,8 @@ import tempfile
 root = Path(__file__).resolve().parents[1] / "experiments/hibernate-efi-restore-marker"
 source = (root / "mba_hibernate_efi_restore_marker.c").read_text()
 assert 'L"OmarchyT2RestoreStage"' in source
+assert 'L"OmarchyT2RestoreStageV2"' in source
+assert 'MODULE_INFO(mba_restore_variable, "v2")' in source
 assert 'EFI_GUID(0x5e17d2ad, 0x021f, 0x4d45, 0xa8, 0xe5, 0xf4, 0xc1, 0x91, 0x98, 0x3e, 0x27)' in source
 assert 'FTRACE_OPS_FL_IPMODIFY' not in source
 assert 'if (READ_ONCE(armed))\n    return -EPERM;' in source

@@ -139,6 +139,18 @@ with tempfile.TemporaryDirectory(prefix="t2-uki-pair-") as temporary:
   else:
     raise AssertionError("Altered restore hook was accepted")
   (hooks / audit.RESTORE_MARKER_HOOK).write_bytes(audit.RESTORE_MARKER_HOOK_SOURCE.read_bytes())
+  v2_marker = {**marker, "version": "v2", "efi_variable": audit.V2_RESTORE_MARKER_VARIABLE}
+  version_file = marker_dir / "marker.version"
+  version_file.write_text("v2\n")
+  audit.verify_restore_marker_tree(extracted, v2_marker)
+  version_file.write_text("v1\n")
+  try:
+    audit.verify_restore_marker_tree(extracted, v2_marker)
+  except ValueError as error:
+    assert "variable version differs" in str(error), error
+  else:
+    raise AssertionError("Mismatched restore marker version was accepted")
+  version_file.unlink()
   (marker_dir / "marker.ko").write_bytes(b"wrong-marker")
   try:
     audit.verify_restore_marker_tree(extracted, marker)

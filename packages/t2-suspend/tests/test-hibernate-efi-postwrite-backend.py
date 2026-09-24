@@ -264,7 +264,7 @@ with tempfile.TemporaryDirectory(prefix="t2-postwrite-v2-backend-") as temporary
     backend.require_kernel_available(root)
     raise AssertionError("V2 backend accepted a module without V2 metadata")
   except ValueError as error:
-    assert "does not declare the V2 variable" in str(error)
+    assert "does not declare the selected variable" in str(error)
   declared[0] = "v2"
   backend.require_kernel_available(root)
   assert backend.inspect(root, VECTOR) is None

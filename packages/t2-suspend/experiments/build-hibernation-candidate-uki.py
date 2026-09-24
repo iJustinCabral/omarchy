@@ -28,6 +28,7 @@ RESTORE_MARKER_FILES = (
   "usr/lib/omarchy-t2-restore-marker/marker.ko",
   "usr/lib/omarchy-t2-restore-marker/marker.sha256",
   "usr/lib/omarchy-t2-restore-marker/marker.srcversion",
+  "usr/lib/omarchy-t2-restore-marker/marker.version",
 )
 MODULES = {
   "brcmfmac": "drivers/net/wireless/broadcom/brcm80211/brcmfmac/brcmfmac.ko",
@@ -106,8 +107,12 @@ def module_metadata(path):
   }
 
 
-def prepare_restore_marker(work, path, expected_sha256, expected_srcversion, release):
+def prepare_restore_marker(work, path, expected_sha256, expected_srcversion, release, version="v1"):
+  if version not in ("v1", "v2"):
+    raise ValueError("Unknown restore marker variable version")
   if path is None and expected_sha256 is None and expected_srcversion is None:
+    if version != "v1":
+      raise ValueError("Restore marker version requires an exact module")
     return None
   if path is None or expected_sha256 is None or expected_srcversion is None:
     raise ValueError("Restore marker requires exact path, SHA-256 and source version together")
@@ -123,18 +128,26 @@ def prepare_restore_marker(work, path, expected_sha256, expected_srcversion, rel
   if (not expected_srcversion or identity["srcversion"] != expected_srcversion or
       identity["vermagic"].split()[0] != release):
     raise ValueError("Restore marker source version or kernel ABI differs")
+  declared_version = run(("modinfo", "-F", "mba_restore_variable", path), capture=True).stdout.strip()
+  if declared_version != ("v2" if version == "v2" else ""):
+    raise ValueError("Restore marker module variable version differs")
   sha_file = work / "restore-marker.sha256"
   srcversion_file = work / "restore-marker.srcversion"
+  version_file = work / "restore-marker.version"
   sha_file.write_text(expected_sha256 + "\n")
   srcversion_file.write_text(expected_srcversion + "\n")
+  version_file.write_text(version + "\n")
   sha_file.chmod(0o600)
   srcversion_file.chmod(0o600)
+  version_file.chmod(0o600)
   return {
     "module": path,
     "sha256": expected_sha256,
     "srcversion": expected_srcversion,
     "sha_file": sha_file,
     "srcversion_file": srcversion_file,
+    "version_file": version_file,
+    "version": version,
   }
 
 
@@ -246,6 +259,7 @@ def build_initrd(work, module_root, payload, release, expected, experiment_id=No
     environment.extend((
       "OMARCHY_T2_RESTORE_MARKER_SHA256_FILE=" + str(restore_marker["sha_file"]),
       "OMARCHY_T2_RESTORE_MARKER_SRCVERSION_FILE=" + str(restore_marker["srcversion_file"]),
+      "OMARCHY_T2_RESTORE_MARKER_VERSION_FILE=" + str(restore_marker["version_file"]),
     ))
   run((
     *environment,
@@ -292,6 +306,8 @@ def build_initrd(work, module_root, payload, release, expected, experiment_id=No
       raise ValueError("Candidate initramfs restore marker SHA identity differs")
     if (embedded / "marker.srcversion").read_text().strip() != restore_marker["srcversion"]:
       raise ValueError("Candidate initramfs restore marker source version differs")
+    if (embedded / "marker.version").read_text().strip() != restore_marker["version"]:
+      raise ValueError("Candidate initramfs restore marker variable version differs")
     hooks_line = re.search(r'^HOOKS="([^"]*)"$', build_config, re.M)
     if hooks_line is None:
       raise ValueError("Candidate initramfs lacks resolved runtime hooks")
@@ -434,6 +450,7 @@ def main():
   parser.add_argument("--restore-marker-module", type=Path, help="private disarmed cold-restore marker module")
   parser.add_argument("--expected-restore-marker-sha256")
   parser.add_argument("--expected-restore-marker-srcversion")
+  parser.add_argument("--restore-marker-version", choices=("v1", "v2"), default="v1")
   args = parser.parse_args()
 
   if os.geteuid() != 0:
@@ -455,7 +472,8 @@ def main():
     module_root, selected = prepare_module_root(work, candidate_source, args.kernel_release, expected)
     payload, payload_modules = prepare_payload(work, candidate_source, args.kernel_release, expected, experiment_id)
     restore_marker = prepare_restore_marker(work, args.restore_marker_module, args.expected_restore_marker_sha256,
-                                            args.expected_restore_marker_srcversion, args.kernel_release)
+                                            args.expected_restore_marker_srcversion, args.kernel_release,
+                                            args.restore_marker_version)
     initrd, staged_payload = build_initrd(work, module_root, payload, args.kernel_release, expected, experiment_id, restore_marker)
     uki, cmdline, sections, production_hash = build_uki(work, production, initrd)
 
@@ -484,7 +502,8 @@ def main():
       "restore_marker": None if restore_marker is None else {
         "sha256": restore_marker["sha256"],
         "srcversion": restore_marker["srcversion"],
-        "efi_variable": "OmarchyT2RestoreStage-5e17d2ad-021f-4d45-a8e5-f4c191983e27",
+        "version": restore_marker["version"],
+        "efi_variable": "OmarchyT2RestoreStage" + ("V2" if restore_marker["version"] == "v2" else "") + "-5e17d2ad-021f-4d45-a8e5-f4c191983e27",
         "pre_resume_hook": "omarchy-t2-restore-marker",
         "hook_sha256": digest(CANDIDATE_HOOKS / "hooks/omarchy-t2-restore-marker"),
       },

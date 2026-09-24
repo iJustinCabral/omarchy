@@ -4,8 +4,9 @@ build() {
   local marker_module=${OMARCHY_T2_RESTORE_MARKER_MODULE:-}
   local marker_sha256=${OMARCHY_T2_RESTORE_MARKER_SHA256_FILE:-}
   local marker_srcversion=${OMARCHY_T2_RESTORE_MARKER_SRCVERSION_FILE:-}
+  local marker_version=${OMARCHY_T2_RESTORE_MARKER_VERSION_FILE:-}
 
-  if [[ ! -f $marker_module || ! -f $marker_sha256 || ! -f $marker_srcversion ]]; then
+  if [[ ! -f $marker_module || ! -f $marker_sha256 || ! -f $marker_srcversion || ! -f $marker_version ]]; then
     error "Missing exact private restore marker module or identity"
     return 1
   fi
@@ -13,6 +14,7 @@ build() {
   add_file "$marker_module" /usr/lib/omarchy-t2-restore-marker/marker.ko 600 || return 1
   add_file "$marker_sha256" /usr/lib/omarchy-t2-restore-marker/marker.sha256 600 || return 1
   add_file "$marker_srcversion" /usr/lib/omarchy-t2-restore-marker/marker.srcversion 600 || return 1
+  add_file "$marker_version" /usr/lib/omarchy-t2-restore-marker/marker.version 600 || return 1
 }
 
 help() {

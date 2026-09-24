@@ -13,6 +13,16 @@ ash = Path("/usr/lib/initcpio/busybox")
 variable = "OmarchyT2RestoreStage-5e17d2ad-021f-4d45-a8e5-f4c191983e27"
 prefix = "0123456789abcdef01234567"
 srcversion = "3119365A09AED2D4CD65DD6"
+witness_guid = "5e17d2ad-021f-4d45-a8e5-f4c191983e27"
+
+
+def witness(root, stage):
+  return root / "sys/firmware/efi/efivars" / f"OmarchyT2RestoreHook{stage}{prefix}-{witness_guid}"
+
+
+def clear_witnesses(root):
+  for stage in ("Entered", "Armed"):
+    witness(root, stage).unlink(missing_ok=True)
 
 script = r'''
 . "$1"
@@ -78,12 +88,22 @@ with tempfile.TemporaryDirectory(prefix="t2-restore-hook-") as temporary:
   output, recovery = run(root)
   assert "hook_status=0" in output and not recovery
   assert (root / "sys/module/mba_hibernate_efi_restore_marker/parameters/arm_prefix").read_text().strip() == "1"
+  assert witness(root, "Entered").read_bytes() == b"\x07\x00\x00\x00MBRH" + prefix.encode() + b"\x01"
+  assert witness(root, "Armed").read_bytes() == b"\x07\x00\x00\x00MBRH" + prefix.encode() + b"\x02"
 
+  output, recovery = run(root)
+  assert "hook_status=1" in output and recovery
+  assert "stale Entered witness" in output
+  assert (root / "recovery-order").read_text().splitlines() == ["plymouth", "shell"]
+  (root / "recovery-shell").unlink()
+  (root / "recovery-order").unlink()
+  clear_witnesses(root)
   marker.write_bytes(marker.read_bytes()[:-1] + b"\x03")
   output, recovery = run(root)
   assert "hook_status=1" in output and recovery
   assert "refusing uninstrumented image resume" in output
   assert (root / "recovery-order").read_text().splitlines() == ["plymouth", "shell"]
+  assert not witness(root, "Entered").exists() and not witness(root, "Armed").exists()
 
   (root / "recovery-shell").unlink()
   (root / "recovery-order").unlink()
@@ -93,19 +113,36 @@ with tempfile.TemporaryDirectory(prefix="t2-restore-hook-") as temporary:
   assert "hook_status=1" in output and recovery
   assert "embedded module identity differs" in output
   assert (root / "recovery-order").read_text().splitlines() == ["plymouth", "shell"]
+  assert witness(root, "Entered").exists() and not witness(root, "Armed").exists()
 
   (root / "recovery-shell").unlink()
   (root / "recovery-order").unlink()
+  clear_witnesses(root)
   (directory / "marker.sha256").write_text(hashlib.sha256(module.read_bytes()).hexdigest() + "\n")
   output, recovery = run(root, fail_insmod=True)
   assert "hook_status=1" in output and recovery
   assert (root / "recovery-order").read_text().splitlines() == ["plymouth", "shell"]
+  assert witness(root, "Entered").exists() and not witness(root, "Armed").exists()
 
   (root / "recovery-shell").unlink()
   (root / "recovery-order").unlink()
+  clear_witnesses(root)
   output, recovery = run(root, version="WRONG")
   assert "hook_status=1" in output and recovery
   assert "loaded module source version differs" in output
   assert (root / "recovery-order").read_text().splitlines() == ["plymouth", "shell"]
+  assert witness(root, "Entered").exists() and not witness(root, "Armed").exists()
+
+  (root / "recovery-shell").unlink()
+  (root / "recovery-order").unlink()
+  clear_witnesses(root)
+  version_file = directory / "marker.version"
+  version_file.write_text("v2\n")
+  v2_marker = marker.parent / ("OmarchyT2RestoreStageV2-" + witness_guid)
+  v2_marker.write_bytes(bytes.fromhex("07000000") + b"MBRS" + bytes.fromhex(prefix) + b"\x00")
+  output, recovery = run(root)
+  assert "hook_status=0" in output and not recovery
+  assert witness(root, "Entered").exists() and witness(root, "Armed").exists()
+  assert marker.read_bytes()[-1] == 0
 
 print("PASS: mkinitcpio ash hook arms only an exact restore marker and fails closed before resume")
