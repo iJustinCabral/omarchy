@@ -113,7 +113,7 @@ module = (script.parent / "mba_hibernate_efi_ftrace_marker.c").read_text()
 assert 'L"OmarchyT2KernelEfiProbe"' in module
 assert 'EFI_GUID(0xd963eecc, 0x8654, 0x47d4, 0xbc, 0x1c, 0x45, 0x6d, 0x7b, 0x77, 0x6a, 0x86)' in module
 assert "module_param_cb(probe_nonce, &probe_nonce_ops, NULL, 0600)" in module
-assert "READ_ONCE(probe_consumed) || READ_ONCE(armed)" in module
+assert "READ_ONCE(probe_consumed) || READ_ONCE(entry_consumed) ||" in module
 assert "READ_ONCE(arm_consumed) ||" in module
 assert "status = mba_write_variable(probe_name, &probe_guid, expected);" in module
 assert "WRITE_ONCE(probe_consumed, true);" in module
