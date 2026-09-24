@@ -3,7 +3,9 @@
 
 import hashlib
 import importlib.util
+import json
 from pathlib import Path
+import tempfile
 
 
 script = Path(__file__).resolve().parents[1] / "experiments/hibernate-pre-write-ftrace/run-efi-boundary.py"
@@ -54,5 +56,42 @@ assert execute.index('"armed").write_text("Y\\n")') < execute.index("completed =
 assert '"--bluetooth-off", "--wifi-unbind"' in execute
 assert 'count == 1' in execute and 'stage == 2' in execute
 assert 'after["page_sha256"] == arm["swap_header_before"]["page_sha256"]' in execute
+
+with tempfile.TemporaryDirectory(prefix="t2-efi-prewrite-clear-") as temporary:
+  root = Path(temporary)
+  boot_id = root / "proc/sys/kernel/random/boot_id"
+  boot_id.parent.mkdir(parents=True)
+  boot_id.write_text(arm["boot_id"] + "\n")
+  state = root / probe.STATE
+  state.mkdir(parents=True)
+  armed = {**arm, "head": probe.PREPARED_HEAD, "swap_header_before": {"page_sha256": "c" * 64}}
+  (state / "armed.json").write_text(json.dumps(armed))
+  (state / "pm-attempted.json").write_text(json.dumps({
+    "kind": probe.KIND + "-pm-attempted", "boot_id": arm["boot_id"], "vector": vector,
+    "marker_module_sha256": probe.MARKER_SHA256, "abort_module_sha256": probe.ABORT_SHA256,
+  }))
+  result = {
+    "kind": probe.KIND + "-result", "boot_id": arm["boot_id"], "vector": vector,
+    "success": False, "observed_stage": 2, "efi_status": "0", "interceptions": 1,
+    "swap_header_after": {"page_sha256": "c" * 64},
+  }
+  (state / "result.json").write_text(json.dumps(result))
+  (state / "cleanup.json").write_text(json.dumps({
+    "kind": probe.KIND + "-cleanup", "boot_id": arm["boot_id"],
+    "abort_module_unloaded": True, "marker_module_unloaded": True, "errors": [],
+  }))
+  variable = probe.MARKER.marker_path(root)
+  variable.parent.mkdir(parents=True)
+  variable.write_bytes(probe.expected(armed, 2))
+  refused(lambda: probe.clear_success(root), "Only the exact returned-and-cleaned")
+  assert variable.exists() and not (state / "clear-intent.json").exists()
+  result["success"] = True
+  (state / "result.json").write_text(json.dumps(result))
+  assert probe.clear_success(root) is True
+  assert not variable.exists()
+  assert json.loads((state / "clear-intent.json").read_text())["stage2_value_hex"] == probe.expected(armed, 2).hex()
+  assert json.loads((state / "cleared.json").read_text())["stage2_sha256"] == arm["stage2_sha256"]
+  assert (state / "pm-attempted.json").exists()
+  refused(lambda: probe.clear_success(root), "EFI stage-2 marker differs")
 
 print("PASS: EFI/pre-write boundary identity, guard ordering and controlled-abort contract")

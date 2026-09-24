@@ -294,6 +294,65 @@ def execute_live(*, operator_attended=False):
   return result
 
 
+def clear_success(root, *, allow_live=False):
+  root = Path(root)
+  if root == Path("/"):
+    if not allow_live or os.geteuid() != 0:
+      raise ValueError("Live EFI marker cleanup requires explicit root scope")
+    COMMON.require_live_stock(root, allow_stage_marker=True)
+    COMMON.require_live_arm_preflight(root)
+  arm = COMMON.load_json(root / STATE / "armed.json", root)
+  attempt = COMMON.load_json(root / STATE / "pm-attempted.json", root)
+  result = COMMON.load_json(root / STATE / "result.json", root)
+  cleanup = COMMON.load_json(root / STATE / "cleanup.json", root)
+  value = expected(arm, 2)
+  if (arm.get("head") != PREPARED_HEAD or arm.get("boot_id") != COMMON.boot_id(root) or
+      attempt.get("kind") != KIND + "-pm-attempted" or
+      attempt.get("boot_id") != arm["boot_id"] or attempt.get("vector") != arm["vector"] or
+      attempt.get("marker_module_sha256") != MARKER_SHA256 or
+      attempt.get("abort_module_sha256") != ABORT_SHA256 or
+      result.get("kind") != KIND + "-result" or
+      result.get("boot_id") != arm["boot_id"] or result.get("vector") != arm["vector"] or
+      result.get("success") is not True or result.get("observed_stage") != 2 or
+      result.get("efi_status") != "0" or result.get("interceptions") != 1 or
+      result.get("swap_header_after", {}).get("page_sha256") != arm["swap_header_before"]["page_sha256"] or
+      cleanup.get("kind") != KIND + "-cleanup" or cleanup.get("boot_id") != arm["boot_id"] or
+      cleanup.get("abort_module_unloaded") is not True or
+      cleanup.get("marker_module_unloaded") is not True or cleanup.get("errors") != []):
+    raise ValueError("Only the exact returned-and-cleaned one-use vector may clear its marker")
+  variable = MARKER.marker_path(root)
+  if COMMON.read_regular(variable) != value:
+    raise ValueError("EFI stage-2 marker differs; preserve it")
+  cleared = root / STATE / "cleared.json"
+  if cleared.exists() or cleared.is_symlink():
+    raise ValueError("One-use marker cleanup already completed")
+  intent = root / STATE / "clear-intent.json"
+  record = {
+    "kind": KIND + "-clear-intent",
+    "boot_id": arm["boot_id"],
+    "vector": arm["vector"],
+    "stage2_value_hex": value.hex(),
+    "stage2_sha256": arm["stage2_sha256"],
+  }
+  if intent.exists() or intent.is_symlink():
+    if COMMON.load_json(intent, root) != record:
+      raise ValueError("Existing marker cleanup intent differs")
+  else:
+    COMMON.atomic_new_json(intent, record)
+  if root == Path("/"):
+    subprocess.run(["chattr", "-i", str(variable)], check=True, timeout=20)
+  variable.unlink()
+  if COMMON.read_regular(variable) is not None or variable.is_symlink():
+    raise ValueError("EFI marker remains after exact cleanup")
+  COMMON.atomic_new_json(cleared, {
+    "kind": KIND + "-cleared",
+    "boot_id": arm["boot_id"],
+    "vector": arm["vector"],
+    "stage2_sha256": arm["stage2_sha256"],
+  })
+  return True
+
+
 def main():
   os.umask(0o077)
   parser = argparse.ArgumentParser(description=__doc__)
@@ -302,6 +361,7 @@ def main():
   mode.add_argument("--prepare", action="store_true")
   mode.add_argument("--validate-armed", action="store_true")
   mode.add_argument("--execute", action="store_true")
+  mode.add_argument("--clear-success", action="store_true")
   parser.add_argument("--operator-attended", action="store_true")
   arguments = parser.parse_args()
   if os.geteuid() != 0:
@@ -312,8 +372,10 @@ def main():
     result = prepare_live()
   elif arguments.validate_armed:
     result = validate_armed_live()
-  else:
+  elif arguments.execute:
     result = execute_live(operator_attended=arguments.operator_attended)
+  else:
+    result = clear_success(Path("/"), allow_live=True)
   print(json.dumps(result, indent=2, sort_keys=True))
 
 
