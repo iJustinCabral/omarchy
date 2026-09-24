@@ -39,7 +39,7 @@ def fake_module(root):
   path = root / probe.MODULE / "parameters"
   path.mkdir(parents=True)
   (root / probe.MODULE / "srcversion").write_text(probe.MODULE_SRCVERSION + "\n")
-  for name, value in (("entry_consumed", "N"), ("entry_armed", "0"),
+  for name, value in (("entry_consumed", "N"), ("entry_armed", "N"),
                       ("entry_stage", "0"), ("entry_efi_status", "0"),
                       ("arm_vector", "0"), ("probe_consumed", "N"),
                       ("stage", "0"), ("entry_nonce", "")):
@@ -51,7 +51,7 @@ def fake_arm(root, value):
   assert value == (arm["nonce_hex"] + "\n").encode()
   probe.module_parameter(root, "entry_nonce").write_bytes(value)
   probe.module_parameter(root, "entry_consumed").write_text("Y\n")
-  probe.module_parameter(root, "entry_armed").write_text("1\n")
+  probe.module_parameter(root, "entry_armed").write_text("Y\n")
 
 
 def remove_fake_module(root):
@@ -70,7 +70,7 @@ def fake_return(root):
   _, stage0, stage1 = probe.load_arm(root)
   assert probe.stage(root, stage0, stage1) == 0
   (root / probe.VARIABLE).write_bytes(stage1)
-  probe.module_parameter(root, "entry_armed").write_text("0\n")
+  probe.module_parameter(root, "entry_armed").write_text("N\n")
   probe.module_parameter(root, "entry_stage").write_text("1\n")
   return 0, "freezer returned"
 
@@ -118,7 +118,7 @@ with tempfile.TemporaryDirectory(prefix="t2-efi-ftrace-entry-") as temporary:
   fake_module(root)
   result = probe.arm_module(root, write_parameter=fake_arm)
   assert result["source_boot_id"] == SOURCE
-  assert probe.parameter_value(root, "entry_armed") == "1"
+  assert probe.parameter_value(root, "entry_armed") == "Y"
   returned = probe.execute_freezer(root, transition=fake_return)
   assert returned["success"] is True
   assert returned["observed_stage"] == 1

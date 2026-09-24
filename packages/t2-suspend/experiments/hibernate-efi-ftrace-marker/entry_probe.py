@@ -189,7 +189,7 @@ def arm_module(root, *, allow_live=False, write_parameter=None):
   if (parameter_value(root, "arm_vector") != "0" or
       parameter_value(root, "probe_consumed") not in ("N", "0") or
       parameter_value(root, "entry_consumed") not in ("N", "0") or
-      parameter_value(root, "entry_armed") != "0" or
+      parameter_value(root, "entry_armed") not in ("N", "0") or
       parameter_value(root, "entry_stage") != "0"):
     raise ValueError("Loaded ftrace entry module is not disarmed and unused")
   value = (arm["nonce_hex"] + "\n").encode()
@@ -204,7 +204,7 @@ def arm_module(root, *, allow_live=False, write_parameter=None):
   else:
     write_parameter(root, value)
   if (parameter_value(root, "entry_consumed") not in ("Y", "1") or
-      parameter_value(root, "entry_armed") != "1" or
+      parameter_value(root, "entry_armed") not in ("Y", "1") or
       parameter_value(root, "arm_vector") != "0" or
       stage(root, stage0, stage1) != 0):
     raise ValueError("Ftrace entry module arm did not read back exactly")
@@ -234,7 +234,7 @@ def execute_freezer(root, *, allow_live=False, transition=None):
     raise ValueError("Ftrace entry probe execution does not match its one-use arm")
   if (module_srcversion(root) != MODULE_SRCVERSION or
       parameter_value(root, "entry_consumed") not in ("Y", "1") or
-      parameter_value(root, "entry_armed") != "1" or
+      parameter_value(root, "entry_armed") not in ("Y", "1") or
       parameter_value(root, "entry_stage") != "0" or
       parameter_value(root, "arm_vector") != "0" or
       parameter_value(root, "probe_consumed") not in ("N", "0")):
@@ -277,7 +277,7 @@ def execute_freezer(root, *, allow_live=False, transition=None):
     "disk_after": selected_value(root, "disk"),
     "success": (returncode == 0 and status == "0" and observed_stage == 1 and
                 parameter_value(root, "entry_stage") == "1" and
-                parameter_value(root, "entry_armed") == "0" and
+                parameter_value(root, "entry_armed") in ("N", "0") and
                 parameter_value(root, "arm_vector") == "0" and
                 selected_value(root, "pm_test") == previous_pm_test and
                 selected_value(root, "disk") == previous_disk),
