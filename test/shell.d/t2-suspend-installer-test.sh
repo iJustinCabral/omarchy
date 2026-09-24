@@ -19,6 +19,7 @@ python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-readback-ftrace.py" "$RO
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-live-readback.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-readback-cleanup.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-efi-postwrite-marker.py"
+python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-efi-postwrite-backend.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-uki-pair-audit.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernation-kernel-repack.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernation-uki-pair-stage.py"

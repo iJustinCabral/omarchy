@@ -36,6 +36,7 @@ S4 = import_path("hibernation_candidate_s4_runner", HERE / "run-hibernation-cand
 MARKER = import_path("hibernation_efi_stage_marker", HERE / "hibernate-efi-stage-marker/marker.py")
 RTC = import_path("hibernation_rtc_stage_runtime", HERE / "hibernate-rtc-stage-marker/runtime.py")
 FTRACE = import_path("hibernation_ftrace_efi_stage_runtime", HERE / "hibernate-efi-ftrace-marker/s4_backend.py")
+POSTWRITE = import_path("hibernation_postwrite_efi_stage_runtime", HERE / "hibernate-efi-postwrite-marker/s4_backend.py")
 TEST = S4.TEST
 WIFI = S4.WIFI
 VECTORS = PAIR.STATE / "s4-vectors"
@@ -213,6 +214,7 @@ def execute(
   restore_armer=PAIR.arm_restore,
   restore_disarmer=PAIR.disarm_restore,
   marker_backend=MARKER,
+  operator_attended=False,
 ):
   evidence = preflight(
     root, source_directory, restore_directory, proof_directory,
@@ -225,6 +227,14 @@ def execute(
     raise ValueError("RTC marker did not survive the MacBookAir9,1 forced-power return; this backend cannot qualify another S4 execution")
   if getattr(marker_backend, "NAME", None) == "ftrace-efi" and not getattr(marker_backend, "EXECUTION_QUALIFIED", False):
     raise ValueError("EFI ftrace marker lacks forced-power persistence and independent recovery proof; this backend cannot qualify S4 execution")
+  operator_acceptance_sha256 = None
+  if getattr(marker_backend, "NAME", None) == "postwrite-efi" and not operator_attended:
+    raise ValueError("Post-write EFI S4 requires an operator at the physical power button")
+  if getattr(marker_backend, "NAME", None) == "postwrite-efi":
+    receipt = PAIR.load_receipt(root)
+    operator_acceptance_sha256 = marker_backend.require_operator_acceptance(
+      root, evidence["transition_vector"], evidence["boot_id"], receipt["production_uki_sha256"],
+    )
   if TEST.candidate_hash(expected_pair_vector) != evidence["transition_vector"]:
     raise ValueError("Explicit pair-wide vector does not match the staged images")
   services_verifier(runner)
@@ -240,6 +250,9 @@ def execute(
     "real_s4_attempted": False,
     "hardware_qualified": False,
   }
+  if getattr(marker_backend, "NAME", None) == "postwrite-efi":
+    record["recovery_method"] = "operator-attended-cold-power"
+    record["operator_recovery_acceptance_sha256"] = operator_acceptance_sha256
   TEST.save_attempt(attempt, record)
 
   power = S4.confined(root, TEST.POWER)
@@ -383,12 +396,16 @@ def main():
   parser.add_argument("--validate-only", action="store_true")
   parser.add_argument("--execute", action="store_true")
   parser.add_argument("--expected-pair-vector")
-  parser.add_argument("--marker-backend", choices=("efi", "rtc", "ftrace-efi"), default="efi")
+  parser.add_argument("--marker-backend", choices=("efi", "rtc", "ftrace-efi", "postwrite-efi"), default="efi")
+  parser.add_argument("--operator-attended", action="store_true")
   parser.add_argument("--rtc-marker-module", type=Path)
   parser.add_argument("--expected-rtc-marker-sha256")
   parser.add_argument("--ftrace-efi-marker-module", type=Path)
   parser.add_argument("--expected-ftrace-efi-marker-sha256")
   parser.add_argument("--expected-ftrace-efi-marker-srcversion")
+  parser.add_argument("--postwrite-efi-marker-module", type=Path)
+  parser.add_argument("--expected-postwrite-efi-marker-sha256")
+  parser.add_argument("--expected-postwrite-efi-marker-srcversion")
   arguments = parser.parse_args()
   if arguments.validate_only == arguments.execute:
     parser.error("select exactly one of --validate-only or --execute")
@@ -408,12 +425,26 @@ def main():
       arguments.expected_ftrace_efi_marker_sha256,
       arguments.expected_ftrace_efi_marker_srcversion,
     )
+  elif arguments.marker_backend == "postwrite-efi":
+    if (arguments.postwrite_efi_marker_module is None or
+        arguments.expected_postwrite_efi_marker_sha256 is None or
+        arguments.expected_postwrite_efi_marker_srcversion is None):
+      parser.error("Post-write EFI backend requires exact module path, SHA-256 and source version")
+    marker_backend = POSTWRITE.PostwriteEfiBackend(
+      arguments.postwrite_efi_marker_module,
+      arguments.expected_postwrite_efi_marker_sha256,
+      arguments.expected_postwrite_efi_marker_srcversion,
+    )
   else:
     marker_backend = MARKER
   if arguments.marker_backend != "rtc" and (arguments.rtc_marker_module is not None or arguments.expected_rtc_marker_sha256 is not None):
     parser.error("RTC module arguments require --marker-backend rtc")
   if arguments.marker_backend != "ftrace-efi" and (arguments.ftrace_efi_marker_module is not None or arguments.expected_ftrace_efi_marker_sha256 is not None or arguments.expected_ftrace_efi_marker_srcversion is not None):
     parser.error("Ftrace EFI module arguments require --marker-backend ftrace-efi")
+  if arguments.marker_backend != "postwrite-efi" and (arguments.postwrite_efi_marker_module is not None or arguments.expected_postwrite_efi_marker_sha256 is not None or arguments.expected_postwrite_efi_marker_srcversion is not None):
+    parser.error("Post-write EFI module arguments require --marker-backend postwrite-efi")
+  if arguments.operator_attended and arguments.marker_backend != "postwrite-efi":
+    parser.error("--operator-attended is reserved for the post-write EFI backend")
   if os.geteuid() != 0:
     raise SystemExit("Root required")
   try:
@@ -425,9 +456,9 @@ def main():
     )
     if arguments.validate_only:
       S4.verify_services()
-      result = preflight(*paths, require_efi_marker=arguments.marker_backend in ("rtc", "ftrace-efi"), marker_backend=marker_backend)
+      result = preflight(*paths, require_efi_marker=arguments.marker_backend in ("rtc", "ftrace-efi", "postwrite-efi"), marker_backend=marker_backend)
     else:
-      result = execute(*paths, arguments.expected_pair_vector, marker_backend=marker_backend)
+      result = execute(*paths, arguments.expected_pair_vector, marker_backend=marker_backend, operator_attended=arguments.operator_attended)
   except (OSError, RuntimeError, ValueError) as error:
     raise SystemExit("Pair cold-boot hibernation refused: " + str(error)) from error
   print(json.dumps(result, indent=2, sort_keys=True))

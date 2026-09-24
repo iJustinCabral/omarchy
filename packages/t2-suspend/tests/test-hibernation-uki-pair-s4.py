@@ -483,6 +483,12 @@ with tempfile.TemporaryDirectory(prefix="t2-pair-s4-") as temporary:
     def inspect(self, _root, _vector):
       return self.stage
 
+    def require_operator_acceptance(self, _root, identity, boot, production):
+      assert identity == vector and boot == BOOT_ID
+      assert production == pair.load_receipt(root)["production_uki_sha256"]
+      events.append(("rtc", "accepted"))
+      return "f" * 64
+
     def before_arm(self, host, identity, boot, directory):
       assert identity == vector and boot == BOOT_ID
       assert (directory.parent.parent / "s4-attempted").read_text().strip() == BOOT_ID
@@ -531,6 +537,19 @@ with tempfile.TemporaryDirectory(prefix="t2-pair-s4-") as temporary:
     assert "lacks forced-power persistence and independent recovery proof" in str(error)
   assert not (root / pair_s4.VECTORS / vector).exists()
   assert ("wifi", "prepare") not in events and ("power", "unexpected") not in events
+  rtc.NAME = "postwrite-efi"
+  try:
+    pair_s4.execute(
+      *inputs, vector, platform_preflight, proof_verifier, input_verifier,
+      wifi_prepare=lambda _root: events.append(("wifi", "prepare")),
+      power_writer=lambda _path, _value: events.append(("power", "unexpected")),
+      services_verifier=lambda _runner: None, marker_backend=rtc,
+    )
+    raise AssertionError("Unattended post-write S4 entered the transaction")
+  except ValueError as error:
+    assert "operator at the physical power button" in str(error)
+  assert not (root / pair_s4.VECTORS / vector).exists()
+  assert ("wifi", "prepare") not in events and ("power", "unexpected") not in events
   rtc.NAME = "rtc"
   rtc.EXECUTION_QUALIFIED = True
   events.clear()
@@ -559,5 +578,41 @@ with tempfile.TemporaryDirectory(prefix="t2-pair-s4-") as temporary:
   assert events.index(("rtc", "pointer")) < events.index(("rtc", "armed"))
   assert events.index(("rtc", "armed")) < events.index(("command", ("bootctl", "set-oneshot", receipt["images"]["restore"]["entry_id"])))
   assert events.index(("rtc", "cleaned")) > events.index(("wifi", "restore"))
+
+  root, source, restore, proof, receipt, _power = fixture(base / "postwrite-attended")
+  vector = pair_s4.pair_vector(receipt)
+  inputs = (root, source, restore, proof, Path("proof/post-input.json"), Path("proof/pre-input.json"), "platform")
+  events = []
+  marker = RTCMarker()
+  marker.NAME = "postwrite-efi"
+  marker.MIN_RETURN_STAGE = 3
+
+  def postwrite_writer(path, value):
+    events.append(("power", path.name, value))
+    if path.name == "disk":
+      write(path, "[platform] shutdown reboot suspend test_resume\n")
+    if path.name == "state":
+      assert marker.stage == 0
+      assert pair.SINGLE.read_efi_string(root / pair.SINGLE.ONESHOT) == receipt["images"]["restore"]["entry_id"]
+      marker.stage = 3
+      (root / pair.SINGLE.ONESHOT).unlink()
+      write_efi(root / pair.SINGLE.SELECTED, receipt["images"]["restore"]["entry_id"])
+
+  result = pair_s4.execute(
+    *inputs, vector, platform_preflight, proof_verifier, input_verifier,
+    wifi_prepare=lambda _root: events.append(("wifi", "prepare")),
+    wifi_restore=lambda _root: events.append(("wifi", "restore")),
+    power_writer=postwrite_writer,
+    runner=fake_runner(root, events, [False], [False]),
+    sync=lambda: None, sleeper=lambda _seconds: None,
+    services_verifier=lambda _runner: None, marker_backend=marker,
+    operator_attended=True,
+  )
+  assert result["state"] == "returned-and-cleaned"
+  assert result["postwrite-efi_stage"] == 3
+  assert result["recovery_method"] == "operator-attended-cold-power"
+  assert result["operator_recovery_acceptance_sha256"] == "f" * 64
+  assert events.index(("rtc", "accepted")) < events.index(("rtc", "pointer"))
+  assert events.index(("rtc", "pointer")) < events.index(("command", ("bootctl", "set-oneshot", receipt["images"]["restore"]["entry_id"])))
 
 print("PASS: pair S4 runner binds proof and pair-wide guard, arms only restore, and clears a failed one-shot")
