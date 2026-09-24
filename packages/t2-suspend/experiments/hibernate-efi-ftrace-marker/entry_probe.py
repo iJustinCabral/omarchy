@@ -20,6 +20,7 @@ SPEC.loader.exec_module(COMMON)
 
 VARIABLE = Path("sys/firmware/efi/efivars/OmarchyT2FtraceEntryProbe-9f946df0-1b9c-4af5-97e8-bc322a728241")
 STATE = Path("var/lib/omarchy-t2-ftrace-entry-probe")
+RECOVERY_ACCEPTANCE = Path("var/lib/omarchy-t2-ftrace-entry-recovery/recovery-acceptance.json")
 MODULE = Path("sys/module/mba_hibernate_efi_ftrace_marker")
 MODULE_FILE = Path("/home/jjc/.local/state/codex-mba-autonomous/efi-ftrace-entry-build.GpkgJK/mba_hibernate_efi_ftrace_marker.ko")
 MODULE_SHA256 = "28e13ee2a660c590d0d66988c0af9d768aa5a37e2e2ed52624215f624b149f32"
@@ -96,9 +97,32 @@ def stage(root, stage0, stage1):
   raise ValueError("Ftrace entry probe variable has unexpected bytes; preserve it")
 
 
+def require_recovery_acceptance(root):
+  directory = (root / RECOVERY_ACCEPTANCE).parent
+  if root == Path("/"):
+    if (directory.is_symlink() or not directory.is_dir() or
+        directory.stat().st_uid != 0 or directory.stat().st_mode & 0o077):
+      raise ValueError("Ftrace entry recovery acceptance directory is not root-owned and private")
+  try:
+    accepted = COMMON.load_json(root / RECOVERY_ACCEPTANCE, root)
+  except ValueError as error:
+    raise ValueError("Ftrace entry probe needs an explicit operator-attended cold-power recovery acceptance") from error
+  if (accepted.get("kind") != "ftrace-entry-freezer-recovery-acceptance-v1" or
+      accepted.get("source_boot_id") != COMMON.boot_id(root) or
+      accepted.get("module_sha256") != MODULE_SHA256 or
+      accepted.get("helper_sha256") != HELPER_SHA256 or
+      accepted.get("production_uki_sha256") != COMMON.PRODUCTION_UKI_SHA256 or
+      accepted.get("production_limine_sha256") != COMMON.PRODUCTION_LIMINE_SHA256 or
+      accepted.get("method") != "operator-attended-cold-power" or
+      accepted.get("accepted") is not True):
+    raise ValueError("Ftrace entry recovery acceptance does not bind this stock boot and probe")
+  return accepted
+
+
 def require_live_preflight(root, *, allow_module=False):
   COMMON.require_live_stock(root, allow_marker_module=allow_module)
   COMMON.require_live_arm_preflight(root)
+  require_recovery_acceptance(root)
   if COMMON.sha256_file(MODULE_FILE) != MODULE_SHA256:
     raise ValueError("Private ftrace entry module hash differs")
   if COMMON.sha256_file(HELPER) != HELPER_SHA256:

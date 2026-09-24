@@ -2,6 +2,7 @@
 """Check guarded freezer-depth ftrace entry behavior on synthetic sysfs."""
 
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 
@@ -77,6 +78,30 @@ def fake_return(root):
 refused(lambda: probe.require_scope(Path("/"), False), "explicit allow_live=True")
 assert probe.HELPER.is_file()
 assert probe.COMMON.sha256_file(probe.HELPER) == probe.HELPER_SHA256
+assert "require_recovery_acceptance" in probe.require_live_preflight.__code__.co_names
+
+with tempfile.TemporaryDirectory(prefix="t2-efi-ftrace-recovery-") as temporary:
+  root = Path(temporary)
+  fixture(root)
+  acceptance_path = root / probe.RECOVERY_ACCEPTANCE
+  refused(lambda: probe.require_recovery_acceptance(root), "explicit operator-attended")
+  acceptance_path.parent.mkdir(parents=True)
+  accepted = {
+    "kind": "ftrace-entry-freezer-recovery-acceptance-v1",
+    "source_boot_id": SOURCE,
+    "module_sha256": probe.MODULE_SHA256,
+    "helper_sha256": probe.HELPER_SHA256,
+    "production_uki_sha256": probe.COMMON.PRODUCTION_UKI_SHA256,
+    "production_limine_sha256": probe.COMMON.PRODUCTION_LIMINE_SHA256,
+    "method": "operator-attended-cold-power",
+    "accepted": True,
+  }
+  for change in ({"source_boot_id": RETURN}, {"module_sha256": "0" * 64},
+                 {"method": "smart-plug"}, {"accepted": False}):
+    acceptance_path.write_text(json.dumps({**accepted, **change}))
+    refused(lambda: probe.require_recovery_acceptance(root), "does not bind")
+  acceptance_path.write_text(json.dumps(accepted))
+  assert probe.require_recovery_acceptance(root) == accepted
 
 with tempfile.TemporaryDirectory(prefix="t2-efi-ftrace-entry-") as temporary:
   root = Path(temporary)
