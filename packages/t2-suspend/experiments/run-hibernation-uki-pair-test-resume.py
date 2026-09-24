@@ -55,7 +55,7 @@ def verify_input(root, evidence, input_path):
   return {"physical_input_confirmed": True, "pre_test_input": str(path), "pre_test_input_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
-def pair_inspector(source_directory, restore_directory, input_path):
+def pair_inspector(source_directory, restore_directory, input_path, input_event_waiver=False):
   def inspect(root, _candidate_directory):
     evidence = SOURCE.inspect(root, source_directory, restore_directory)
     if PAIR.rooted(root, PAIR.SINGLE.DEFAULT).exists():
@@ -65,13 +65,21 @@ def pair_inspector(source_directory, restore_directory, input_path):
       "entry_id": evidence["source_entry_id"],
       "candidate_uki_sha256": evidence["source_uki_sha256"],
     }
+    if input_event_waiver:
+      if input_path is not None:
+        raise ValueError("Input event waiver cannot be combined with physical evidence")
+      if evidence.get("devices", {}).get("internal_input_interfaces") != 2:
+        raise ValueError("Input event waiver still requires both internal interfaces")
+      return {**result, "physical_input_confirmed": False, "input_event_waiver": "operator-declined-manual-events-v1"}
+    if input_path is None:
+      raise ValueError("Physical-input evidence is required without an explicit waiver")
     return {**result, **verify_input(root, result, input_path)}
 
   return inspect
 
 
-def preflight(root, source_directory, restore_directory, input_path):
-  inspector = pair_inspector(source_directory, restore_directory, input_path)
+def preflight(root, source_directory, restore_directory, input_path, input_event_waiver=False):
+  inspector = pair_inspector(source_directory, restore_directory, input_path, input_event_waiver)
   evidence = TEST.preflight(root, source_directory, inspector=inspector)
   cmdline = TEST.confined(root, Path("proc/cmdline")).read_text().split()
   expected_offset = next((item.split("=", 1)[1] for item in cmdline if item.startswith("resume_offset=")), None)
@@ -89,21 +97,25 @@ def preflight(root, source_directory, restore_directory, input_path):
   return evidence
 
 
-def execute(root, source_directory, restore_directory, input_path, expected_source_sha256, operator_attended, candidate_execute=TEST.execute):
+def execute(root, source_directory, restore_directory, input_path, expected_source_sha256, operator_attended, candidate_execute=TEST.execute, input_event_waiver=False):
   if not operator_attended:
     raise ValueError("An operator must be present for physical cold-power recovery")
-  evidence = preflight(root, source_directory, restore_directory, input_path)
+  evidence = preflight(root, source_directory, restore_directory, input_path, input_event_waiver)
   if TEST.candidate_hash(expected_source_sha256) != evidence["source_uki_sha256"]:
     raise ValueError("Explicit source SHA-256 differs from the selected UKI")
-  inspector = pair_inspector(source_directory, restore_directory, input_path)
-  return candidate_execute(root, source_directory, True, inspector=inspector, pm_trace_value="0", label="omarchy-t2-hibernation-pair")
+  inspector = pair_inspector(source_directory, restore_directory, input_path, input_event_waiver)
+  return candidate_execute(root, source_directory, not input_event_waiver, inspector=inspector,
+                           pm_trace_value="0", label="omarchy-t2-hibernation-pair",
+                           physical_input_waiver=input_event_waiver)
 
 
 def main():
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--source", type=Path, required=True)
   parser.add_argument("--restore", type=Path, required=True)
-  parser.add_argument("--physical-input-evidence", type=Path, required=True)
+  input_group = parser.add_mutually_exclusive_group(required=True)
+  input_group.add_argument("--physical-input-evidence", type=Path)
+  input_group.add_argument("--waive-input-events", action="store_true", help="record the operator's explicit choice to skip manual keyboard/trackpad events")
   parser.add_argument("--validate-only", action="store_true")
   parser.add_argument("--execute", action="store_true")
   parser.add_argument("--expected-source-sha256")
@@ -120,9 +132,10 @@ def main():
   restore = arguments.restore.resolve()
   try:
     if arguments.validate_only:
-      result = preflight(root, source, restore, arguments.physical_input_evidence)
+      result = preflight(root, source, restore, arguments.physical_input_evidence, arguments.waive_input_events)
     else:
-      result = execute(root, source, restore, arguments.physical_input_evidence, arguments.expected_source_sha256, arguments.operator_attended)
+      result = execute(root, source, restore, arguments.physical_input_evidence, arguments.expected_source_sha256,
+                       arguments.operator_attended, input_event_waiver=arguments.waive_input_events)
   except (OSError, RuntimeError, ValueError) as error:
     raise SystemExit("Pair test-resume refused: " + str(error)) from error
   print(json.dumps(result, indent=2, sort_keys=True))

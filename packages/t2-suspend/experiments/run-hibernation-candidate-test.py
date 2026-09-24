@@ -218,9 +218,12 @@ def execute(
   sleeper=time.sleep,
   pm_trace_value="1",
   label="omarchy-t2-hibernation-candidate",
+  physical_input_waiver=False,
 ):
-  if not physical_input_confirmed:
+  if not physical_input_confirmed and not physical_input_waiver:
     raise ValueError("Physical keyboard and trackpad confirmation is required")
+  if physical_input_confirmed and physical_input_waiver:
+    raise ValueError("Physical input cannot be both confirmed and waived")
   if pm_trace_value not in ("0", "1"):
     raise ValueError("Unsupported PM trace setting")
   evidence = preflight(root, candidate_directory, inspector)
@@ -232,7 +235,8 @@ def execute(
   record = {
     **evidence,
     "state": "preparing",
-    "physical_input_confirmed": True,
+    "physical_input_confirmed": physical_input_confirmed,
+    "input_event_waiver": "operator-declined-manual-events-v1" if physical_input_waiver else None,
     "hibernate_attempted": False,
     "hardware_qualified": False,
   }

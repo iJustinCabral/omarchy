@@ -54,6 +54,7 @@ def inspect(_root, _source, _restore):
     "source_uki_sha256": SOURCE_SHA,
     "restore_entry_id": "MBA-T2-hibernation-restore-" + "b" * 16,
     "restore_uki_sha256": RESTORE_SHA,
+    "devices": {"internal_input_interfaces": 2},
   }
 
 
@@ -87,8 +88,8 @@ try:
 
     calls = []
 
-    def fake_execute(host, candidate, confirmed, inspector, pm_trace_value, label):
-      calls.append((host, candidate, confirmed, pm_trace_value, label))
+    def fake_execute(host, candidate, confirmed, inspector, pm_trace_value, label, physical_input_waiver):
+      calls.append((host, candidate, confirmed, pm_trace_value, label, physical_input_waiver))
       assert inspector(host, candidate)["pre_test_input_sha256"] == evidence["pre_test_input_sha256"]
       return {"state": "returned-and-cleaned"}
 
@@ -96,7 +97,7 @@ try:
     expect_refusal(lambda: runner.execute(root, source, restore, input_path, RESTORE_SHA, True, candidate_execute=fake_execute), "Explicit source")
     result = runner.execute(root, source, restore, input_path, SOURCE_SHA, True, candidate_execute=fake_execute)
     assert result["state"] == "returned-and-cleaned"
-    assert calls == [(root, source, True, "0", "omarchy-t2-hibernation-pair")]
+    assert calls == [(root, source, True, "0", "omarchy-t2-hibernation-pair", False)]
 
     guard = root / runner.TEST.VECTORS / SOURCE_SHA / "test-resume-attempted"
     write(guard, BOOT_ID + "\n")
@@ -126,7 +127,7 @@ try:
       if path.name == "state":
         assert (root / runner.TEST.VECTORS / SOURCE_SHA / "test-resume-attempted").is_file()
 
-    def synthetic_execute(host, candidate, confirmed, inspector, pm_trace_value, label):
+    def synthetic_execute(host, candidate, confirmed, inspector, pm_trace_value, label, physical_input_waiver):
       return runner.TEST.execute(
         host, candidate, confirmed, inspector=inspector,
         wifi_prepare=lambda _root: None,
@@ -137,6 +138,7 @@ try:
         sleeper=lambda _seconds: None,
         pm_trace_value=pm_trace_value,
         label=label,
+        physical_input_waiver=physical_input_waiver,
       )
 
     result = runner.execute(root, source, restore, input_path, SOURCE_SHA, True, candidate_execute=synthetic_execute)
@@ -151,6 +153,23 @@ try:
     attempt = root / runner.TEST.VECTORS / SOURCE_SHA / "attempts" / BOOT_ID / "attempt.json"
     assert json.loads(attempt.read_text())["state"] == "returned-and-cleaned"
     expect_refusal(lambda: runner.preflight(root, source, restore, input_path), "already consumed")
+
+    root, _input_path = fixture(base / "explicit-input-waiver")
+    waived = runner.preflight(root, source, restore, None, input_event_waiver=True)
+    assert waived["physical_input_confirmed"] is False
+    assert waived["input_event_waiver"] == "operator-declined-manual-events-v1"
+    expect_refusal(lambda: runner.preflight(root, source, restore, None), "required without an explicit waiver")
+    expect_refusal(lambda: runner.preflight(root, source, restore, _input_path, input_event_waiver=True), "cannot be combined")
+    result = runner.execute(root, source, restore, None, SOURCE_SHA, True,
+                            candidate_execute=synthetic_execute, input_event_waiver=True)
+    assert result["state"] == "returned-and-cleaned"
+    assert result["physical_input_confirmed"] is False
+    assert result["input_event_waiver"] == "operator-declined-manual-events-v1"
+    attempt = root / runner.TEST.VECTORS / SOURCE_SHA / "attempts" / BOOT_ID / "attempt.json"
+    stored = json.loads(attempt.read_text())
+    assert stored["physical_input_confirmed"] is False
+    assert stored["input_event_waiver"] == "operator-declined-manual-events-v1"
+    expect_refusal(lambda: runner.preflight(root, source, restore, None, input_event_waiver=True), "already consumed")
 
     root, input_path = fixture(base / "prepared-no-guard")
     (root / runner.TEST.VECTORS / SOURCE_SHA / "attempts").mkdir(parents=True)
