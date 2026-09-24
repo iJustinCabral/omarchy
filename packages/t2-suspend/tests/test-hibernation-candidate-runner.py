@@ -135,6 +135,29 @@ with tempfile.TemporaryDirectory(prefix="t2-candidate-runner-") as directory:
   except ValueError as error:
     assert "already consumed" in str(error)
 
+  root = fixture(base / "trace-off")
+  vector = root / candidate_runner.VECTORS / CANDIDATE_HASH
+  bluetooth = [True]
+  timer = [False]
+  events = []
+  trace_off = candidate_runner.execute(
+    root,
+    candidate,
+    True,
+    inspector=inspect,
+    wifi_prepare=wifi_prepare,
+    wifi_restore=wifi_restore,
+    power_writer=lambda path, value: events.append(("power", path.name, value)),
+    runner=runner,
+    sync=lambda: None,
+    sleeper=lambda _seconds: None,
+    pm_trace_value="0",
+  )
+  assert trace_off["state"] == "returned-and-cleaned"
+  assert ("power", "pm_trace", "0") in events
+  assert ("power", "pm_trace", "1") not in events
+  assert (vector / "test-resume-attempted").exists()
+
   root = fixture(base / "failure")
   vector = root / candidate_runner.VECTORS / CANDIDATE_HASH
   bluetooth = [True]

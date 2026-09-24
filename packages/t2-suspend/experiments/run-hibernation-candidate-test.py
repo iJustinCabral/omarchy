@@ -216,9 +216,13 @@ def execute(
   runner=run,
   sync=os.sync,
   sleeper=time.sleep,
+  pm_trace_value="1",
+  label="omarchy-t2-hibernation-candidate",
 ):
   if not physical_input_confirmed:
     raise ValueError("Physical keyboard and trackpad confirmation is required")
+  if pm_trace_value not in ("0", "1"):
+    raise ValueError("Unsupported PM trace setting")
   evidence = preflight(root, candidate_directory, inspector)
   boot_id = evidence["boot_id"]
   attempts, guard = vector_paths(root, evidence)
@@ -247,13 +251,13 @@ def execute(
     wifi_prepare(root)
     power_writer(power / "pm_test", "none")
     power_writer(power / "disk", "test_resume")
-    power_writer(power / "pm_trace", "1")
+    power_writer(power / "pm_trace", pm_trace_value)
     timer_armed = True
     arm_recovery_timer(runner)
     record["state"] = "isolated"
     save_attempt(attempt, record)
     print(
-      "omarchy-t2-hibernation-candidate: starting guarded test-resume "
+      label + ": starting guarded test-resume "
       f"boot={boot_id} entry={evidence['entry_id']}",
       flush=True,
     )
@@ -262,7 +266,7 @@ def execute(
     create_guard(guard, boot_id)
     transition_started = True
     power_writer(power / "state", "disk")
-    print("omarchy-t2-hibernation-candidate: test-resume returned", flush=True)
+    print(label + ": test-resume returned", flush=True)
     record["state"] = "returned"
     record["hibernate_attempted"] = True
     save_attempt(attempt, record)
@@ -304,7 +308,7 @@ def execute(
     raise RuntimeError("Candidate test returned but cleanup failed: " + "; ".join(record["cleanup_errors"]))
   record["state"] = "returned-and-cleaned"
   save_attempt(attempt, record)
-  print("omarchy-t2-hibernation-candidate: cleanup complete", flush=True)
+  print(label + ": cleanup complete", flush=True)
   return record
 
 
