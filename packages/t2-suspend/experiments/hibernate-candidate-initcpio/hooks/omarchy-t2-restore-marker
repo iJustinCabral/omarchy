@@ -57,6 +57,11 @@ run_hook() {
     return 0
   fi
   if ! arm_restore_marker; then
+    # Plymouth is started before this hook. Without quitting it, the
+    # fail-closed shell is hidden behind the splash and looks like a hang.
+    if command -v plymouth >/dev/null 2>&1; then
+      plymouth quit >/dev/null 2>&1 || :
+    fi
     err "omarchy-t2-restore-marker: refusing uninstrumented image resume"
     # A hook return code is ignored by mkinitcpio. In the real initramfs this
     # replaces PID 1 with a recovery shell before the following resume hook.

@@ -20,8 +20,13 @@ msg() { :; }
 err() { printf 'ERROR: %s\n' "$*"; }
 launch_interactive_shell() {
   [[ $1 == "--exec" ]] || exit 90
+  printf 'shell\n' >> "$OMARCHY_T2_RESTORE_MARKER_ROOT/recovery-order"
   printf 'called\n' > "$OMARCHY_T2_RESTORE_MARKER_ROOT/recovery-shell"
   return 0
+}
+plymouth() {
+  [[ $1 == "quit" ]] || exit 92
+  printf 'plymouth\n' >> "$OMARCHY_T2_RESTORE_MARKER_ROOT/recovery-order"
 }
 insmod() {
   [[ ${MOCK_FAIL_INSMOD:-0} == "0" ]] || return 1
@@ -78,22 +83,29 @@ with tempfile.TemporaryDirectory(prefix="t2-restore-hook-") as temporary:
   output, recovery = run(root)
   assert "hook_status=1" in output and recovery
   assert "refusing uninstrumented image resume" in output
+  assert (root / "recovery-order").read_text().splitlines() == ["plymouth", "shell"]
 
   (root / "recovery-shell").unlink()
+  (root / "recovery-order").unlink()
   marker.write_bytes(bytes.fromhex("07000000") + b"MBRS" + bytes.fromhex(prefix) + b"\x00")
   (directory / "marker.sha256").write_text("0" * 64 + "\n")
   output, recovery = run(root)
   assert "hook_status=1" in output and recovery
   assert "embedded module identity differs" in output
+  assert (root / "recovery-order").read_text().splitlines() == ["plymouth", "shell"]
 
   (root / "recovery-shell").unlink()
+  (root / "recovery-order").unlink()
   (directory / "marker.sha256").write_text(hashlib.sha256(module.read_bytes()).hexdigest() + "\n")
   output, recovery = run(root, fail_insmod=True)
   assert "hook_status=1" in output and recovery
+  assert (root / "recovery-order").read_text().splitlines() == ["plymouth", "shell"]
 
   (root / "recovery-shell").unlink()
+  (root / "recovery-order").unlink()
   output, recovery = run(root, version="WRONG")
   assert "hook_status=1" in output and recovery
   assert "loaded module source version differs" in output
+  assert (root / "recovery-order").read_text().splitlines() == ["plymouth", "shell"]
 
 print("PASS: mkinitcpio ash hook arms only an exact restore marker and fails closed before resume")
