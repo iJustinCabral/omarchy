@@ -13,8 +13,10 @@ import subprocess
 MODULE_NAME = "mba_hibernate_efi_postwrite_marker"
 PARAMETERS = Path("sys/module") / MODULE_NAME / "parameters"
 VARIABLE = Path("sys/firmware/efi/efivars/OmarchyT2PostwriteStage-47a2fceb-87bc-4e58-8d83-23f62ffb3393")
+V2_VARIABLE = Path("sys/firmware/efi/efivars/OmarchyT2PostwriteStageV2-47a2fceb-87bc-4e58-8d83-23f62ffb3393")
 RESTORE_VARIABLE = Path("sys/firmware/efi/efivars/OmarchyT2RestoreStage-5e17d2ad-021f-4d45-a8e5-f4c191983e27")
 ACCEPTANCE = Path("var/lib/omarchy-t2-postwrite-marker/recovery-acceptance.json")
+V2_ACCEPTANCE = Path("var/lib/omarchy-t2-postwrite-marker/recovery-acceptance-v2.json")
 ATTRIBUTES = b"\x07\x00\x00\x00"
 MAGIC = b"MBPW"
 RESTORE_MAGIC = b"MBRS"
@@ -47,13 +49,19 @@ class PostwriteEfiBackend:
   MIN_RETURN_STAGE = 3
 
   def __init__(self, module_path, expected_sha256, expected_srcversion,
-               command=command_output, kernel_release=None, parameter_writer=None):
+               command=command_output, kernel_release=None, parameter_writer=None,
+               source_variable_version="v1"):
+    if source_variable_version not in ("v1", "v2"):
+      raise ValueError("Unknown post-write EFI source variable version")
     self.module_path = Path(module_path)
     self.expected_sha256 = expected_sha256
     self.expected_srcversion = expected_srcversion
     self.command = command
     self.kernel_release = kernel_release or os.uname().release
     self.parameter_writer = parameter_writer
+    self.source_variable_version = source_variable_version
+    self.source_variable = VARIABLE if source_variable_version == "v1" else V2_VARIABLE
+    self.acceptance_path = ACCEPTANCE if source_variable_version == "v1" else V2_ACCEPTANCE
     self.vector = None
     self.source_boot_id = None
 
@@ -72,7 +80,7 @@ class PostwriteEfiBackend:
   def inspect(self, root, vector):
     if SHA256.fullmatch(vector) is None:
       raise ValueError("Post-write EFI marker vector is malformed")
-    path = Path(root) / VARIABLE
+    path = Path(root) / self.source_variable
     if path.is_symlink():
       raise ValueError("Post-write EFI marker is symlinked")
     if not path.exists():
@@ -102,6 +110,8 @@ class PostwriteEfiBackend:
       raise ValueError("Post-write EFI module does not match the running kernel")
     if self.command(("modinfo", "-F", "srcversion", str(self.module_path))).strip() != self.expected_srcversion:
       raise ValueError("Post-write EFI module source version differs")
+    if self.source_variable_version == "v2" and self.command(("modinfo", "-F", "mba_postwrite_variable", str(self.module_path))).strip() != "v2":
+      raise ValueError("Post-write EFI module does not declare the V2 variable")
     if self.loaded(root):
       raise ValueError("Post-write EFI module is already loaded")
     if (root / "sys/power/pm_trace").read_text().strip() != "0":
@@ -111,7 +121,7 @@ class PostwriteEfiBackend:
     if (SHA256.fullmatch(vector) is None or UUID.fullmatch(boot_id) is None or
         SHA256.fullmatch(production_uki_sha256) is None):
       raise ValueError("Post-write EFI recovery identity is malformed")
-    path = Path(root) / ACCEPTANCE
+    path = Path(root) / self.acceptance_path
     if path.is_symlink() or not path.is_file():
       raise ValueError("Boot-bound operator recovery acceptance is missing or symlinked")
     metadata = path.stat()
@@ -124,7 +134,7 @@ class PostwriteEfiBackend:
     except json.JSONDecodeError as error:
       raise ValueError("Operator recovery acceptance is malformed") from error
     expected = {
-      "kind": "postwrite-efi-attended-s4-v1",
+      "kind": "postwrite-efi-attended-s4-" + self.source_variable_version,
       "boot_id": boot_id,
       "transition_vector": vector,
       "module_sha256": self.expected_sha256,
@@ -132,6 +142,8 @@ class PostwriteEfiBackend:
       "method": "operator-attended-cold-power",
       "accepted": True,
     }
+    if self.source_variable_version == "v2":
+      expected["source_efi_variable"] = self.source_variable.name
     if record != expected:
       raise ValueError("Operator recovery acceptance differs from this boot and vector")
     return hashlib.sha256(raw).hexdigest()
@@ -157,6 +169,7 @@ class PostwriteEfiBackend:
       "module_sha256": self.expected_sha256,
       "module_srcversion": self.expected_srcversion,
       "recovery": "operator-attended-cold-power",
+      "source_efi_variable": self.source_variable.name,
     })
     self.vector = vector
     self.source_boot_id = boot_id
@@ -174,7 +187,7 @@ class PostwriteEfiBackend:
       raise ValueError("Post-write EFI prearm differs from its loaded attempt")
     if Path(root).resolve() == Path("/") and self.parameter_writer is not None:
       raise ValueError("Live post-write EFI arm cannot inject a test writer")
-    path = Path(root) / VARIABLE
+    path = Path(root) / self.source_variable
     if path.exists() or path.is_symlink():
       raise ValueError("Post-write EFI marker already exists; preserve it")
     value = ATTRIBUTES + MAGIC + bytes.fromhex(vector[:24]) + b"\x00"
@@ -212,10 +225,12 @@ class PostwriteRestoreEfiBackend(PostwriteEfiBackend):
 
   def __init__(self, module_path, expected_sha256, expected_srcversion,
                restore_module_path, restore_module_sha256, restore_module_srcversion,
-               command=command_output, kernel_release=None, parameter_writer=None):
+               command=command_output, kernel_release=None, parameter_writer=None,
+               source_variable_version="v1"):
     super().__init__(module_path, expected_sha256, expected_srcversion,
                      command=command, kernel_release=kernel_release,
-                     parameter_writer=parameter_writer)
+                     parameter_writer=parameter_writer,
+                     source_variable_version=source_variable_version)
     self.restore_module_path = Path(restore_module_path)
     self.restore_module_sha256 = restore_module_sha256
     self.restore_module_srcversion = restore_module_srcversion
@@ -269,7 +284,7 @@ class PostwriteRestoreEfiBackend(PostwriteEfiBackend):
     if (SHA256.fullmatch(vector) is None or UUID.fullmatch(boot_id) is None or
         SHA256.fullmatch(production_uki_sha256) is None):
       raise ValueError("Restore EFI recovery identity is malformed")
-    path = Path(root) / ACCEPTANCE
+    path = Path(root) / self.acceptance_path
     if path.is_symlink() or not path.is_file():
       raise ValueError("Boot-bound restore EFI recovery acceptance is missing or symlinked")
     metadata = path.stat()
@@ -282,7 +297,7 @@ class PostwriteRestoreEfiBackend(PostwriteEfiBackend):
     except json.JSONDecodeError as error:
       raise ValueError("Restore EFI recovery acceptance is malformed") from error
     expected = {
-      "kind": "postwrite-restore-efi-attended-s4-v1",
+      "kind": "postwrite-restore-efi-attended-s4-" + self.source_variable_version,
       "boot_id": boot_id,
       "transition_vector": vector,
       "module_sha256": self.expected_sha256,
@@ -291,6 +306,8 @@ class PostwriteRestoreEfiBackend(PostwriteEfiBackend):
       "method": "operator-attended-cold-power",
       "accepted": True,
     }
+    if self.source_variable_version == "v2":
+      expected["source_efi_variable"] = self.source_variable.name
     if record != expected:
       raise ValueError("Restore EFI recovery acceptance differs from this boot and vector")
     return hashlib.sha256(raw).hexdigest()
@@ -306,6 +323,7 @@ class PostwriteRestoreEfiBackend(PostwriteEfiBackend):
       "module_sha256": self.restore_module_sha256,
       "module_srcversion": self.restore_module_srcversion,
       "efi_variable": RESTORE_VARIABLE.name,
+      "source_efi_variable": self.source_variable.name,
     })
 
   def prearm(self, root, vector):

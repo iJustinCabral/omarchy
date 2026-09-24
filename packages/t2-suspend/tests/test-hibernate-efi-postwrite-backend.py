@@ -219,4 +219,78 @@ with tempfile.TemporaryDirectory(prefix="t2-postwrite-restore-backend-") as temp
   except ValueError as error:
     assert "Restore EFI module differs" in str(error)
 
+with tempfile.TemporaryDirectory(prefix="t2-postwrite-v2-backend-") as temporary:
+  root = Path(temporary)
+  module = root / "v2-source-marker.ko"
+  module.write_bytes(b"v2-source-marker")
+  module_hash = hashlib.sha256(module.read_bytes()).hexdigest()
+  write(root / "sys/power/pm_trace", "0\n")
+  old_path = root / backend_module.VARIABLE
+  old_path.parent.mkdir(parents=True)
+  old_value = backend_module.ATTRIBUTES + backend_module.MAGIC + b"old-vector!!" + b"\x04"
+  old_path.write_bytes(old_value)
+  parameters = root / backend_module.PARAMETERS
+  declared = ["v2"]
+
+  def command(arguments):
+    if arguments[:3] == ("modinfo", "-F", "vermagic"):
+      return RELEASE + " SMP preempt mod_unload\n"
+    if arguments[:3] == ("modinfo", "-F", "srcversion"):
+      return SRCVERSION + "\n"
+    if arguments[:3] == ("modinfo", "-F", "mba_postwrite_variable"):
+      return declared[0] + "\n"
+    if arguments == ("insmod", str(module)):
+      write(parameters / "arm_vector", "0\n")
+      write(parameters / "stage", "0\n")
+      write(parameters / "last_efi_status", "0\n")
+      return ""
+    if arguments == ("rmmod", backend_module.MODULE_NAME):
+      for path in parameters.iterdir():
+        path.unlink()
+      parameters.rmdir()
+      return ""
+    raise AssertionError("Unexpected command: " + repr(arguments))
+
+  def arm(_root, identity):
+    assert identity == VECTOR
+    write(parameters / "arm_vector", "1\n")
+
+  backend = backend_module.PostwriteEfiBackend(
+    module, module_hash, SRCVERSION, command=command,
+    kernel_release=RELEASE, parameter_writer=arm, source_variable_version="v2",
+  )
+  declared[0] = ""
+  try:
+    backend.require_kernel_available(root)
+    raise AssertionError("V2 backend accepted a module without V2 metadata")
+  except ValueError as error:
+    assert "does not declare the V2 variable" in str(error)
+  declared[0] = "v2"
+  backend.require_kernel_available(root)
+  assert backend.inspect(root, VECTOR) is None
+  acceptance = {
+    "kind": "postwrite-efi-attended-s4-v2",
+    "boot_id": BOOT_ID,
+    "transition_vector": VECTOR,
+    "module_sha256": module_hash,
+    "production_uki_sha256": "a" * 64,
+    "method": "operator-attended-cold-power",
+    "accepted": True,
+    "source_efi_variable": backend_module.V2_VARIABLE.name,
+  }
+  acceptance_path = root / backend_module.V2_ACCEPTANCE
+  write(acceptance_path, json.dumps(acceptance))
+  acceptance_path.chmod(0o600)
+  backend.require_operator_acceptance(root, VECTOR, BOOT_ID, "a" * 64)
+  attempt_directory = root / "var/lib/pair/s4-vectors" / VECTOR / "attempts" / BOOT_ID
+  write(attempt_directory.parent.parent / "s4-attempted", BOOT_ID + "\n")
+  write(attempt_directory / "attempt.json", json.dumps({"transition_vector": VECTOR, "boot_id": BOOT_ID}))
+  backend.before_arm(root, VECTOR, BOOT_ID, attempt_directory)
+  backend.enable(root)
+  assert Path(backend.prearm(root, VECTOR)) == root / backend_module.V2_VARIABLE
+  assert backend.inspect(root, VECTOR) == 0
+  assert old_path.read_bytes() == old_value
+  backend.cleanup(root, VECTOR, BOOT_ID, attempt_directory)
+  assert old_path.read_bytes() == old_value
+
 print("PASS: post-write EFI backend binds exact module, consumed guard, stage and attended recovery")

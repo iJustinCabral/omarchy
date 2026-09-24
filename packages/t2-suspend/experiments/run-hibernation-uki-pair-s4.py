@@ -77,7 +77,15 @@ def private_evidence(path, root, description):
   return S4.load_json_file(path, description)
 
 
-def verify_pair_test_resume_proof(root, evidence, post_input_path, source_directory, proof_source_directory, allow_matching_early_source=False):
+INPUT_EVENT_WAIVER = "operator-declined-manual-events-v1"
+
+
+def has_both_internal_inputs(evidence):
+  devices = evidence.get("devices")
+  return isinstance(devices, dict) and devices.get("internal_input_interfaces") == 2
+
+
+def verify_pair_test_resume_proof(root, evidence, post_input_path, source_directory, proof_source_directory, allow_matching_early_source=False, input_event_waiver=False):
   if Path(source_directory).resolve() != Path(proof_source_directory).resolve():
     raise ValueError("Pair test_resume proof must name this exact source image")
   source_hash = TEST.candidate_hash(evidence.get("source_uki_sha256"))
@@ -109,7 +117,7 @@ def verify_pair_test_resume_proof(root, evidence, post_input_path, source_direct
     "qualification": "pair-source-ordinary-boot-preflight-passed",
     "state": "returned-and-cleaned",
     "hibernate_attempted": True,
-    "physical_input_confirmed": True,
+    "physical_input_confirmed": not input_event_waiver,
     "hardware_qualified": False,
   }
   for key, value in expected.items():
@@ -117,6 +125,22 @@ def verify_pair_test_resume_proof(root, evidence, post_input_path, source_direct
       raise ValueError("Pair test_resume proof mismatch: " + key)
   if record.get("cleanup_errors"):
     raise ValueError("Pair test_resume proof has cleanup errors")
+  if input_event_waiver:
+    if post_input_path is not None:
+      raise ValueError("Input event waiver cannot be combined with post-test input evidence")
+    if record.get("input_event_waiver") != INPUT_EVENT_WAIVER:
+      raise ValueError("Pair test_resume proof lacks the exact input event waiver")
+    if not has_both_internal_inputs(record):
+      raise ValueError("Pair test_resume proof lacks both internal input interfaces")
+    return {
+      "test_resume_boot_id": proof_boot_id,
+      "test_resume_source_uki_sha256": source_hash,
+      "test_resume_attempt": str(attempt),
+      "test_resume_runtime_stack_sha256": evidence["runtime_stack_sha256"],
+      "input_event_waiver": INPUT_EVENT_WAIVER,
+    }
+  if post_input_path is None:
+    raise ValueError("Post-test_resume input evidence is required without an explicit waiver")
   post_path = S4.supplied_path(root, post_input_path)
   post_input = private_evidence(post_path, root, "Post-test_resume input evidence")
   if post_input.get("boot_id") != proof_boot_id or post_input.get("entry_id") != evidence["source_entry_id"]:
@@ -145,6 +169,7 @@ def preflight(
   current_input_verifier=S4.verify_current_input,
   require_efi_marker=False,
   marker_backend=MARKER,
+  input_event_waiver=False,
 ):
   if disk_mode not in ("platform", "shutdown"):
     raise ValueError("Unsupported cold-boot hibernation mode")
@@ -167,11 +192,24 @@ def preflight(
   if disk_mode == "platform" and selected_mode != "platform":
     raise ValueError("Platform hibernation is not selected")
 
-  proof = proof_verifier(
-    root, evidence, post_input_path, source_directory, proof_directory,
-    allow_matching_early_source=True,
-  )
-  current_input = current_input_verifier(root, evidence, pre_s4_input_path)
+  if input_event_waiver:
+    if post_input_path is not None or pre_s4_input_path is not None:
+      raise ValueError("Input event waiver cannot be combined with physical evidence")
+    if not has_both_internal_inputs(evidence):
+      raise ValueError("Input event waiver still requires both current internal interfaces")
+    proof = proof_verifier(
+      root, evidence, post_input_path, source_directory, proof_directory,
+      allow_matching_early_source=True, input_event_waiver=True,
+    )
+    current_input = {"input_event_waiver": INPUT_EVENT_WAIVER}
+  else:
+    proof = proof_verifier(
+      root, evidence, post_input_path, source_directory, proof_directory,
+      allow_matching_early_source=True,
+    )
+    if pre_s4_input_path is None:
+      raise ValueError("Pre-S4 input evidence is required without an explicit waiver")
+    current_input = current_input_verifier(root, evidence, pre_s4_input_path)
   vector = pair_vector(receipt)
   attempts, guard = vector_paths(root, vector)
   if guard.exists() or attempts.exists():
@@ -195,7 +233,7 @@ def preflight(
     **evidence,
     **proof,
     **current_input,
-    "physical_input_confirmed": True,
+    "physical_input_confirmed": not input_event_waiver,
     "transition_vector": vector,
     "requested_disk_mode": disk_mode,
     "s4_attempts": str(attempts),
@@ -226,6 +264,7 @@ def execute(
   restore_disarmer=PAIR.disarm_restore,
   marker_backend=MARKER,
   operator_attended=False,
+  input_event_waiver=False,
 ):
   evidence = preflight(
     root, source_directory, restore_directory, proof_directory,
@@ -233,6 +272,7 @@ def execute(
     platform_preflight, proof_verifier, current_input_verifier,
     require_efi_marker=True,
     marker_backend=marker_backend,
+    input_event_waiver=input_event_waiver,
   )
   if getattr(marker_backend, "NAME", None) == "rtc" and not getattr(marker_backend, "EXECUTION_QUALIFIED", False):
     raise ValueError("RTC marker did not survive the MacBookAir9,1 forced-power return; this backend cannot qualify another S4 execution")
@@ -407,8 +447,9 @@ def main():
   parser.add_argument("--source", type=Path, required=True)
   parser.add_argument("--restore", type=Path, required=True)
   parser.add_argument("--test-resume-proof-source", type=Path, required=True)
-  parser.add_argument("--post-resume-input-evidence", type=Path, required=True)
-  parser.add_argument("--pre-s4-input-evidence", type=Path, required=True)
+  parser.add_argument("--post-resume-input-evidence", type=Path)
+  parser.add_argument("--pre-s4-input-evidence", type=Path)
+  parser.add_argument("--waive-input-events", action="store_true", help="record the operator's explicit choice to skip manual keyboard/trackpad events")
   parser.add_argument("--disk-mode", choices=("platform", "shutdown"), required=True)
   parser.add_argument("--validate-only", action="store_true")
   parser.add_argument("--execute", action="store_true")
@@ -421,6 +462,7 @@ def main():
   parser.add_argument("--expected-ftrace-efi-marker-sha256")
   parser.add_argument("--expected-ftrace-efi-marker-srcversion")
   parser.add_argument("--postwrite-efi-marker-module", type=Path)
+  parser.add_argument("--postwrite-source-marker-version", choices=("v1", "v2"), default="v1")
   parser.add_argument("--expected-postwrite-efi-marker-sha256")
   parser.add_argument("--expected-postwrite-efi-marker-srcversion")
   parser.add_argument("--restore-efi-marker-module", type=Path)
@@ -431,6 +473,11 @@ def main():
     parser.error("select exactly one of --validate-only or --execute")
   if arguments.execute and arguments.expected_pair_vector is None:
     parser.error("--execute requires --expected-pair-vector")
+  if arguments.waive_input_events:
+    if arguments.post_resume_input_evidence is not None or arguments.pre_s4_input_evidence is not None:
+      parser.error("--waive-input-events cannot be combined with physical input evidence")
+  elif arguments.post_resume_input_evidence is None or arguments.pre_s4_input_evidence is None:
+    parser.error("both input evidence paths are required without --waive-input-events")
   if arguments.marker_backend == "rtc":
     if arguments.rtc_marker_module is None or arguments.expected_rtc_marker_sha256 is None:
       parser.error("RTC backend requires --rtc-marker-module and --expected-rtc-marker-sha256")
@@ -460,6 +507,7 @@ def main():
         arguments.postwrite_efi_marker_module,
         arguments.expected_postwrite_efi_marker_sha256,
         arguments.expected_postwrite_efi_marker_srcversion,
+        source_variable_version=arguments.postwrite_source_marker_version,
       )
     elif all(value is not None for value in restore_options):
       marker_backend = POSTWRITE.PostwriteRestoreEfiBackend(
@@ -467,6 +515,7 @@ def main():
         arguments.expected_postwrite_efi_marker_sha256,
         arguments.expected_postwrite_efi_marker_srcversion,
         *restore_options,
+        source_variable_version=arguments.postwrite_source_marker_version,
       )
     else:
       parser.error("Restore EFI backend requires exact module path, SHA-256 and source version together")
@@ -478,6 +527,8 @@ def main():
     parser.error("Ftrace EFI module arguments require --marker-backend ftrace-efi")
   if arguments.marker_backend != "postwrite-efi" and (arguments.postwrite_efi_marker_module is not None or arguments.expected_postwrite_efi_marker_sha256 is not None or arguments.expected_postwrite_efi_marker_srcversion is not None):
     parser.error("Post-write EFI module arguments require --marker-backend postwrite-efi")
+  if arguments.marker_backend != "postwrite-efi" and arguments.postwrite_source_marker_version != "v1":
+    parser.error("Post-write source marker version requires --marker-backend postwrite-efi")
   if arguments.marker_backend != "postwrite-efi" and (arguments.restore_efi_marker_module is not None or arguments.expected_restore_efi_marker_sha256 is not None or arguments.expected_restore_efi_marker_srcversion is not None):
     parser.error("Restore EFI module arguments require --marker-backend postwrite-efi")
   if arguments.operator_attended and arguments.marker_backend != "postwrite-efi":
@@ -493,9 +544,9 @@ def main():
     )
     if arguments.validate_only:
       S4.verify_services()
-      result = preflight(*paths, require_efi_marker=arguments.marker_backend in ("rtc", "ftrace-efi", "postwrite-efi"), marker_backend=marker_backend)
+      result = preflight(*paths, require_efi_marker=arguments.marker_backend in ("rtc", "ftrace-efi", "postwrite-efi"), marker_backend=marker_backend, input_event_waiver=arguments.waive_input_events)
     else:
-      result = execute(*paths, arguments.expected_pair_vector, marker_backend=marker_backend, operator_attended=arguments.operator_attended)
+      result = execute(*paths, arguments.expected_pair_vector, marker_backend=marker_backend, operator_attended=arguments.operator_attended, input_event_waiver=arguments.waive_input_events)
   except (OSError, RuntimeError, ValueError) as error:
     raise SystemExit("Pair cold-boot hibernation refused: " + str(error)) from error
   print(json.dumps(result, indent=2, sort_keys=True))

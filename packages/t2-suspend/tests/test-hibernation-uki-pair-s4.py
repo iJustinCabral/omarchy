@@ -122,6 +122,7 @@ def platform_preflight(root, _source, _restore):
     "resume": "254:0",
     "resume_offset": 42,
     "swap_file": "/swap/swapfile",
+    "devices": {"internal_input_interfaces": 2},
   }
 
 
@@ -723,5 +724,111 @@ with tempfile.TemporaryDirectory(prefix="t2-pair-s4-") as temporary:
   assert (root / pair_s4.POSTWRITE.RESTORE_VARIABLE).is_file()
   assert events.index(("marker-command", ("insmod", str(source_module)))) < events.index(
     ("command", ("bootctl", "set-oneshot", receipt["images"]["restore"]["entry_id"])))
+
+  root, source, restore, proof, receipt, _power = fixture(base / "v2-retains-old-marker")
+  vector = pair_s4.pair_vector(receipt)
+  old_marker = root / pair_s4.POSTWRITE.VARIABLE
+  old_marker.parent.mkdir(parents=True, exist_ok=True)
+  old_value = pair_s4.POSTWRITE.ATTRIBUTES + pair_s4.POSTWRITE.MAGIC + bytes.fromhex(("f" * 64)[:24]) + b"\x04"
+  old_marker.write_bytes(old_value)
+  source_module = root / "v2-source-marker.ko"
+  restore_module = root / "restore-marker.ko"
+  source_module.write_bytes(b"source EFI module v2")
+  restore_module.write_bytes(b"restore EFI module")
+  source_hash = hashlib.sha256(source_module.read_bytes()).hexdigest()
+  restore_hash = hashlib.sha256(restore_module.read_bytes()).hexdigest()
+  restore_version = "3119365A09AED2D4CD65DD6"
+
+  def v2_module_info(arguments):
+    if arguments[:3] == ("modinfo", "-F", "vermagic"):
+      return "7.2.6-arch2-Watanare-T2-2-t2 SMP preempt mod_unload\n"
+    if arguments[:3] == ("modinfo", "-F", "srcversion"):
+      return (restore_version if arguments[3] == str(restore_module) else "19F05361B80C3D339C2B0E4") + "\n"
+    if arguments[:3] == ("modinfo", "-F", "mba_postwrite_variable"):
+      return "v2\n"
+    raise AssertionError("Unexpected module metadata query: " + repr(arguments))
+
+  marker = pair_s4.POSTWRITE.PostwriteRestoreEfiBackend(
+    source_module, source_hash, "19F05361B80C3D339C2B0E4",
+    restore_module, restore_hash, restore_version,
+    command=v2_module_info, kernel_release="7.2.6-arch2-Watanare-T2-2-t2",
+    source_variable_version="v2",
+  )
+  original_load_candidate = pair_s4.PAIR.AUDIT.load_candidate
+  pair_s4.PAIR.AUDIT.load_candidate = lambda directory, role: {
+    "restore_marker": {"sha256": restore_hash, "srcversion": restore_version}
+  } if directory == restore and role == "restore" else None
+  try:
+    ready = pair_s4.preflight(
+      root, source, restore, proof, Path("proof/post-input.json"), Path("proof/pre-input.json"), "platform",
+      platform_preflight, proof_verifier, input_verifier,
+      require_efi_marker=True, marker_backend=marker,
+    )
+  finally:
+    pair_s4.PAIR.AUDIT.load_candidate = original_load_candidate
+  assert ready["transition_vector"] == vector
+  assert marker.inspect(root, vector) is None
+  assert old_marker.read_bytes() == old_value
+
+  root, source, restore, _proof, receipt, _power = fixture(base / "input-waiver")
+  evidence = platform_preflight(root, source, restore)
+  source_hash = evidence["source_uki_sha256"]
+  proof_directory = root / pair.STATE / "test-resume-vectors" / source_hash
+  guard = proof_directory / "test-resume-attempted"
+  write(guard, BOOT_ID + "\n")
+  guard.chmod(0o600)
+  attempt = proof_directory / "attempts" / BOOT_ID / "attempt.json"
+  waived_record = {
+    "boot_id": BOOT_ID,
+    "entry_id": evidence["source_entry_id"],
+    "candidate_uki_sha256": source_hash,
+    "source_uki_sha256": source_hash,
+    "restore_uki_sha256": evidence["restore_uki_sha256"],
+    "runtime_stack_sha256": evidence["runtime_stack_sha256"],
+    "cmdline_sha256": evidence["cmdline_sha256"],
+    "kernel_release": evidence["kernel_release"],
+    "transition_vector": source_hash,
+    "qualification": "pair-source-ordinary-boot-preflight-passed",
+    "state": "returned-and-cleaned",
+    "hibernate_attempted": True,
+    "physical_input_confirmed": False,
+    "input_event_waiver": pair_s4.INPUT_EVENT_WAIVER,
+    "devices": {"internal_input_interfaces": 2},
+    "hardware_qualified": False,
+  }
+  write(attempt, json.dumps(waived_record))
+  attempt.chmod(0o600)
+  waived = pair_s4.verify_pair_test_resume_proof(
+    root, evidence, None, source, source, True, input_event_waiver=True,
+  )
+  assert waived["input_event_waiver"] == pair_s4.INPUT_EVENT_WAIVER
+  result = pair_s4.preflight(
+    root, source, restore, source, None, None, "platform",
+    platform_preflight=platform_preflight, input_event_waiver=True,
+  )
+  assert result["physical_input_confirmed"] is False
+  assert result["real_s4_attempted"] is False
+  assert result["input_event_waiver"] == pair_s4.INPUT_EVENT_WAIVER
+  for post, pre in ((Path("post.json"), None), (None, Path("pre.json"))):
+    try:
+      pair_s4.preflight(root, source, restore, source, post, pre, "platform", platform_preflight=platform_preflight, input_event_waiver=True)
+      raise AssertionError("Waiver accepted physical input paths")
+    except ValueError as error:
+      assert "cannot be combined" in str(error)
+  for key, changed in (("input_event_waiver", "wrong-waiver"), ("physical_input_confirmed", True), ("devices", {"internal_input_interfaces": 1})):
+    bad = {**waived_record, key: changed}
+    write(attempt, json.dumps(bad))
+    try:
+      pair_s4.verify_pair_test_resume_proof(root, evidence, None, source, source, True, input_event_waiver=True)
+      raise AssertionError("Invalid waiver proof was accepted: " + key)
+    except ValueError:
+      pass
+  write(attempt, json.dumps(waived_record))
+  evidence["devices"] = {"internal_input_interfaces": 1}
+  try:
+    pair_s4.preflight(root, source, restore, source, None, None, "platform", platform_preflight=lambda *_args: evidence, input_event_waiver=True)
+    raise AssertionError("Waiver accepted missing current input interface")
+  except ValueError as error:
+    assert "both current internal interfaces" in str(error)
 
 print("PASS: pair S4 runner binds proof and pair-wide guard, arms only restore, and clears a failed one-shot")

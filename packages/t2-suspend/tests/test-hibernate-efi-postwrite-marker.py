@@ -10,6 +10,8 @@ import tempfile
 root = Path(__file__).resolve().parents[1] / "experiments/hibernate-efi-postwrite-marker"
 source = (root / "mba_hibernate_efi_postwrite_marker.c").read_text()
 assert 'L"OmarchyT2PostwriteStage"' in source
+assert '#ifdef MBA_POSTWRITE_SOURCE_MARKER_V2\nstatic efi_char16_t marker_name[] = L"OmarchyT2PostwriteStageV2";' in source
+assert 'MODULE_INFO(mba_postwrite_variable, "v2")' in source
 assert 'EFI_GUID(0x47a2fceb, 0x87bc, 0x4e58, 0x8d, 0x83, 0x23, 0xf6, 0x2f, 0xfb, 0x33, 0x93)' in source
 assert 'FTRACE_OPS_FL_IPMODIFY' not in source
 assert 'if (READ_ONCE(armed))\n    return -EPERM;' in source
