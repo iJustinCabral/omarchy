@@ -436,6 +436,20 @@ with tempfile.TemporaryDirectory(prefix="t2-pair-s4-") as temporary:
   assert not (root / pair_s4.VECTORS / vector).exists()
   assert not (root / pair.SINGLE.ONESHOT).exists()
   assert ("wifi", "prepare") not in events and ("power", "unexpected") not in events
+  rtc.NAME = "ftrace-efi"
+  try:
+    pair_s4.execute(
+      *inputs, vector, platform_preflight, proof_verifier, input_verifier,
+      wifi_prepare=lambda _root: events.append(("wifi", "prepare")),
+      power_writer=lambda _path, _value: events.append(("power", "unexpected")),
+      services_verifier=lambda _runner: None, marker_backend=rtc,
+    )
+    raise AssertionError("Unqualified ftrace EFI backend entered the S4 transaction")
+  except ValueError as error:
+    assert "lacks forced-power persistence and independent recovery proof" in str(error)
+  assert not (root / pair_s4.VECTORS / vector).exists()
+  assert ("wifi", "prepare") not in events and ("power", "unexpected") not in events
+  rtc.NAME = "rtc"
   rtc.EXECUTION_QUALIFIED = True
   events.clear()
 
