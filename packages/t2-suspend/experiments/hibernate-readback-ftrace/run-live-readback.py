@@ -368,8 +368,10 @@ def execute(*, operator_attended=False):
     if swap_active:
       try:
         alternate_signature = HEADER.read_header(DEVICE, arm["alternate_offset"])["marker"]
-        if alternate_signature == "normal-swap-signature":
+        if alternate_signature == "normal-swap-signature" and not (STATE / "pm-enter-intent.json").exists():
           command("swapoff", str(SWAP_FILE))
+        elif alternate_signature == "normal-swap-signature":
+          errors.append("alternate swap retains hibernation slots; leave active until stock reboot")
         else:
           errors.append("alternate swap header is not normal; preserving active swap")
       except (OSError, ValueError, subprocess.SubprocessError) as error:

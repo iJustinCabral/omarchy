@@ -50,7 +50,8 @@ assert 'result["observed_stage"] == 2' in execute
 assert 'result["interceptions"] == 1' in execute
 assert 'stock_after["page_sha256"] == arm["stock_header"]["page_sha256"]' in execute
 assert execute.index('write_resume_offset(STOCK_OFFSET)') < execute.index('command("swapoff", str(SWAP_FILE))')
-assert 'if alternate_signature == "normal-swap-signature":' in execute
+assert 'if alternate_signature == "normal-swap-signature" and not (STATE / "pm-enter-intent.json").exists():' in execute
+assert 'alternate swap retains hibernation slots; leave active until stock reboot' in execute
 assert '"alternate_swap_active": str(SWAP_FILE) in active_swap_paths()' in execute
 
 print("PASS: separate swap readback runner guards one-use PM entry and restores the stock offset")
