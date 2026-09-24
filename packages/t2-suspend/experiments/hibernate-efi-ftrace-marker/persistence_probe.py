@@ -42,7 +42,7 @@ def command_output(*arguments):
   return subprocess.run(arguments, check=True, capture_output=True, text=True).stdout
 
 
-def require_live_stock(root, *, allow_marker_module=False):
+def require_live_stock(root, *, allow_marker_module=False, allow_stage_marker=False):
   if os.geteuid() != 0:
     raise ValueError("Live EFI probe requires root")
   if command_output("findmnt", "-no", "SOURCE,FSTYPE", "/").strip() != "/dev/mapper/root[/@] btrfs":
@@ -58,7 +58,7 @@ def require_live_stock(root, *, allow_marker_module=False):
       raise ValueError("An EFI boot-entry override exists")
   if not allow_marker_module and ((root / MARKER_MODULE).exists() or (root / MARKER_MODULE).is_symlink()):
     raise ValueError("Experimental EFI marker module is loaded")
-  if read_regular(root / STAGE_VARIABLE) is not None:
+  if not allow_stage_marker and read_regular(root / STAGE_VARIABLE) is not None:
     raise ValueError("A real S4 EFI stage marker exists")
   if read_regular(root / "sys/power/pm_trace") != b"0\n":
     raise ValueError("PM tracing is not disabled")

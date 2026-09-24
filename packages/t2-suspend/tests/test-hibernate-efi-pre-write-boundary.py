@@ -41,7 +41,11 @@ refused(lambda: probe.expected({**arm, "marker_module_sha256": "0" * 64}, 0), "i
 refused(lambda: probe.expected({**arm, "stage2_sha256": "0" * 64}, 2), "stage digest differs")
 
 source = script.read_text()
+armed_validation = source.split("def validate_armed_live():", 1)[1].split("\ndef execute_live(", 1)[0]
 execute = source.split("def execute_live(", 1)[1].split("\ndef main():", 1)[0]
+assert 'allow_stage_marker=True' in armed_validation
+assert armed_validation.index('COMMON.read_regular(MARKER.marker_path(root)) != expected(arm, 0)') < armed_validation.index('"pm-attempted.json"')
+assert 'arm = validate_armed_live()' in execute
 assert execute.index('"pm-attempted.json"') < execute.index('subprocess.run(["insmod", str(MARKER_MODULE)]')
 assert execute.index('str(MARKER_MODULE)]') < execute.index('str(ABORT_MODULE)]')
 assert execute.index('"arm_vector").write_text') < execute.index('"armed").write_text("Y\\n")')

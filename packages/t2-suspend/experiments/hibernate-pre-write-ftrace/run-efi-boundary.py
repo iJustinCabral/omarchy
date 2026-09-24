@@ -180,11 +180,9 @@ def parameter(base, name):
   return value.strip().decode()
 
 
-def execute_live(*, operator_attended=False):
-  if not operator_attended:
-    raise ValueError("The one-use PM boundary requires an operator at the power button")
+def validate_armed_live():
   root = Path("/")
-  COMMON.require_live_stock(root, allow_marker_module=True)
+  COMMON.require_live_stock(root, allow_marker_module=True, allow_stage_marker=True)
   COMMON.require_live_arm_preflight(root)
   arm = COMMON.load_json(root / STATE / "armed.json", root)
   if arm["boot_id"] != COMMON.boot_id(root) or arm["head"] != run("git", "-C", str(HELPER.parents[1]), "rev-parse", "HEAD"):
@@ -203,6 +201,14 @@ def execute_live(*, operator_attended=False):
     raise ValueError("Swap header changed since the boundary arm")
   if selected(root, "pm_test") != "none" or selected(root, "disk") != "platform":
     raise ValueError("PM controls changed since the boundary arm")
+  return arm
+
+
+def execute_live(*, operator_attended=False):
+  if not operator_attended:
+    raise ValueError("The one-use PM boundary requires an operator at the power button")
+  root = Path("/")
+  arm = validate_armed_live()
   command = [str(HELPER), "test", "test-resume", "--bluetooth-off", "--wifi-unbind",
              "--no-sudo-prompt", "--yes"]
   COMMON.atomic_new_json(root / STATE / "pm-attempted.json", {
@@ -293,6 +299,7 @@ def main():
   mode = parser.add_mutually_exclusive_group(required=True)
   mode.add_argument("--validate-only", action="store_true")
   mode.add_argument("--prepare", action="store_true")
+  mode.add_argument("--validate-armed", action="store_true")
   mode.add_argument("--execute", action="store_true")
   parser.add_argument("--operator-attended", action="store_true")
   arguments = parser.parse_args()
@@ -302,6 +309,8 @@ def main():
     result = validate_live()
   elif arguments.prepare:
     result = prepare_live()
+  elif arguments.validate_armed:
+    result = validate_armed_live()
   else:
     result = execute_live(operator_attended=arguments.operator_attended)
   print(json.dumps(result, indent=2, sort_keys=True))
