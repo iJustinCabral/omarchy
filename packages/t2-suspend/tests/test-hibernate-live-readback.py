@@ -32,6 +32,8 @@ assert finish.index('alternate = swap_offset(SWAP_FILE)') < finish.index('COMMON
 assert 'alternate == STOCK_OFFSET' in finish
 assert 'evidence = validate_stock(prepared=True)' in recover
 assert '"prepare-intent.json"' in recover and 'return finish_preparation(evidence)' in recover
+assert 'not matching_intent_head(intent, evidence)' in recover
+assert 'EARLY_PREPARE_INTENT_SHA256' in source
 assert 'str(SWAP_FILE) in active_swap_paths()' in validate
 assert '(STATE / "pm-attempted.json").exists()' in validate
 assert 'arm.get("alternate_offset") != swap_offset(SWAP_FILE)' in validate

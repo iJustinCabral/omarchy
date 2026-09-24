@@ -39,6 +39,8 @@ MARKER_SHA256 = "28e13ee2a660c590d0d66988c0af9d768aa5a37e2e2ed52624215f624b149f3
 ABORT_SHA256 = "1d524ff4ca53980be38654f3f872fe3d82b725baac5fd6c9dbc86306db9aba39"
 MARKER_SRCVERSION = "693755E32EFAB59747D2ED1"
 ABORT_SRCVERSION = "7DCE0D2BAF567A1426BAD50"
+EARLY_PREPARED_HEAD = "6a465d16fc574e96bde67a7df34c64d80ba889b0"
+EARLY_PREPARE_INTENT_SHA256 = "fb86cf4ad8664cb6258df33160d41bda2dd35c96336bb0b94cee11fcc889b1bf"
 MARKER_PARAMETERS = Path("/sys/module/mba_hibernate_efi_ftrace_marker/parameters")
 ABORT_PARAMETERS = Path("/sys/module/mba_hibernate_readback_abort/parameters")
 HELPER = Path(__file__).resolve().parents[4] / "bin/omarchy-debug-t2-hibernate"
@@ -187,6 +189,13 @@ def finish_preparation(evidence):
   return {"boot_id": arm["boot_id"], "vector": vector, "alternate_offset": alternate}
 
 
+def matching_intent_head(intent, evidence):
+  if intent.get("head") == evidence["head"]:
+    return True
+  return (intent.get("head") == EARLY_PREPARED_HEAD and
+          COMMON.sha256_file(STATE / "prepare-intent.json") == EARLY_PREPARE_INTENT_SHA256)
+
+
 def prepare():
   evidence = validate_stock()
   if int(command("df", "--output=avail", "-B1", str(SWAP_FILE.parent)).splitlines()[-1]) < 16 * 1024**3:
@@ -208,7 +217,7 @@ def recover_preparation():
   intent = COMMON.load_json(STATE / "prepare-intent.json", Path("/"))
   if (intent.get("kind") != KIND + "-prepare-intent" or
       intent.get("boot_id") != evidence["boot_id"] or
-      intent.get("head") != evidence["head"] or
+      not matching_intent_head(intent, evidence) or
       intent.get("swap_file") != str(SWAP_FILE) or
       intent.get("stock_offset") != STOCK_OFFSET or
       intent.get("stock_header", {}).get("page_sha256") != evidence["stock_header"]["page_sha256"]):
@@ -222,7 +231,7 @@ def validate_armed():
   intent = COMMON.load_json(STATE / "prepare-intent.json", Path("/"))
   if (arm["boot_id"] != evidence["boot_id"] or arm["head"] != evidence["head"] or
       intent.get("kind") != KIND + "-prepare-intent" or
-      intent["boot_id"] != evidence["boot_id"] or intent["head"] != evidence["head"] or
+      intent["boot_id"] != evidence["boot_id"] or not matching_intent_head(intent, evidence) or
       intent.get("swap_file") != str(SWAP_FILE) or arm.get("swap_file") != str(SWAP_FILE) or
       intent.get("stock_offset") != STOCK_OFFSET or
       intent.get("stock_header", {}).get("page_sha256") != evidence["stock_header"]["page_sha256"] or
