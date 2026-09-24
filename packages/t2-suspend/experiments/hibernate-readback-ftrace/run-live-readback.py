@@ -160,19 +160,14 @@ def expected_marker(arm, stage):
   return value
 
 
-def prepare():
-  evidence = validate_stock()
-  if int(command("df", "--output=avail", "-B1", str(SWAP_FILE.parent)).splitlines()[-1]) < 16 * 1024**3:
-    raise ValueError("Less than 16 GiB free for the 10 GiB diagnostic swapfile")
-  STATE.mkdir(mode=0o700)
-  COMMON.atomic_new_json(STATE / "prepare-intent.json", {
-    "kind": KIND + "-prepare-intent", "boot_id": evidence["boot_id"],
-    "head": evidence["head"], "swap_file": str(SWAP_FILE),
-    "stock_offset": STOCK_OFFSET, "stock_header": evidence["stock_header"],
-  })
-  command("btrfs", "filesystem", "mkswapfile", "--size", "10G", str(SWAP_FILE))
-  if SWAP_FILE.is_symlink() or SWAP_FILE.stat().st_uid != 0 or SWAP_FILE.stat().st_mode & 0o077:
-    raise ValueError("New swapfile is not root-owned and private")
+def finish_preparation(evidence):
+  if (STATE / "armed.json").exists() or (STATE / "pm-attempted.json").exists():
+    raise ValueError("Preparation or PM guard already exists")
+  descriptor = os.open(SWAP_FILE, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+  try:
+    os.fsync(descriptor)
+  finally:
+    os.close(descriptor)
   alternate = swap_offset(SWAP_FILE)
   if alternate == STOCK_OFFSET:
     raise ValueError("Alternate swapfile maps to the stock resume page")
@@ -190,6 +185,35 @@ def prepare():
       MARKER.ATTRIBUTES + MARKER.payload(vector, stage)).hexdigest()
   COMMON.atomic_new_json(STATE / "armed.json", arm)
   return {"boot_id": arm["boot_id"], "vector": vector, "alternate_offset": alternate}
+
+
+def prepare():
+  evidence = validate_stock()
+  if int(command("df", "--output=avail", "-B1", str(SWAP_FILE.parent)).splitlines()[-1]) < 16 * 1024**3:
+    raise ValueError("Less than 16 GiB free for the 10 GiB diagnostic swapfile")
+  STATE.mkdir(mode=0o700)
+  COMMON.atomic_new_json(STATE / "prepare-intent.json", {
+    "kind": KIND + "-prepare-intent", "boot_id": evidence["boot_id"],
+    "head": evidence["head"], "swap_file": str(SWAP_FILE),
+    "stock_offset": STOCK_OFFSET, "stock_header": evidence["stock_header"],
+  })
+  command("btrfs", "filesystem", "mkswapfile", "--size", "10G", str(SWAP_FILE))
+  if SWAP_FILE.is_symlink() or SWAP_FILE.stat().st_uid != 0 or SWAP_FILE.stat().st_mode & 0o077:
+    raise ValueError("New swapfile is not root-owned and private")
+  return finish_preparation(evidence)
+
+
+def recover_preparation():
+  evidence = validate_stock(prepared=True)
+  intent = COMMON.load_json(STATE / "prepare-intent.json", Path("/"))
+  if (intent.get("kind") != KIND + "-prepare-intent" or
+      intent.get("boot_id") != evidence["boot_id"] or
+      intent.get("head") != evidence["head"] or
+      intent.get("swap_file") != str(SWAP_FILE) or
+      intent.get("stock_offset") != STOCK_OFFSET or
+      intent.get("stock_header", {}).get("page_sha256") != evidence["stock_header"]["page_sha256"]):
+    raise ValueError("Incomplete preparation does not match this stock boot")
+  return finish_preparation(evidence)
 
 
 def validate_armed():
@@ -365,6 +389,7 @@ def main():
   modes = parser.add_mutually_exclusive_group(required=True)
   modes.add_argument("--validate-only", action="store_true")
   modes.add_argument("--prepare", action="store_true")
+  modes.add_argument("--recover-preparation", action="store_true")
   modes.add_argument("--validate-armed", action="store_true")
   modes.add_argument("--execute", action="store_true")
   parser.add_argument("--operator-attended", action="store_true")
@@ -375,6 +400,8 @@ def main():
     result = validate_stock()
   elif arguments.prepare:
     result = prepare()
+  elif arguments.recover_preparation:
+    result = recover_preparation()
   elif arguments.validate_armed:
     result = validate_armed()
   else:

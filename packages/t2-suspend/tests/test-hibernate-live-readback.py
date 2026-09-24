@@ -18,14 +18,20 @@ else:
   raise AssertionError("Live image-I/O execution accepted without an operator gate")
 
 source = script.read_text()
-prepare = source.split("def prepare():", 1)[1].split("\ndef validate_armed():", 1)[0]
+finish = source.split("def finish_preparation(", 1)[1].split("\ndef prepare():", 1)[0]
+prepare = source.split("def prepare():", 1)[1].split("\ndef recover_preparation():", 1)[0]
+recover = source.split("def recover_preparation():", 1)[1].split("\ndef validate_armed():", 1)[0]
 validate = source.split("def validate_armed():", 1)[1].split("\ndef require_hooks():", 1)[0]
 execute = source.split("def execute(", 1)[1].split("\ndef main():", 1)[0]
 
 assert prepare.index("evidence = validate_stock()") < prepare.index('STATE.mkdir(mode=0o700)')
 assert prepare.index('"prepare-intent.json"') < prepare.index('"mkswapfile"')
-assert prepare.index('"mkswapfile"') < prepare.index('"armed.json"')
-assert 'alternate == STOCK_OFFSET' in prepare
+assert prepare.index('"mkswapfile"') < prepare.index('return finish_preparation(evidence)')
+assert finish.index('os.fsync(descriptor)') < finish.index('alternate = swap_offset(SWAP_FILE)')
+assert finish.index('alternate = swap_offset(SWAP_FILE)') < finish.index('COMMON.atomic_new_json(STATE / "armed.json"')
+assert 'alternate == STOCK_OFFSET' in finish
+assert 'evidence = validate_stock(prepared=True)' in recover
+assert '"prepare-intent.json"' in recover and 'return finish_preparation(evidence)' in recover
 assert 'str(SWAP_FILE) in active_swap_paths()' in validate
 assert '(STATE / "pm-attempted.json").exists()' in validate
 assert 'arm.get("alternate_offset") != swap_offset(SWAP_FILE)' in validate
