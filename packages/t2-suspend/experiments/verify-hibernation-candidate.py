@@ -27,6 +27,7 @@ PATCHES = (
   "0009-t2bce-ave-hibernation-idle.patch",
   "0010-t2bce-block-dma-before-queue-drop.patch",
   "0011-t2bce-wake-before-device-noirq.patch",
+  "0013-t2bce-quarantine-vhci-command-timeout.patch",
 )
 
 
@@ -135,6 +136,7 @@ def run_candidate_regressions(candidate):
     ("test-dma-quiesce.py", core, header, bluetooth),
     ("test-cold-s4-rebuild.py", candidate),
     ("test-syscore-early-wake.py", candidate),
+    ("test-vhci-command-timeout.py", candidate),
     ("test-shared-pci-pm-serialization.py", candidate),
     ("test-ave-hibernation-idle.py", candidate),
     ("test-wifi-hibernate-isolation.py",),

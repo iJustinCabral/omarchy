@@ -2,6 +2,12 @@
 
 These patches are not part of `manifest.json`, normal source preparation, DKMS installation, or any automatic migration. They are diagnostic candidates, not qualified fixes. Do not install them over managed modules or bypass the boot-image source-version guard.
 
+## VHCI command timeout quarantine
+
+The v9 successful `test_resume` journal contains 25 VHCI cancellation-timeout warnings during virtual USB teardown. This does not establish the cause of the later cold-S4 or v11 source failures, but source review found a definite waiter-lifetime bug: if a timed-out command cannot reserve a cancellation slot, the old code returns with `completion.result` still pointing to its caller's stack. Patch `0013-t2bce-quarantine-vhci-command-timeout.patch` clears that pointer under the completion lock and quarantines the queue after a failed cancellation reservation, an unacknowledged cancellation or a mismatched reply. Subsequent commands fail until the no-state rebuild creates a new queue; normal successful commands remain unchanged.
+
+The candidate verifier applies this patch after experiment 0011. Its extracted-C fault harness exercises a late reply after the failed-reservation return, retries on the quarantined queue, cancellation timeout, mismatched reply and normal success. Full pinned-source reconstruction, candidate regressions and all ten `W=1` module builds passed for 7.2.6; the private output remains outside `/boot` with `installed=false` and `hardware_qualified=false`. This is an offline memory-safety repair and a new candidate identity, not evidence of working hibernation or permission to replay a consumed test.
+
 ## BCE restore-entry abort
 
 `0001-bce-abort-image-restore-probe.patch` applies to the prepared 1.4 BCE core source. Its read-only load-time parameter `hibernate_restore_abort` defaults to false. With it enabled, only the image `.restore` callback returns `-ECANCELED` before invoking `t2bce_resume`; ordinary suspend/resume and freeze/thaw retain their original callbacks. The diagnostic intentionally does not restore BCE, so internal input and audio may fail until reboot. It must not be presented as usable hibernation.
