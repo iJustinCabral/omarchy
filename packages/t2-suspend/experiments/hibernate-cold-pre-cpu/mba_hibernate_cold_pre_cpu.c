@@ -73,7 +73,8 @@ module_param_cb(arm_prefix, &arm_prefix_ops, NULL, 0600);
 
 static struct ftrace_ops cold_ops = {
   .func = mba_cold_hook,
-  .flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_RECURSION | FTRACE_OPS_FL_IPMODIFY,
+  .flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_RECURSION | FTRACE_OPS_FL_IPMODIFY |
+           FTRACE_OPS_FL_PERMANENT,
 };
 
 static int __init mba_cold_init(void)
@@ -105,4 +106,5 @@ static void __exit mba_cold_exit(void)
 module_init(mba_cold_init);
 module_exit(mba_cold_exit);
 MODULE_LICENSE("GPL");
+MODULE_INFO(mba_cold_permanent, "v1");
 MODULE_DESCRIPTION("One-use cold-restore abort before secondary CPU disable; no EFI callbacks");

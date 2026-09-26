@@ -87,7 +87,8 @@ module_param_cb(arm_prefix, &arm_prefix_ops, NULL, 0600);
 
 static struct ftrace_ops pre_syscore_ops = {
   .func = mba_pre_syscore_hook,
-  .flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_RECURSION | FTRACE_OPS_FL_IPMODIFY,
+  .flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_RECURSION | FTRACE_OPS_FL_IPMODIFY |
+           FTRACE_OPS_FL_PERMANENT,
 };
 
 static int __init mba_pre_syscore_init(void)
@@ -121,4 +122,5 @@ module_init(mba_pre_syscore_init);
 module_exit(mba_pre_syscore_exit);
 MODULE_LICENSE("GPL");
 MODULE_INFO(mba_cold_boundary, "pre-syscore-v1");
+MODULE_INFO(mba_cold_permanent, "v1");
 MODULE_DESCRIPTION("Cold restore abort after CPU/IRQ disable, before syscore callbacks; RAM observations only");

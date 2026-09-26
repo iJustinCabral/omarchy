@@ -10,6 +10,9 @@ import tempfile
 project = Path(__file__).resolve().parents[3]
 experiment = project / "packages/t2-suspend/experiments/hibernate-cold-pre-syscore"
 source = (experiment / "mba_hibernate_cold_pre_syscore.c").read_text()
+pre_cpu_source = (experiment.parent / "hibernate-cold-pre-cpu/mba_hibernate_cold_pre_cpu.c").read_text()
+assert "FTRACE_OPS_FL_PERMANENT" in pre_cpu_source
+assert 'MODULE_INFO(mba_cold_permanent, "v1")' in pre_cpu_source
 kernel_path = Path(sys.argv[1]) if len(sys.argv) == 2 else Path("/home/jjc/.local/state/codex-mba-autonomous/kernel-readback-input/linux-7.2.6/kernel/power/hibernate.c")
 if len(sys.argv) > 2:
   raise SystemExit("Usage: test-cold-pre-syscore.py [pinned-kernel/power/hibernate.c]")
@@ -17,14 +20,24 @@ kernel_bytes = kernel_path.read_bytes()
 if hashlib.sha256(kernel_bytes).hexdigest() != "989a5fef5d7843518d31815c88bf1a1f35a51a176f6fb8fe1d3e6e0f1dbc9bf3":
   raise SystemExit("Refusing changed kernel caller source")
 kernel = kernel_bytes.decode()
+kernel_root = kernel_path.parents[2]
+ftrace_bytes = (kernel_root / "kernel/trace/ftrace.c").read_bytes()
+ftrace_header_bytes = (kernel_root / "include/linux/ftrace.h").read_bytes()
+if hashlib.sha256(ftrace_bytes).hexdigest() != "b465ec022f67f3367a758bcc915dafed843c22e04e098a1dba3648aea07f85e3":
+  raise SystemExit("Refusing changed kernel ftrace source")
+if hashlib.sha256(ftrace_header_bytes).hexdigest() != "fbe362770824c729f496b8fe22c68d68d07bd5afb2eb0d2561198c3f9d910927":
+  raise SystemExit("Refusing changed kernel ftrace flag definitions")
+ftrace = ftrace_bytes.decode()
 assert '#define TARGET_FUNCTION "syscore_suspend"' in source
 assert 'MODULE_INFO(mba_cold_boundary, "pre-syscore-v1")' in source
+assert 'MODULE_INFO(mba_cold_permanent, "v1")' in source
 assert 'module_param_cb(arm_prefix, &arm_prefix_ops, NULL, 0600)' in source
 assert "efivar" not in source and "kretprobe" not in source and "pr_" not in source
 assert "FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_RECURSION | FTRACE_OPS_FL_IPMODIFY" in source
+assert "FTRACE_OPS_FL_PERMANENT" in source
 
 def extract(text, name):
-  match = re.search(r"(?:static )?(?:int|void)(?: notrace| __init| __exit)? " + name + r"\([^;]+?\)\n\{", text)
+  match = re.search(r"(?:static )?(?:int|void|bool)(?: notrace| __init| __exit)?\s+" + name + r"\([^;]+?\)\n\{", text)
   assert match, name
   index, depth = match.end(), 1
   while depth:
@@ -267,4 +280,131 @@ with tempfile.TemporaryDirectory(prefix="cold-pre-syscore-control-") as tmp:
   (root / "test.c").write_text(harness)
   subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", str(root / "test.c"), "-o", str(root / "test")], check=True)
   subprocess.run([str(root / "test")], check=True)
+
+flags = re.search(r"enum \{\n\s*FTRACE_OPS_FL_ENABLED.*?\n\};", ftrace_header_bytes.decode(), re.S).group(0)
+ops = re.search(r"static struct ftrace_ops pre_syscore_ops = \{.*?\n\};", source, re.S).group(0)
+trace_harness = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#define __init
+#define __exit
+#define READ_ONCE(x) (x)
+#define WRITE_ONCE(x,v) ((x)=(v))
+#define TARGET_FUNCTION "syscore_suspend"
+#define CONFIG_DYNAMIC_FTRACE_WITH_REGS 1
+#define BIT(x) (1UL << (x))
+#define WARN_ON(x) (!!(x))
+#define unlikely(x) (x)
+#define guard(kind) mock_guard
+#define rcu_dereference_protected(pointer,condition) (pointer)
+#define lockdep_is_held(lock) 1
+typedef long long loff_t;
+struct ctl_table {int unused;};
+struct ftrace_regs {int unused;};
+'''
+trace_harness += flags + "\n"
+trace_harness += r'''
+struct ftrace_ops {
+  unsigned long flags;
+  void (*func)(unsigned long,unsigned long,struct ftrace_ops *,struct ftrace_regs *);
+  void (*saved_func)(unsigned long,unsigned long,struct ftrace_ops *,struct ftrace_regs *);
+  struct ftrace_ops *next;
+};
+static struct ftrace_ops ftrace_list_end;
+static struct ftrace_ops *ftrace_ops_list=&ftrace_list_end;
+static int ftrace_enabled=1,last_ftrace_enabled=1,ftrace_lock;
+static bool ftrace_disabled;
+static unsigned int startups,shutdowns,updates,filters,frees;
+static bool registered,armed,arm_consumed;
+static unsigned int interceptions,observed_online_cpus;
+static char vector_prefix[25];
+static bool observed_irqs_disabled,observed_boundary_valid;
+static void mba_pre_syscore_hook(unsigned long ip,unsigned long parent,struct ftrace_ops *ops,struct ftrace_regs *regs) {
+  (void)ip;(void)parent;(void)ops;(void)regs;
+}
+static void ftrace_pid_func(unsigned long ip,unsigned long parent,struct ftrace_ops *ops,struct ftrace_regs *regs) {
+  (void)ip;(void)parent;(void)ops;(void)regs;
+}
+static void ftrace_stub(void) {}
+static void (*ftrace_trace_function)(void);
+static void mock_guard(int *lock) {assert(lock==&ftrace_lock);}
+static bool is_kernel_core_data(unsigned long address) {(void)address;return false;}
+static void add_ftrace_ops(struct ftrace_ops **list,struct ftrace_ops *ops) {ops->next=*list;*list=ops;}
+static bool ftrace_pids_enabled(struct ftrace_ops *ops) {(void)ops;return false;}
+static void ftrace_update_trampoline(struct ftrace_ops *ops) {(void)ops;}
+static void update_ftrace_function(void) {updates++;}
+static void ftrace_startup_sysctl(void) {startups++;}
+static void ftrace_shutdown_sysctl(void) {shutdowns++;}
+static int proc_dointvec(const struct ctl_table *table,int write,void *buffer,size_t *length,loff_t *position) {
+  (void)table;(void)length;(void)position;if(write) ftrace_enabled=*(int *)buffer;return 0;
+}
+#define do_for_each_ftrace_op(op,list) for((op)=(list);(op)!=&ftrace_list_end;(op)=(op)->next)
+#define while_for_each_ftrace_op(op)
+'''
+trace_harness += extract(ftrace, "__register_ftrace_function")
+trace_harness += extract(ftrace, "is_permanent_ops_registered")
+trace_harness += extract(ftrace, "ftrace_enable_sysctl")
+trace_harness += ops + "\n"
+trace_harness += r'''
+static int ftrace_set_filter(struct ftrace_ops *ops,unsigned char *target,unsigned int length,int reset) {
+  assert(ops==&pre_syscore_ops && !strcmp((char *)target,TARGET_FUNCTION));
+  assert(length==strlen(TARGET_FUNCTION) && !reset);filters++;return 0;
+}
+static int register_ftrace_function(struct ftrace_ops *ops) {return __register_ftrace_function(ops);}
+static void ftrace_free_filter(struct ftrace_ops *ops) {assert(ops==&pre_syscore_ops);frees++;}
+static void unregister_ftrace_function(struct ftrace_ops *ops) {
+  assert(!registered && !armed && ftrace_ops_list==ops);ftrace_ops_list=ops->next;
+}
+'''
+trace_harness += extract(source, "mba_pre_syscore_init") + extract(source, "mba_pre_syscore_exit")
+trace_harness += r'''
+int main(void) {
+  struct ctl_table table={0};size_t length=sizeof(int);loff_t position=0;int value=0;
+  assert(pre_syscore_ops.flags & FTRACE_OPS_FL_PERMANENT);
+  ftrace_enabled=last_ftrace_enabled=0;
+  assert(mba_pre_syscore_init()==-EBUSY && !registered && !armed);
+  assert(filters==1 && frees==1 && ftrace_ops_list==&ftrace_list_end);
+  ftrace_enabled=last_ftrace_enabled=1;
+  assert(mba_pre_syscore_init()==0 && registered);
+  assert(is_permanent_ops_registered());
+  assert(ftrace_enable_sysctl(&table,1,&value,&length,&position)==-EBUSY);
+  assert(ftrace_enabled==1 && last_ftrace_enabled==1 && !shutdowns);
+  assert(ftrace_enable_sysctl(&table,0,&value,&length,&position)==0);
+  assert(ftrace_enabled==1 && !shutdowns);
+  ftrace_disabled=true;
+  assert(ftrace_enable_sysctl(&table,1,&value,&length,&position)==-ENODEV);
+  assert(ftrace_enabled==1);ftrace_disabled=false;
+  mba_pre_syscore_exit();assert(!is_permanent_ops_registered());
+  assert(ftrace_enable_sysctl(&table,1,&value,&length,&position)==0);
+  assert(!ftrace_enabled && !last_ftrace_enabled && shutdowns==1 && ftrace_trace_function==ftrace_stub);
+  // Actual registration of an ordinary op while disabled demonstrates the old bypass.
+  struct ftrace_ops ordinary={.flags=FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_IPMODIFY,.func=mba_pre_syscore_hook};
+  assert(__register_ftrace_function(&ordinary)==0);
+  assert(!is_permanent_ops_registered() && !ftrace_enabled);
+  value=1;
+  assert(ftrace_enable_sysctl(&table,1,&value,&length,&position)==0 && startups==1);
+  assert(ftrace_enabled==1 && last_ftrace_enabled==1);
+  assert(updates>=1);
+  return 0;
+}
+'''
+with tempfile.TemporaryDirectory(prefix="cold-pre-syscore-permanent-") as tmp:
+  root = Path(tmp)
+  (root / "test.c").write_text(trace_harness)
+  subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", str(root / "test.c"), "-o", str(root / "test")], check=True)
+  subprocess.run([str(root / "test")], check=True)
+# Reuse actual registration/sysctl guards with the other profile's real flags.
+# Only local initializer symbol names are adapted to the same harness interface.
+pre_cpu_ops = re.search(r"static struct ftrace_ops cold_ops = \{.*?\n\};", pre_cpu_source, re.S).group(0)
+pre_cpu_ops = pre_cpu_ops.replace("cold_ops", "pre_syscore_ops").replace("mba_cold_hook", "mba_pre_syscore_hook")
+with tempfile.TemporaryDirectory(prefix="cold-pre-cpu-permanent-") as tmp:
+  root = Path(tmp)
+  (root / "test.c").write_text(trace_harness.replace(ops, pre_cpu_ops))
+  subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", str(root / "test.c"), "-o", str(root / "test")], check=True)
+  subprocess.run([str(root / "test")], check=True)
 print("PASS: actual pre-syscore module and kernel caller preserve IRQ/CPU/device recovery and abort on invalid observations")
+print("PASS: actual pinned ftrace registration/sysctl guards refuse disabled registration and later hook disabling")
+print("PASS: both cold profiles' actual permanent flags enforce the same pinned registration/sysctl guards")
