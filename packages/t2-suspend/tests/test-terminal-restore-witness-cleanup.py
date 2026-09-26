@@ -43,6 +43,8 @@ def fixture(root):
         values[name] = b"\x07\0\0\0MBCP" + m.VECTOR[:24].encode() + b"\x01"
       elif name.startswith("OmarchyT2ColdPreSyscoreReturned"):
         values[name] = b"\x07\0\0\0MBSC" + m.VECTOR[:24].encode() + b"\x01"
+      elif name.startswith("OmarchyT2ColdPreArchReturned"):
+        values[name] = b"\x07\0\0\0MBAR" + m.VECTOR[:24].encode() + b"\x01"
       elif name == "s4-attempted":
         values[name] = guard
       elif name == "attempt.json":
@@ -81,11 +83,19 @@ with tempfile.TemporaryDirectory(prefix="terminal-witness-cleanup-") as temporar
   base = Path(temporary)
   cases = ("success", "archive", "live", "guard", "missing", "symlink", "mode", "witness", "intent", "partial", "boot",
            "live-returned", "archive-returned", "missing-returned", "symlink-returned", "wrong-return-boot")
-  assert len(m.TERMINALS) == 5
+  assert len(m.TERMINALS) == 6
+  pre_arch_vector = "9c973c61402167014599b656d6689c62a46a8c10b596a0fde89c542d0f1ec676"
+  assert m.RETURN_BOOTS[pre_arch_vector] == "539f1798-06d8-437f-928b-c66449efc98d"
+  source_boot, archive, pins, guard_sha, attempt_sha, restore_stage = m.TERMINALS[pre_arch_vector]
+  assert source_boot == "3ccfac5c-e956-483f-a68c-62c4f355527e" and restore_stage == 7
+  assert archive == Path("var/lib/omarchy-t2-postwrite-marker/archive-v3-9c973c6140216701")
+  assert len(pins) == 11 and pins["s4-attempted"] == guard_sha and pins["attempt.json"] == attempt_sha
+  returned_name = "OmarchyT2ColdPreArchReturned" + pre_arch_vector[:24] + "-" + m.BACKEND.RESTORE_HOOK_GUID
+  assert pins[returned_name] == hashlib.sha256(b"\x07\0\0\0MBAR" + pre_arch_vector[:24].encode() + b"\x01").hexdigest()
   refused(lambda: m.select_terminal("0" * 64))
   for vector, case in ((vector, case) for vector in m.TERMINALS for case in cases):
     m.select_terminal(vector)
-    returned = next((name for name in m.preserved_live_pins() if name.startswith(("OmarchyT2ColdPreCpuReturned", "OmarchyT2ColdPreSyscoreReturned"))), None)
+    returned = next((name for name in m.preserved_live_pins() if name.startswith(("OmarchyT2ColdPreCpuReturned", "OmarchyT2ColdPreSyscoreReturned", "OmarchyT2ColdPreArchReturned"))), None)
     if case.endswith("returned") and returned is None:
       continue
     root = base / vector / case
@@ -182,7 +192,8 @@ with tempfile.TemporaryDirectory(prefix="terminal-witness-cleanup-") as temporar
     m.PAIR.selected_entry = lambda _: "Omarchy.linux-t2"
     m.SOURCE.verify_primary_root = lambda _: None
     m.PRODUCTION_SHA = hashlib.sha256(b"synthetic production image").hexdigest()
-    assert {"mba_hibernate_cold_pre_cpu", "mba_hibernate_cold_pre_syscore", "mba_hibernate_cold_pre_arch"}.issubset(m.NO_CURRENT_MODULES)
+    assert {"mba_hibernate_cold_pre_cpu", "mba_hibernate_cold_pre_syscore", "mba_hibernate_cold_pre_arch",
+            "mba_hibernate_cold_pre_relocate", "mba_hibernate_cold_pci_guard"}.issubset(m.NO_CURRENT_MODULES)
     for vector in m.TERMINALS:
       m.select_terminal(vector)
       assert m.current_stock(stock_root) == RETURN_BOOT

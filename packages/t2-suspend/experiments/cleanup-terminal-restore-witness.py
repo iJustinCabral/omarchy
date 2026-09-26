@@ -58,14 +58,17 @@ RESTORE_STAGE = 0
 PRESERVED_LIVE_PREFIXES = (
   "OmarchyT2RestoreHookEntered", "OmarchyT2RestoreHookArmed", "OmarchyT2ColdPreCpuReturned",
   "OmarchyT2ColdPreSyscoreReturned",
+  "OmarchyT2ColdPreArchReturned",
 )
 RETURN_BOOTS = {
   "529d919f498f44aee33c92f63604a85fd6e5c447e8e84740df6c340feb074f32": "aec7b794-2684-4277-b6ff-2050493f3932",
   "538d486ba4a44f7e41227526e28e9d545b0b705a226d4d0c0fe8f2eae65ff66a": "911e153f-ce56-4baa-97b2-2d5e7d93f6bf",
+  "9c973c61402167014599b656d6689c62a46a8c10b596a0fde89c542d0f1ec676": "539f1798-06d8-437f-928b-c66449efc98d",
 }
 NO_CURRENT_MODULES = (
   "mba_hibernate_efi_postwrite_marker", "mba_hibernate_efi_restore_marker",
   "mba_hibernate_cold_pre_cpu", "mba_hibernate_cold_pre_syscore", "mba_hibernate_cold_pre_arch",
+  "mba_hibernate_cold_pre_relocate", "mba_hibernate_cold_pci_guard",
 )
 TERMINALS = {
   VECTOR: (SOURCE_BOOT, ARCHIVE, dict(PINS), GUARD_SHA, ATTEMPT_SHA, 0),
@@ -137,6 +140,26 @@ TERMINALS = {
     },
     "2211c808d99f2c75716e1652d031f15439030b48816061d29cfa54fc00bbb535",
     "906c97dbe3b52908fb5a7cfe4f272ea80e96cfa3295c8538d7c0fe9731cf8e96",
+    7,
+  ),
+  "9c973c61402167014599b656d6689c62a46a8c10b596a0fde89c542d0f1ec676": (
+    "3ccfac5c-e956-483f-a68c-62c4f355527e",
+    Path("var/lib/omarchy-t2-postwrite-marker/archive-v3-9c973c6140216701"),
+    {
+      SOURCE_VAR: "bd823cb7cab51ca2ac2c4ffd54b7363ead441aadab96c6b5097f2cb6fb50a95d",
+      RESTORE_VAR: "fd99871a54c358af877914db14a5bce39ac8fb78ce50c1f24832f79f93ace236",
+      "OmarchyT2RestoreHookEntered9c973c61402167014599b656-" + BACKEND.RESTORE_HOOK_GUID: "ccc13afe9371516303c4691ea4cca3a9b05ebf0135775079afa1bdebb52fbfea",
+      "OmarchyT2RestoreHookArmed9c973c61402167014599b656-" + BACKEND.RESTORE_HOOK_GUID: "fb9edeab75e76fae37b9e7840a5593c35eb49444810f477f48e24769a5ceb6ab",
+      "OmarchyT2ColdPreArchReturned9c973c61402167014599b656-" + BACKEND.RESTORE_HOOK_GUID: "5a5bb684d9f37068ae61cecaf5f93e61b66eb96fef580d94b2b28d1a0dd62e78",
+      "receipt.json": "9cad1d647031d2cb9cc01342985d19dfff571c1d3e6304358944ec2b56a890bb",
+      "recovery-acceptance-v3.json": "d3387119dbd34afb4d8011c5a208e7ed42830a52d8cd4321ed68d42bc97b1c8c",
+      "s4-attempted": "9df7cd9aaaab7c75ff652dceee57d21b534a07ca73c08ad1cd359df457e2d58d",
+      "attempt.json": "fdec7f9a6e74221fd4ba4d63593d2bbdb5250ad739173309697af05b83632e00",
+      "postwrite-efi-identity.json": "dd329fcc3bb2b54cee074373e26e7cf04a306c7b8e7f409c90c4742d4e308c26",
+      "restore-efi-identity.json": "faf2cc6742ca13faf09cc36b360247dfa0377e491a9a01980d64c7f6d2baa103",
+    },
+    "9df7cd9aaaab7c75ff652dceee57d21b534a07ca73c08ad1cd359df457e2d58d",
+    "fdec7f9a6e74221fd4ba4d63593d2bbdb5250ad739173309697af05b83632e00",
     7,
   ),
 }
