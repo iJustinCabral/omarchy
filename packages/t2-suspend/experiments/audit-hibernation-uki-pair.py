@@ -39,6 +39,47 @@ LEGACY_RESTORE_MARKER_HOOK_SHA256 = {
   "6cbf3fc606eab48094e6af7d9835e538bf5e2a7e99e5695b144d7ce102ea0bc5",
   "596148e631fbf3218fdacf5c2ea83040a3ecbffab834a25204f289242b37585d",
 }
+MINIMAL_RESTORE_POLICY = {
+  "version": "storage-no-gpu-thunderbolt-v1",
+  "excluded_hooks": ["kms", "plymouth"],
+  "excluded_modules": ["i915", "xe", "thunderbolt"],
+}
+
+
+def verify_minimal_restore_tree(extracted, provenance):
+  if provenance.get("minimal_restore_policy") != MINIMAL_RESTORE_POLICY:
+    raise ValueError("Unknown or malformed minimal restore device policy")
+  config = (extracted / "config").read_text()
+  resolved = {}
+  for field in ("MODULES", "HOOKS", "EARLYHOOKS", "LATEHOOKS", "CLEANUPHOOKS", "EMERGENCYHOOKS"):
+    match = re.search(r'^' + field + r'="([^\"]*)"$', config, re.M)
+    if match is None:
+      raise ValueError("Minimal restore audit lacks resolved " + field)
+    resolved[field] = match.group(1).split()
+    excluded = MINIMAL_RESTORE_POLICY["excluded_modules"] if field == "MODULES" else MINIMAL_RESTORE_POLICY["excluded_hooks"]
+    if set(resolved[field]) & set(excluded):
+      raise ValueError("Minimal restore audit found an excluded device or hook")
+  if not {"udev", "encrypt", "resume"}.issubset(resolved["HOOKS"]):
+    raise ValueError("Minimal restore audit lacks encrypted-root resume hooks")
+  if "omarchy-t2-candidate-modules" not in resolved["LATEHOOKS"]:
+    raise ValueError("Minimal restore audit lacks ordinary-boot payload hook")
+  module_tree = extracted / "usr/lib/modules" / provenance["kernel_release"]
+  modules = []
+  for path in module_tree.rglob("*"):
+    if not re.search(r"\.ko(?:\.|$)", path.name):
+      continue
+    name = path.name.split(".ko", 1)[0]
+    if (name in MINIMAL_RESTORE_POLICY["excluded_modules"] or
+        "drivers/gpu/drm/" in path.as_posix() or "drivers/thunderbolt/" in path.as_posix()):
+      raise ValueError("Minimal restore audit found an excluded driver or DRM dependency: " + path.name)
+    modules.append(name)
+  for name in ("nvme", "nvme-core", "dm-crypt", "dm-mod"):
+    if modules.count(name) != 1:
+      raise ValueError("Minimal restore audit lacks one exact root-critical module: " + name)
+  for name in ("usr/bin/cryptsetup", "usr/bin/btrfs", "etc/cryptsetup-keys.d/root.key"):
+    path = extracted / name
+    if path.is_symlink() or not path.is_file():
+      raise ValueError("Minimal restore audit lacks a regular root-critical file: " + name)
 
 
 def sha256(path):
@@ -98,6 +139,18 @@ def verify_restore_marker_tree(extracted, marker):
     raise ValueError("Restore marker does not run immediately before resume")
 
 
+def extract_restore_initramfs(initrd, extracted):
+  # mkinitcpio can place root-critical modules alongside early microcode;
+  # audit the same combined tree the kernel unpacks, including both archives.
+  try:
+    subprocess.run(("lsinitcpio", "--early", "--extract", str(initrd)), cwd=extracted,
+                   check=True, capture_output=True)
+    subprocess.run(("lsinitcpio", "--cpio", "--extract", str(initrd)), cwd=extracted,
+                   check=True, capture_output=True)
+  except subprocess.CalledProcessError as error:
+    raise ValueError("Restore marker initramfs could not be extracted") from error
+
+
 def load_candidate(directory, label):
   if directory.is_symlink() or not directory.is_dir():
     raise ValueError(label + " private directory is missing or symlinked")
@@ -124,16 +177,18 @@ def load_candidate(directory, label):
     if provenance.get(field) is not False:
       raise ValueError(label + " is not an offline private build: " + field)
   marker = provenance.get("restore_marker")
-  if marker is not None:
+  minimal = "minimal_restore_policy" in provenance
+  if minimal and marker is None:
+    raise ValueError("Minimal cold-restore policy requires the restore marker")
+  if marker is not None or minimal:
     if label != "restore":
       raise ValueError("Source image must not load the cold-restore marker")
     with tempfile.TemporaryDirectory(prefix="t2-restore-marker-audit-") as temporary:
-      try:
-        subprocess.run(("lsinitcpio", "--cpio", "--extract", str(initrd)), cwd=temporary,
-                       check=True, capture_output=True)
-      except subprocess.CalledProcessError as error:
-        raise ValueError("Restore marker initramfs could not be extracted") from error
-      verify_restore_marker_tree(Path(temporary), marker)
+      extract_restore_initramfs(initrd, Path(temporary))
+      if marker is not None:
+        verify_restore_marker_tree(Path(temporary), marker)
+      if minimal:
+        verify_minimal_restore_tree(Path(temporary), provenance)
   if provenance.get("modified_sections_sha256") is not None:
     modified = provenance["modified_sections_sha256"]
     if not isinstance(modified, dict) or set(modified) != {".linux"}:
@@ -161,9 +216,15 @@ def load_candidate(directory, label):
 
 
 def audit(source, restore):
+  if "minimal_restore_policy" in source:
+    raise ValueError("Source image must not use the minimal cold-restore policy")
+  if "minimal_restore_policy" in restore and restore["minimal_restore_policy"] != MINIMAL_RESTORE_POLICY:
+    raise ValueError("Unknown or malformed minimal restore device policy")
   if source.get("restore_marker") is not None:
     raise ValueError("Source image must not contain the cold-restore marker")
   marker = restore.get("restore_marker")
+  if "minimal_restore_policy" in restore and marker is None:
+    raise ValueError("Minimal cold-restore policy requires the restore marker")
   if marker is not None:
     validate_restore_marker_metadata(marker)
   source_stack = S4.runtime_stack_identity(source)
@@ -194,7 +255,7 @@ def audit(source, restore):
   if any(not isinstance(path, str) or not path.startswith("usr/lib/omarchy-t2-hibernation-candidate/payload/") for path in payload.values()):
     raise ValueError("Restore payload paths are malformed")
 
-  return {
+  result = {
     "classification": "structurally-matched-private-pair-not-boot-qualified",
     "source_uki_sha256": source["candidate_uki_sha256"],
     "restore_uki_sha256": restore["candidate_uki_sha256"],
@@ -203,6 +264,9 @@ def audit(source, restore):
     "restore_pre_restore_excluded_modules": sorted(excluded),
     "restore_marker": marker,
   }
+  if "minimal_restore_policy" in restore:
+    result["minimal_restore_policy"] = restore["minimal_restore_policy"]
+  return result
 
 
 def main():

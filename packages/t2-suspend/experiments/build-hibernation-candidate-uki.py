@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import shlex
 import stat
 import subprocess
 import tempfile
@@ -43,6 +44,11 @@ MODULES = {
   "t2bce_ave": "drivers/staging/t2bce/t2bce_ave/t2bce_ave.ko",
 }
 PRE_RESTORE_EXCLUDED_MODULES = tuple(MODULES)
+MINIMAL_RESTORE_POLICY = {
+  "version": "storage-no-gpu-thunderbolt-v1",
+  "excluded_hooks": ["kms", "plymouth"],
+  "excluded_modules": ["i915", "xe", "thunderbolt"],
+}
 REQUIRED_INITRD_FILES = (
   "hooks/omarchy-t2-candidate-modules",
   "usr/lib/omarchy-t2-hibernation-candidate/load-modules.py",
@@ -244,8 +250,61 @@ def prepare_payload(work, candidate, release, expected, experiment_id=None):
   return payload, modules
 
 
-def build_initrd(work, module_root, payload, release, expected, experiment_id=None, restore_marker=None):
+def minimal_restore_config(base):
+  # Filter inherited settings after all host drop-ins have been sourced. Only
+  # the private build configuration changes; dependency resolution stays with
+  # mkinitcpio and no files are pruned from its completed module tree.
+  return "source " + shlex.quote(str(base)) + "\n" + '''
+minimal_hooks=()
+for minimal_hook in "${HOOKS[@]}"; do
+  case $minimal_hook in
+    kms|plymouth) ;;
+    *) minimal_hooks+=("$minimal_hook") ;;
+  esac
+done
+HOOKS=("${minimal_hooks[@]}")
+minimal_modules=()
+for minimal_module in "${MODULES[@]}"; do
+  case $minimal_module in
+    i915|xe|thunderbolt) ;;
+    *) minimal_modules+=("$minimal_module") ;;
+  esac
+done
+MODULES=("${minimal_modules[@]}")
+unset minimal_hooks minimal_hook minimal_modules minimal_module
+'''
+
+
+def verify_minimal_restore_tree(extracted, release):
+  config = (extracted / "config").read_text()
+  for field in ("MODULES", "HOOKS", "EARLYHOOKS", "LATEHOOKS", "CLEANUPHOOKS", "EMERGENCYHOOKS"):
+    match = re.search(r'^' + field + r'="([^\"]*)"$', config, re.M)
+    if match is None:
+      raise ValueError("Minimal restore initramfs lacks resolved " + field)
+    banned = MINIMAL_RESTORE_POLICY["excluded_modules"] if field == "MODULES" else MINIMAL_RESTORE_POLICY["excluded_hooks"]
+    if set(match.group(1).split()) & set(banned):
+      raise ValueError("Minimal restore initramfs schedules an excluded device or hook")
+  module_tree = extracted / "usr/lib/modules" / release
+  for path in module_tree.rglob("*"):
+    if not re.search(r"\.ko(?:\.|$)", path.name):
+      continue
+    if (path.name.split(".ko", 1)[0] in MINIMAL_RESTORE_POLICY["excluded_modules"] or
+        "drivers/gpu/drm/" in path.as_posix() or "drivers/thunderbolt/" in path.as_posix()):
+      raise ValueError("Minimal restore initramfs contains an excluded driver or DRM dependency: " + path.name)
+  hooks = re.search(r'^HOOKS="([^\"]*)"$', config, re.M).group(1).split()
+  if not {"udev", "encrypt", "resume"}.issubset(hooks):
+    raise ValueError("Minimal restore initramfs lacks encrypted-root resume hooks")
+  late = re.search(r'^LATEHOOKS="([^\"]*)"$', config, re.M).group(1).split()
+  if "omarchy-t2-candidate-modules" not in late:
+    raise ValueError("Minimal restore initramfs lacks ordinary-boot payload hook")
+
+
+def build_initrd(work, module_root, payload, release, expected, experiment_id=None, restore_marker=None, minimal_restore_devices=False):
   initrd = work / "candidate.initrd"
+  config_path = CONFIG
+  if minimal_restore_devices:
+    config_path = work / "minimal-restore-mkinitcpio.conf"
+    config_path.write_text(minimal_restore_config(CONFIG))
   environment = [
     "env",
     "MKINITCPIO_HOOKS=" + str(CANDIDATE_HOOKS / "hooks") + ":/etc/initcpio/hooks:/usr/lib/initcpio/hooks",
@@ -265,7 +324,7 @@ def build_initrd(work, module_root, payload, release, expected, experiment_id=No
     *environment,
     "mkinitcpio",
     "--config",
-    CONFIG,
+    config_path,
     "--generate",
     initrd,
     "--kernel",
@@ -291,6 +350,8 @@ def build_initrd(work, module_root, payload, release, expected, experiment_id=No
     if not (extracted / name).is_file():
       raise ValueError("Candidate initramfs omitted candidate boot policy: " + name)
   build_config = (extracted / "config").read_text()
+  if minimal_restore_devices:
+    verify_minimal_restore_tree(extracted, release)
   if "omarchy-t2-candidate-modules" not in build_config:
     raise ValueError("Candidate initramfs late hook is not scheduled")
   if restore_marker is not None:
@@ -451,7 +512,10 @@ def main():
   parser.add_argument("--expected-restore-marker-sha256")
   parser.add_argument("--expected-restore-marker-srcversion")
   parser.add_argument("--restore-marker-version", choices=("v1", "v2"), default="v1")
+  parser.add_argument("--minimal-restore-devices", action="store_true", help="omit private initramfs KMS/Plymouth and GPU/Thunderbolt drivers; retain normal root userspace loading")
   args = parser.parse_args()
+  if args.minimal_restore_devices and args.restore_marker_module is None:
+    parser.error("--minimal-restore-devices requires an explicit --restore-marker-module")
 
   if os.geteuid() != 0:
     raise SystemExit("Run as root so the root-unlock key retains protected handling")
@@ -474,7 +538,7 @@ def main():
     restore_marker = prepare_restore_marker(work, args.restore_marker_module, args.expected_restore_marker_sha256,
                                             args.expected_restore_marker_srcversion, args.kernel_release,
                                             args.restore_marker_version)
-    initrd, staged_payload = build_initrd(work, module_root, payload, args.kernel_release, expected, experiment_id, restore_marker)
+    initrd, staged_payload = build_initrd(work, module_root, payload, args.kernel_release, expected, experiment_id, restore_marker, args.minimal_restore_devices)
     uki, cmdline, sections, production_hash = build_uki(work, production, initrd)
 
     publish = work / "publish"
@@ -512,6 +576,8 @@ def main():
       "boot_entry_created": False,
       "hardware_qualified": False,
     }
+    if args.minimal_restore_devices:
+      report["minimal_restore_policy"] = MINIMAL_RESTORE_POLICY
     (publish / "provenance.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     publish.rename(output)
   secure_output(output)
