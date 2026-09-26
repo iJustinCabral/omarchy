@@ -96,6 +96,9 @@ arm_restore_marker() {
   fi
   write_restore_hook_witness "$marker_root" "$marker_prefix" Armed || return 1
   msg "omarchy-t2-restore-marker: exact cold-restore marker armed before resume"
+  # mkinitcpio's msg returns failure when quiet suppresses the message.
+  # Only the verified arm determines success, not optional console output.
+  return 0
 }
 
 run_hook() {

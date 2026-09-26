@@ -25,8 +25,13 @@ def clear_witnesses(root):
     witness(root, stage).unlink(missing_ok=True)
 
 script = r'''
+. "$2"
 . "$1"
-msg() { :; }
+getarg() {
+  if [[ $1 == "quiet" && $MOCK_QUIET == "1" ]]; then
+    printf 'y\n'
+  fi
+}
 err() { printf 'ERROR: %s\n' "$*"; }
 launch_interactive_shell() {
   [[ $1 == "--exec" ]] || exit 90
@@ -55,15 +60,16 @@ printf 'hook_status=%s\n' "$?"
 '''
 
 
-def run(root, *, fail_insmod=False, version=srcversion):
+def run(root, *, fail_insmod=False, version=srcversion, quiet=False):
   result = subprocess.run(
-    (str(ash), "ash", "-c", script, "ash", str(hook)),
+    (str(ash), "ash", "-c", script, "ash", str(hook), "/usr/lib/initcpio/init_functions"),
     check=True, capture_output=True, text=True,
     env={
       "PATH": os.environ["PATH"],
       "OMARCHY_T2_RESTORE_MARKER_ROOT": str(root),
       "MOCK_FAIL_INSMOD": "1" if fail_insmod else "0",
       "MOCK_SRCVERSION": version,
+      "MOCK_QUIET": "1" if quiet else "0",
     },
   )
   return result.stdout, (root / "recovery-shell").exists()
@@ -90,6 +96,14 @@ with tempfile.TemporaryDirectory(prefix="t2-restore-hook-") as temporary:
   assert (root / "sys/module/mba_hibernate_efi_restore_marker/parameters/arm_prefix").read_text().strip() == "1"
   assert witness(root, "Entered").read_bytes() == b"\x07\x00\x00\x00MBRH" + prefix.encode() + b"\x01"
   assert witness(root, "Armed").read_bytes() == b"\x07\x00\x00\x00MBRH" + prefix.encode() + b"\x02"
+
+  # Real mkinitcpio msg() returns 1 when quiet suppresses its output.
+  # That must not turn a successfully armed marker into a recovery shell.
+  clear_witnesses(root)
+  output, recovery = run(root, quiet=True)
+  assert "hook_status=0" in output and not recovery
+  assert "exact cold-restore marker armed" not in output
+  assert witness(root, "Entered").exists() and witness(root, "Armed").exists()
 
   output, recovery = run(root)
   assert "hook_status=1" in output and recovery
@@ -140,7 +154,7 @@ with tempfile.TemporaryDirectory(prefix="t2-restore-hook-") as temporary:
   version_file.write_text("v2\n")
   v2_marker = marker.parent / ("OmarchyT2RestoreStageV2-" + witness_guid)
   v2_marker.write_bytes(bytes.fromhex("07000000") + b"MBRS" + bytes.fromhex(prefix) + b"\x00")
-  output, recovery = run(root)
+  output, recovery = run(root, quiet=True)
   assert "hook_status=0" in output and not recovery
   assert witness(root, "Entered").exists() and witness(root, "Armed").exists()
   assert marker.read_bytes()[-1] == 0
