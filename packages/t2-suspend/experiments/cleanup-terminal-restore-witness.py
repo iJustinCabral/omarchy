@@ -57,13 +57,15 @@ TARGETS = {
 RESTORE_STAGE = 0
 PRESERVED_LIVE_PREFIXES = (
   "OmarchyT2RestoreHookEntered", "OmarchyT2RestoreHookArmed", "OmarchyT2ColdPreCpuReturned",
+  "OmarchyT2ColdPreSyscoreReturned",
 )
 RETURN_BOOTS = {
   "529d919f498f44aee33c92f63604a85fd6e5c447e8e84740df6c340feb074f32": "aec7b794-2684-4277-b6ff-2050493f3932",
+  "538d486ba4a44f7e41227526e28e9d545b0b705a226d4d0c0fe8f2eae65ff66a": "911e153f-ce56-4baa-97b2-2d5e7d93f6bf",
 }
 NO_CURRENT_MODULES = (
   "mba_hibernate_efi_postwrite_marker", "mba_hibernate_efi_restore_marker",
-  "mba_hibernate_cold_pre_cpu", "mba_hibernate_cold_pre_syscore",
+  "mba_hibernate_cold_pre_cpu", "mba_hibernate_cold_pre_syscore", "mba_hibernate_cold_pre_arch",
 )
 TERMINALS = {
   VECTOR: (SOURCE_BOOT, ARCHIVE, dict(PINS), GUARD_SHA, ATTEMPT_SHA, 0),
@@ -115,6 +117,26 @@ TERMINALS = {
     },
     "cf50fbdb69e2a0ed26adda22e2c65695953d5b9609ecd57137d5aee38de3aee5",
     "25505b8e548c79af9081d8908e3d215714c64d78fa07b21ec9e2adf4872d94fa",
+    7,
+  ),
+  "538d486ba4a44f7e41227526e28e9d545b0b705a226d4d0c0fe8f2eae65ff66a": (
+    "520e5b24-0ca7-4663-ad50-c151404ef229",
+    Path("var/lib/omarchy-t2-postwrite-marker/archive-v3-538d486ba4a44f7e"),
+    {
+      SOURCE_VAR: "4efa1b5a748593affc4fa7d937249f714b74da6dfefd881f1b185948a40f479c",
+      RESTORE_VAR: "4f1374f64e6e25671a6aca076c91b78ed678770503d97d57f4ed4ded2fa28fb2",
+      "OmarchyT2RestoreHookEntered538d486ba4a44f7e41227526-" + BACKEND.RESTORE_HOOK_GUID: "d36be73fbdc96431604d9784017835eddc6d05a4f89b553f0808cadaf72ef10e",
+      "OmarchyT2RestoreHookArmed538d486ba4a44f7e41227526-" + BACKEND.RESTORE_HOOK_GUID: "2304f465258b359d9b748160bb43c283ee174e10d5a8406b3ea70386038db8a9",
+      "OmarchyT2ColdPreSyscoreReturned538d486ba4a44f7e41227526-" + BACKEND.RESTORE_HOOK_GUID: "3dbc954c07ac66843d6bca5a854b84fab6a875ffa219b19dabd2dda2fdba340b",
+      "receipt.json": "dcd0f4a9e1373d7bf749ece51ed98b2249da609f1f2768a29f92873e0bc12b0d",
+      "recovery-acceptance-v3.json": "2476397389e41a1a1be2e58ed361f73856ce223495468cb33469c326a91153bb",
+      "s4-attempted": "2211c808d99f2c75716e1652d031f15439030b48816061d29cfa54fc00bbb535",
+      "attempt.json": "906c97dbe3b52908fb5a7cfe4f272ea80e96cfa3295c8538d7c0fe9731cf8e96",
+      "postwrite-efi-identity.json": "aa934444da64a816d800664f20dd1b2d0ba773cd88bb7727cfc316561eb52170",
+      "restore-efi-identity.json": "db0e0ec7c2d306689ad29ff5334dac843449db89ae2dfd96fde8b6867403dca5",
+    },
+    "2211c808d99f2c75716e1652d031f15439030b48816061d29cfa54fc00bbb535",
+    "906c97dbe3b52908fb5a7cfe4f272ea80e96cfa3295c8538d7c0fe9731cf8e96",
     7,
   ),
 }

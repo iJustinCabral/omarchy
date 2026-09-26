@@ -41,6 +41,8 @@ def fixture(root):
     if name not in values:
       if name.startswith("OmarchyT2ColdPreCpuReturned"):
         values[name] = b"\x07\0\0\0MBCP" + m.VECTOR[:24].encode() + b"\x01"
+      elif name.startswith("OmarchyT2ColdPreSyscoreReturned"):
+        values[name] = b"\x07\0\0\0MBSC" + m.VECTOR[:24].encode() + b"\x01"
       elif name == "s4-attempted":
         values[name] = guard
       elif name == "attempt.json":
@@ -78,12 +80,12 @@ def refused(function):
 with tempfile.TemporaryDirectory(prefix="terminal-witness-cleanup-") as temporary:
   base = Path(temporary)
   cases = ("success", "archive", "live", "guard", "missing", "symlink", "mode", "witness", "intent", "partial", "boot",
-           "live-returned", "archive-returned", "missing-returned", "symlink-returned")
-  assert len(m.TERMINALS) == 4
+           "live-returned", "archive-returned", "missing-returned", "symlink-returned", "wrong-return-boot")
+  assert len(m.TERMINALS) == 5
   refused(lambda: m.select_terminal("0" * 64))
   for vector, case in ((vector, case) for vector in m.TERMINALS for case in cases):
     m.select_terminal(vector)
-    returned = next((name for name in m.preserved_live_pins() if name.startswith("OmarchyT2ColdPreCpuReturned")), None)
+    returned = next((name for name in m.preserved_live_pins() if name.startswith(("OmarchyT2ColdPreCpuReturned", "OmarchyT2ColdPreSyscoreReturned"))), None)
     if case.endswith("returned") and returned is None:
       continue
     root = base / vector / case
@@ -117,6 +119,12 @@ with tempfile.TemporaryDirectory(prefix="terminal-witness-cleanup-") as temporar
     elif case == "boot":
       m.execute(root, stock, Path.unlink)
       refused(lambda: m.validate(root, lambda _: m.SOURCE_BOOT))
+    elif case == "wrong-return-boot":
+      if vector in m.RETURN_BOOTS:
+        refused(lambda: m.execute(root, lambda _: RETURN_BOOT, Path.unlink))
+        assert not (root / m.ARCHIVE / "slot-clear-intent.json").exists()
+      else:
+        assert m.validate(root, lambda _: RETURN_BOOT)["return_boot_id"] == RETURN_BOOT
     else:
       if case == "archive":
         (root / m.ARCHIVE / m.SOURCE_VAR).write_bytes(b"changed archive")
@@ -174,14 +182,16 @@ with tempfile.TemporaryDirectory(prefix="terminal-witness-cleanup-") as temporar
     m.PAIR.selected_entry = lambda _: "Omarchy.linux-t2"
     m.SOURCE.verify_primary_root = lambda _: None
     m.PRODUCTION_SHA = hashlib.sha256(b"synthetic production image").hexdigest()
-    assert m.current_stock(stock_root) == RETURN_BOOT
-    assert {"mba_hibernate_cold_pre_cpu", "mba_hibernate_cold_pre_syscore"}.issubset(m.NO_CURRENT_MODULES)
-    for name in m.NO_CURRENT_MODULES:
-      loaded = stock_root / "sys/module" / name
-      loaded.mkdir(parents=True)
-      refused(lambda: m.current_stock(stock_root))
-      loaded.rmdir()
-    assert m.current_stock(stock_root) == RETURN_BOOT
+    assert {"mba_hibernate_cold_pre_cpu", "mba_hibernate_cold_pre_syscore", "mba_hibernate_cold_pre_arch"}.issubset(m.NO_CURRENT_MODULES)
+    for vector in m.TERMINALS:
+      m.select_terminal(vector)
+      assert m.current_stock(stock_root) == RETURN_BOOT
+      for name in m.NO_CURRENT_MODULES:
+        loaded = stock_root / "sys/module" / name
+        loaded.mkdir(parents=True)
+        refused(lambda: m.current_stock(stock_root))
+        loaded.rmdir()
+      assert m.current_stock(stock_root) == RETURN_BOOT
   finally:
     m.PAIR.selected_entry = selected_entry
     m.SOURCE.verify_primary_root = verify_primary_root
