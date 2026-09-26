@@ -1,0 +1,16 @@
+# Replaces the regular resume hook only for this private combined profile.
+run_hook() {
+  local file=${OMARCHY_T2_COLD_PRE_CPU_ROOT:-}/usr/lib/omarchy-t2-cold-pci-pre-arch/functions
+  if [[ ! -f $file || -L $file ]]; then
+    err "omarchy-t2-cold-pci-pre-arch: missing diagnostic functions before resume"
+    launch_interactive_shell --exec
+    exit 1
+  fi
+  . "$file"
+  if ! pg_before_resume; then
+    pg_recovery "immediate resume gate failed"
+    return 1
+  fi
+  . "$pg_dir/stock-resume"
+  run_hook
+}

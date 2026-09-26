@@ -1,0 +1,8 @@
+build() {
+  . "${BASH_SOURCE[0]%/*}/bundle" || return 1
+  build_pci_pre_arch_bundle || return 1
+  add_runscript
+}
+help() {
+  echo "Private pending-only PCI guard with pre-architecture controlled abort."
+}

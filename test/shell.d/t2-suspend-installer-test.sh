@@ -36,6 +36,8 @@ python3 "$ROOT/packages/t2-suspend/tests/test-cold-pre-cpu-return.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-cold-pre-cpu-uki.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-cold-pre-syscore-integration.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-cold-pre-arch-integration.py"
+python3 "$ROOT/packages/t2-suspend/tests/test-cold-pci-pre-arch-runtime.py"
+python3 "$ROOT/packages/t2-suspend/tests/test-cold-pci-pre-arch-tooling.py"
 pass "T2 suspend source and installer transactions"
 
 test_tmp=$(mktemp -d)

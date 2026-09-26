@@ -21,6 +21,7 @@ SPEC = importlib.util.spec_from_file_location("cold_return_pair", HERE / "stage-
 PAIR = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PAIR)
 COLD = PAIR.AUDIT.COLD
+PCI = PAIR.AUDIT.PCI
 HASH = re.compile(r"[0-9a-f]{64}")
 UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 GUID = "5e17d2ad-021f-4d45-a8e5-f4c191983e27"
@@ -177,10 +178,10 @@ def inspect(root, source, restore, expected_pair_vector, pair_loader=PAIR.load_p
   snapshot = Snapshot(root)
   receipt = snapshot.json(PAIR.RECEIPT)
   pair, images, _ = pair_loader(Path(source), Path(restore))
-  protocol = COLD.select(pair)
-  if protocol != required_protocol or protocol not in COLD.PROFILES:
+  protocol = PCI.select(pair)
+  if protocol != required_protocol or protocol not in PCI.PROFILES:
     raise ValueError("Restore provenance does not identify the requested cold abort protocol")
-  profile = COLD.PROFILES[protocol]
+  profile = PCI.PROFILES[protocol]
   if not isinstance(pair.get(protocol), dict) or pair[protocol].get("version") != profile["version"]:
     raise ValueError("Restore provenance does not identify the exact cold abort diagnostic")
   if profile["observations"] is not None:
@@ -188,6 +189,8 @@ def inspect(root, source, restore, expected_pair_vector, pair_loader=PAIR.load_p
     if (not isinstance(observed, dict) or observed != profile["observations"] or
         any(type(observed[key]) is not type(value) for key, value in profile["observations"].items())):
       raise ValueError("Cold abort returned proof lacks its exact observation contract")
+  if protocol == PCI.KEY:
+    PCI.validate_metadata(pair)
   restore_marker = pair.get("restore_marker")
   if not isinstance(restore_marker, dict) or restore_marker.get("version") != "v2" or restore_marker.get("efi_variable") != RESTORE_VARIABLE:
     raise ValueError("Restore provenance does not identify the V2 stage marker")
@@ -273,7 +276,7 @@ def inspect(root, source, restore, expected_pair_vector, pair_loader=PAIR.load_p
     name = (profile["returned"] if kind == "returned" else "OmarchyT2RestoreHook" + kind.capitalize()) + vector[:24] + "-" + GUID
     markers[kind] = marker(snapshot, name, profile["magic"] if kind == "returned" else b"MBRH", vector, stage,
                            ascii_prefix=True, exact_stage=stage)
-  for key, other in COLD.PROFILES.items():
+  for key, other in PCI.PROFILES.items():
     if key != protocol:
       conflicting = marker(snapshot, other["returned"] + vector[:24] + "-" + GUID, other["magic"], vector, 1,
                            ascii_prefix=True, exact_stage=1)
@@ -313,7 +316,7 @@ def inspect(root, source, restore, expected_pair_vector, pair_loader=PAIR.load_p
   if attempt_names(snapshot, attempts) != names:
     raise ValueError("Attempt archive changed during audit")
   evidence_hashes = snapshot.finish()
-  return {
+  result = {
     "classification": result, "pair_vector": vector,
     "hibernate_success": False, "restored_userspace": False, "hardware_qualified": False,
     "source_boot_id": source_boot or (current_boot if selected == receipt["images"]["source"]["entry_id"] else None),
@@ -328,10 +331,15 @@ def inspect(root, source, restore, expected_pair_vector, pair_loader=PAIR.load_p
     "restore_stage_7_semantics": "dpm_suspend_end entry only; no proof of noirq or atomic restore completion",
     "controlled_return_semantics": "exclusive witness of intentional " + profile["target"] + " entry abort recovery to restore initramfs; not restored source userspace or completion of target body",
   }
+  if protocol == PCI.KEY:
+    result["witness_attested_guard_observations"] = profile["guard_observations"] if result["classification"] == "controlled-abort-return" else None
+    result["physical_dma_inactivity_proven"] = False
+    result["controlled_return_semantics"] += "; a positive combined witness attests one-use PCI gate recovery without latched failure; not proof of posted-DMA drain"
+  return result
 
 
 def main(required_protocol="cold_pre_cpu"):
-  profile = COLD.PROFILES[required_protocol]
+  profile = PCI.PROFILES[required_protocol]
   parser = argparse.ArgumentParser(description="Read-only " + profile["version"] + " controlled-return audit; never proof of atomic restoration or successful hibernation.")
   parser.add_argument("--source", type=Path, required=True)
   parser.add_argument("--restore", type=Path, required=True)

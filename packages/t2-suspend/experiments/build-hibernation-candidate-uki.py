@@ -31,6 +31,9 @@ COLD_STOCK_RESUME = Path("/usr/lib/initcpio/hooks/resume")
 _protocol_spec = importlib.util.spec_from_file_location("builder_cold_protocols", HERE / "cold-abort-protocols.py")
 COLD = importlib.util.module_from_spec(_protocol_spec)
 _protocol_spec.loader.exec_module(COLD)
+_pci_spec = importlib.util.spec_from_file_location("builder_cold_pci_protocols", HERE / "cold-pci-abort-protocols.py")
+PCI = importlib.util.module_from_spec(_pci_spec)
+_pci_spec.loader.exec_module(PCI)
 RESTORE_MARKER_FILES = (
   "hooks/omarchy-t2-restore-marker",
   "usr/lib/omarchy-t2-restore-marker/marker.ko",
@@ -266,7 +269,65 @@ def verify_cold_pre_cpu_tree(extracted, provenance, release, restore_marker, pro
   spec.loader.exec_module(auditor)
   marker = {"efi_variable": "OmarchyT2RestoreStage" + ("V2" if restore_marker["version"] == "v2" else "") + "-5e17d2ad-021f-4d45-a8e5-f4c191983e27"}
   auditor.verify_cold_pre_cpu_tree(extracted, {protocol: provenance, "restore_marker": marker, "kernel_release": release,
-                                            "experiment_id": COLD.PROFILES[protocol]["version"]})
+                                            "experiment_id": PCI.PROFILES[protocol]["version"]})
+
+
+def prepare_cold_pci_pre_arch(work, module, module_sha256, srcversion, helper, helper_sha256,
+                             guard, guard_sha256, guard_srcversion, release, restore_marker):
+  inputs = (module, module_sha256, srcversion, helper, helper_sha256, guard, guard_sha256, guard_srcversion)
+  if all(value is None for value in inputs):
+    return None
+  if any(value is None for value in inputs) or restore_marker is None or restore_marker.get("version") != "v2":
+    raise ValueError("Combined PCI guard requires both exact modules, helper and V2 restore marker together")
+  validate_cold_private_file(module, module_sha256)
+  validate_cold_private_file(guard, guard_sha256)
+  validate_cold_private_file(helper, helper_sha256, executable=True)
+  identities = []
+  for path, pin, name in ((module, srcversion, PCI.PROFILE["module"]),
+                          (guard, guard_srcversion, PCI.PROFILE["guard_module"])):
+    identity = module_metadata(path)
+    if (not isinstance(pin, str) or re.fullmatch(r"[0-9A-F]+", pin) is None or
+        identity["srcversion"] != pin or not identity["vermagic"].split() or
+        identity["vermagic"].split()[0] != release):
+      raise ValueError("Combined PCI guard module source version or production ABI differs")
+    if run(("modinfo", "-F", "name", path), capture=True).stdout.strip() != name:
+      raise ValueError("Combined PCI guard module name differs")
+    identities.append(identity)
+  if identities[0]["vermagic"] != identities[1]["vermagic"] or module_sha256 == guard_sha256:
+    raise ValueError("Combined PCI guard modules must be distinct with identical production ABI")
+  for field, expected in (("mba_cold_permanent", "v1"), ("mba_cold_boundary", "pre-arch-v1")):
+    if run(("modinfo", "-F", field, module), capture=True).stdout.strip() != expected:
+      raise ValueError("Combined PCI guard abort module attestation differs: " + field)
+  profile = PCI.PROFILE
+  bundle = work / (profile["version"] + "-bundle")
+  bundle.mkdir(mode=0o700)
+  for name, path in (("abort.ko", module), ("guard.ko", guard), ("header-reader", helper),
+                     ("functions", profile["source"] / "functions"), ("stock-resume", COLD_STOCK_RESUME)):
+    if path.is_symlink() or not path.is_file():
+      raise ValueError("Combined PCI guard bundle source missing or symlinked: " + name)
+    shutil.copyfile(path, bundle / name)
+    (bundle / name).chmod(0o700 if name == "header-reader" else 0o600)
+  variable = "OmarchyT2RestoreStageV2-5e17d2ad-021f-4d45-a8e5-f4c191983e27"
+  for name, value in {
+    "abort.sha256": module_sha256, "abort.srcversion": srcversion,
+    "guard.sha256": guard_sha256, "guard.srcversion": guard_srcversion,
+    "header-reader.sha256": helper_sha256, "restore.variable": variable,
+    "resume.device": "/dev/mapper/root", "resume.offset": "1923214", "resume.devnum": "253:0",
+    "stock-resume.sha256": digest(COLD_STOCK_RESUME),
+  }.items():
+    (bundle / name).write_text(value + "\n")
+    (bundle / name).chmod(0o600)
+  files = {profile["directory"] + path.name: digest(path) for path in bundle.iterdir()}
+  files.update({"hooks/" + hook: digest(profile["source"] / "hooks" / hook) for hook in PCI.hooks(PCI.KEY)})
+  return {"bundle": bundle, "protocol": PCI.KEY, "provenance": {
+    "version": profile["version"], "target": profile["target"],
+    "module_sha256": module_sha256, "module_srcversion": srcversion, "module_vermagic": identities[0]["vermagic"],
+    "guard_module_sha256": guard_sha256, "guard_module_srcversion": guard_srcversion,
+    "guard_module_vermagic": identities[1]["vermagic"], "header_helper_sha256": helper_sha256,
+    "restore_variable": variable, "resume": {"device": "/dev/mapper/root", "offset": 1923214, "devnum": "253:0"},
+    "boundary_observations": profile["observations"].copy(), "guard_observations": profile["guard_observations"].copy(),
+    "source_sha256": {name: digest(path) for name, path in PCI.sources(PCI.KEY).items()}, "files_sha256": files,
+  }}
 
 
 def validate_candidate(candidate, release):
@@ -388,14 +449,14 @@ unset minimal_hooks minimal_hook minimal_modules minimal_module
 
 
 def cold_pre_cpu_config(base, protocol="cold_pre_cpu"):
-  hook = COLD.PROFILES[protocol]["hook"]
+  hook = PCI.PROFILES[protocol]["hook"]
   script = "source " + shlex.quote(str(base)) + "\n" + '''
 cold_hooks=()
 cold_marker_count=0
 cold_resume_count=0
 for cold_hook in "${HOOKS[@]}"; do
   case $cold_hook in
-    omarchy-t2-cold-pre-cpu|omarchy-t2-cold-pre-cpu-return|omarchy-t2-cold-pre-syscore|omarchy-t2-cold-pre-syscore-return|omarchy-t2-cold-pre-arch|omarchy-t2-cold-pre-arch-return)
+    omarchy-t2-cold-pre-cpu|omarchy-t2-cold-pre-cpu-return|omarchy-t2-cold-pre-syscore|omarchy-t2-cold-pre-syscore-return|omarchy-t2-cold-pre-arch|omarchy-t2-cold-pre-arch-return|omarchy-t2-cold-pci-pre-arch|omarchy-t2-cold-pci-pre-arch-return)
       echo "Cold pre-CPU hook already configured" >&2
       exit 1
       ;;
@@ -455,7 +516,12 @@ def build_initrd(work, module_root, payload, release, expected, experiment_id=No
     wrapped = work / "cold-pre-cpu-mkinitcpio.conf"
     wrapped.write_text(cold_pre_cpu_config(config_path, cold_pre_cpu["protocol"]))
     config_path = wrapped
-  cold_sources = (COLD.COMMON, COLD.PROFILES[cold_pre_cpu["protocol"]]["source"]) if cold_pre_cpu is not None else ()
+  if cold_pre_cpu is None:
+    cold_sources = ()
+  elif cold_pre_cpu["protocol"] == PCI.KEY:
+    cold_sources = (PCI.PROFILE["source"],)
+  else:
+    cold_sources = (COLD.COMMON, COLD.PROFILES[cold_pre_cpu["protocol"]]["source"])
   cold_hooks = "".join(str(path / "hooks") + ":" for path in cold_sources)
   cold_install = "".join(str(path / "install") + ":" for path in cold_sources)
   environment = [
@@ -468,7 +534,8 @@ def build_initrd(work, module_root, payload, release, expected, experiment_id=No
     "OMARCHY_T2_RESTORE_MARKER_MODULE=" + (str(restore_marker["module"]) if restore_marker is not None else ""),
   ]
   if cold_pre_cpu is not None:
-    environment.append("OMARCHY_T2_COLD_ABORT_BUNDLE=" + str(cold_pre_cpu["bundle"]))
+    variable = "OMARCHY_T2_COLD_PCI_ABORT_BUNDLE" if cold_pre_cpu["protocol"] == PCI.KEY else "OMARCHY_T2_COLD_ABORT_BUNDLE"
+    environment.append(variable + "=" + str(cold_pre_cpu["bundle"]))
   if restore_marker is not None:
     environment.extend((
       "OMARCHY_T2_RESTORE_MARKER_SHA256_FILE=" + str(restore_marker["sha_file"]),
@@ -685,6 +752,14 @@ def main():
   parser.add_argument("--expected-cold-pre-arch-srcversion")
   parser.add_argument("--cold-pre-arch-header-helper", type=Path)
   parser.add_argument("--expected-cold-pre-arch-header-helper-sha256")
+  parser.add_argument("--cold-pci-pre-arch-module", type=Path)
+  parser.add_argument("--expected-cold-pci-pre-arch-sha256")
+  parser.add_argument("--expected-cold-pci-pre-arch-srcversion")
+  parser.add_argument("--cold-pci-pre-arch-header-helper", type=Path)
+  parser.add_argument("--expected-cold-pci-pre-arch-header-helper-sha256")
+  parser.add_argument("--cold-pci-pre-arch-guard-module", type=Path)
+  parser.add_argument("--expected-cold-pci-pre-arch-guard-sha256")
+  parser.add_argument("--expected-cold-pci-pre-arch-guard-srcversion")
   args = parser.parse_args()
   if args.minimal_restore_devices and args.restore_marker_module is None:
     parser.error("--minimal-restore-devices requires an explicit --restore-marker-module")
@@ -694,19 +769,25 @@ def main():
                getattr(args, "expected_" + protocol + "_header_helper_sha256"))
     for protocol in COLD.PROFILES
   }
+  profiles[PCI.KEY] = (args.cold_pci_pre_arch_module, args.expected_cold_pci_pre_arch_sha256,
+                       args.expected_cold_pci_pre_arch_srcversion, args.cold_pci_pre_arch_header_helper,
+                       args.expected_cold_pci_pre_arch_header_helper_sha256, args.cold_pci_pre_arch_guard_module,
+                       args.expected_cold_pci_pre_arch_guard_sha256, args.expected_cold_pci_pre_arch_guard_srcversion)
   selected = [protocol for protocol, inputs in profiles.items() if any(value is not None for value in inputs)]
   if len(selected) > 1:
-    parser.error("Cold pre-CPU, pre-syscore and pre-arch protocols are mutually exclusive")
+    parser.error("Cold abort protocols are mutually exclusive")
   cold_protocol = selected[0] if selected else "cold_pre_cpu"
   cold_inputs = profiles[cold_protocol]
   if any(value is not None for value in cold_inputs):
     if any(value is None for value in cold_inputs) or args.restore_marker_module is None or not args.minimal_restore_devices:
       parser.error("Cold abort requires complete module/helper pins, restore marker and --minimal-restore-devices")
+    if cold_protocol == PCI.KEY and args.restore_marker_version != "v2":
+      parser.error("Combined PCI guard requires the V2 restore marker")
 
   if os.geteuid() != 0:
     raise SystemExit("Run as root so the root-unlock key retains protected handling")
   experiment_id = validate_experiment_id(args.experiment_id)
-  if any(value is not None for value in cold_inputs) and experiment_id != COLD.PROFILES[cold_protocol]["version"]:
+  if any(value is not None for value in cold_inputs) and experiment_id != PCI.PROFILES[cold_protocol]["version"]:
     parser.error("Cold diagnostic experiment ID must exactly match its selected protocol")
   output = args.output.absolute()
   if output.exists():
@@ -726,7 +807,10 @@ def main():
     restore_marker = prepare_restore_marker(work, args.restore_marker_module, args.expected_restore_marker_sha256,
                                             args.expected_restore_marker_srcversion, args.kernel_release,
                                             args.restore_marker_version)
-    cold_pre_cpu = prepare_cold_pre_cpu(work, *cold_inputs, args.kernel_release, restore_marker, protocol=cold_protocol)
+    if cold_protocol == PCI.KEY:
+      cold_pre_cpu = prepare_cold_pci_pre_arch(work, *cold_inputs, args.kernel_release, restore_marker)
+    else:
+      cold_pre_cpu = prepare_cold_pre_cpu(work, *cold_inputs, args.kernel_release, restore_marker, protocol=cold_protocol)
     initrd, staged_payload = build_initrd(work, module_root, payload, args.kernel_release, expected, experiment_id, restore_marker, args.minimal_restore_devices, cold_pre_cpu)
     uki, cmdline, sections, production_hash = build_uki(work, production, initrd)
 
