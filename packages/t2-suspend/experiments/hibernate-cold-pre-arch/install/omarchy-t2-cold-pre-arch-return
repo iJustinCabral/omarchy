@@ -1,0 +1,6 @@
+build() {
+  add_runscript
+}
+help() {
+  echo "Capture a recovered pre-architecture controlled abort after synchronous resume."
+}

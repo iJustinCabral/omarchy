@@ -187,7 +187,7 @@ def inspect(root, source, restore, expected_pair_vector, pair_loader=PAIR.load_p
     observed = pair[protocol].get("boundary_observations")
     if (not isinstance(observed, dict) or observed != profile["observations"] or
         any(type(observed[key]) is not type(value) for key, value in profile["observations"].items())):
-      raise ValueError("Pre-syscore returned proof lacks its exact observation contract")
+      raise ValueError("Cold abort returned proof lacks its exact observation contract")
   restore_marker = pair.get("restore_marker")
   if not isinstance(restore_marker, dict) or restore_marker.get("version") != "v2" or restore_marker.get("efi_variable") != RESTORE_VARIABLE:
     raise ValueError("Restore provenance does not identify the V2 stage marker")
@@ -331,7 +331,8 @@ def inspect(root, source, restore, expected_pair_vector, pair_loader=PAIR.load_p
 
 
 def main(required_protocol="cold_pre_cpu"):
-  parser = argparse.ArgumentParser(description=__doc__)
+  profile = COLD.PROFILES[required_protocol]
+  parser = argparse.ArgumentParser(description="Read-only " + profile["version"] + " controlled-return audit; never proof of atomic restoration or successful hibernation.")
   parser.add_argument("--source", type=Path, required=True)
   parser.add_argument("--restore", type=Path, required=True)
   parser.add_argument("--expected-pair-vector", required=True)
@@ -341,7 +342,7 @@ def main(required_protocol="cold_pre_cpu"):
   try:
     result = inspect(Path("/"), arguments.source, arguments.restore, arguments.expected_pair_vector, required_protocol=required_protocol)
   except (ValueError, OSError, KeyError, TypeError) as error:
-    parser.exit(1, "cold-pre-cpu-return audit refused: " + str(error) + "\n")
+    parser.exit(1, required_protocol.replace("_", "-") + "-return audit refused: " + str(error) + "\n")
   print(json.dumps(result, indent=2, sort_keys=True))
 
 

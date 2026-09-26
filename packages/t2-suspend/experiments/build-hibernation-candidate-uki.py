@@ -209,7 +209,7 @@ def prepare_cold_pre_cpu(work, module, module_sha256, srcversion, helper, helper
   if run(("modinfo", "-F", "mba_cold_permanent", module), capture=True).stdout.strip() != "v1":
     raise ValueError("Cold abort compiled module lacks exact permanent-ftrace attestation")
   if profile["boundary"] is not None and run(("modinfo", "-F", "mba_cold_boundary", module), capture=True).stdout.strip() != profile["boundary"]:
-    raise ValueError("Cold pre-syscore module boundary metadata differs")
+    raise ValueError("Cold abort module boundary metadata differs")
   bundle = work / (profile["version"] + "-bundle")
   bundle.mkdir(mode=0o700)
   variable = "OmarchyT2RestoreStage" + ("V2" if restore_marker["version"] == "v2" else "") + "-5e17d2ad-021f-4d45-a8e5-f4c191983e27"
@@ -395,7 +395,7 @@ cold_marker_count=0
 cold_resume_count=0
 for cold_hook in "${HOOKS[@]}"; do
   case $cold_hook in
-    omarchy-t2-cold-pre-cpu|omarchy-t2-cold-pre-cpu-return|omarchy-t2-cold-pre-syscore|omarchy-t2-cold-pre-syscore-return)
+    omarchy-t2-cold-pre-cpu|omarchy-t2-cold-pre-cpu-return|omarchy-t2-cold-pre-syscore|omarchy-t2-cold-pre-syscore-return|omarchy-t2-cold-pre-arch|omarchy-t2-cold-pre-arch-return)
       echo "Cold pre-CPU hook already configured" >&2
       exit 1
       ;;
@@ -680,21 +680,28 @@ def main():
   parser.add_argument("--expected-cold-pre-syscore-srcversion")
   parser.add_argument("--cold-pre-syscore-header-helper", type=Path)
   parser.add_argument("--expected-cold-pre-syscore-header-helper-sha256")
+  parser.add_argument("--cold-pre-arch-module", type=Path)
+  parser.add_argument("--expected-cold-pre-arch-sha256")
+  parser.add_argument("--expected-cold-pre-arch-srcversion")
+  parser.add_argument("--cold-pre-arch-header-helper", type=Path)
+  parser.add_argument("--expected-cold-pre-arch-header-helper-sha256")
   args = parser.parse_args()
   if args.minimal_restore_devices and args.restore_marker_module is None:
     parser.error("--minimal-restore-devices requires an explicit --restore-marker-module")
-  cold_inputs = (args.cold_pre_cpu_module, args.expected_cold_pre_cpu_sha256, args.expected_cold_pre_cpu_srcversion,
-                 args.cold_pre_cpu_header_helper, args.expected_cold_pre_cpu_header_helper_sha256)
-  syscore_inputs = (args.cold_pre_syscore_module, args.expected_cold_pre_syscore_sha256, args.expected_cold_pre_syscore_srcversion,
-                    args.cold_pre_syscore_header_helper, args.expected_cold_pre_syscore_header_helper_sha256)
-  if any(value is not None for value in cold_inputs) and any(value is not None for value in syscore_inputs):
-    parser.error("Cold pre-CPU and pre-syscore protocols are mutually exclusive")
-  cold_protocol = "cold_pre_syscore" if any(value is not None for value in syscore_inputs) else "cold_pre_cpu"
-  if cold_protocol == "cold_pre_syscore":
-    cold_inputs = syscore_inputs
+  profiles = {
+    protocol: (getattr(args, protocol + "_module"), getattr(args, "expected_" + protocol + "_sha256"),
+               getattr(args, "expected_" + protocol + "_srcversion"), getattr(args, protocol + "_header_helper"),
+               getattr(args, "expected_" + protocol + "_header_helper_sha256"))
+    for protocol in COLD.PROFILES
+  }
+  selected = [protocol for protocol, inputs in profiles.items() if any(value is not None for value in inputs)]
+  if len(selected) > 1:
+    parser.error("Cold pre-CPU, pre-syscore and pre-arch protocols are mutually exclusive")
+  cold_protocol = selected[0] if selected else "cold_pre_cpu"
+  cold_inputs = profiles[cold_protocol]
   if any(value is not None for value in cold_inputs):
     if any(value is None for value in cold_inputs) or args.restore_marker_module is None or not args.minimal_restore_devices:
-      parser.error("Cold pre-CPU requires complete module/helper pins, restore marker and --minimal-restore-devices")
+      parser.error("Cold abort requires complete module/helper pins, restore marker and --minimal-restore-devices")
 
   if os.geteuid() != 0:
     raise SystemExit("Run as root so the root-unlock key retains protected handling")

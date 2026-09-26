@@ -1,8 +1,8 @@
-# Shared by exactly two mkinitcpio busybox ash diagnostics. No source-time PM or EFI operations.
+# Shared by exactly three mkinitcpio busybox ash diagnostics. No source-time PM or EFI operations.
 cold_select_protocol() {
   cold_failure=protocol-selector
   cold_root=${OMARCHY_T2_COLD_PRE_CPU_ROOT:-}
-  local file=$cold_root/usr/lib/omarchy-t2-cold-common/protocol
+  local file=$cold_root/usr/lib/omarchy-t2-cold-common/protocol other_module
   [[ -f $file && ! -L $file ]] || return 1
   read -r cold_protocol < "$file" || return 1
   [[ -z "$1" || $cold_protocol == "$1" ]] || return 1
@@ -11,28 +11,38 @@ cold_select_protocol() {
       cold_name=omarchy-t2-cold-pre-cpu
       cold_module=mba_hibernate_cold_pre_cpu
       cold_magic=MBCP
-      cold_return_name=OmarchyT2ColdPreCpuReturned ;;
+      cold_return_name=OmarchyT2ColdPreCpuReturned
+      cold_other_modules="mba_hibernate_cold_pre_syscore mba_hibernate_cold_pre_arch"
+      cold_other_returns="OmarchyT2ColdPreSyscoreReturned OmarchyT2ColdPreArchReturned" ;;
     cold-pre-syscore-abort-v1)
       cold_name=omarchy-t2-cold-pre-syscore
       cold_module=mba_hibernate_cold_pre_syscore
       cold_magic=MBSC
-      cold_return_name=OmarchyT2ColdPreSyscoreReturned ;;
+      cold_return_name=OmarchyT2ColdPreSyscoreReturned
+      cold_other_modules="mba_hibernate_cold_pre_cpu mba_hibernate_cold_pre_arch"
+      cold_other_returns="OmarchyT2ColdPreCpuReturned OmarchyT2ColdPreArchReturned" ;;
+    cold-pre-arch-abort-v1)
+      cold_name=omarchy-t2-cold-pre-arch
+      cold_module=mba_hibernate_cold_pre_arch
+      cold_magic=MBAR
+      cold_return_name=OmarchyT2ColdPreArchReturned
+      cold_other_modules="mba_hibernate_cold_pre_cpu mba_hibernate_cold_pre_syscore"
+      cold_other_returns="OmarchyT2ColdPreCpuReturned OmarchyT2ColdPreSyscoreReturned" ;;
     *) return 1 ;;
   esac
-  cold_other_module=mba_hibernate_cold_pre_cpu
-  cold_other_return=OmarchyT2ColdPreCpuReturned
-  if [[ $cold_module == "$cold_other_module" ]]; then
-    cold_other_module=mba_hibernate_cold_pre_syscore
-    cold_other_return=OmarchyT2ColdPreSyscoreReturned
-  fi
   cold_failure=other-protocol-loaded
-  [[ ! -e $cold_root/sys/module/$cold_other_module && ! -L $cold_root/sys/module/$cold_other_module ]] || return 1
+  for other_module in $cold_other_modules; do
+    [[ ! -e $cold_root/sys/module/$other_module && ! -L $cold_root/sys/module/$other_module ]] || return 1
+  done
   return 0
 }
 
 cold_observations() {
   local irq online valid
-  [[ $cold_protocol == "cold-pre-syscore-abort-v1" ]] || return 0
+  case $cold_protocol in
+    cold-pre-syscore-abort-v1|cold-pre-arch-abort-v1) ;;
+    *) return 0 ;;
+  esac
   read -r irq < "$cold_sys/parameters/observed_irqs_disabled" || return 1
   read -r online < "$cold_sys/parameters/observed_online_cpus" || return 1
   read -r valid < "$cold_sys/parameters/observed_boundary_valid" || return 1
@@ -61,7 +71,7 @@ cold_hook_order() {
       "$cold_name-return")
         [[ $phase == "3" ]] || return 1
         phase=4 ;;
-      omarchy-t2-cold-pre-cpu|omarchy-t2-cold-pre-cpu-return|omarchy-t2-cold-pre-syscore|omarchy-t2-cold-pre-syscore-return) return 1 ;;
+      omarchy-t2-cold-pre-cpu|omarchy-t2-cold-pre-cpu-return|omarchy-t2-cold-pre-syscore|omarchy-t2-cold-pre-syscore-return|omarchy-t2-cold-pre-arch|omarchy-t2-cold-pre-arch-return) return 1 ;;
       *)
         [[ $phase == "0" || $phase == "4" ]] || return 1 ;;
     esac
@@ -70,7 +80,7 @@ cold_hook_order() {
   for hooks_array in "$EARLYHOOKS" "$LATEHOOKS" "$CLEANUPHOOKS" "$EMERGENCYHOOKS"; do
     for hook in $hooks_array; do
       case $hook in
-        omarchy-t2-cold-pre-cpu|omarchy-t2-cold-pre-cpu-return|omarchy-t2-cold-pre-syscore|omarchy-t2-cold-pre-syscore-return|omarchy-t2-restore-marker|resume) return 1 ;;
+        omarchy-t2-cold-pre-cpu|omarchy-t2-cold-pre-cpu-return|omarchy-t2-cold-pre-syscore|omarchy-t2-cold-pre-syscore-return|omarchy-t2-cold-pre-arch|omarchy-t2-cold-pre-arch-return|omarchy-t2-restore-marker|resume) return 1 ;;
       esac
     done
   done
@@ -169,6 +179,7 @@ cold_before_resume() {
   read -r prefix < "$cold_intent" || return 1
   cold_marker_prefix 00 || return 1
   [[ $prefix == "$cold_prefix" ]] || return 1
+  cold_witnesses_absent || return 1
   cold_identity || return 1
   read -r armed < "$cold_sys/parameters/arm_prefix" || return 1
   read -r consumed < "$cold_sys/parameters/arm_consumed" || return 1
@@ -214,6 +225,15 @@ cold_write_arm() {
   printf '%s\n' "$cold_prefix" > "$cold_sys/parameters/arm_prefix"
 }
 
+cold_witnesses_absent() {
+  local returned_name
+  cold_failure=returned-witness-present
+  for returned_name in "$cold_return_name" $cold_other_returns; do
+    [[ ! -e $cold_vars/${returned_name}${cold_prefix}-$cold_guid && ! -L $cold_vars/${returned_name}${cold_prefix}-$cold_guid ]] || return 1
+  done
+  return 0
+}
+
 cold_recovery() {
   if command -v plymouth >/dev/null 2>&1; then
     plymouth quit >/dev/null 2>&1 || :
@@ -240,9 +260,7 @@ cold_prepare() {
   cold_marker_prefix 00 || return 1
   cold_failure=pending-residue
   [[ ! -e $cold_intent && ! -L $cold_intent && ! -e $cold_sys ]] || return 1
-  cold_failure=returned-witness-present
-  [[ ! -e $cold_vars/${cold_return_name}${cold_prefix}-$cold_guid && ! -L $cold_vars/${cold_return_name}${cold_prefix}-$cold_guid ]] || return 1
-  [[ ! -e $cold_vars/${cold_other_return}${cold_prefix}-$cold_guid && ! -L $cold_vars/${cold_other_return}${cold_prefix}-$cold_guid ]] || return 1
+  cold_witnesses_absent || return 1
   cold_failure=abort-file-identity
   cold_file_identity || return 1
   # Record intent before insertion/arming; a partial arm cannot become inert.
@@ -293,8 +311,7 @@ cold_capture_return() {
   cold_header_gate || return 1
   [[ $cold_header == "NORMAL" ]] || return 1
   witness=$cold_vars/${cold_return_name}${cold_prefix}-$cold_guid
-  [[ ! -e $witness && ! -L $witness ]] || return 1
-  [[ ! -e $cold_vars/${cold_other_return}${cold_prefix}-$cold_guid && ! -L $cold_vars/${cold_other_return}${cold_prefix}-$cold_guid ]] || return 1
+  cold_witnesses_absent || return 1
   expected=$(printf '\007\000\000\000%s%s\001' "$cold_magic" "$cold_prefix" | hexdump -v -e '/1 "%02x"') || return 1
   (umask 077; set -C; printf '\007\000\000\000%s%s\001' "$cold_magic" "$cold_prefix" > "$witness") || return 1
   actual=$(hexdump -v -e '/1 "%02x"' "$witness") || return 1

@@ -1,4 +1,4 @@
-"""Closed constants for the two supported cold-restore abort boundaries."""
+"""Closed constants for the three supported cold-restore abort boundaries."""
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -17,6 +17,13 @@ PROFILES = {
     "observations": {"observed_irqs_disabled": "Y", "observed_online_cpus": 1, "observed_boundary_valid": "Y"},
     "directory": "usr/lib/omarchy-t2-cold-pre-syscore/", "hook": "omarchy-t2-cold-pre-syscore",
     "source": HERE / "hibernate-cold-pre-syscore", "magic": b"MBSC", "returned": "OmarchyT2ColdPreSyscoreReturned",
+  },
+  "cold_pre_arch": {
+    "version": "cold-pre-arch-abort-v1", "target": "swsusp_arch_resume",
+    "module": "mba_hibernate_cold_pre_arch", "boundary": "pre-arch-v1",
+    "observations": {"observed_irqs_disabled": "Y", "observed_online_cpus": 1, "observed_boundary_valid": "Y"},
+    "directory": "usr/lib/omarchy-t2-cold-pre-arch/", "hook": "omarchy-t2-cold-pre-arch",
+    "source": HERE / "hibernate-cold-pre-arch", "magic": b"MBAR", "returned": "OmarchyT2ColdPreArchReturned",
   },
 }
 

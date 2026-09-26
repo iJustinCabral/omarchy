@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Exact two-protocol image/runtime/returned-proof fixtures; no host PM."""
+"""Exact closed-protocol image/runtime/returned-proof fixtures; no host PM."""
 import copy
 import hashlib
 import importlib.util
@@ -30,7 +30,7 @@ PROFILE = builder.COLD.PROFILES["cold_pre_syscore"]
 
 
 class SyscoreIntegrationTests(unittest.TestCase):
-  def test_busybox_ordinary_gate_reports_fixed_refusal_reasons_for_both_protocols(self):
+  def test_busybox_ordinary_gate_reports_fixed_refusal_reasons_for_all_protocols(self):
     busybox = "/usr/lib/initcpio/busybox"
     self.assertTrue(Path(busybox).is_file())
     cases = {
@@ -203,7 +203,7 @@ printf '%s:%s\n' "$status" "$cold_failure"
         builder.prepare_cold_pre_cpu(fixture.root, fixture.module, builder.digest(fixture.module), "ABC123", fixture.helper,
                                     builder.digest(fixture.helper), fixture.release, fixture.marker, protocol="cold_pre_syscore")
 
-  def test_both_compiled_modules_require_permanent_attestation(self):
+  def test_all_compiled_modules_require_permanent_attestation(self):
     for protocol, profile in builder.COLD.PROFILES.items():
       with self.subTest(protocol=protocol):
         fixture = self.image_fixture()
@@ -370,6 +370,9 @@ error() { printf 'ERROR %s\n' "$*"; return 1; }
       self.assertEqual(result.returncode, 0, str(path) + result.stderr)
 
   def test_actual_quiet_dispatch_stock_resume_and_syscore_observations(self):
+    self.runtime_dispatch(PROFILE)
+
+  def runtime_dispatch(self, profile, other_profile=None):
     # Source the real dispatcher/stock resume; only absolute paths are
     # relocated. Module insertion and the sysfs trigger are explicit mocks.
     dispatch = re.search(r"run_hookfunctions\(\) \{\n.*?\n\}", Path("/usr/lib/initcpio/init_functions").read_text(), re.S).group(0)
@@ -410,6 +413,10 @@ insmod() {
       command printf '0\n' > "$module/parameters/arm_prefix"
       command printf '0\n' > "$module/parameters/stage"
       write_restore_arm_prefix() { command printf '1\n' > "$2"; }
+      case $MOCK in
+        pre-resume-cross-return) command printf 'conflict\n' > "$cold_vars/OmarchyT2ColdPreCpuReturned${cold_prefix}-$cold_guid" ;;
+        pre-resume-own-return) command printf 'conflict\n' > "$cold_vars/${cold_return_name}${cold_prefix}-$cold_guid" ;;
+      esac
       ;;
     *) exit 93 ;;
   esac
@@ -441,9 +448,15 @@ printf() {
   command printf "$@"
 }
 '''
+    other_profile = other_profile or builder.COLD.PROFILES["cold_pre_cpu"]
+    driver = driver.replace(PROFILE["directory"], profile["directory"]).replace(PROFILE["module"], profile["module"])
+    driver = driver.replace("OmarchyT2ColdPreCpuReturned", other_profile["returned"])
     driver += dispatch + '\nrun_hookfunctions run_hook hook $HOOKS\n'
     modes = ("success", "ordinary", "irq-enabled", "multi-cpu", "invalid-boundary", "missing-observation",
-             "no-interception", "pending-after-return", "ftrace-disabled", "ftrace-lost", "other-module", "cross-return", "other-hook")
+             "no-interception", "pending-after-return", "ftrace-disabled", "ftrace-lost", "other-module", "cross-return", "other-hook",
+             "pre-resume-cross-return", "pre-resume-own-return")
+    if profile["observations"] is None:
+      modes = tuple(mode for mode in modes if mode not in ("irq-enabled", "multi-cpu", "invalid-boundary", "missing-observation"))
     with tempfile.TemporaryDirectory(prefix="syscore-runtime-test-") as temporary:
       for mode in modes:
         with self.subTest(mode=mode):
@@ -456,10 +469,10 @@ printf() {
               path.chmod(0o700)
             return path
           common = builder.COLD.COMMON_DIRECTORY
-          directory = PROFILE["directory"]
+          directory = profile["directory"]
           write(common + "functions", (builder.COLD.COMMON / "functions").read_bytes())
-          write(common + "protocol", PROFILE["version"] + "\n")
-          write(directory + "functions", (PROFILE["source"] / "functions").read_bytes())
+          write(common + "protocol", profile["version"] + "\n")
+          write(directory + "functions", (profile["source"] / "functions").read_bytes())
           write(directory + "abort.ko", b"explicit synthetic module")
           write(directory + "abort.sha256", hashlib.sha256(b"explicit synthetic module").hexdigest() + "\n")
           write(directory + "abort.srcversion", "SRC\n")
@@ -485,20 +498,21 @@ printf() {
           write(marker_dir + "marker.sha256", hashlib.sha256(b"synthetic restore marker").hexdigest() + "\n")
           write(marker_dir + "marker.srcversion", "SRC\n")
           write(marker_dir + "marker.version", "v2\n")
-          for hook in builder.COLD.hooks("cold_pre_syscore"):
-            source = builder.COLD.COMMON if hook == "resume" else PROFILE["source"]
+          protocol = next(key for key, value in builder.COLD.PROFILES.items() if value == profile)
+          for hook in builder.COLD.hooks(protocol):
+            source = builder.COLD.COMMON if hook == "resume" else profile["source"]
             write("hooks/" + hook, (source / "hooks" / hook).read_bytes(), True)
           write("hooks/omarchy-t2-restore-marker", (EXPERIMENTS / "hibernate-candidate-initcpio/hooks/omarchy-t2-restore-marker").read_bytes(), True)
           if mode == "other-module":
-            (root / "sys/module/mba_hibernate_cold_pre_cpu").mkdir(parents=True)
-          chain = "encrypt " + PROFILE["hook"] + " omarchy-t2-restore-marker resume " + PROFILE["hook"] + "-return"
+            (root / "sys/module" / other_profile["module"]).mkdir(parents=True)
+          chain = "encrypt " + profile["hook"] + " omarchy-t2-restore-marker resume " + profile["hook"] + "-return"
           if mode == "other-hook":
-            chain = "omarchy-t2-cold-pre-cpu " + chain
+            chain = other_profile["hook"] + " " + chain
           result = subprocess.run(["/usr/lib/initcpio/busybox", "ash", "-c", driver, "ash"], capture_output=True, text=True,
                                   env={"PATH": os.environ["PATH"], "OMARCHY_T2_COLD_PRE_CPU_ROOT": str(root), "OMARCHY_T2_RESTORE_MARKER_ROOT": str(root),
                                        "MOCK_HOOKS": str(root / "hooks"),
                                        "MOCK": mode, "HOOKS": chain})
-          witness = root / reader.EFI / (PROFILE["returned"] + "0123456789abcdef01234567-" + reader.GUID)
+          witness = root / reader.EFI / (profile["returned"] + "0123456789abcdef01234567-" + reader.GUID)
           if mode == "ordinary":
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertFalse(witness.exists())
@@ -507,11 +521,16 @@ printf() {
             self.assertIn("STOP", result.stdout)
             if mode == "success":
               self.assertTrue(witness.exists(), result.stdout + result.stderr)
-              self.assertEqual(witness.read_bytes(), reader.ATTRIBUTES + b"MBSC0123456789abcdef01234567\1")
+              self.assertEqual(witness.read_bytes(), reader.ATTRIBUTES + profile["magic"] + b"0123456789abcdef01234567\1")
               self.assertEqual(result.stderr, "")
               self.assertIn("controlled abort returned and EFI witness verified", result.stdout)
+            elif mode == "pre-resume-own-return":
+              self.assertEqual(witness.read_bytes(), b"conflict\n", "Existing witness must never be overwritten")
             else:
               self.assertFalse(witness.exists(), result.stdout + result.stderr)
+            if mode.startswith("pre-resume-"):
+              order = root / "order"
+              self.assertFalse(order.exists(), "Conflicting witness must prevent the direct resume trigger")
 
 
 if __name__ == "__main__":

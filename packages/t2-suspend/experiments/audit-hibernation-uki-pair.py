@@ -83,7 +83,7 @@ def validate_cold_pre_cpu_metadata(provenance):
     observed = diagnostic.get("boundary_observations")
     if (not isinstance(observed, dict) or observed != profile["observations"] or
         any(type(observed[key]) is not type(value) for key, value in profile["observations"].items())):
-      raise ValueError("Cold pre-syscore observation contract differs")
+      raise ValueError("Cold abort observation contract differs")
   if set(diagnostic) != fields:
     raise ValueError("Cold pre-CPU metadata is missing or malformed")
   if diagnostic["version"] != profile["version"] or diagnostic["target"] != profile["target"]:
