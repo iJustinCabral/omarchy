@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 
 
@@ -67,7 +68,13 @@ def provenance(role):
 def publish(directory, role):
   directory.mkdir()
   image = (role + "-uki").encode()
-  initrd = (role + "-initrd").encode()
+  fixture = directory / "initrd-fixture"
+  fixture.mkdir()
+  (fixture / "early_cpio").write_text("1\n")
+  (fixture / "config").write_text(role + "\n")
+  initrd = b"".join(subprocess.run(("bsdcpio", "--create", "--format=newc"), cwd=fixture,
+                                  input=(name + "\n").encode(), check=True, capture_output=True).stdout
+                    for name in ("early_cpio", "config"))
   (directory / "mba-t2-hibernation-candidate.efi").write_bytes(image)
   (directory / "mba-t2-hibernation-candidate.initrd").write_bytes(initrd)
   report = provenance(role)

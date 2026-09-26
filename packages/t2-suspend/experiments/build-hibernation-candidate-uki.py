@@ -8,6 +8,7 @@ Run it as root so mkinitcpio can preserve the embedded root-unlock key.
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ import re
 import shutil
 import shlex
 import stat
+import struct
 import subprocess
 import tempfile
 
@@ -24,6 +26,8 @@ CONFIG = HERE / "hibernate-candidate-mkinitcpio.conf"
 CANDIDATE_HOOKS = HERE / "hibernate-candidate-initcpio"
 CANDIDATE_MODULE_HELPER = HERE / "hibernate-candidate-modules.py"
 CANDIDATE_BLUETOOTH_HELPER = HERE / "hibernate-candidate-bluetooth.py"
+COLD_PRE_CPU = HERE / "hibernate-cold-pre-cpu"
+COLD_STOCK_RESUME = Path("/usr/lib/initcpio/hooks/resume")
 RESTORE_MARKER_FILES = (
   "hooks/omarchy-t2-restore-marker",
   "usr/lib/omarchy-t2-restore-marker/marker.ko",
@@ -113,6 +117,32 @@ def module_metadata(path):
   }
 
 
+def validate_cold_private_file(path, expected_sha256, executable=False):
+  if (path is None or not path.is_absolute() or path.is_symlink() or not path.is_file() or
+      under(path, Path("/boot")) or under(path, Path("/efi"))):
+    raise ValueError("Cold pre-CPU input must be a private regular file outside boot storage")
+  metadata = path.stat()
+  required_mode = 0o700 if executable else 0o600
+  if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) != required_mode:
+    raise ValueError("Cold pre-CPU input must be root-owned with exact protected mode")
+  if not isinstance(expected_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None or digest(path) != expected_sha256:
+    raise ValueError("Cold pre-CPU input differs from its explicit SHA-256")
+  if executable:
+    validate_static_header_helper(path.read_bytes())
+
+
+def validate_static_header_helper(data):
+  if len(data) < 64 or data[:7] != b"\x7fELF\x02\x01\x01":
+    raise ValueError("Cold pre-CPU header helper must be a static x86-64 ELF executable")
+  values = struct.unpack_from("<HHIQQQIHHHHHH", data, 16)
+  kind, machine, version, _, offset, _, _, size, entry_size, count, _, _, _ = values
+  if kind not in (2, 3) or machine != 62 or version != 1 or size != 64 or entry_size != 56 or not count or offset < 64 or offset + entry_size * count > len(data):
+    raise ValueError("Cold pre-CPU header helper has invalid ELF program headers")
+  types = [struct.unpack_from("<I", data, offset + index * entry_size)[0] for index in range(count)]
+  if 3 in types or 1 not in types:
+    raise ValueError("Cold pre-CPU header helper must be static without PT_INTERP")
+
+
 def prepare_restore_marker(work, path, expected_sha256, expected_srcversion, release, version="v1"):
   if version not in ("v1", "v2"):
     raise ValueError("Unknown restore marker variable version")
@@ -155,6 +185,75 @@ def prepare_restore_marker(work, path, expected_sha256, expected_srcversion, rel
     "version_file": version_file,
     "version": version,
   }
+
+
+def prepare_cold_pre_cpu(work, module, module_sha256, srcversion, helper, helper_sha256, release, restore_marker):
+  inputs = (module, module_sha256, srcversion, helper, helper_sha256)
+  if all(value is None for value in inputs):
+    return None
+  if any(value is None for value in inputs) or restore_marker is None:
+    raise ValueError("Cold pre-CPU requires exact module/helper pins and an exact restore marker together")
+  validate_cold_private_file(module, module_sha256)
+  validate_cold_private_file(helper, helper_sha256, executable=True)
+  identity = module_metadata(module)
+  if (not isinstance(srcversion, str) or re.fullmatch(r"[0-9A-F]+", srcversion) is None or
+      identity["srcversion"] != srcversion or not identity["vermagic"] or
+      identity["vermagic"].split()[0] != release):
+    raise ValueError("Cold pre-CPU module source version or production ABI differs")
+  if run(("modinfo", "-F", "name", module), capture=True).stdout.strip() != "mba_hibernate_cold_pre_cpu":
+    raise ValueError("Cold pre-CPU module name differs from the diagnostic")
+  bundle = work / "cold-pre-cpu-bundle"
+  bundle.mkdir(mode=0o700)
+  variable = "OmarchyT2RestoreStage" + ("V2" if restore_marker["version"] == "v2" else "") + "-5e17d2ad-021f-4d45-a8e5-f4c191983e27"
+  for filename, source in (("abort.ko", module), ("header-reader", helper),
+                           ("functions", COLD_PRE_CPU / "functions"), ("stock-resume", COLD_STOCK_RESUME)):
+    if source.is_symlink() or not source.is_file():
+      raise ValueError("Cold pre-CPU bundle source is missing or symlinked: " + filename)
+    shutil.copyfile(source, bundle / filename)
+    (bundle / filename).chmod(0o700 if filename == "header-reader" else 0o600)
+  for filename, value in {
+    "abort.sha256": module_sha256,
+    "abort.srcversion": srcversion,
+    "header-reader.sha256": helper_sha256,
+    "restore.variable": variable,
+    "resume.device": "/dev/mapper/root",
+    "resume.offset": "1923214",
+    "resume.devnum": "253:0",
+    "stock-resume.sha256": digest(COLD_STOCK_RESUME),
+  }.items():
+    (bundle / filename).write_text(value + "\n")
+    (bundle / filename).chmod(0o600)
+  files = {"usr/lib/omarchy-t2-cold-pre-cpu/" + path.name: digest(path) for path in bundle.iterdir()}
+  for hook in ("omarchy-t2-cold-pre-cpu", "omarchy-t2-cold-pre-cpu-return", "resume"):
+    files["hooks/" + hook] = digest(COLD_PRE_CPU / "hooks" / hook)
+  return {
+    "bundle": bundle,
+    "provenance": {
+      "version": "cold-pre-cpu-abort-v1",
+      "target": "hibernate_resume_nonboot_cpu_disable",
+      "module_sha256": module_sha256,
+      "module_srcversion": srcversion,
+      "module_vermagic": identity["vermagic"],
+      "header_helper_sha256": helper_sha256,
+      "restore_variable": variable,
+      "resume": {"device": "/dev/mapper/root", "offset": 1923214, "devnum": "253:0"},
+      "source_sha256": {
+        "mba_hibernate_cold_pre_cpu.c": digest(COLD_PRE_CPU / "mba_hibernate_cold_pre_cpu.c"),
+        "read-swap-header.c": digest(COLD_PRE_CPU / "read-swap-header.c"),
+        "audit-order.py": digest(COLD_PRE_CPU / "audit-order.py"),
+        **{"install/" + hook: digest(COLD_PRE_CPU / "install" / hook) for hook in ("omarchy-t2-cold-pre-cpu", "omarchy-t2-cold-pre-cpu-return", "resume")},
+      },
+      "files_sha256": files,
+    },
+  }
+
+
+def verify_cold_pre_cpu_tree(extracted, provenance, release, restore_marker):
+  spec = importlib.util.spec_from_file_location("cold_pre_cpu_tree_auditor", HERE / "audit-hibernation-uki-pair.py")
+  auditor = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(auditor)
+  marker = {"efi_variable": "OmarchyT2RestoreStage" + ("V2" if restore_marker["version"] == "v2" else "") + "-5e17d2ad-021f-4d45-a8e5-f4c191983e27"}
+  auditor.verify_cold_pre_cpu_tree(extracted, {"cold_pre_cpu": provenance, "restore_marker": marker, "kernel_release": release})
 
 
 def validate_candidate(candidate, release):
@@ -275,6 +374,37 @@ unset minimal_hooks minimal_hook minimal_modules minimal_module
 '''
 
 
+def cold_pre_cpu_config(base):
+  return "source " + shlex.quote(str(base)) + "\n" + '''
+cold_hooks=()
+cold_marker_count=0
+cold_resume_count=0
+for cold_hook in "${HOOKS[@]}"; do
+  case $cold_hook in
+    omarchy-t2-cold-pre-cpu|omarchy-t2-cold-pre-cpu-return)
+      echo "Cold pre-CPU hook already configured" >&2
+      exit 1
+      ;;
+    omarchy-t2-restore-marker)
+      cold_hooks+=(omarchy-t2-cold-pre-cpu)
+      (( cold_marker_count += 1 ))
+      ;;
+    resume) (( cold_resume_count += 1 )) ;;
+  esac
+  cold_hooks+=("$cold_hook")
+  if [[ $cold_hook == "resume" ]]; then
+    cold_hooks+=(omarchy-t2-cold-pre-cpu-return)
+  fi
+done
+if (( cold_marker_count != 1 || cold_resume_count != 1 )); then
+  echo "Cold pre-CPU requires one restore marker and one resume" >&2
+  exit 1
+fi
+HOOKS=("${cold_hooks[@]}")
+unset cold_hooks cold_hook cold_marker_count cold_resume_count
+'''
+
+
 def verify_minimal_restore_tree(extracted, release):
   config = (extracted / "config").read_text()
   for field in ("MODULES", "HOOKS", "EARLYHOOKS", "LATEHOOKS", "CLEANUPHOOKS", "EMERGENCYHOOKS"):
@@ -299,21 +429,29 @@ def verify_minimal_restore_tree(extracted, release):
     raise ValueError("Minimal restore initramfs lacks ordinary-boot payload hook")
 
 
-def build_initrd(work, module_root, payload, release, expected, experiment_id=None, restore_marker=None, minimal_restore_devices=False):
+def build_initrd(work, module_root, payload, release, expected, experiment_id=None, restore_marker=None, minimal_restore_devices=False, cold_pre_cpu=None):
   initrd = work / "candidate.initrd"
   config_path = CONFIG
   if minimal_restore_devices:
     config_path = work / "minimal-restore-mkinitcpio.conf"
     config_path.write_text(minimal_restore_config(CONFIG))
+  if cold_pre_cpu is not None:
+    wrapped = work / "cold-pre-cpu-mkinitcpio.conf"
+    wrapped.write_text(cold_pre_cpu_config(config_path))
+    config_path = wrapped
+  cold_hooks = str(COLD_PRE_CPU / "hooks") + ":" if cold_pre_cpu is not None else ""
+  cold_install = str(COLD_PRE_CPU / "install") + ":" if cold_pre_cpu is not None else ""
   environment = [
     "env",
-    "MKINITCPIO_HOOKS=" + str(CANDIDATE_HOOKS / "hooks") + ":/etc/initcpio/hooks:/usr/lib/initcpio/hooks",
-    "MKINITCPIO_INSTALL=" + str(CANDIDATE_HOOKS / "install") + ":/etc/initcpio/install:/usr/lib/initcpio/install",
+    "MKINITCPIO_HOOKS=" + cold_hooks + str(CANDIDATE_HOOKS / "hooks") + ":/etc/initcpio/hooks:/usr/lib/initcpio/hooks",
+    "MKINITCPIO_INSTALL=" + cold_install + str(CANDIDATE_HOOKS / "install") + ":/etc/initcpio/install:/usr/lib/initcpio/install",
     "OMARCHY_T2_CANDIDATE_PAYLOAD=" + str(payload),
     "OMARCHY_T2_CANDIDATE_MODULE_HELPER=" + str(CANDIDATE_MODULE_HELPER),
     "OMARCHY_T2_CANDIDATE_BLUETOOTH_HELPER=" + str(CANDIDATE_BLUETOOTH_HELPER),
     "OMARCHY_T2_RESTORE_MARKER_MODULE=" + (str(restore_marker["module"]) if restore_marker is not None else ""),
   ]
+  if cold_pre_cpu is not None:
+    environment.append("OMARCHY_T2_COLD_PRE_CPU_BUNDLE=" + str(cold_pre_cpu["bundle"]))
   if restore_marker is not None:
     environment.extend((
       "OMARCHY_T2_RESTORE_MARKER_SHA256_FILE=" + str(restore_marker["sha_file"]),
@@ -352,6 +490,8 @@ def build_initrd(work, module_root, payload, release, expected, experiment_id=No
   build_config = (extracted / "config").read_text()
   if minimal_restore_devices:
     verify_minimal_restore_tree(extracted, release)
+  if cold_pre_cpu is not None:
+    verify_cold_pre_cpu_tree(extracted, cold_pre_cpu["provenance"], release, restore_marker)
   if "omarchy-t2-candidate-modules" not in build_config:
     raise ValueError("Candidate initramfs late hook is not scheduled")
   if restore_marker is not None:
@@ -513,9 +653,19 @@ def main():
   parser.add_argument("--expected-restore-marker-srcversion")
   parser.add_argument("--restore-marker-version", choices=("v1", "v2"), default="v1")
   parser.add_argument("--minimal-restore-devices", action="store_true", help="omit private initramfs KMS/Plymouth and GPU/Thunderbolt drivers; retain normal root userspace loading")
+  parser.add_argument("--cold-pre-cpu-module", type=Path, help="private controlled-abort cold-restore module")
+  parser.add_argument("--expected-cold-pre-cpu-sha256")
+  parser.add_argument("--expected-cold-pre-cpu-srcversion")
+  parser.add_argument("--cold-pre-cpu-header-helper", type=Path, help="private read-only pending-swap header helper")
+  parser.add_argument("--expected-cold-pre-cpu-header-helper-sha256")
   args = parser.parse_args()
   if args.minimal_restore_devices and args.restore_marker_module is None:
     parser.error("--minimal-restore-devices requires an explicit --restore-marker-module")
+  cold_inputs = (args.cold_pre_cpu_module, args.expected_cold_pre_cpu_sha256, args.expected_cold_pre_cpu_srcversion,
+                 args.cold_pre_cpu_header_helper, args.expected_cold_pre_cpu_header_helper_sha256)
+  if any(value is not None for value in cold_inputs):
+    if any(value is None for value in cold_inputs) or args.restore_marker_module is None or not args.minimal_restore_devices:
+      parser.error("Cold pre-CPU requires complete module/helper pins, restore marker and --minimal-restore-devices")
 
   if os.geteuid() != 0:
     raise SystemExit("Run as root so the root-unlock key retains protected handling")
@@ -538,7 +688,8 @@ def main():
     restore_marker = prepare_restore_marker(work, args.restore_marker_module, args.expected_restore_marker_sha256,
                                             args.expected_restore_marker_srcversion, args.kernel_release,
                                             args.restore_marker_version)
-    initrd, staged_payload = build_initrd(work, module_root, payload, args.kernel_release, expected, experiment_id, restore_marker, args.minimal_restore_devices)
+    cold_pre_cpu = prepare_cold_pre_cpu(work, *cold_inputs, args.kernel_release, restore_marker)
+    initrd, staged_payload = build_initrd(work, module_root, payload, args.kernel_release, expected, experiment_id, restore_marker, args.minimal_restore_devices, cold_pre_cpu)
     uki, cmdline, sections, production_hash = build_uki(work, production, initrd)
 
     publish = work / "publish"
@@ -578,6 +729,8 @@ def main():
     }
     if args.minimal_restore_devices:
       report["minimal_restore_policy"] = MINIMAL_RESTORE_POLICY
+    if cold_pre_cpu is not None:
+      report["cold_pre_cpu"] = cold_pre_cpu["provenance"]
     (publish / "provenance.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     publish.rename(output)
   secure_output(output)

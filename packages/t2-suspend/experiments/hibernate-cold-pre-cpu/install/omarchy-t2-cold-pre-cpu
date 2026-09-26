@@ -6,11 +6,10 @@ build() {
     [[ -f $bundle/$name && ! -L $bundle/$name ]] || return 1
   done
   # Include ELF loader/dependencies without exposing the helper as a command.
-  add_binary "$bundle/header-reader" /usr/lib/omarchy-t2-cold-pre-cpu/header-reader || return 1
+  add_binary "$bundle/header-reader" /usr/lib/omarchy-t2-cold-pre-cpu/header-reader 700 || return 1
   for name in functions abort.ko abort.sha256 abort.srcversion restore.variable header-reader.sha256 resume.device resume.offset resume.devnum stock-resume stock-resume.sha256; do
     add_file "$bundle/$name" "/usr/lib/omarchy-t2-cold-pre-cpu/$name" 600 || return 1
   done
-  add_file "$bundle/header-reader" /usr/lib/omarchy-t2-cold-pre-cpu/header-reader 700 || return 1
   add_runscript
 }
 help() {

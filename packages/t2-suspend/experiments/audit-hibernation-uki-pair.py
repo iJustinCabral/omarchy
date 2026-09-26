@@ -14,6 +14,7 @@ import importlib.util
 import json
 from pathlib import Path
 import re
+import struct
 import subprocess
 import tempfile
 
@@ -44,6 +45,130 @@ MINIMAL_RESTORE_POLICY = {
   "excluded_hooks": ["kms", "plymouth"],
   "excluded_modules": ["i915", "xe", "thunderbolt"],
 }
+COLD_PRE_CPU = HERE / "hibernate-cold-pre-cpu"
+COLD_DIRECTORY = "usr/lib/omarchy-t2-cold-pre-cpu/"
+COLD_BUNDLE_FILES = (
+  "functions", "abort.ko", "abort.sha256", "abort.srcversion", "restore.variable",
+  "header-reader", "header-reader.sha256", "resume.device", "resume.offset", "resume.devnum",
+  "stock-resume", "stock-resume.sha256",
+)
+COLD_HOOKS = ("omarchy-t2-cold-pre-cpu", "omarchy-t2-cold-pre-cpu-return", "resume")
+
+
+def validate_static_header_helper(data):
+  if len(data) < 64 or data[:7] != b"\x7fELF\x02\x01\x01":
+    raise ValueError("Cold pre-CPU header helper must be a static x86-64 ELF executable")
+  values = struct.unpack_from("<HHIQQQIHHHHHH", data, 16)
+  kind, machine, version, _, offset, _, _, size, entry_size, count, _, _, _ = values
+  if kind not in (2, 3) or machine != 62 or version != 1 or size != 64 or entry_size != 56 or not count or offset < 64 or offset + entry_size * count > len(data):
+    raise ValueError("Cold pre-CPU header helper has invalid ELF program headers")
+  types = [struct.unpack_from("<I", data, offset + index * entry_size)[0] for index in range(count)]
+  if 3 in types or 1 not in types:
+    raise ValueError("Cold pre-CPU header helper must be static without PT_INTERP")
+
+
+def validate_cold_pre_cpu_metadata(provenance):
+  diagnostic = provenance.get("cold_pre_cpu")
+  fields = {"version", "target", "module_sha256", "module_srcversion", "module_vermagic",
+            "header_helper_sha256", "restore_variable", "resume", "source_sha256", "files_sha256"}
+  if not isinstance(diagnostic, dict) or set(diagnostic) != fields:
+    raise ValueError("Cold pre-CPU metadata is missing or malformed")
+  if diagnostic["version"] != "cold-pre-cpu-abort-v1" or diagnostic["target"] != "hibernate_resume_nonboot_cpu_disable":
+    raise ValueError("Cold pre-CPU protocol or target differs")
+  for key in ("module_sha256", "header_helper_sha256"):
+    if not isinstance(diagnostic[key], str) or HASH.fullmatch(diagnostic[key]) is None:
+      raise ValueError("Cold pre-CPU binary identity is malformed")
+  marker = provenance.get("restore_marker")
+  if not isinstance(marker, dict) or diagnostic["restore_variable"] != marker.get("efi_variable"):
+    raise ValueError("Cold pre-CPU marker selector differs from the restore marker")
+  srcversion, vermagic = diagnostic["module_srcversion"], diagnostic["module_vermagic"]
+  if (not isinstance(srcversion, str) or re.fullmatch(r"[0-9A-F]+", srcversion) is None or
+      not isinstance(vermagic, str) or not vermagic.split() or vermagic.split()[0] != provenance.get("kernel_release")):
+    raise ValueError("Cold pre-CPU module source version or production ABI differs")
+  if diagnostic["resume"] != {"device": "/dev/mapper/root", "offset": 1923214, "devnum": "253:0"}:
+    raise ValueError("Cold pre-CPU pending-header target differs")
+  sources = diagnostic["source_sha256"]
+  required_sources = {"mba_hibernate_cold_pre_cpu.c", "read-swap-header.c", "audit-order.py"} | {"install/" + hook for hook in COLD_HOOKS}
+  if not isinstance(sources, dict) or set(sources) != required_sources:
+    raise ValueError("Cold pre-CPU source identity is incomplete")
+  for filename, expected in sources.items():
+    if expected != sha256(COLD_PRE_CPU / filename):
+      raise ValueError("Cold pre-CPU source differs from the pinned diagnostic: " + filename)
+  files = diagnostic["files_sha256"]
+  required = {COLD_DIRECTORY + name for name in COLD_BUNDLE_FILES} | {"hooks/" + name for name in COLD_HOOKS}
+  if not isinstance(files, dict) or set(files) != required or any(not isinstance(value, str) or HASH.fullmatch(value) is None for value in files.values()):
+    raise ValueError("Cold pre-CPU bundle identities are incomplete")
+  for filename, source in [(COLD_DIRECTORY + "functions", COLD_PRE_CPU / "functions"),
+                           (COLD_DIRECTORY + "stock-resume", Path("/usr/lib/initcpio/hooks/resume")),
+                           *[("hooks/" + hook, COLD_PRE_CPU / "hooks" / hook) for hook in COLD_HOOKS]]:
+    if files[filename] != sha256(source):
+      raise ValueError("Cold pre-CPU script differs from pinned source: " + filename)
+  if files[COLD_DIRECTORY + "abort.ko"] != diagnostic["module_sha256"] or files[COLD_DIRECTORY + "header-reader"] != diagnostic["header_helper_sha256"]:
+    raise ValueError("Cold pre-CPU binary identity disagrees with its bundle")
+  return diagnostic
+
+
+def verify_cold_pre_cpu_tree(extracted, provenance):
+  diagnostic = validate_cold_pre_cpu_metadata(provenance)
+  for filename, expected in diagnostic["files_sha256"].items():
+    path = extracted / filename
+    if path.is_symlink() or not path.is_file() or sha256(path) != expected:
+      raise ValueError("Cold pre-CPU embedded file differs: " + filename)
+  directory = extracted / COLD_DIRECTORY
+  for filename, expected in {
+    "abort.sha256": diagnostic["module_sha256"],
+    "abort.srcversion": diagnostic["module_srcversion"],
+    "header-reader.sha256": diagnostic["header_helper_sha256"],
+    "restore.variable": diagnostic["restore_variable"],
+    "resume.device": "/dev/mapper/root", "resume.offset": "1923214", "resume.devnum": "253:0",
+    "stock-resume.sha256": diagnostic["files_sha256"][COLD_DIRECTORY + "stock-resume"],
+  }.items():
+    if (directory / filename).read_text() != expected + "\n":
+      raise ValueError("Cold pre-CPU embedded identity differs: " + filename)
+  for field, expected in (("name", "mba_hibernate_cold_pre_cpu"), ("srcversion", diagnostic["module_srcversion"]), ("vermagic", diagnostic["module_vermagic"])):
+    actual = subprocess.run(("modinfo", "-F", field, str(directory / "abort.ko")), check=True, capture_output=True, text=True).stdout.strip()
+    if actual != expected:
+      raise ValueError("Cold pre-CPU embedded module metadata differs: " + field)
+  if not (directory / "header-reader").stat().st_mode & 0o100:
+    raise ValueError("Cold pre-CPU pending-header helper is not executable")
+  validate_static_header_helper((directory / "header-reader").read_bytes())
+  alternative = extracted / "usr/lib/systemd/systemd-hibernate-resume"
+  if alternative.exists() or alternative.is_symlink():
+    raise ValueError("Cold pre-CPU would permit an alternative effective resume target")
+  config = (extracted / "config").read_text()
+  resolved = {}
+  for field in ("HOOKS", "EARLYHOOKS", "LATEHOOKS", "CLEANUPHOOKS", "EMERGENCYHOOKS"):
+    matches = re.findall(r'^' + field + r'="([^\"]*)"$', config, re.M)
+    if len(matches) != 1:
+      raise ValueError("Cold pre-CPU lacks resolved hook order: " + field)
+    resolved[field] = matches[0].split()
+  chain = ["omarchy-t2-cold-pre-cpu", "omarchy-t2-restore-marker", "resume", "omarchy-t2-cold-pre-cpu-return"]
+  required = ["encrypt", *chain]
+  hooks = resolved["HOOKS"]
+  if any(hooks.count(name) != 1 for name in required):
+    raise ValueError("Cold pre-CPU hook order is missing or duplicated")
+  start = hooks.index(chain[0])
+  if hooks[start:start + len(chain)] != chain or hooks.index("encrypt") >= start:
+    raise ValueError("Cold pre-CPU hooks must surround synchronous marker/resume after encrypt")
+  for field, names in resolved.items():
+    if field != "HOOKS" and set(names) & {"omarchy-t2-restore-marker", *COLD_HOOKS}:
+      raise ValueError("Cold pre-CPU hook is scheduled outside synchronous resume")
+
+
+def verify_no_unannounced_cold_tree(extracted):
+  directory = extracted / COLD_DIRECTORY
+  if directory.exists() or directory.is_symlink():
+    raise ValueError("Unannounced cold pre-CPU bundle is forbidden")
+  for hook in COLD_HOOKS[:2]:
+    path = extracted / "hooks" / hook
+    if path.exists() or path.is_symlink():
+      raise ValueError("Unannounced cold pre-CPU hook is forbidden")
+  for path in extracted.rglob("mba_hibernate_cold_pre_cpu.ko*"):
+    raise ValueError("Unannounced cold pre-CPU module is forbidden")
+  for filename in ("config", "hooks/resume"):
+    path = extracted / filename
+    if path.is_file() and "omarchy-t2-cold-pre-cpu" in path.read_text():
+      raise ValueError("Unannounced cold pre-CPU runtime policy is forbidden")
 
 
 def verify_minimal_restore_tree(extracted, provenance):
@@ -148,7 +273,8 @@ def extract_restore_initramfs(initrd, extracted):
     subprocess.run(("lsinitcpio", "--cpio", "--extract", str(initrd)), cwd=extracted,
                    check=True, capture_output=True)
   except subprocess.CalledProcessError as error:
-    raise ValueError("Restore marker initramfs could not be extracted") from error
+    detail = error.stderr.decode(errors="replace").strip() if isinstance(error.stderr, bytes) else str(error.stderr or "").strip()
+    raise ValueError("Restore marker initramfs could not be extracted: " + detail) from error
 
 
 def load_candidate(directory, label):
@@ -178,17 +304,26 @@ def load_candidate(directory, label):
       raise ValueError(label + " is not an offline private build: " + field)
   marker = provenance.get("restore_marker")
   minimal = "minimal_restore_policy" in provenance
+  cold = "cold_pre_cpu" in provenance
   if minimal and marker is None:
     raise ValueError("Minimal cold-restore policy requires the restore marker")
-  if marker is not None or minimal:
-    if label != "restore":
-      raise ValueError("Source image must not load the cold-restore marker")
-    with tempfile.TemporaryDirectory(prefix="t2-restore-marker-audit-") as temporary:
-      extract_restore_initramfs(initrd, Path(temporary))
-      if marker is not None:
-        verify_restore_marker_tree(Path(temporary), marker)
-      if minimal:
-        verify_minimal_restore_tree(Path(temporary), provenance)
+  if cold:
+    if label != "restore" or provenance.get("minimal_restore_policy") != MINIMAL_RESTORE_POLICY:
+      raise ValueError("Cold pre-CPU is restricted to a minimal private restore image")
+    validate_cold_pre_cpu_metadata(provenance)
+  if (marker is not None or minimal) and label != "restore":
+    raise ValueError("Source image must not load the cold-restore marker")
+  with tempfile.TemporaryDirectory(prefix="t2-initramfs-audit-") as temporary:
+    extracted = Path(temporary)
+    extract_restore_initramfs(initrd, extracted)
+    if marker is not None:
+      verify_restore_marker_tree(extracted, marker)
+    if minimal:
+      verify_minimal_restore_tree(extracted, provenance)
+    if cold:
+      verify_cold_pre_cpu_tree(extracted, provenance)
+    else:
+      verify_no_unannounced_cold_tree(extracted)
   if provenance.get("modified_sections_sha256") is not None:
     modified = provenance["modified_sections_sha256"]
     if not isinstance(modified, dict) or set(modified) != {".linux"}:
@@ -216,6 +351,12 @@ def load_candidate(directory, label):
 
 
 def audit(source, restore):
+  if "cold_pre_cpu" in source:
+    raise ValueError("Source image must not contain cold pre-CPU diagnostics")
+  if "cold_pre_cpu" in restore:
+    if restore.get("minimal_restore_policy") != MINIMAL_RESTORE_POLICY:
+      raise ValueError("Cold pre-CPU requires the minimal private restore policy")
+    validate_cold_pre_cpu_metadata(restore)
   if "minimal_restore_policy" in source:
     raise ValueError("Source image must not use the minimal cold-restore policy")
   if "minimal_restore_policy" in restore and restore["minimal_restore_policy"] != MINIMAL_RESTORE_POLICY:
@@ -266,6 +407,8 @@ def audit(source, restore):
   }
   if "minimal_restore_policy" in restore:
     result["minimal_restore_policy"] = restore["minimal_restore_policy"]
+  if "cold_pre_cpu" in restore:
+    result["cold_pre_cpu"] = restore["cold_pre_cpu"]
   return result
 
 

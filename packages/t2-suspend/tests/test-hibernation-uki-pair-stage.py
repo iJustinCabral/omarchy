@@ -42,7 +42,13 @@ def objcopy(*arguments):
 
 def publish(directory, role, production):
   directory.mkdir()
-  initrd = (role + "-private-initrd").encode()
+  fixture = directory / "initrd-fixture"
+  fixture.mkdir()
+  (fixture / "early_cpio").write_text("1\n")
+  (fixture / "config").write_text(role + "\n")
+  initrd = b"".join(subprocess.run(("bsdcpio", "--create", "--format=newc"), cwd=fixture,
+                                  input=(name + "\n").encode(), check=True, capture_output=True).stdout
+                    for name in ("early_cpio", "config"))
   initrd_path = directory / "mba-t2-hibernation-candidate.initrd"
   image_path = directory / "mba-t2-hibernation-candidate.efi"
   initrd_path.write_bytes(initrd)

@@ -35,7 +35,13 @@ def make_input(role, root, original_kernel):
   work.mkdir()
   image = work / "stub.efi"
   image.write_bytes(stub.read_bytes())
-  initrd = (role + "-root-unlock-initrd").encode()
+  fixture = work / "initrd-fixture"
+  fixture.mkdir()
+  (fixture / "early_cpio").write_text("1\n")
+  (fixture / "config").write_text(role + "\n")
+  initrd = b"".join(subprocess.run(("bsdcpio", "--create", "--format=newc"), cwd=fixture,
+                                  input=(name + "\n").encode(), check=True, capture_output=True).stdout
+                    for name in ("early_cpio", "config"))
   for number, (name, data, address) in enumerate((
     (".uname", b"test-release\0", 0x14dfb5000),
     (".osrel", b"ID=test\n", 0x14dfb6000),
