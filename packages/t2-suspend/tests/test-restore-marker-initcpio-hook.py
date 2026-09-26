@@ -45,6 +45,7 @@ plymouth() {
 }
 insmod() {
   [[ ${MOCK_FAIL_INSMOD:-0} == "0" ]] || return 1
+  printf 'called\n' >> "$OMARCHY_T2_RESTORE_MARKER_ROOT/module-insertions"
   module=$OMARCHY_T2_RESTORE_MARKER_ROOT/sys/module/mba_hibernate_efi_restore_marker
   mkdir -p "$module/parameters"
   printf '%s\n' "$MOCK_SRCVERSION" > "$module/srcversion"
@@ -72,6 +73,8 @@ def run(root, *, fail_insmod=False, version=srcversion, quiet=False):
       "MOCK_QUIET": "1" if quiet else "0",
     },
   )
+  if quiet:
+    assert result.stderr == "", "Quiet BusyBox hook emitted a shell error: " + result.stderr
   return result.stdout, (root / "recovery-shell").exists()
 
 
@@ -158,5 +161,24 @@ with tempfile.TemporaryDirectory(prefix="t2-restore-hook-") as temporary:
   assert "hook_status=0" in output and not recovery
   assert witness(root, "Entered").exists() and witness(root, "Armed").exists()
   assert marker.read_bytes()[-1] == 0
+
+  # BusyBox ash must reject nonexact payload lengths before inserting the
+  # marker module or creating witnesses. Bash's (( ... )) command is not
+  # supported by ash: it emits `42: not found` even for the valid payload,
+  # and can accept trailing bytes when the independent prefix/stage matches.
+  valid = v2_marker.read_bytes()
+  for malformed in (valid[:-1], valid + b"\xff", valid + b"\0" * 100):
+    clear_witnesses(root)
+    insertions = (root / "module-insertions").read_bytes()
+    v2_marker.write_bytes(malformed)
+    output, recovery = run(root, quiet=True)
+    assert "hook_status=1" in output and recovery
+    assert "EFI stage 0 is malformed; preserving it" in output
+    assert v2_marker.read_bytes() == malformed
+    assert (root / "module-insertions").read_bytes() == insertions
+    assert not witness(root, "Entered").exists() and not witness(root, "Armed").exists()
+    assert (root / "recovery-order").read_text().splitlines() == ["plymouth", "shell"]
+    (root / "recovery-shell").unlink()
+    (root / "recovery-order").unlink()
 
 print("PASS: mkinitcpio ash hook arms only an exact restore marker and fails closed before resume")

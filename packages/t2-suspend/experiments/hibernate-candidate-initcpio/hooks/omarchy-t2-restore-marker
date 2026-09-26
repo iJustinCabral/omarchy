@@ -66,7 +66,7 @@ arm_restore_marker() {
     return 1
   fi
   marker_bytes=$(hexdump -v -e '/1 "%02x"' "$marker_var") || return 1
-  if (( ${#marker_bytes} != 42 )) || [[ ${marker_bytes:0:16} != "070000004d425253" || ${marker_bytes:40:2} != "00" ]]; then
+  if [[ ${#marker_bytes} != "42" ]] || [[ ${marker_bytes:0:16} != "070000004d425253" || ${marker_bytes:40:2} != "00" ]]; then
     err "omarchy-t2-restore-marker: EFI stage 0 is malformed; preserving it"
     return 1
   fi
