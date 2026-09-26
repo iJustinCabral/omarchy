@@ -53,6 +53,7 @@ COLD_BUNDLE_FILES = (
   "stock-resume", "stock-resume.sha256",
 )
 COLD_HOOKS = ("omarchy-t2-cold-pre-cpu", "omarchy-t2-cold-pre-cpu-return", "resume")
+COLD = import_path("audit_cold_protocols", HERE / "cold-abort-protocols.py")
 
 
 def validate_static_header_helper(data):
@@ -68,13 +69,27 @@ def validate_static_header_helper(data):
 
 
 def validate_cold_pre_cpu_metadata(provenance):
-  diagnostic = provenance.get("cold_pre_cpu")
+  protocol = COLD.select(provenance)
+  if protocol is None:
+    raise ValueError("Cold abort metadata is absent")
+  profile = COLD.PROFILES[protocol]
+  diagnostic = provenance.get(protocol)
+  if not isinstance(diagnostic, dict):
+    raise ValueError("Cold abort metadata is missing or malformed")
   fields = {"version", "target", "module_sha256", "module_srcversion", "module_vermagic",
             "header_helper_sha256", "restore_variable", "resume", "source_sha256", "files_sha256"}
-  if not isinstance(diagnostic, dict) or set(diagnostic) != fields:
+  if profile["observations"] is not None:
+    fields.add("boundary_observations")
+    observed = diagnostic.get("boundary_observations")
+    if (not isinstance(observed, dict) or observed != profile["observations"] or
+        any(type(observed[key]) is not type(value) for key, value in profile["observations"].items())):
+      raise ValueError("Cold pre-syscore observation contract differs")
+  if set(diagnostic) != fields:
     raise ValueError("Cold pre-CPU metadata is missing or malformed")
-  if diagnostic["version"] != "cold-pre-cpu-abort-v1" or diagnostic["target"] != "hibernate_resume_nonboot_cpu_disable":
+  if diagnostic["version"] != profile["version"] or diagnostic["target"] != profile["target"]:
     raise ValueError("Cold pre-CPU protocol or target differs")
+  if provenance.get("experiment_id") != profile["version"]:
+    raise ValueError("Cold abort experiment ID differs from its exact protocol")
   for key in ("module_sha256", "header_helper_sha256"):
     if not isinstance(diagnostic[key], str) or HASH.fullmatch(diagnostic[key]) is None:
       raise ValueError("Cold pre-CPU binary identity is malformed")
@@ -88,44 +103,55 @@ def validate_cold_pre_cpu_metadata(provenance):
   if diagnostic["resume"] != {"device": "/dev/mapper/root", "offset": 1923214, "devnum": "253:0"}:
     raise ValueError("Cold pre-CPU pending-header target differs")
   sources = diagnostic["source_sha256"]
-  required_sources = {"mba_hibernate_cold_pre_cpu.c", "read-swap-header.c", "audit-order.py"} | {"install/" + hook for hook in COLD_HOOKS}
-  if not isinstance(sources, dict) or set(sources) != required_sources:
+  required_sources = COLD.sources(protocol)
+  if not isinstance(sources, dict) or set(sources) != set(required_sources):
     raise ValueError("Cold pre-CPU source identity is incomplete")
   for filename, expected in sources.items():
-    if expected != sha256(COLD_PRE_CPU / filename):
+    if expected != sha256(required_sources[filename]):
       raise ValueError("Cold pre-CPU source differs from the pinned diagnostic: " + filename)
   files = diagnostic["files_sha256"]
-  required = {COLD_DIRECTORY + name for name in COLD_BUNDLE_FILES} | {"hooks/" + name for name in COLD_HOOKS}
+  required = {profile["directory"] + name for name in COLD_BUNDLE_FILES} | {"hooks/" + name for name in COLD.hooks(protocol)} | {
+    COLD.COMMON_DIRECTORY + "functions", COLD.COMMON_DIRECTORY + "protocol"}
   if not isinstance(files, dict) or set(files) != required or any(not isinstance(value, str) or HASH.fullmatch(value) is None for value in files.values()):
     raise ValueError("Cold pre-CPU bundle identities are incomplete")
-  for filename, source in [(COLD_DIRECTORY + "functions", COLD_PRE_CPU / "functions"),
-                           (COLD_DIRECTORY + "stock-resume", Path("/usr/lib/initcpio/hooks/resume")),
-                           *[("hooks/" + hook, COLD_PRE_CPU / "hooks" / hook) for hook in COLD_HOOKS]]:
+  for filename, source in [(profile["directory"] + "functions", profile["source"] / "functions"),
+                           (COLD.COMMON_DIRECTORY + "functions", COLD.COMMON / "functions"),
+                           (profile["directory"] + "stock-resume", Path("/usr/lib/initcpio/hooks/resume")),
+                           *[("hooks/" + hook, (COLD.COMMON if hook == "resume" else profile["source"]) / "hooks" / hook) for hook in COLD.hooks(protocol)]]:
     if files[filename] != sha256(source):
       raise ValueError("Cold pre-CPU script differs from pinned source: " + filename)
-  if files[COLD_DIRECTORY + "abort.ko"] != diagnostic["module_sha256"] or files[COLD_DIRECTORY + "header-reader"] != diagnostic["header_helper_sha256"]:
+  if files[profile["directory"] + "abort.ko"] != diagnostic["module_sha256"] or files[profile["directory"] + "header-reader"] != diagnostic["header_helper_sha256"]:
     raise ValueError("Cold pre-CPU binary identity disagrees with its bundle")
   return diagnostic
 
 
 def verify_cold_pre_cpu_tree(extracted, provenance):
   diagnostic = validate_cold_pre_cpu_metadata(provenance)
+  protocol = COLD.select(provenance)
+  profile = COLD.PROFILES[protocol]
+  selected = extracted / COLD.COMMON_DIRECTORY / "protocol"
+  if selected.read_text() != profile["version"] + "\n":
+    raise ValueError("Cold abort shared selector differs from provenance")
   for filename, expected in diagnostic["files_sha256"].items():
     path = extracted / filename
     if path.is_symlink() or not path.is_file() or sha256(path) != expected:
       raise ValueError("Cold pre-CPU embedded file differs: " + filename)
-  directory = extracted / COLD_DIRECTORY
+  directory = extracted / profile["directory"]
   for filename, expected in {
     "abort.sha256": diagnostic["module_sha256"],
     "abort.srcversion": diagnostic["module_srcversion"],
     "header-reader.sha256": diagnostic["header_helper_sha256"],
     "restore.variable": diagnostic["restore_variable"],
     "resume.device": "/dev/mapper/root", "resume.offset": "1923214", "resume.devnum": "253:0",
-    "stock-resume.sha256": diagnostic["files_sha256"][COLD_DIRECTORY + "stock-resume"],
+    "stock-resume.sha256": diagnostic["files_sha256"][profile["directory"] + "stock-resume"],
   }.items():
     if (directory / filename).read_text() != expected + "\n":
       raise ValueError("Cold pre-CPU embedded identity differs: " + filename)
-  for field, expected in (("name", "mba_hibernate_cold_pre_cpu"), ("srcversion", diagnostic["module_srcversion"]), ("vermagic", diagnostic["module_vermagic"])):
+  module_fields = [("name", profile["module"]), ("srcversion", diagnostic["module_srcversion"]),
+                   ("vermagic", diagnostic["module_vermagic"]), ("mba_cold_permanent", "v1")]
+  if profile["boundary"] is not None:
+    module_fields.append(("mba_cold_boundary", profile["boundary"]))
+  for field, expected in module_fields:
     actual = subprocess.run(("modinfo", "-F", field, str(directory / "abort.ko")), check=True, capture_output=True, text=True).stdout.strip()
     if actual != expected:
       raise ValueError("Cold pre-CPU embedded module metadata differs: " + field)
@@ -142,7 +168,7 @@ def verify_cold_pre_cpu_tree(extracted, provenance):
     if len(matches) != 1:
       raise ValueError("Cold pre-CPU lacks resolved hook order: " + field)
     resolved[field] = matches[0].split()
-  chain = ["omarchy-t2-cold-pre-cpu", "omarchy-t2-restore-marker", "resume", "omarchy-t2-cold-pre-cpu-return"]
+  chain = [profile["hook"], "omarchy-t2-restore-marker", "resume", profile["hook"] + "-return"]
   required = ["encrypt", *chain]
   hooks = resolved["HOOKS"]
   if any(hooks.count(name) != 1 for name in required):
@@ -151,23 +177,36 @@ def verify_cold_pre_cpu_tree(extracted, provenance):
   if hooks[start:start + len(chain)] != chain or hooks.index("encrypt") >= start:
     raise ValueError("Cold pre-CPU hooks must surround synchronous marker/resume after encrypt")
   for field, names in resolved.items():
-    if field != "HOOKS" and set(names) & {"omarchy-t2-restore-marker", *COLD_HOOKS}:
+    if field != "HOOKS" and set(names) & {"omarchy-t2-restore-marker", *COLD.hooks(protocol)}:
       raise ValueError("Cold pre-CPU hook is scheduled outside synchronous resume")
+  for other in COLD.PROFILES:
+    if other != protocol:
+      verify_no_unannounced_cold_tree(extracted, protocols=(other,), common=False)
 
 
-def verify_no_unannounced_cold_tree(extracted):
-  directory = extracted / COLD_DIRECTORY
+def verify_no_unannounced_cold_tree(extracted, protocols=None, common=True):
+  if common:
+    directory = extracted / COLD.COMMON_DIRECTORY
+    if directory.exists() or directory.is_symlink():
+      raise ValueError("Unannounced cold abort shared bundle is forbidden")
+  for protocol in (COLD.PROFILES if protocols is None else protocols):
+    _verify_unannounced_protocol(extracted, protocol)
+
+
+def _verify_unannounced_protocol(extracted, protocol):
+  profile = COLD.PROFILES[protocol]
+  directory = extracted / profile["directory"]
   if directory.exists() or directory.is_symlink():
     raise ValueError("Unannounced cold pre-CPU bundle is forbidden")
-  for hook in COLD_HOOKS[:2]:
+  for hook in COLD.hooks(protocol)[:2]:
     path = extracted / "hooks" / hook
     if path.exists() or path.is_symlink():
       raise ValueError("Unannounced cold pre-CPU hook is forbidden")
-  for path in extracted.rglob("mba_hibernate_cold_pre_cpu.ko*"):
+  for path in extracted.rglob(profile["module"] + ".ko*"):
     raise ValueError("Unannounced cold pre-CPU module is forbidden")
   for filename in ("config", "hooks/resume"):
     path = extracted / filename
-    if path.is_file() and "omarchy-t2-cold-pre-cpu" in path.read_text():
+    if path.is_file() and profile["hook"] in path.read_text():
       raise ValueError("Unannounced cold pre-CPU runtime policy is forbidden")
 
 
@@ -304,7 +343,7 @@ def load_candidate(directory, label):
       raise ValueError(label + " is not an offline private build: " + field)
   marker = provenance.get("restore_marker")
   minimal = "minimal_restore_policy" in provenance
-  cold = "cold_pre_cpu" in provenance
+  cold = COLD.select(provenance)
   if minimal and marker is None:
     raise ValueError("Minimal cold-restore policy requires the restore marker")
   if cold:
@@ -351,9 +390,10 @@ def load_candidate(directory, label):
 
 
 def audit(source, restore):
-  if "cold_pre_cpu" in source:
+  if COLD.select(source) is not None:
     raise ValueError("Source image must not contain cold pre-CPU diagnostics")
-  if "cold_pre_cpu" in restore:
+  protocol = COLD.select(restore)
+  if protocol is not None:
     if restore.get("minimal_restore_policy") != MINIMAL_RESTORE_POLICY:
       raise ValueError("Cold pre-CPU requires the minimal private restore policy")
     validate_cold_pre_cpu_metadata(restore)
@@ -407,8 +447,8 @@ def audit(source, restore):
   }
   if "minimal_restore_policy" in restore:
     result["minimal_restore_policy"] = restore["minimal_restore_policy"]
-  if "cold_pre_cpu" in restore:
-    result["cold_pre_cpu"] = restore["cold_pre_cpu"]
+  if protocol is not None:
+    result[protocol] = restore[protocol]
   return result
 
 

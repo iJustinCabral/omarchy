@@ -55,35 +55,45 @@ class ColdPreCpuImageTests(unittest.TestCase):
     args.update(changes)
     # Simulate root ownership only; actual module bytes and per-file pinning
     # are retained. Direct metadata/file security faults are covered below.
-    with mock.patch.object(builder, "validate_cold_private_file"), mock.patch.object(builder, "module_metadata", return_value=self.identity), mock.patch.object(builder, "run", return_value=SimpleNamespace(stdout="mba_hibernate_cold_pre_cpu\n")):
+    profile = builder.COLD.PROFILES[args.get("protocol", "cold_pre_cpu")]
+    def module_info(command, **kwargs):
+      value = {"name": profile["module"], "mba_cold_boundary": profile["boundary"], "mba_cold_permanent": "v1"}[command[2]]
+      return SimpleNamespace(stdout=value + "\n")
+    with mock.patch.object(builder, "validate_cold_private_file"), mock.patch.object(builder, "module_metadata", return_value=self.identity), mock.patch.object(builder, "run", side_effect=module_info):
       return builder.prepare_cold_pre_cpu(**args)
 
-  def extracted(self):
-    prepared = self.prepare()
+  def extracted(self, protocol="cold_pre_cpu"):
+    prepared = self.prepare(protocol=protocol)
+    profile = builder.COLD.PROFILES[protocol]
     tree = self.root / "extracted"
-    directory = tree / auditor.COLD_DIRECTORY
+    directory = tree / profile["directory"]
     directory.mkdir(parents=True)
     for path in prepared["bundle"].iterdir():
-      target = directory / path.name
+      target = tree / auditor.COLD.COMMON_DIRECTORY / path.name.removeprefix("common.") if path.name.startswith("common.") else directory / path.name
+      target.parent.mkdir(parents=True, exist_ok=True)
       target.write_bytes(path.read_bytes())
       target.chmod(path.stat().st_mode & 0o777)
     hooks = tree / "hooks"
     hooks.mkdir()
-    for hook in auditor.COLD_HOOKS:
-      (hooks / hook).write_bytes((builder.COLD_PRE_CPU / "hooks" / hook).read_bytes())
+    for hook in builder.COLD.hooks(protocol):
+      source = builder.COLD.COMMON if hook == "resume" else profile["source"]
+      (hooks / hook).write_bytes((source / "hooks" / hook).read_bytes())
     config = (
       'HOOKS="udev encrypt omarchy-t2-cold-pre-cpu omarchy-t2-restore-marker resume omarchy-t2-cold-pre-cpu-return"\n'
       'EARLYHOOKS="udev"\nLATEHOOKS="omarchy-t2-candidate-modules"\nCLEANUPHOOKS="udev"\nEMERGENCYHOOKS=""\n'
     )
+    config = config.replace("omarchy-t2-cold-pre-cpu", profile["hook"])
     (tree / "config").write_text(config)
-    report = {"cold_pre_cpu": prepared["provenance"], "kernel_release": self.release,
+    report = {protocol: prepared["provenance"], "kernel_release": self.release, "experiment_id": profile["version"],
               "restore_marker": {"efi_variable": prepared["provenance"]["restore_variable"]}}
     return tree, report
 
   def verify(self, tree, report):
+    profile = builder.COLD.PROFILES[builder.COLD.select(report)]
     def metadata(command, **kwargs):
       self.assertEqual(command[0], "modinfo")
-      return SimpleNamespace(stdout=("mba_hibernate_cold_pre_cpu" if command[2] == "name" else self.identity[command[2]]) + "\n")
+      values = {"name": profile["module"], "mba_cold_boundary": profile["boundary"], "mba_cold_permanent": "v1", **self.identity}
+      return SimpleNamespace(stdout=values[command[2]] + "\n")
     with mock.patch.object(auditor.subprocess, "run", side_effect=metadata):
       auditor.verify_cold_pre_cpu_tree(tree, report)
 
@@ -223,12 +233,12 @@ class ColdPreCpuImageTests(unittest.TestCase):
         builder.build_initrd(self.root, self.root, self.root, self.release, {})
       with self.assertRaises(StopBeforeMkinitcpio):
         builder.build_initrd(self.root, self.root, self.root, self.release, {},
-                             minimal_restore_devices=True, cold_pre_cpu={"bundle": self.root})
+                             minimal_restore_devices=True, cold_pre_cpu={"bundle": self.root, "protocol": "cold_pre_cpu"})
     normal, diagnostic = captured
-    self.assertNotIn("OMARCHY_T2_COLD_PRE_CPU_BUNDLE=" + str(self.root), normal)
-    self.assertIn("OMARCHY_T2_COLD_PRE_CPU_BUNDLE=" + str(self.root), diagnostic)
+    self.assertNotIn("OMARCHY_T2_COLD_ABORT_BUNDLE=" + str(self.root), normal)
+    self.assertIn("OMARCHY_T2_COLD_ABORT_BUNDLE=" + str(self.root), diagnostic)
     for field, directory in (("MKINITCPIO_HOOKS", "hooks"), ("MKINITCPIO_INSTALL", "install")):
-      expected = field + "=" + str(builder.COLD_PRE_CPU / directory) + ":"
+      expected = field + "=" + str(builder.COLD.COMMON / directory) + ":" + str(builder.COLD_PRE_CPU / directory) + ":"
       self.assertTrue(any(str(item).startswith(expected) for item in diagnostic))
       self.assertFalse(any(str(item).startswith(expected) for item in normal))
     self.assertEqual(normal[normal.index("--config") + 1], builder.CONFIG)

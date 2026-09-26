@@ -28,6 +28,9 @@ CANDIDATE_MODULE_HELPER = HERE / "hibernate-candidate-modules.py"
 CANDIDATE_BLUETOOTH_HELPER = HERE / "hibernate-candidate-bluetooth.py"
 COLD_PRE_CPU = HERE / "hibernate-cold-pre-cpu"
 COLD_STOCK_RESUME = Path("/usr/lib/initcpio/hooks/resume")
+_protocol_spec = importlib.util.spec_from_file_location("builder_cold_protocols", HERE / "cold-abort-protocols.py")
+COLD = importlib.util.module_from_spec(_protocol_spec)
+_protocol_spec.loader.exec_module(COLD)
 RESTORE_MARKER_FILES = (
   "hooks/omarchy-t2-restore-marker",
   "usr/lib/omarchy-t2-restore-marker/marker.ko",
@@ -187,7 +190,8 @@ def prepare_restore_marker(work, path, expected_sha256, expected_srcversion, rel
   }
 
 
-def prepare_cold_pre_cpu(work, module, module_sha256, srcversion, helper, helper_sha256, release, restore_marker):
+def prepare_cold_pre_cpu(work, module, module_sha256, srcversion, helper, helper_sha256, release, restore_marker, protocol="cold_pre_cpu"):
+  profile = COLD.PROFILES[protocol]
   inputs = (module, module_sha256, srcversion, helper, helper_sha256)
   if all(value is None for value in inputs):
     return None
@@ -200,13 +204,18 @@ def prepare_cold_pre_cpu(work, module, module_sha256, srcversion, helper, helper
       identity["srcversion"] != srcversion or not identity["vermagic"] or
       identity["vermagic"].split()[0] != release):
     raise ValueError("Cold pre-CPU module source version or production ABI differs")
-  if run(("modinfo", "-F", "name", module), capture=True).stdout.strip() != "mba_hibernate_cold_pre_cpu":
+  if run(("modinfo", "-F", "name", module), capture=True).stdout.strip() != profile["module"]:
     raise ValueError("Cold pre-CPU module name differs from the diagnostic")
-  bundle = work / "cold-pre-cpu-bundle"
+  if run(("modinfo", "-F", "mba_cold_permanent", module), capture=True).stdout.strip() != "v1":
+    raise ValueError("Cold abort compiled module lacks exact permanent-ftrace attestation")
+  if profile["boundary"] is not None and run(("modinfo", "-F", "mba_cold_boundary", module), capture=True).stdout.strip() != profile["boundary"]:
+    raise ValueError("Cold pre-syscore module boundary metadata differs")
+  bundle = work / (profile["version"] + "-bundle")
   bundle.mkdir(mode=0o700)
   variable = "OmarchyT2RestoreStage" + ("V2" if restore_marker["version"] == "v2" else "") + "-5e17d2ad-021f-4d45-a8e5-f4c191983e27"
   for filename, source in (("abort.ko", module), ("header-reader", helper),
-                           ("functions", COLD_PRE_CPU / "functions"), ("stock-resume", COLD_STOCK_RESUME)):
+                           ("functions", profile["source"] / "functions"),
+                           ("common.functions", COLD.COMMON / "functions"), ("stock-resume", COLD_STOCK_RESUME)):
     if source.is_symlink() or not source.is_file():
       raise ValueError("Cold pre-CPU bundle source is missing or symlinked: " + filename)
     shutil.copyfile(source, bundle / filename)
@@ -220,40 +229,44 @@ def prepare_cold_pre_cpu(work, module, module_sha256, srcversion, helper, helper
     "resume.offset": "1923214",
     "resume.devnum": "253:0",
     "stock-resume.sha256": digest(COLD_STOCK_RESUME),
+    "common.protocol": profile["version"],
   }.items():
     (bundle / filename).write_text(value + "\n")
     (bundle / filename).chmod(0o600)
-  files = {"usr/lib/omarchy-t2-cold-pre-cpu/" + path.name: digest(path) for path in bundle.iterdir()}
-  for hook in ("omarchy-t2-cold-pre-cpu", "omarchy-t2-cold-pre-cpu-return", "resume"):
-    files["hooks/" + hook] = digest(COLD_PRE_CPU / "hooks" / hook)
-  return {
+  files = {profile["directory"] + path.name: digest(path) for path in bundle.iterdir() if not path.name.startswith("common.")}
+  files[COLD.COMMON_DIRECTORY + "functions"] = digest(bundle / "common.functions")
+  files[COLD.COMMON_DIRECTORY + "protocol"] = digest(bundle / "common.protocol")
+  for hook in COLD.hooks(protocol):
+    source = COLD.COMMON if hook == "resume" else profile["source"]
+    files["hooks/" + hook] = digest(source / "hooks" / hook)
+  result = {
     "bundle": bundle,
+    "protocol": protocol,
     "provenance": {
-      "version": "cold-pre-cpu-abort-v1",
-      "target": "hibernate_resume_nonboot_cpu_disable",
+      "version": profile["version"],
+      "target": profile["target"],
       "module_sha256": module_sha256,
       "module_srcversion": srcversion,
       "module_vermagic": identity["vermagic"],
       "header_helper_sha256": helper_sha256,
       "restore_variable": variable,
       "resume": {"device": "/dev/mapper/root", "offset": 1923214, "devnum": "253:0"},
-      "source_sha256": {
-        "mba_hibernate_cold_pre_cpu.c": digest(COLD_PRE_CPU / "mba_hibernate_cold_pre_cpu.c"),
-        "read-swap-header.c": digest(COLD_PRE_CPU / "read-swap-header.c"),
-        "audit-order.py": digest(COLD_PRE_CPU / "audit-order.py"),
-        **{"install/" + hook: digest(COLD_PRE_CPU / "install" / hook) for hook in ("omarchy-t2-cold-pre-cpu", "omarchy-t2-cold-pre-cpu-return", "resume")},
-      },
+      "source_sha256": {name: digest(path) for name, path in COLD.sources(protocol).items()},
       "files_sha256": files,
     },
   }
+  if profile["observations"] is not None:
+    result["provenance"]["boundary_observations"] = profile["observations"].copy()
+  return result
 
 
-def verify_cold_pre_cpu_tree(extracted, provenance, release, restore_marker):
+def verify_cold_pre_cpu_tree(extracted, provenance, release, restore_marker, protocol="cold_pre_cpu"):
   spec = importlib.util.spec_from_file_location("cold_pre_cpu_tree_auditor", HERE / "audit-hibernation-uki-pair.py")
   auditor = importlib.util.module_from_spec(spec)
   spec.loader.exec_module(auditor)
   marker = {"efi_variable": "OmarchyT2RestoreStage" + ("V2" if restore_marker["version"] == "v2" else "") + "-5e17d2ad-021f-4d45-a8e5-f4c191983e27"}
-  auditor.verify_cold_pre_cpu_tree(extracted, {"cold_pre_cpu": provenance, "restore_marker": marker, "kernel_release": release})
+  auditor.verify_cold_pre_cpu_tree(extracted, {protocol: provenance, "restore_marker": marker, "kernel_release": release,
+                                            "experiment_id": COLD.PROFILES[protocol]["version"]})
 
 
 def validate_candidate(candidate, release):
@@ -374,14 +387,15 @@ unset minimal_hooks minimal_hook minimal_modules minimal_module
 '''
 
 
-def cold_pre_cpu_config(base):
-  return "source " + shlex.quote(str(base)) + "\n" + '''
+def cold_pre_cpu_config(base, protocol="cold_pre_cpu"):
+  hook = COLD.PROFILES[protocol]["hook"]
+  script = "source " + shlex.quote(str(base)) + "\n" + '''
 cold_hooks=()
 cold_marker_count=0
 cold_resume_count=0
 for cold_hook in "${HOOKS[@]}"; do
   case $cold_hook in
-    omarchy-t2-cold-pre-cpu|omarchy-t2-cold-pre-cpu-return)
+    omarchy-t2-cold-pre-cpu|omarchy-t2-cold-pre-cpu-return|omarchy-t2-cold-pre-syscore|omarchy-t2-cold-pre-syscore-return)
       echo "Cold pre-CPU hook already configured" >&2
       exit 1
       ;;
@@ -403,6 +417,8 @@ fi
 HOOKS=("${cold_hooks[@]}")
 unset cold_hooks cold_hook cold_marker_count cold_resume_count
 '''
+  return script.replace("cold_hooks+=(omarchy-t2-cold-pre-cpu)", "cold_hooks+=(" + hook + ")").replace(
+    "cold_hooks+=(omarchy-t2-cold-pre-cpu-return)", "cold_hooks+=(" + hook + "-return)")
 
 
 def verify_minimal_restore_tree(extracted, release):
@@ -437,10 +453,11 @@ def build_initrd(work, module_root, payload, release, expected, experiment_id=No
     config_path.write_text(minimal_restore_config(CONFIG))
   if cold_pre_cpu is not None:
     wrapped = work / "cold-pre-cpu-mkinitcpio.conf"
-    wrapped.write_text(cold_pre_cpu_config(config_path))
+    wrapped.write_text(cold_pre_cpu_config(config_path, cold_pre_cpu["protocol"]))
     config_path = wrapped
-  cold_hooks = str(COLD_PRE_CPU / "hooks") + ":" if cold_pre_cpu is not None else ""
-  cold_install = str(COLD_PRE_CPU / "install") + ":" if cold_pre_cpu is not None else ""
+  cold_sources = (COLD.COMMON, COLD.PROFILES[cold_pre_cpu["protocol"]]["source"]) if cold_pre_cpu is not None else ()
+  cold_hooks = "".join(str(path / "hooks") + ":" for path in cold_sources)
+  cold_install = "".join(str(path / "install") + ":" for path in cold_sources)
   environment = [
     "env",
     "MKINITCPIO_HOOKS=" + cold_hooks + str(CANDIDATE_HOOKS / "hooks") + ":/etc/initcpio/hooks:/usr/lib/initcpio/hooks",
@@ -451,7 +468,7 @@ def build_initrd(work, module_root, payload, release, expected, experiment_id=No
     "OMARCHY_T2_RESTORE_MARKER_MODULE=" + (str(restore_marker["module"]) if restore_marker is not None else ""),
   ]
   if cold_pre_cpu is not None:
-    environment.append("OMARCHY_T2_COLD_PRE_CPU_BUNDLE=" + str(cold_pre_cpu["bundle"]))
+    environment.append("OMARCHY_T2_COLD_ABORT_BUNDLE=" + str(cold_pre_cpu["bundle"]))
   if restore_marker is not None:
     environment.extend((
       "OMARCHY_T2_RESTORE_MARKER_SHA256_FILE=" + str(restore_marker["sha_file"]),
@@ -491,7 +508,7 @@ def build_initrd(work, module_root, payload, release, expected, experiment_id=No
   if minimal_restore_devices:
     verify_minimal_restore_tree(extracted, release)
   if cold_pre_cpu is not None:
-    verify_cold_pre_cpu_tree(extracted, cold_pre_cpu["provenance"], release, restore_marker)
+    verify_cold_pre_cpu_tree(extracted, cold_pre_cpu["provenance"], release, restore_marker, cold_pre_cpu["protocol"])
   if "omarchy-t2-candidate-modules" not in build_config:
     raise ValueError("Candidate initramfs late hook is not scheduled")
   if restore_marker is not None:
@@ -658,11 +675,23 @@ def main():
   parser.add_argument("--expected-cold-pre-cpu-srcversion")
   parser.add_argument("--cold-pre-cpu-header-helper", type=Path, help="private read-only pending-swap header helper")
   parser.add_argument("--expected-cold-pre-cpu-header-helper-sha256")
+  parser.add_argument("--cold-pre-syscore-module", type=Path)
+  parser.add_argument("--expected-cold-pre-syscore-sha256")
+  parser.add_argument("--expected-cold-pre-syscore-srcversion")
+  parser.add_argument("--cold-pre-syscore-header-helper", type=Path)
+  parser.add_argument("--expected-cold-pre-syscore-header-helper-sha256")
   args = parser.parse_args()
   if args.minimal_restore_devices and args.restore_marker_module is None:
     parser.error("--minimal-restore-devices requires an explicit --restore-marker-module")
   cold_inputs = (args.cold_pre_cpu_module, args.expected_cold_pre_cpu_sha256, args.expected_cold_pre_cpu_srcversion,
                  args.cold_pre_cpu_header_helper, args.expected_cold_pre_cpu_header_helper_sha256)
+  syscore_inputs = (args.cold_pre_syscore_module, args.expected_cold_pre_syscore_sha256, args.expected_cold_pre_syscore_srcversion,
+                    args.cold_pre_syscore_header_helper, args.expected_cold_pre_syscore_header_helper_sha256)
+  if any(value is not None for value in cold_inputs) and any(value is not None for value in syscore_inputs):
+    parser.error("Cold pre-CPU and pre-syscore protocols are mutually exclusive")
+  cold_protocol = "cold_pre_syscore" if any(value is not None for value in syscore_inputs) else "cold_pre_cpu"
+  if cold_protocol == "cold_pre_syscore":
+    cold_inputs = syscore_inputs
   if any(value is not None for value in cold_inputs):
     if any(value is None for value in cold_inputs) or args.restore_marker_module is None or not args.minimal_restore_devices:
       parser.error("Cold pre-CPU requires complete module/helper pins, restore marker and --minimal-restore-devices")
@@ -670,6 +699,8 @@ def main():
   if os.geteuid() != 0:
     raise SystemExit("Run as root so the root-unlock key retains protected handling")
   experiment_id = validate_experiment_id(args.experiment_id)
+  if any(value is not None for value in cold_inputs) and experiment_id != COLD.PROFILES[cold_protocol]["version"]:
+    parser.error("Cold diagnostic experiment ID must exactly match its selected protocol")
   output = args.output.absolute()
   if output.exists():
     raise ValueError("Output already exists; choose a new directory")
@@ -688,7 +719,7 @@ def main():
     restore_marker = prepare_restore_marker(work, args.restore_marker_module, args.expected_restore_marker_sha256,
                                             args.expected_restore_marker_srcversion, args.kernel_release,
                                             args.restore_marker_version)
-    cold_pre_cpu = prepare_cold_pre_cpu(work, *cold_inputs, args.kernel_release, restore_marker)
+    cold_pre_cpu = prepare_cold_pre_cpu(work, *cold_inputs, args.kernel_release, restore_marker, protocol=cold_protocol)
     initrd, staged_payload = build_initrd(work, module_root, payload, args.kernel_release, expected, experiment_id, restore_marker, args.minimal_restore_devices, cold_pre_cpu)
     uki, cmdline, sections, production_hash = build_uki(work, production, initrd)
 
@@ -730,7 +761,7 @@ def main():
     if args.minimal_restore_devices:
       report["minimal_restore_policy"] = MINIMAL_RESTORE_POLICY
     if cold_pre_cpu is not None:
-      report["cold_pre_cpu"] = cold_pre_cpu["provenance"]
+      report[cold_protocol] = cold_pre_cpu["provenance"]
     (publish / "provenance.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     publish.rename(output)
   secure_output(output)

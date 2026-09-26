@@ -177,7 +177,7 @@ fake_stock_resume() {
    printf 'ordinary-resume\n' >> "$cold_root/order"
  fi
 }
-. "$1/hooks/resume"
+. "$1/../hibernate-cold-common/hooks/resume"
 run_hook || exit 83
 . "$1/hooks/omarchy-t2-cold-pre-cpu-return"
 run_hook
@@ -193,13 +193,18 @@ with tempfile.TemporaryDirectory(prefix="cold-pre-cpu-offline-") as tmp:
     files = root / "usr/lib/omarchy-t2-cold-pre-cpu"
     files.mkdir(parents=True)
     (root / "run").mkdir()
-    (root / "proc").mkdir()
+    (root / "proc/sys/kernel").mkdir(parents=True)
+    (root / "proc/sys/kernel/ftrace_enabled").write_text("1\n")
     (root / "sys/power").mkdir(parents=True)
     (root / "proc/cmdline").write_text("quiet resume=/dev/mapper/root resume_offset=1923214\n")
     (root / "sys/power/resume_offset").write_text("1923214\n")
     variables = root / "sys/firmware/efi/efivars"
     variables.mkdir(parents=True)
     (files / "functions").write_bytes((directory / "functions").read_bytes())
+    common = root / "usr/lib/omarchy-t2-cold-common"
+    common.mkdir()
+    (common / "functions").write_bytes((directory.parent / "hibernate-cold-common/functions").read_bytes())
+    (common / "protocol").write_text("cold-pre-cpu-abort-v1\n")
     (files / "abort.ko").write_bytes(b"synthetic offline module")
     (files / "abort.sha256").write_text(hashlib.sha256((files / "abort.ko").read_bytes()).hexdigest() + "\n")
     (files / "abort.srcversion").write_text("SRC\n")
@@ -345,7 +350,8 @@ run_hookfunctions run_hook hook $HOOKS
     hooks = root / "hooks"
     hooks.mkdir()
     for name in ("omarchy-t2-cold-pre-cpu", "resume", "omarchy-t2-cold-pre-cpu-return"):
-      shutil.copyfile(directory / "hooks" / name, hooks / name)
+      source_directory = directory.parent / "hibernate-cold-common" if name == "resume" else directory
+      shutil.copyfile(source_directory / "hooks" / name, hooks / name)
       (hooks / name).chmod(0o700)
     shutil.copyfile(directory.parent / "hibernate-candidate-initcpio/hooks/omarchy-t2-restore-marker", hooks / "omarchy-t2-restore-marker")
     (hooks / "omarchy-t2-restore-marker").chmod(0o700)

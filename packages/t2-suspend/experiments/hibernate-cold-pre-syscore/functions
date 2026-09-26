@@ -1,3 +1,3 @@
 # Closed adapter; the immutable shared selector must name this protocol.
 . "${OMARCHY_T2_COLD_PRE_CPU_ROOT:-}/usr/lib/omarchy-t2-cold-common/functions" || return 1
-cold_select_protocol "cold-pre-cpu-abort-v1"
+cold_select_protocol "cold-pre-syscore-abort-v1"

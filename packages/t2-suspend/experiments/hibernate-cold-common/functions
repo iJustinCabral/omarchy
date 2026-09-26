@@ -1,0 +1,267 @@
+# Shared by exactly two mkinitcpio busybox ash diagnostics. No source-time PM or EFI operations.
+cold_select_protocol() {
+  cold_root=${OMARCHY_T2_COLD_PRE_CPU_ROOT:-}
+  local file=$cold_root/usr/lib/omarchy-t2-cold-common/protocol
+  [[ -f $file && ! -L $file ]] || return 1
+  read -r cold_protocol < "$file" || return 1
+  [[ -z "$1" || $cold_protocol == "$1" ]] || return 1
+  case $cold_protocol in
+    cold-pre-cpu-abort-v1)
+      cold_name=omarchy-t2-cold-pre-cpu
+      cold_module=mba_hibernate_cold_pre_cpu
+      cold_magic=MBCP
+      cold_return_name=OmarchyT2ColdPreCpuReturned ;;
+    cold-pre-syscore-abort-v1)
+      cold_name=omarchy-t2-cold-pre-syscore
+      cold_module=mba_hibernate_cold_pre_syscore
+      cold_magic=MBSC
+      cold_return_name=OmarchyT2ColdPreSyscoreReturned ;;
+    *) return 1 ;;
+  esac
+  cold_other_module=mba_hibernate_cold_pre_cpu
+  cold_other_return=OmarchyT2ColdPreCpuReturned
+  if [[ $cold_module == "$cold_other_module" ]]; then
+    cold_other_module=mba_hibernate_cold_pre_syscore
+    cold_other_return=OmarchyT2ColdPreSyscoreReturned
+  fi
+  [[ ! -e $cold_root/sys/module/$cold_other_module && ! -L $cold_root/sys/module/$cold_other_module ]] || return 1
+  return 0
+}
+
+cold_observations() {
+  local irq online valid
+  [[ $cold_protocol == "cold-pre-syscore-abort-v1" ]] || return 0
+  read -r irq < "$cold_sys/parameters/observed_irqs_disabled" || return 1
+  read -r online < "$cold_sys/parameters/observed_online_cpus" || return 1
+  read -r valid < "$cold_sys/parameters/observed_boundary_valid" || return 1
+  if [[ $1 == "before" ]]; then
+    [[ $irq == "N" && $online == "0" && $valid == "N" ]]
+  else
+    [[ $irq == "Y" && $online == "1" && $valid == "Y" ]]
+  fi
+}
+cold_hook_order() {
+  local hook phase=0 encrypted=0 hooks_array
+  for hook in $HOOKS; do
+    case $hook in
+      encrypt)
+        [[ $phase == "0" && $encrypted == "0" ]] || return 1
+        encrypted=1 ;;
+      "$cold_name")
+        [[ $phase == "0" && $encrypted == "1" ]] || return 1
+        phase=1 ;;
+      omarchy-t2-restore-marker)
+        [[ $phase == "1" ]] || return 1
+        phase=2 ;;
+      resume)
+        [[ $phase == "2" ]] || return 1
+        phase=3 ;;
+      "$cold_name-return")
+        [[ $phase == "3" ]] || return 1
+        phase=4 ;;
+      omarchy-t2-cold-pre-cpu|omarchy-t2-cold-pre-cpu-return|omarchy-t2-cold-pre-syscore|omarchy-t2-cold-pre-syscore-return) return 1 ;;
+      *)
+        [[ $phase == "0" || $phase == "4" ]] || return 1 ;;
+    esac
+  done
+  [[ $phase == "4" ]] || return 1
+  for hooks_array in "$EARLYHOOKS" "$LATEHOOKS" "$CLEANUPHOOKS" "$EMERGENCYHOOKS"; do
+    for hook in $hooks_array; do
+      case $hook in
+        omarchy-t2-cold-pre-cpu|omarchy-t2-cold-pre-cpu-return|omarchy-t2-cold-pre-syscore|omarchy-t2-cold-pre-syscore-return|omarchy-t2-restore-marker|resume) return 1 ;;
+      esac
+    done
+  done
+  return 0
+}
+
+cold_paths() {
+  cold_select_protocol || return 1
+  cold_dir=$cold_root/usr/lib/$cold_name
+  cold_sys=$cold_root/sys/module/$cold_module
+  cold_intent=$cold_root/run/$cold_name.intent
+  cold_guid=5e17d2ad-021f-4d45-a8e5-f4c191983e27
+  cold_vars=$cold_root/sys/firmware/efi/efivars
+  [[ -f $cold_dir/restore.variable && ! -L $cold_dir/restore.variable ]] || return 1
+  read -r cold_variable < "$cold_dir/restore.variable" || return 1
+  case $cold_variable in
+    OmarchyT2RestoreStage-$cold_guid|OmarchyT2RestoreStageV2-$cold_guid) ;;
+    *) return 1 ;;
+  esac
+  cold_marker=$cold_vars/$cold_variable
+}
+
+cold_header_gate() {
+  local device offset devnum actual_offset commandline token resume_count=0 offset_count=0
+  local expected actual major_number minor_number
+  local tracing
+  read -r tracing < "$cold_root/proc/sys/kernel/ftrace_enabled" || return 1
+  [[ $tracing == "1" ]] || return 1
+  cold_hook_order || return 1
+  for token in resume.device resume.offset resume.devnum header-reader header-reader.sha256; do
+    [[ -f $cold_dir/$token && ! -L $cold_dir/$token ]] || return 1
+  done
+  read -r device < "$cold_dir/resume.device" || return 1
+  read -r offset < "$cold_dir/resume.offset" || return 1
+  read -r devnum < "$cold_dir/resume.devnum" || return 1
+  [[ $device == "/dev/mapper/root" && $offset == "1923214" && $devnum == "253:0" ]] || return 1
+  read -r actual_offset < "$cold_root/sys/power/resume_offset" || return 1
+  [[ $actual_offset == "$offset" ]] || return 1
+  read -r commandline < "$cold_root/proc/cmdline" || return 1
+  for token in $commandline; do
+    case $token in
+      resume=*)
+        [[ ${token#resume=} == "$device" ]] || return 1
+        resume_count=$((resume_count + 1)) ;;
+      resume_offset=*)
+        [[ ${token#resume_offset=} == "$offset" ]] || return 1
+        offset_count=$((offset_count + 1)) ;;
+      noresume|noresume=*|hibernate=noresume|hibernate=no|disablehooks=*) return 1 ;;
+    esac
+  done
+  [[ $resume_count == "1" && $offset_count == "1" ]] || return 1
+  read -r expected < "$cold_dir/header-reader.sha256" || return 1
+  actual=$(sha256sum "$cold_dir/header-reader") || return 1
+  [[ ${actual%% *} == "$expected" && -x $cold_dir/header-reader ]] || return 1
+  major_number=${devnum%:*}
+  minor_number=${devnum#*:}
+  cold_header=$("$cold_dir/header-reader" "$device" "$offset" "$major_number" "$minor_number") || return 1
+  case $cold_header in NORMAL|PENDING) return 0 ;; *) return 1 ;; esac
+}
+
+cold_before_resume() {
+  local prefix armed consumed interceptions loaded_prefix expected actual
+  cold_paths || return 1
+  # Stock resume's systemd branch can derive another location from EFI.
+  [[ ! -x $cold_root/usr/lib/systemd/systemd-hibernate-resume ]] || return 1
+  cold_header_gate || return 1
+  [[ -f $cold_dir/stock-resume && ! -L $cold_dir/stock-resume && -f $cold_dir/stock-resume.sha256 && ! -L $cold_dir/stock-resume.sha256 ]] || return 1
+  read -r expected < "$cold_dir/stock-resume.sha256" || return 1
+  actual=$(sha256sum "$cold_dir/stock-resume") || return 1
+  [[ ${actual%% *} == "$expected" ]] || return 1
+  if [[ ! -e $cold_intent && ! -L $cold_intent ]]; then
+    [[ $cold_header == "NORMAL" && ! -e $cold_marker && ! -L $cold_marker && ! -e $cold_sys ]] || return 1
+    return 0
+  fi
+  [[ $cold_header == "PENDING" && -f $cold_intent && ! -L $cold_intent ]] || return 1
+  read -r prefix < "$cold_intent" || return 1
+  cold_marker_prefix 00 || return 1
+  [[ $prefix == "$cold_prefix" ]] || return 1
+  cold_identity || return 1
+  read -r armed < "$cold_sys/parameters/arm_prefix" || return 1
+  read -r consumed < "$cold_sys/parameters/arm_consumed" || return 1
+  read -r interceptions < "$cold_sys/parameters/interceptions" || return 1
+  read -r loaded_prefix < "$cold_sys/parameters/vector_prefix" || return 1
+  [[ $armed == "1" && $consumed == "Y" && $interceptions == "0" && $loaded_prefix == "$prefix" ]] || return 1
+  cold_observations before || return 1
+  # The adjacent existing marker hook must also have armed its exact module.
+  local restore_sys=$cold_root/sys/module/mba_hibernate_efi_restore_marker
+  read -r armed < "$restore_sys/parameters/arm_prefix" || return 1
+  read -r interceptions < "$restore_sys/parameters/stage" || return 1
+  [[ $armed == "1" && $interceptions == "0" ]] || return 1
+  return 0
+}
+
+cold_file_identity() {
+  local expected actual
+  [[ -f $cold_dir/abort.ko && ! -L $cold_dir/abort.ko && -f $cold_dir/abort.sha256 && ! -L $cold_dir/abort.sha256 && -f $cold_dir/abort.srcversion && ! -L $cold_dir/abort.srcversion ]] || return 1
+  read -r expected < "$cold_dir/abort.sha256" || return 1
+  actual=$(sha256sum "$cold_dir/abort.ko") || return 1
+  [[ ${actual%% *} == "$expected" ]]
+}
+
+cold_identity() {
+  local expected_src actual_src
+  cold_file_identity || return 1
+  read -r expected_src < "$cold_dir/abort.srcversion" || return 1
+  read -r actual_src < "$cold_sys/srcversion" || return 1
+  [[ -n $expected_src && $actual_src == "$expected_src" ]]
+}
+
+cold_marker_prefix() {
+  local bytes
+  [[ -f $cold_marker && ! -L $cold_marker ]] || return 1
+  bytes=$(hexdump -v -e '/1 "%02x"' "$cold_marker") || return 1
+  # Busybox ash lacks bash's arithmetic-command syntax.
+  [[ ${#bytes} == "42" ]] || return 1
+  [[ ${bytes:0:16} == "070000004d425253" && ${bytes:40:2} == "$1" ]] || return 1
+  cold_prefix=${bytes:16:24}
+}
+
+cold_write_arm() {
+  printf '%s\n' "$cold_prefix" > "$cold_sys/parameters/arm_prefix"
+}
+
+cold_recovery() {
+  if command -v plymouth >/dev/null 2>&1; then
+    plymouth quit >/dev/null 2>&1 || :
+  fi
+  err "$cold_name: $*; diagnostic stops before normal boot"
+  launch_interactive_shell --exec
+  return 1
+}
+
+cold_prepare() {
+  local armed consumed interceptions
+  cold_paths || return 1
+  cold_header_gate || return 1
+  if [[ ! -e $cold_marker && ! -L $cold_marker ]]; then
+    [[ ! -e $cold_intent && ! -L $cold_intent && ! -e $cold_sys ]] || return 1
+    [[ $cold_header == "NORMAL" ]] || return 1
+    return 0
+  fi
+  [[ $cold_header == "PENDING" ]] || return 1
+  cold_marker_prefix 00 || return 1
+  [[ ! -e $cold_intent && ! -L $cold_intent && ! -e $cold_sys ]] || return 1
+  [[ ! -e $cold_vars/${cold_return_name}${cold_prefix}-$cold_guid && ! -L $cold_vars/${cold_return_name}${cold_prefix}-$cold_guid ]] || return 1
+  [[ ! -e $cold_vars/${cold_other_return}${cold_prefix}-$cold_guid && ! -L $cold_vars/${cold_other_return}${cold_prefix}-$cold_guid ]] || return 1
+  cold_file_identity || return 1
+  # Record intent before insertion/arming; a partial arm cannot become inert.
+  (umask 077; set -C; printf '%s\n' "$cold_prefix" > "$cold_intent") || return 1
+  insmod "$cold_dir/abort.ko" || return 1
+  cold_identity || return 1
+  read -r armed < "$cold_sys/parameters/arm_prefix" || return 1
+  read -r consumed < "$cold_sys/parameters/arm_consumed" || return 1
+  read -r interceptions < "$cold_sys/parameters/interceptions" || return 1
+  [[ $armed == "0" && $consumed == "N" && $interceptions == "0" ]] || return 1
+  cold_observations before || return 1
+  cold_write_arm || return 1
+  read -r armed < "$cold_sys/parameters/arm_prefix" || return 1
+  read -r consumed < "$cold_sys/parameters/arm_consumed" || return 1
+  read -r cold_loaded_prefix < "$cold_sys/parameters/vector_prefix" || return 1
+  [[ $armed == "1" && $consumed == "Y" && $cold_loaded_prefix == "$cold_prefix" ]] || return 1
+  msg "$cold_name: exact diagnostic armed before resume"
+  return 0
+}
+
+cold_capture_return() {
+  local intent_prefix armed consumed interceptions loaded_prefix witness expected actual
+  cold_paths || return 1
+  if [[ ! -e $cold_intent && ! -L $cold_intent ]]; then
+    [[ ! -e $cold_marker && ! -L $cold_marker && ! -e $cold_sys ]] || return 1
+    cold_header_gate || return 1
+    [[ $cold_header == "NORMAL" ]] || return 1
+    return 0
+  fi
+  [[ -f $cold_intent && ! -L $cold_intent ]] || return 1
+  read -r intent_prefix < "$cold_intent" || return 1
+  cold_marker_prefix 07 || return 1
+  [[ $cold_prefix == "$intent_prefix" ]] || return 1
+  cold_identity || return 1
+  read -r armed < "$cold_sys/parameters/arm_prefix" || return 1
+  read -r consumed < "$cold_sys/parameters/arm_consumed" || return 1
+  read -r interceptions < "$cold_sys/parameters/interceptions" || return 1
+  read -r loaded_prefix < "$cold_sys/parameters/vector_prefix" || return 1
+  [[ $armed == "0" && $consumed == "Y" && $interceptions == "1" && $loaded_prefix == "$cold_prefix" ]] || return 1
+  cold_observations returned || return 1
+  cold_header_gate || return 1
+  [[ $cold_header == "NORMAL" ]] || return 1
+  witness=$cold_vars/${cold_return_name}${cold_prefix}-$cold_guid
+  [[ ! -e $witness && ! -L $witness ]] || return 1
+  [[ ! -e $cold_vars/${cold_other_return}${cold_prefix}-$cold_guid && ! -L $cold_vars/${cold_other_return}${cold_prefix}-$cold_guid ]] || return 1
+  expected=$(printf '\007\000\000\000%s%s\001' "$cold_magic" "$cold_prefix" | hexdump -v -e '/1 "%02x"') || return 1
+  (umask 077; set -C; printf '\007\000\000\000%s%s\001' "$cold_magic" "$cold_prefix" > "$witness") || return 1
+  actual=$(hexdump -v -e '/1 "%02x"' "$witness") || return 1
+  [[ $actual == "$expected" ]] || return 1
+  return 0
+}

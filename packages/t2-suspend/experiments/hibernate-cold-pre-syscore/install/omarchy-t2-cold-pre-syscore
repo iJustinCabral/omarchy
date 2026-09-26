@@ -1,0 +1,8 @@
+build() {
+  . "${BASH_SOURCE[0]%/*}/../../hibernate-cold-common/install/bundle" || return 1
+  build_cold_abort_bundle /usr/lib/omarchy-t2-cold-pre-syscore || return 1
+  add_runscript
+}
+help() {
+  echo "Guarded syscore controlled-abort diagnostic; requires exact bundle."
+}

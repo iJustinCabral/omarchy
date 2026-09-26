@@ -20,6 +20,7 @@ HERE = Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("cold_return_pair", HERE / "stage-hibernation-uki-pair.py")
 PAIR = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PAIR)
+COLD = PAIR.AUDIT.COLD
 HASH = re.compile(r"[0-9a-f]{64}")
 UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 GUID = "5e17d2ad-021f-4d45-a8e5-f4c191983e27"
@@ -170,13 +171,23 @@ def attempt_names(snapshot, directory):
   return names
 
 
-def inspect(root, source, restore, expected_pair_vector, pair_loader=PAIR.load_pair, staged_verifier=PAIR.verify_staged):
+def inspect(root, source, restore, expected_pair_vector, pair_loader=PAIR.load_pair, staged_verifier=PAIR.verify_staged,
+            required_protocol="cold_pre_cpu"):
   vector = exact_hash(expected_pair_vector, "Expected pair vector")
   snapshot = Snapshot(root)
   receipt = snapshot.json(PAIR.RECEIPT)
   pair, images, _ = pair_loader(Path(source), Path(restore))
-  if not isinstance(pair.get("cold_pre_cpu"), dict) or pair["cold_pre_cpu"].get("version") != "cold-pre-cpu-abort-v1":
-    raise ValueError("Restore provenance does not identify the cold pre-CPU abort diagnostic")
+  protocol = COLD.select(pair)
+  if protocol != required_protocol or protocol not in COLD.PROFILES:
+    raise ValueError("Restore provenance does not identify the requested cold abort protocol")
+  profile = COLD.PROFILES[protocol]
+  if not isinstance(pair.get(protocol), dict) or pair[protocol].get("version") != profile["version"]:
+    raise ValueError("Restore provenance does not identify the exact cold abort diagnostic")
+  if profile["observations"] is not None:
+    observed = pair[protocol].get("boundary_observations")
+    if (not isinstance(observed, dict) or observed != profile["observations"] or
+        any(type(observed[key]) is not type(value) for key, value in profile["observations"].items())):
+      raise ValueError("Pre-syscore returned proof lacks its exact observation contract")
   restore_marker = pair.get("restore_marker")
   if not isinstance(restore_marker, dict) or restore_marker.get("version") != "v2" or restore_marker.get("efi_variable") != RESTORE_VARIABLE:
     raise ValueError("Restore provenance does not identify the V2 stage marker")
@@ -259,9 +270,15 @@ def inspect(root, source, restore, expected_pair_vector, pair_loader=PAIR.load_p
     "restore": marker(snapshot, RESTORE_VARIABLE, b"MBRS", vector, 7),
   }
   for kind, stage in (("entered", 1), ("armed", 2), ("returned", 1)):
-    name = ("OmarchyT2ColdPreCpuReturned" if kind == "returned" else "OmarchyT2RestoreHook" + kind.capitalize()) + vector[:24] + "-" + GUID
-    markers[kind] = marker(snapshot, name, b"MBCP" if kind == "returned" else b"MBRH", vector, stage,
+    name = (profile["returned"] if kind == "returned" else "OmarchyT2RestoreHook" + kind.capitalize()) + vector[:24] + "-" + GUID
+    markers[kind] = marker(snapshot, name, profile["magic"] if kind == "returned" else b"MBRH", vector, stage,
                            ascii_prefix=True, exact_stage=stage)
+  for key, other in COLD.PROFILES.items():
+    if key != protocol:
+      conflicting = marker(snapshot, other["returned"] + vector[:24] + "-" + GUID, other["magic"], vector, 1,
+                           ascii_prefix=True, exact_stage=1)
+      if conflicting["present"]:
+        raise ValueError("Cross-protocol returned witness is forbidden")
   matching = lambda kind: markers[kind]["present"] and markers[kind]["matching_vector"]
   if markers["armed"]["present"] and not markers["entered"]["present"]:
     raise ValueError("Armed witness without entered witness")
@@ -305,14 +322,15 @@ def inspect(root, source, restore, expected_pair_vector, pair_loader=PAIR.load_p
     "guard_consumed": guard_boot is not None, "attempt_state": record.get("state") if record else None,
     "real_s4_attempted": record.get("real_s4_attempted") if record else False,
     "images": {role: {key: images[role][key] for key in ("sha256", "provenance_sha256", "experiment_id")} for role in images},
-    "runtime_stack_sha256": runtime, "cold_pre_cpu": pair["cold_pre_cpu"],
+    "runtime_stack_sha256": runtime, protocol: pair[protocol], "protocol": profile["version"],
+    "boundary": profile["target"], "witness_attested_observations": profile["observations"] if result == "controlled-abort-return" else None,
     "markers": markers, "evidence_sha256": evidence_hashes,
     "restore_stage_7_semantics": "dpm_suspend_end entry only; no proof of noirq or atomic restore completion",
-    "controlled_return_semantics": "exclusive witness of intentional pre-CPU abort recovery to restore initramfs; not restored source userspace",
+    "controlled_return_semantics": "exclusive witness of intentional " + profile["target"] + " entry abort recovery to restore initramfs; not restored source userspace or completion of target body",
   }
 
 
-def main():
+def main(required_protocol="cold_pre_cpu"):
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--source", type=Path, required=True)
   parser.add_argument("--restore", type=Path, required=True)
@@ -321,7 +339,7 @@ def main():
   if os.geteuid() != 0:
     parser.error("Read-only host evidence audit requires root")
   try:
-    result = inspect(Path("/"), arguments.source, arguments.restore, arguments.expected_pair_vector)
+    result = inspect(Path("/"), arguments.source, arguments.restore, arguments.expected_pair_vector, required_protocol=required_protocol)
   except (ValueError, OSError, KeyError, TypeError) as error:
     parser.exit(1, "cold-pre-cpu-return audit refused: " + str(error) + "\n")
   print(json.dumps(result, indent=2, sort_keys=True))

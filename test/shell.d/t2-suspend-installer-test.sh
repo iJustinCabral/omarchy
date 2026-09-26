@@ -33,6 +33,8 @@ python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-rtc-stage-marker.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-rtc-boot-recovery.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernation-uki-pair-s4.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-cold-pre-cpu-return.py"
+python3 "$ROOT/packages/t2-suspend/tests/test-cold-pre-cpu-uki.py"
+python3 "$ROOT/packages/t2-suspend/tests/test-cold-pre-syscore-integration.py"
 pass "T2 suspend source and installer transactions"
 
 test_tmp=$(mktemp -d)
