@@ -24,6 +24,11 @@ def write(root, relative, value, mode=0o600):
 
 
 def fixture(root):
+  guard = (m.SOURCE_BOOT + "\n").encode()
+  assert hashlib.sha256(guard).hexdigest() == m.GUARD_SHA
+  attempt = json.dumps({"transition_vector": m.VECTOR, "boot_id": m.SOURCE_BOOT,
+                        "state": "transition-armed", "real_s4_attempted": True}).encode()
+  m.ATTEMPT_SHA = hashlib.sha256(attempt).hexdigest()
   values = {
     m.SOURCE_VAR: b"\x07\0\0\0MBPW" + bytes.fromhex(m.VECTOR[:24]) + b"\x04",
     m.RESTORE_VAR: b"\x07\0\0\0MBRS" + bytes.fromhex(m.VECTOR[:24]) + bytes((m.RESTORE_STAGE,)),
@@ -32,6 +37,17 @@ def fixture(root):
     "receipt.json": b'{"fixture":"archived receipt"}\n',
     "recovery-acceptance-v3.json": b'{"fixture":"archived acceptance"}\n',
   }
+  for name in m.PINS:
+    if name not in values:
+      if name.startswith("OmarchyT2ColdPreCpuReturned"):
+        values[name] = b"\x07\0\0\0MBCP" + m.VECTOR[:24].encode() + b"\x01"
+      elif name == "s4-attempted":
+        values[name] = guard
+      elif name == "attempt.json":
+        values[name] = attempt
+      else:
+        assert name.endswith(".json"), name
+        values[name] = json.dumps({"fixture": name, "vector": m.VECTOR}).encode()
   for name, value in values.items():
     if name.endswith(".json"):
       m.PINS[name] = hashlib.sha256(value).hexdigest()
@@ -41,19 +57,14 @@ def fixture(root):
   (root / m.ARCHIVE).chmod(0o700)
   for name, relative in m.TARGETS.items():
     write(root, relative, values[name])
-  for name in (m.ENTERED, m.ARMED):
+  for name in m.preserved_live_pins():
     write(root, Path("sys/firmware/efi/efivars") / name, values[name])
-  guard = (m.SOURCE_BOOT + "\n").encode()
-  assert hashlib.sha256(guard).hexdigest() == m.GUARD_SHA
   write(root, m.GUARD, guard)
-  attempt = json.dumps({"transition_vector": m.VECTOR, "boot_id": m.SOURCE_BOOT,
-                        "state": "transition-armed", "real_s4_attempted": True}).encode()
-  m.ATTEMPT_SHA = hashlib.sha256(attempt).hexdigest()
   write(root, m.ATTEMPT, attempt)
 
 
 def stock(root):
-  return RETURN_BOOT
+  return m.RETURN_BOOTS.get(m.VECTOR, RETURN_BOOT)
 
 
 def refused(function):
@@ -66,14 +77,20 @@ def refused(function):
 
 with tempfile.TemporaryDirectory(prefix="terminal-witness-cleanup-") as temporary:
   base = Path(temporary)
-  cases = ("success", "archive", "live", "guard", "missing", "symlink", "mode", "witness", "intent", "partial", "boot")
+  cases = ("success", "archive", "live", "guard", "missing", "symlink", "mode", "witness", "intent", "partial", "boot",
+           "live-returned", "archive-returned", "missing-returned", "symlink-returned")
+  assert len(m.TERMINALS) == 4
   refused(lambda: m.select_terminal("0" * 64))
   for vector, case in ((vector, case) for vector in m.TERMINALS for case in cases):
     m.select_terminal(vector)
+    returned = next((name for name in m.preserved_live_pins() if name.startswith("OmarchyT2ColdPreCpuReturned")), None)
+    if case.endswith("returned") and returned is None:
+      continue
     root = base / vector / case
     fixture(root)
     if case == "success":
       before = {name: (root / m.ARCHIVE / name).read_bytes() for name in m.PINS}
+      live_before = {name: (root / "sys/firmware/efi/efivars" / name).read_bytes() for name in m.preserved_live_pins()}
       unrelated = write(root, Path("sys/firmware/efi/efivars/old-stage-variable"), b"old evidence")
       m.validate(root, stock)
       assert not (root / m.ARCHIVE / "slot-clear-intent.json").exists()
@@ -81,6 +98,7 @@ with tempfile.TemporaryDirectory(prefix="terminal-witness-cleanup-") as temporar
       assert result["guards_and_witnesses_preserved"]
       assert all(not (root / relative).exists() for relative in m.TARGETS.values())
       assert all((root / m.ARCHIVE / name).read_bytes() == value for name, value in before.items())
+      assert all((root / "sys/firmware/efi/efivars" / name).read_bytes() == value for name, value in live_before.items())
       assert (root / m.GUARD).exists() and (root / m.ATTEMPT).exists() and unrelated.read_bytes() == b"old evidence"
       assert m.execute(root, stock, Path.unlink) == result
       write(root, m.BACKEND.V3_VARIABLE, before[m.SOURCE_VAR])
@@ -118,8 +136,55 @@ with tempfile.TemporaryDirectory(prefix="terminal-witness-cleanup-") as temporar
         (root / "sys/firmware/efi/efivars" / m.ARMED).write_bytes(b"changed witness")
       elif case == "intent":
         write(root, m.ARCHIVE / "slot-clear-intent.json", b"{}\n")
+      elif case == "live-returned":
+        (root / "sys/firmware/efi/efivars" / returned).write_bytes(b"changed returned witness")
+      elif case == "archive-returned":
+        (root / m.ARCHIVE / returned).write_bytes(b"changed archived returned witness")
+      elif case == "missing-returned":
+        (root / "sys/firmware/efi/efivars" / returned).unlink()
+      elif case == "symlink-returned":
+        target = root / "sys/firmware/efi/efivars" / returned
+        target.unlink()
+        target.symlink_to(root / m.ARCHIVE / returned)
       refused(lambda: m.execute(root, stock, Path.unlink))
       if case != "intent":
         assert not (root / m.ARCHIVE / "slot-clear-intent.json").exists()
+
+  # Exercise current_stock itself on a portable filesystem. Only selected-entry
+  # lookup and physical-root inspection are stubbed; PM/kernel/resume/module
+  # gates and production hash checks execute their real validator logic.
+  m.select_terminal(next(iter(m.TERMINALS)))
+  stock_root = base / "stock-module-gate"
+  for relative, value in {
+    "proc/sys/kernel/osrelease": b"7.2.6-arch2-Watanare-T2-2-t2\n",
+    "proc/sys/kernel/random/boot_id": RETURN_BOOT.encode() + b"\n",
+    "sys/devices/virtual/dmi/id/product_name": b"MacBookAir9,1\n",
+    "sys/power/pm_test": b"[none] freezer devices platform processors core\n",
+    "sys/power/disk": b"[platform] shutdown\n",
+    "sys/power/pm_trace": b"0\n",
+    "sys/power/resume": b"253:0\n",
+    "sys/power/resume_offset": b"1923214\n",
+    "boot/EFI/Linux/omarchy_linux-t2.efi": b"synthetic production image",
+  }.items():
+    write(stock_root, Path(relative), value)
+  selected_entry = m.PAIR.selected_entry
+  verify_primary_root = m.SOURCE.verify_primary_root
+  production_sha = m.PRODUCTION_SHA
+  try:
+    m.PAIR.selected_entry = lambda _: "Omarchy.linux-t2"
+    m.SOURCE.verify_primary_root = lambda _: None
+    m.PRODUCTION_SHA = hashlib.sha256(b"synthetic production image").hexdigest()
+    assert m.current_stock(stock_root) == RETURN_BOOT
+    assert {"mba_hibernate_cold_pre_cpu", "mba_hibernate_cold_pre_syscore"}.issubset(m.NO_CURRENT_MODULES)
+    for name in m.NO_CURRENT_MODULES:
+      loaded = stock_root / "sys/module" / name
+      loaded.mkdir(parents=True)
+      refused(lambda: m.current_stock(stock_root))
+      loaded.rmdir()
+    assert m.current_stock(stock_root) == RETURN_BOOT
+  finally:
+    m.PAIR.selected_entry = selected_entry
+    m.SOURCE.verify_primary_root = verify_primary_root
+    m.PRODUCTION_SHA = production_sha
 
 print("PASS: terminal EFI slot cleanup preserves archives/guards/witnesses and fails closed on changed evidence")

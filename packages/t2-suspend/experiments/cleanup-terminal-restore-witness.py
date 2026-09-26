@@ -55,6 +55,16 @@ TARGETS = {
   "recovery-acceptance-v3.json": BACKEND.V3_ACCEPTANCE,
 }
 RESTORE_STAGE = 0
+PRESERVED_LIVE_PREFIXES = (
+  "OmarchyT2RestoreHookEntered", "OmarchyT2RestoreHookArmed", "OmarchyT2ColdPreCpuReturned",
+)
+RETURN_BOOTS = {
+  "529d919f498f44aee33c92f63604a85fd6e5c447e8e84740df6c340feb074f32": "aec7b794-2684-4277-b6ff-2050493f3932",
+}
+NO_CURRENT_MODULES = (
+  "mba_hibernate_efi_postwrite_marker", "mba_hibernate_efi_restore_marker",
+  "mba_hibernate_cold_pre_cpu", "mba_hibernate_cold_pre_syscore",
+)
 TERMINALS = {
   VECTOR: (SOURCE_BOOT, ARCHIVE, dict(PINS), GUARD_SHA, ATTEMPT_SHA, 0),
   "cf01e856dcab2e454332b80c96f9dd04c0698e3e8b214fe02b0b549a31623418": (
@@ -87,6 +97,26 @@ TERMINALS = {
     "69578178f3821d513e6e639209649ded15d48e992a7f5cc7e04427d845a3a92e",
     7,
   ),
+  "529d919f498f44aee33c92f63604a85fd6e5c447e8e84740df6c340feb074f32": (
+    "ef4c6f48-9b79-4560-978f-b523e5545f0e",
+    Path("var/lib/omarchy-t2-postwrite-marker/archive-v3-529d919f498f44ae"),
+    {
+      SOURCE_VAR: "de7593194d4007e9fd04bfb32ec3a58917346765488a3773fadd1a22cd86fc4a",
+      RESTORE_VAR: "8ddf71ff4f8aa05f82e74ff69de4dcea1b216ab5f32fdafbe9c251b5656a232b",
+      "OmarchyT2RestoreHookEntered529d919f498f44aee33c92f6-" + BACKEND.RESTORE_HOOK_GUID: "6261d5c5181a5ba5ea9bccfa730b84a46bff4c58bc0a68be510520fea3fdd19b",
+      "OmarchyT2RestoreHookArmed529d919f498f44aee33c92f6-" + BACKEND.RESTORE_HOOK_GUID: "756ea4a1698d30b366923d19f74c9d4c43edaa6356881167587ba9905013fefa",
+      "OmarchyT2ColdPreCpuReturned529d919f498f44aee33c92f6-" + BACKEND.RESTORE_HOOK_GUID: "f210dcbb855fd837e92bc64e0af11c6d26902a4ff3c7b7167ec9306196c152e0",
+      "receipt.json": "fb7a8f217cfdc12bd029392f42b47acaa7ead0c8d8d5c158a96e01ca005741e9",
+      "recovery-acceptance-v3.json": "b63cd291c36c15d15f077ed966ca28517d64b9a60cc5a39627e3085f02327e8b",
+      "s4-attempted": "cf50fbdb69e2a0ed26adda22e2c65695953d5b9609ecd57137d5aee38de3aee5",
+      "attempt.json": "25505b8e548c79af9081d8908e3d215714c64d78fa07b21ec9e2adf4872d94fa",
+      "postwrite-efi-identity.json": "6680c86a560ed609ab390736da123e9604370bbdaf2baf08e2f9064aa3eca7c3",
+      "restore-efi-identity.json": "0e99e8140ef8ccd75d8d860b2fed12c3d400bc046a71e3d9fb872bb7d626ac6e",
+    },
+    "cf50fbdb69e2a0ed26adda22e2c65695953d5b9609ecd57137d5aee38de3aee5",
+    "25505b8e548c79af9081d8908e3d215714c64d78fa07b21ec9e2adf4872d94fa",
+    7,
+  ),
 }
 
 
@@ -102,6 +132,13 @@ def select_terminal(vector):
   ATTEMPT = GUARD.parent / "attempts" / SOURCE_BOOT / "attempt.json"
   ENTERED = "OmarchyT2RestoreHookEntered" + VECTOR[:24] + "-" + BACKEND.RESTORE_HOOK_GUID
   ARMED = "OmarchyT2RestoreHookArmed" + VECTOR[:24] + "-" + BACKEND.RESTORE_HOOK_GUID
+
+
+def preserved_live_pins():
+  # Only internally pinned, vector-bound witness names qualify. No caller can
+  # extend the preservation set or provide alternative live evidence hashes.
+  prefixes = tuple(prefix + VECTOR[:24] + "-" for prefix in PRESERVED_LIVE_PREFIXES)
+  return {name: expected for name, expected in PINS.items() if name.startswith(prefixes)}
 
 
 def path(root, relative):
@@ -152,9 +189,9 @@ def current_stock(root):
   if (read(root, Path("sys/power/resume")).strip() != b"253:0" or
       read(root, Path("sys/power/resume_offset")).strip() != b"1923214"):
     raise ValueError("Resume target changed")
-  for name in ("mba_hibernate_efi_postwrite_marker", "mba_hibernate_efi_restore_marker"):
+  for name in NO_CURRENT_MODULES:
     if path(root, Path("sys/module") / name).exists():
-      raise ValueError("Marker module is still loaded")
+      raise ValueError("Marker or cold diagnostic module is still loaded")
   if Path(root) == Path("/"):
     if HEADER.read_header(Path("/dev/mapper/root"), 1923214)["marker"] != "normal-swap-signature":
       raise ValueError("Pending or unknown swap signature; preserve markers")
@@ -165,6 +202,8 @@ def current_stock(root):
 
 def validate(root, stock_validator=current_stock):
   current = stock_validator(root)
+  if VECTOR in RETURN_BOOTS and current != RETURN_BOOTS[VECTOR]:
+    raise ValueError("Cleanup requires the pinned physical stock return boot")
   archive = path(root, ARCHIVE)
   owner = 0 if Path(root) == Path("/") else os.geteuid()
   if archive.stat().st_uid != owner or stat.S_IMODE(archive.stat().st_mode) != 0o700:
@@ -177,8 +216,8 @@ def validate(root, stock_validator=current_stock):
   if (attempt.get("transition_vector") != VECTOR or attempt.get("boot_id") != SOURCE_BOOT or
       attempt.get("state") != "transition-armed" or attempt.get("real_s4_attempted") is not True):
     raise ValueError("Not the pinned terminal S4 attempt")
-  for name in (ENTERED, ARMED):
-    exact(root, Path("sys/firmware/efi/efivars") / name, PINS[name])
+  for name, expected in preserved_live_pins().items():
+    exact(root, Path("sys/firmware/efi/efivars") / name, expected)
   record = {"kind": "archived-terminal-marker-slot-clear-v1", "vector": VECTOR,
             "return_boot_id": current, "archive_sha256": PINS,
             "guard_sha256": GUARD_SHA, "attempt_sha256": ATTEMPT_SHA}
