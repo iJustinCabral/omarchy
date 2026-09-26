@@ -1,0 +1,20 @@
+# Must run immediately AFTER stock resume, before root mount/switch_root.
+run_hook() {
+  local cold_functions=${OMARCHY_T2_COLD_PRE_CPU_ROOT:-}/usr/lib/omarchy-t2-cold-pre-cpu/functions
+  if [[ ! -f $cold_functions || -L $cold_functions ]]; then
+    plymouth quit >/dev/null 2>&1 || :
+    err "omarchy-t2-cold-pre-cpu: missing diagnostic functions"
+    launch_interactive_shell --exec
+    return 1
+  fi
+  . "$cold_functions"
+  if ! cold_capture_return; then
+    cold_recovery "exact recovered interception not proved"
+    return 1
+  fi
+  if [[ -e $cold_intent ]]; then
+    cold_recovery "controlled abort returned and EFI witness verified"
+    return 1
+  fi
+  return 0
+}
