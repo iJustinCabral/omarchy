@@ -15,6 +15,10 @@ matching guide before starting:
 
 Before touching the MacBookAir9,1 boot image or power state, reconcile the current boot with `/home/jjc/.local/state/codex-mba-autonomous/handoff.json` and the evidence in [`docs/t2-suspend/HIBERNATION.md`](docs/t2-suspend/HIBERNATION.md). Replacement `.linux` kernels have repeatedly failed to mount the physical `/dev/mapper/root` even when offline and VM checks passed. Never reboot into or restage the failed marker-source UKI SHA-256 `974246c01bdc329917651b35f5dbe0b80e2f5e4125987f7c0050e20e4fc39ffd`, the earlier rejected v1/v2 images, or another replacement-kernel image under the current boot design. Any private UKI must preserve the production `.linux` and `.cmdline` sections byte-for-byte; the pair stager enforces the production-kernel policy. A successful ordinary boot of source and restore images does not establish that S4 or cold image restoration is safe. Preserve consumed PM guards and do not repeat a failed hardware vector.
 
+# Autonomous T2 Agent Routing
+
+For the autonomous MacBookAir9,1 hibernation goal, use `gpt-6-astra` with `medium` reasoning as the orchestrator for planning, discovery, review and integration. Delegate implementation and independent audits to `gpt-6-sol` with `high` reasoning, using explicit model/effort overrides and bounded task context. Parallelize independent work with clearly separated file ownership; keep physical boot, EFI, module-load and power transitions serialized under the orchestrator. Do not let delegation weaken the hardware safety rules or reinterpret a diagnostic boundary as successful hibernation.
+
 # Documentation Layout
 
 Three documentation trees, split by genre and audience:
