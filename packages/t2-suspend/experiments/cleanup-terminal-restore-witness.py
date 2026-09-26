@@ -57,6 +57,21 @@ TARGETS = {
 RESTORE_STAGE = 0
 TERMINALS = {
   VECTOR: (SOURCE_BOOT, ARCHIVE, dict(PINS), GUARD_SHA, ATTEMPT_SHA, 0),
+  "cf01e856dcab2e454332b80c96f9dd04c0698e3e8b214fe02b0b549a31623418": (
+    "32072873-3fc3-499d-843d-c1e115e3bef3",
+    Path("var/lib/omarchy-t2-postwrite-marker/archive-v3-cf01e856dcab2e45"),
+    {
+      SOURCE_VAR: "c0ad385464abca5088229e8a097e43bd3294c705f7e03932a7a69582ddd36c02",
+      RESTORE_VAR: "b434034f45daf745710a8a4de44d11c9641856de2754b088d33cbd170cea643a",
+      "OmarchyT2RestoreHookEnteredcf01e856dcab2e454332b80c-" + BACKEND.RESTORE_HOOK_GUID: "cc8a9f216630bd4fb7152e0dfc030db341424f701e6c81bf839143fb92f33caa",
+      "OmarchyT2RestoreHookArmedcf01e856dcab2e454332b80c-" + BACKEND.RESTORE_HOOK_GUID: "848f09a42a7616fab904ff14d9278852b93baa21a4ac8d546df56457e66594ef",
+      "receipt.json": "ec085ee988a39b7af28ef3e32dcca1c9510b549132ac11735185bf4b8a528bb4",
+      "recovery-acceptance-v3.json": "7cd869e34224d9c0ae7863b73b723a1b98e6a1cd6e0162978580afd4e40d9ee9",
+    },
+    "ed6a4ae4b2c9bda29f8de46b7011878a8e2c706ac775456a794b4de6fe3ec329",
+    "ff7d51d0d70e9a7a4752b6241bdb0d71603e77b6257e7c8514a06e1fb7fbf12e",
+    7,
+  ),
   "8309257dfe8c39719e890bebc8e52587b8407d08c47b97952185c6d7ebd009d6": (
     "cdf79ca2-cd83-49fb-b679-6d1b8e8d8af5",
     Path("var/lib/omarchy-t2-postwrite-marker/archive-v3-8309257dfe8c3971"),
