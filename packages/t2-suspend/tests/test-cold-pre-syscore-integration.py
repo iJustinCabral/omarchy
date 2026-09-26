@@ -41,6 +41,15 @@ class SyscoreIntegrationTests(unittest.TestCase):
       "ftrace-missing": "ftrace-read",
       "ftrace-empty": "ftrace-read",
       "ftrace-disabled": "ftrace-disabled",
+      "ftrace-directory": "ftrace-read",
+      "ftrace-partial-read": "ftrace-read",
+      "ftrace-no-newline": "ftrace-disabled",
+      "ftrace-leading-space": "ftrace-disabled",
+      "ftrace-trailing-space": "ftrace-disabled",
+      "ftrace-extra-line": "ftrace-disabled",
+      "ftrace-extra-newline": "ftrace-disabled",
+      "ftrace-nul": "ftrace-disabled",
+      "ftrace-other-value": "ftrace-disabled",
       "bad-order": "hook-order",
       "offset-missing": "resume-offset-read",
       "offset-wrong": "resume-offset-mismatch",
@@ -57,6 +66,14 @@ err() { printf '%s\n' "$*"; }
 plymouth() { return 0; }
 launch_interactive_shell() { exit 81; }
 insmod() { printf 'UNEXPECTED INSMOD\n'; exit 90; }
+cat() {
+  if [[ $MOCK == "ftrace-partial-read" ]]; then
+    printf '1\n'
+    return 1
+  fi
+  /usr/lib/initcpio/busybox cat "$@"
+}
+hexdump() { /usr/lib/initcpio/busybox hexdump "$@"; }
 . "$OMARCHY_T2_COLD_PRE_CPU_ROOT/config"
 . "$1"
 run_hook
@@ -100,10 +117,17 @@ run_hook
             (directory / "restore.variable").write_text("wrong\n")
           elif mode == "ftrace-missing":
             (root / "proc/sys/kernel/ftrace_enabled").unlink()
-          elif mode == "ftrace-empty":
-            (root / "proc/sys/kernel/ftrace_enabled").write_text("")
-          elif mode == "ftrace-disabled":
-            (root / "proc/sys/kernel/ftrace_enabled").write_text("0\n")
+          elif mode == "ftrace-directory":
+            (root / "proc/sys/kernel/ftrace_enabled").unlink()
+            (root / "proc/sys/kernel/ftrace_enabled").mkdir()
+          elif mode.startswith("ftrace-") and mode != "ftrace-partial-read":
+            values = {
+              "ftrace-empty": b"", "ftrace-disabled": b"0\n", "ftrace-no-newline": b"1",
+              "ftrace-leading-space": b" 1\n", "ftrace-trailing-space": b"1 \n",
+              "ftrace-extra-line": b"1\n0\n", "ftrace-extra-newline": b"1\n\n",
+              "ftrace-nul": b"1\0\n", "ftrace-other-value": b"2\n",
+            }
+            (root / "proc/sys/kernel/ftrace_enabled").write_bytes(values[mode])
           elif mode == "bad-order":
             (root / "config").write_text('HOOKS="encrypt resume"\n')
           elif mode == "offset-missing":
@@ -120,7 +144,7 @@ run_hook
             (directory / "header-reader.sha256").write_text("0" * 64 + "\n")
           result = subprocess.run([busybox, "ash", "-c", script, "ash", str(profile["source"] / "hooks" / hook)],
                                   capture_output=True, text=True,
-                                  env={"PATH": os.environ["PATH"], "OMARCHY_T2_COLD_PRE_CPU_ROOT": str(root)})
+                                  env={"PATH": os.environ["PATH"], "OMARCHY_T2_COLD_PRE_CPU_ROOT": str(root), "MOCK": mode})
           if expected is None:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(result.stdout, "")
@@ -129,6 +153,32 @@ run_hook
             self.assertIn("(" + expected + ")", result.stdout)
           self.assertNotIn("UNEXPECTED INSMOD", result.stdout)
           self.assertNotIn("private-value-never-printed", result.stdout + result.stderr)
+
+  def test_busybox_ftrace_gate_reads_live_procfs_without_changing_it(self):
+    path = Path("/proc/sys/kernel/ftrace_enabled")
+    try:
+      value = path.read_bytes()
+    except OSError as error:
+      self.skipTest("Live ftrace sysctl unavailable: " + str(error))
+    # Stop immediately after the ftrace check: no device, module, EFI or PM
+    # operations can follow, even when the live sysctl is enabled.
+    script = r'''
+. "$1"
+cold_root=
+cat() { /usr/lib/initcpio/busybox cat "$@"; }
+hexdump() { /usr/lib/initcpio/busybox hexdump "$@"; }
+cold_hook_order() { return 1; }
+cold_header_gate
+status=$?
+printf '%s:%s\n' "$status" "$cold_failure"
+'''
+    result = subprocess.run(["/usr/lib/initcpio/busybox", "ash", "-c", script, "ash",
+                             str(EXPERIMENTS / "hibernate-cold-common/functions")],
+                            capture_output=True, text=True)
+    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+    expected = "hook-order" if value == b"1\n" else "ftrace-disabled" if value else "ftrace-read"
+    self.assertEqual(result.stdout, "1:" + expected + "\n", result.stderr)
+    self.assertEqual(result.stderr, "")
 
   def image_fixture(self):
     fixture = images.ColdPreCpuImageTests()

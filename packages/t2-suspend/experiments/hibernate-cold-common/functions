@@ -100,9 +100,15 @@ cold_header_gate() {
   local expected actual major_number minor_number
   local tracing
   cold_failure=ftrace-read
-  read -r tracing < "$cold_root/proc/sys/kernel/ftrace_enabled" || return 1
+  # Busybox ash's byte-at-a-time read can hit EOF after "1" on numeric sysctls.
+  # Read the complete sysctl and retain every byte, including its newline.
+  tracing=$(
+    set -o pipefail
+    cat "$cold_root/proc/sys/kernel/ftrace_enabled" | hexdump -v -e '/1 "%02x"'
+  ) || return 1
+  [[ -n "$tracing" ]] || return 1
   cold_failure=ftrace-disabled
-  [[ $tracing == "1" ]] || return 1
+  [[ $tracing == "310a" ]] || return 1
   cold_failure=hook-order
   cold_hook_order || return 1
   cold_failure=resume-input-files
