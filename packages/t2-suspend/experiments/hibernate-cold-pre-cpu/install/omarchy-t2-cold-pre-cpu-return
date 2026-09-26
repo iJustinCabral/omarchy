@@ -1,0 +1,6 @@
+build() {
+  add_runscript
+}
+help() {
+  echo "Capture a returned controlled abort after synchronous resume."
+}

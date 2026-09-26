@@ -1,0 +1,18 @@
+# Same regular hook name/order; the pinned stock hook is invoked synchronously.
+run_hook() {
+  local cold_functions=${OMARCHY_T2_COLD_PRE_CPU_ROOT:-}/usr/lib/omarchy-t2-cold-pre-cpu/functions
+  if [[ ! -f $cold_functions || -L $cold_functions ]]; then
+    plymouth quit >/dev/null 2>&1 || :
+    err "omarchy-t2-cold-pre-cpu: missing diagnostic functions before resume"
+    launch_interactive_shell --exec
+    return 1
+  fi
+  . "$cold_functions"
+  if ! cold_before_resume; then
+    cold_recovery "immediate resume gate failed"
+    return 1
+  fi
+  # Sourcing replaces run_hook with the exact bundled stock implementation.
+  . "$cold_dir/stock-resume"
+  run_hook
+}
