@@ -30,6 +30,106 @@ PROFILE = builder.COLD.PROFILES["cold_pre_syscore"]
 
 
 class SyscoreIntegrationTests(unittest.TestCase):
+  def test_busybox_ordinary_gate_reports_fixed_refusal_reasons_for_both_protocols(self):
+    busybox = "/usr/lib/initcpio/busybox"
+    self.assertTrue(Path(busybox).is_file())
+    cases = {
+      "normal": None,
+      "selector-missing": "protocol-selector",
+      "variable-missing": "restore-variable-file",
+      "variable-wrong": "restore-variable-identity",
+      "ftrace-missing": "ftrace-read",
+      "ftrace-empty": "ftrace-read",
+      "ftrace-disabled": "ftrace-disabled",
+      "bad-order": "hook-order",
+      "offset-missing": "resume-offset-read",
+      "offset-wrong": "resume-offset-mismatch",
+      "cmdline-missing": "commandline-read",
+      "cmdline-wrong": "commandline-resume",
+      "reader-fails": "header-reader-execution",
+      "reader-hash-wrong": "header-reader-hash",
+      "reader-unknown": "header-reader-result",
+      "pending-no-marker": "ordinary-header",
+      "ordinary-residue": "ordinary-residue",
+    }
+    script = r'''
+err() { printf '%s\n' "$*"; }
+plymouth() { return 0; }
+launch_interactive_shell() { exit 81; }
+insmod() { printf 'UNEXPECTED INSMOD\n'; exit 90; }
+. "$OMARCHY_T2_COLD_PRE_CPU_ROOT/config"
+. "$1"
+run_hook
+'''
+    for protocol, profile in builder.COLD.PROFILES.items():
+      for mode, expected in cases.items():
+        with self.subTest(protocol=protocol, mode=mode), tempfile.TemporaryDirectory(prefix="cold-gate-reason-") as temporary:
+          root = Path(temporary)
+          common = root / builder.COLD.COMMON_DIRECTORY
+          directory = root / profile["directory"]
+          common.mkdir(parents=True)
+          directory.mkdir(parents=True)
+          (common / "functions").write_bytes((EXPERIMENTS / "hibernate-cold-common/functions").read_bytes())
+          (common / "protocol").write_text(profile["version"] + "\n")
+          (directory / "functions").write_bytes((profile["source"] / "functions").read_bytes())
+          (directory / "restore.variable").write_text("OmarchyT2RestoreStageV2-5e17d2ad-021f-4d45-a8e5-f4c191983e27\n")
+          for name, value in (("resume.device", "/dev/mapper/root"), ("resume.offset", "1923214"), ("resume.devnum", "253:0")):
+            (directory / name).write_text(value + "\n")
+          (root / "proc/sys/kernel").mkdir(parents=True)
+          (root / "proc/sys/kernel/ftrace_enabled").write_text("1\n")
+          (root / "proc/cmdline").write_text("quiet resume=/dev/mapper/root resume_offset=1923214\n")
+          (root / "sys/power").mkdir(parents=True)
+          (root / "sys/power/resume_offset").write_text("1923214\n")
+          (root / "run").mkdir()
+          hook = profile["hook"]
+          # Exact resolved arrays from the published ordinary v10 image.
+          (root / "config").write_text('HOOKS="udev keymap consolefont encrypt ' + hook + ' omarchy-t2-restore-marker resume ' + hook + '-return"\nEARLYHOOKS="udev"\nLATEHOOKS="btrfs-overlayfs omarchy-t2-candidate-modules"\nCLEANUPHOOKS="udev"\nEMERGENCYHOOKS=""\n')
+          reader = directory / "header-reader"
+          reader.write_text("#!/bin/sh\nprintf 'NORMAL\\n'\n")
+          if mode == "reader-fails":
+            reader.write_text("#!/bin/sh\nexit 3\n")
+          elif mode in ("reader-unknown", "pending-no-marker"):
+            reader.write_text("#!/bin/sh\nprintf '" + ("UNKNOWN" if mode == "reader-unknown" else "PENDING") + "\\n'\n")
+          reader.chmod(0o700)
+          (directory / "header-reader.sha256").write_text(hashlib.sha256(reader.read_bytes()).hexdigest() + "\n")
+          if mode == "selector-missing":
+            (common / "protocol").unlink()
+          elif mode == "variable-missing":
+            (directory / "restore.variable").unlink()
+          elif mode == "variable-wrong":
+            (directory / "restore.variable").write_text("wrong\n")
+          elif mode == "ftrace-missing":
+            (root / "proc/sys/kernel/ftrace_enabled").unlink()
+          elif mode == "ftrace-empty":
+            (root / "proc/sys/kernel/ftrace_enabled").write_text("")
+          elif mode == "ftrace-disabled":
+            (root / "proc/sys/kernel/ftrace_enabled").write_text("0\n")
+          elif mode == "bad-order":
+            (root / "config").write_text('HOOKS="encrypt resume"\n')
+          elif mode == "offset-missing":
+            (root / "sys/power/resume_offset").unlink()
+          elif mode == "offset-wrong":
+            (root / "sys/power/resume_offset").write_text("0\n")
+          elif mode == "cmdline-missing":
+            (root / "proc/cmdline").unlink()
+          elif mode == "cmdline-wrong":
+            (root / "proc/cmdline").write_text("quiet resume=/dev/other resume_offset=1923214\n")
+          elif mode == "ordinary-residue":
+            (root / "run" / (hook + ".intent")).write_text("private-value-never-printed\n")
+          elif mode == "reader-hash-wrong":
+            (directory / "header-reader.sha256").write_text("0" * 64 + "\n")
+          result = subprocess.run([busybox, "ash", "-c", script, "ash", str(profile["source"] / "hooks" / hook)],
+                                  capture_output=True, text=True,
+                                  env={"PATH": os.environ["PATH"], "OMARCHY_T2_COLD_PRE_CPU_ROOT": str(root)})
+          if expected is None:
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout, "")
+          else:
+            self.assertEqual(result.returncode, 81, result.stdout + result.stderr)
+            self.assertIn("(" + expected + ")", result.stdout)
+          self.assertNotIn("UNEXPECTED INSMOD", result.stdout)
+          self.assertNotIn("private-value-never-printed", result.stdout + result.stderr)
+
   def image_fixture(self):
     fixture = images.ColdPreCpuImageTests()
     fixture.setUp()

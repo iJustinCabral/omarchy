@@ -6,12 +6,13 @@ run_hook() {
     launch_interactive_shell --exec
     return 1
   fi
+  cold_failure=protocol-selector
   . "$cold_functions" || {
-    cold_recovery "diagnostic protocol selection failed"
+    cold_recovery "diagnostic protocol selection failed (${cold_failure:-protocol-selector})"
     return 1
   }
   if ! cold_prepare; then
-    cold_recovery "arming failed"
+    cold_recovery "arming failed (${cold_failure:-unknown})"
     return 1
   fi
   return 0

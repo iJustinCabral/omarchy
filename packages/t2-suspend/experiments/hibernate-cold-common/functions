@@ -1,5 +1,6 @@
 # Shared by exactly two mkinitcpio busybox ash diagnostics. No source-time PM or EFI operations.
 cold_select_protocol() {
+  cold_failure=protocol-selector
   cold_root=${OMARCHY_T2_COLD_PRE_CPU_ROOT:-}
   local file=$cold_root/usr/lib/omarchy-t2-cold-common/protocol
   [[ -f $file && ! -L $file ]] || return 1
@@ -24,6 +25,7 @@ cold_select_protocol() {
     cold_other_module=mba_hibernate_cold_pre_syscore
     cold_other_return=OmarchyT2ColdPreSyscoreReturned
   fi
+  cold_failure=other-protocol-loaded
   [[ ! -e $cold_root/sys/module/$cold_other_module && ! -L $cold_root/sys/module/$cold_other_module ]] || return 1
   return 0
 }
@@ -82,8 +84,10 @@ cold_paths() {
   cold_intent=$cold_root/run/$cold_name.intent
   cold_guid=5e17d2ad-021f-4d45-a8e5-f4c191983e27
   cold_vars=$cold_root/sys/firmware/efi/efivars
+  cold_failure=restore-variable-file
   [[ -f $cold_dir/restore.variable && ! -L $cold_dir/restore.variable ]] || return 1
   read -r cold_variable < "$cold_dir/restore.variable" || return 1
+  cold_failure=restore-variable-identity
   case $cold_variable in
     OmarchyT2RestoreStage-$cold_guid|OmarchyT2RestoreStageV2-$cold_guid) ;;
     *) return 1 ;;
@@ -95,19 +99,28 @@ cold_header_gate() {
   local device offset devnum actual_offset commandline token resume_count=0 offset_count=0
   local expected actual major_number minor_number
   local tracing
+  cold_failure=ftrace-read
   read -r tracing < "$cold_root/proc/sys/kernel/ftrace_enabled" || return 1
+  cold_failure=ftrace-disabled
   [[ $tracing == "1" ]] || return 1
+  cold_failure=hook-order
   cold_hook_order || return 1
+  cold_failure=resume-input-files
   for token in resume.device resume.offset resume.devnum header-reader header-reader.sha256; do
     [[ -f $cold_dir/$token && ! -L $cold_dir/$token ]] || return 1
   done
   read -r device < "$cold_dir/resume.device" || return 1
   read -r offset < "$cold_dir/resume.offset" || return 1
   read -r devnum < "$cold_dir/resume.devnum" || return 1
+  cold_failure=resume-input-identity
   [[ $device == "/dev/mapper/root" && $offset == "1923214" && $devnum == "253:0" ]] || return 1
+  cold_failure=resume-offset-read
   read -r actual_offset < "$cold_root/sys/power/resume_offset" || return 1
+  cold_failure=resume-offset-mismatch
   [[ $actual_offset == "$offset" ]] || return 1
+  cold_failure=commandline-read
   read -r commandline < "$cold_root/proc/cmdline" || return 1
+  cold_failure=commandline-resume
   for token in $commandline; do
     case $token in
       resume=*)
@@ -120,12 +133,15 @@ cold_header_gate() {
     esac
   done
   [[ $resume_count == "1" && $offset_count == "1" ]] || return 1
+  cold_failure=header-reader-hash
   read -r expected < "$cold_dir/header-reader.sha256" || return 1
   actual=$(sha256sum "$cold_dir/header-reader") || return 1
   [[ ${actual%% *} == "$expected" && -x $cold_dir/header-reader ]] || return 1
   major_number=${devnum%:*}
   minor_number=${devnum#*:}
+  cold_failure=header-reader-execution
   cold_header=$("$cold_dir/header-reader" "$device" "$offset" "$major_number" "$minor_number") || return 1
+  cold_failure=header-reader-result
   case $cold_header in NORMAL|PENDING) return 0 ;; *) return 1 ;; esac
 }
 
@@ -206,26 +222,40 @@ cold_prepare() {
   cold_paths || return 1
   cold_header_gate || return 1
   if [[ ! -e $cold_marker && ! -L $cold_marker ]]; then
+    cold_failure=ordinary-residue
     [[ ! -e $cold_intent && ! -L $cold_intent && ! -e $cold_sys ]] || return 1
+    cold_failure=ordinary-header
     [[ $cold_header == "NORMAL" ]] || return 1
     return 0
   fi
+  cold_failure=pending-header
   [[ $cold_header == "PENDING" ]] || return 1
+  cold_failure=marker-prefix
   cold_marker_prefix 00 || return 1
+  cold_failure=pending-residue
   [[ ! -e $cold_intent && ! -L $cold_intent && ! -e $cold_sys ]] || return 1
+  cold_failure=returned-witness-present
   [[ ! -e $cold_vars/${cold_return_name}${cold_prefix}-$cold_guid && ! -L $cold_vars/${cold_return_name}${cold_prefix}-$cold_guid ]] || return 1
   [[ ! -e $cold_vars/${cold_other_return}${cold_prefix}-$cold_guid && ! -L $cold_vars/${cold_other_return}${cold_prefix}-$cold_guid ]] || return 1
+  cold_failure=abort-file-identity
   cold_file_identity || return 1
   # Record intent before insertion/arming; a partial arm cannot become inert.
+  cold_failure=intent-record
   (umask 077; set -C; printf '%s\n' "$cold_prefix" > "$cold_intent") || return 1
+  cold_failure=abort-insertion
   insmod "$cold_dir/abort.ko" || return 1
+  cold_failure=abort-loaded-identity
   cold_identity || return 1
+  cold_failure=abort-initial-readback
   read -r armed < "$cold_sys/parameters/arm_prefix" || return 1
   read -r consumed < "$cold_sys/parameters/arm_consumed" || return 1
   read -r interceptions < "$cold_sys/parameters/interceptions" || return 1
   [[ $armed == "0" && $consumed == "N" && $interceptions == "0" ]] || return 1
+  cold_failure=abort-initial-observations
   cold_observations before || return 1
+  cold_failure=abort-arm-write
   cold_write_arm || return 1
+  cold_failure=abort-armed-readback
   read -r armed < "$cold_sys/parameters/arm_prefix" || return 1
   read -r consumed < "$cold_sys/parameters/arm_consumed" || return 1
   read -r cold_loaded_prefix < "$cold_sys/parameters/vector_prefix" || return 1
