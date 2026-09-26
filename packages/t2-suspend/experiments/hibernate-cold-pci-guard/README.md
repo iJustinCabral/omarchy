@@ -1,6 +1,8 @@
 # Offline cold PCI guard prototype
 
-This private external-module prototype is not installed, loaded, built as a kernel module, included in an initramfs, or hardware qualified. It does not replace the production kernel or command line. It is not a hibernation fix, a durable attempt runner, or permission to retry a terminal vector.
+This private external-module prototype is not installed, loaded, included in an initramfs, or hardware qualified. It does not replace the production kernel or command line. It is not a hibernation fix, a durable attempt runner, or permission to retry a terminal vector.
+
+A private `W=1` module build against the production `7.2.6-arch2-Watanare-T2-2-t2` headers passed at `/home/jjc/.local/state/codex-mba-autonomous/cold-pci-guard-build.tlIA6Q`. Module SHA-256 is `bea6b7a5ff147554fbe6193cd8f5cca00ac66d69e4e43775e505e5e27b030ebf`, source version `E7BD9BAF24EDFD93B6EF0C0`. The build reported the existing pahole tool-version difference, not a compiler failure. No kernel was rebuilt and the resulting module was not loaded or installed. Compilation establishes ABI availability only, not safe PCI behavior.
 
 The driver claims only the otherwise-unbound Apple BCE function and acquires references to the exact same-slot ANS/BCE/SEP/audio functions. It rejects unexpected IDs and bound SEP/audio drivers, requires ANS to use the ordinary `nvme` PCI driver, and maps only the standard ANS status register range for reads. It does not enable any PCI device, request IRQs, initialize BCE firmware, allocate DMA queues, or reset ANS. Probe failures release every acquired reference and mapping. Successful probe temporarily disables asynchronous PM for all four siblings and remove restores their original policy.
 
