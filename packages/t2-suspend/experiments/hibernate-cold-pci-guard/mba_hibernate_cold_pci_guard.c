@@ -175,7 +175,7 @@ static void mba_complete(struct device *dev)
       continue;
     pci_set_master(guard->functions[i]);
     if (pci_read_config_word(guard->functions[i], PCI_COMMAND, &command) ||
-        !(command & PCI_COMMAND_MASTER)) {
+        command == 0xffff || !(command & PCI_COMMAND_MASTER)) {
       guard->gate_failed = true;
       gate_failed = true;
     }

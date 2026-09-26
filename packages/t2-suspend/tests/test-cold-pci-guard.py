@@ -90,7 +90,8 @@ static struct pci_dev devices[4];
 static struct pci_driver nvme = { .name="nvme" }, other = { .name="unexpected" };
 static u32 regs[8];
 static int missing=-1, map_fail, maps, frees, ref_puts;
-static unsigned int clear_fail, save_fail, read_fail;
+static unsigned int clear_fail, save_fail, read_fail, read_ones, set_fail;
+static unsigned int clear_calls[4], set_calls[4];
 static bool main_recovered;
 static unsigned int enabled_before_main;
 static unsigned int generic_reenables;
@@ -115,15 +116,18 @@ static void *ioremap(unsigned long start, size_t size) {(void)start;(void)size;i
 static void iounmap(void *p) {assert(p==regs);maps--;}
 static u32 readl(void *p) {return *(u32 *)p;}
 static int pci_read_config_word(struct pci_dev *p,int reg,u16 *v) {
-  assert(reg==PCI_COMMAND); if(read_fail&BIT(p->index))return -EIO; *v=p->command;return 0;
+  assert(reg==PCI_COMMAND); if(read_fail&BIT(p->index))return -EIO;
+  *v=(read_ones&BIT(p->index)) ? 0xffff : p->command;return 0;
 }
 static void pci_clear_master(struct pci_dev *p) {
+  clear_calls[p->index]++;
   if(clear_fail&BIT(p->index))p->command|=PCI_COMMAND_MASTER;
   else p->command&=~PCI_COMMAND_MASTER;
 }
 static void pci_set_master(struct pci_dev *p) {
+  set_calls[p->index]++;
   if(!main_recovered) enabled_before_main++;
-  p->command|=PCI_COMMAND_MASTER;
+  if(!(set_fail&BIT(p->index)))p->command|=PCI_COMMAND_MASTER;
 }
 static int pci_save_state(struct pci_dev *p) {
   p->saved_config_space[1]=p->command;p->state_saved=true;
@@ -166,7 +170,9 @@ static void reset(void) {
   devices[0].command=0x100;
   armed=arm_consumed=false;gates=0;vector_prefix[0]=0;
   gate_active=gate_failed=false;generic_reenables=0;
-  missing=-1;map_fail=0;clear_fail=save_fail=read_fail=0;main_recovered=false;enabled_before_main=0;
+  missing=-1;map_fail=0;clear_fail=save_fail=read_fail=read_ones=set_fail=0;
+  memset(clear_calls,0,sizeof(clear_calls));memset(set_calls,0,sizeof(set_calls));
+  main_recovered=false;enabled_before_main=0;
 }
 static void probe_arm(void) {
   char value[8];assert(mba_probe(&devices[1],NULL)==0);assert(instance);
@@ -251,6 +257,44 @@ int main(void) {
     assert(instance->active && instance->gate_failed && gate_active && gate_failed && !enabled_before_main);
     for(int i=0;i<4;i++)assert(!(devices[i].saved_config_space[1]&PCI_COMMAND_MASTER));
     save_fail=0;recover();remove_guard();
+  }
+  // Inaccessible configuration during noirq recovery must latch failure,
+  // including an all-ones read whose PCI accessor reports success.
+  for(int fault=0;fault<2;fault++) {
+    for(int sibling=0;sibling<4;sibling++) {
+      reset();probe_arm();assert(pci_pm_freeze_noirq(&devices[1].dev)==0);
+      if(fault==0)read_fail=BIT(sibling);else read_ones=BIT(sibling);
+      assert(pci_pm_thaw_noirq(&devices[1].dev)==-EIO);
+      assert(instance->gate_failed && gate_failed && instance->active && gate_active);
+      assert(!enabled_before_main && clear_calls[sibling]==2);
+      read_fail=read_ones=0;recover();
+      assert(instance->gate_failed && gate_failed && !gate_active);
+      remove_guard();
+    }
+  }
+  // Completion may restore siblings only after main recovery. Every read or
+  // write failure must invalidate proof while preserving ANS fresh-queue MASTER.
+  for(int fault=0;fault<3;fault++) {
+    for(int sibling=1;sibling<4;sibling++) {
+      reset();probe_arm();assert(pci_pm_freeze_noirq(&devices[1].dev)==0);
+      for(int i=0;i<4;i++)assert(pci_pm_thaw_noirq(&devices[i].dev)==0);
+      assert(pci_pm_thaw(&devices[1].dev)==0 && !enabled_before_main);
+      main_recovered=true;pci_set_master(&devices[0]);
+      if(fault==0)read_fail=BIT(sibling);
+      if(fault==1)set_fail=BIT(sibling);
+      if(fault==2)read_ones=BIT(sibling);
+      pci_pm_complete(&devices[1].dev);
+      assert(instance->gate_failed && gate_failed && !instance->active && !gate_active);
+      assert(gates==1 && arm_consumed && !armed && !enabled_before_main);
+      assert((devices[0].command&PCI_COMMAND_MASTER) && set_calls[0]==1 && clear_calls[0]==1);
+      for(int i=1;i<4;i++)assert(set_calls[i]==1 && clear_calls[i]==1);
+      if(fault==1)assert(!(devices[sibling].command&PCI_COMMAND_MASTER));
+      read_fail=read_ones=set_fail=0;
+      pci_pm_complete(&devices[1].dev);
+      assert(instance->gate_failed && gate_failed && !gate_active);
+      for(int i=0;i<4;i++)assert(set_calls[i]==1);
+      remove_guard();
+    }
   }
   assert(frees>0 && ref_puts>0);
   return 0;
