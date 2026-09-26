@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Clear only hash-pinned, archived c285fe83 terminal marker slots on stock.
+"""Clear only explicitly selected, hash-pinned archived terminal slots on stock.
 
 Consumed PM guards, attempts, archived bytes and vector-bound hook witnesses
 are never removed. This does not authorize replaying the terminal vector.
@@ -54,6 +54,39 @@ TARGETS = {
   RESTORE_VAR: BACKEND.V2_RESTORE_VARIABLE,
   "recovery-acceptance-v3.json": BACKEND.V3_ACCEPTANCE,
 }
+RESTORE_STAGE = 0
+TERMINALS = {
+  VECTOR: (SOURCE_BOOT, ARCHIVE, dict(PINS), GUARD_SHA, ATTEMPT_SHA, 0),
+  "8309257dfe8c39719e890bebc8e52587b8407d08c47b97952185c6d7ebd009d6": (
+    "cdf79ca2-cd83-49fb-b679-6d1b8e8d8af5",
+    Path("var/lib/omarchy-t2-postwrite-marker/archive-v3-8309257dfe8c3971"),
+    {
+      SOURCE_VAR: "647405b735e1d081479db5dda820a383bfdcdc58504766b91d4c102d8b70b0f3",
+      RESTORE_VAR: "6b89dfa08d1e4e583d81caf561e1776bc162e0830f712642694fb03b0ccf2b58",
+      "OmarchyT2RestoreHookEntered8309257dfe8c39719e890beb-" + BACKEND.RESTORE_HOOK_GUID: "096648b84f76a8f6bdb6a9195d82f71a1175fd8f540659d95b18a283e0921bda",
+      "OmarchyT2RestoreHookArmed8309257dfe8c39719e890beb-" + BACKEND.RESTORE_HOOK_GUID: "46bbf4e5c12c5a7827dad6b0d34e215f6f336461678f32253b5ca04984ad22d3",
+      "receipt.json": "c41f2f8c4f74016b23675aa6f29a6a6cb52812b776ff795d10ca39d1c85dfc5e",
+      "recovery-acceptance-v3.json": "d97c34c9bacd25909c3c84a655729b4a9e11bb09434f4b946a30157d388ea500",
+    },
+    "9dbc1b06708097b5ac3575f6952c0716808080eb7b9863bda9ec0f412db5c460",
+    "69578178f3821d513e6e639209649ded15d48e992a7f5cc7e04427d845a3a92e",
+    7,
+  ),
+}
+
+
+def select_terminal(vector):
+  global VECTOR, SOURCE_BOOT, ARCHIVE, PINS, GUARD_SHA, ATTEMPT_SHA, RESTORE_STAGE
+  global GUARD, ATTEMPT, ENTERED, ARMED
+  if vector not in TERMINALS:
+    raise ValueError("Unknown terminal vector; no caller-supplied evidence pins allowed")
+  VECTOR = vector
+  SOURCE_BOOT, ARCHIVE, pins, GUARD_SHA, ATTEMPT_SHA, RESTORE_STAGE = TERMINALS[vector]
+  PINS = dict(pins)
+  GUARD = PAIR.STATE / "s4-vectors" / VECTOR / "s4-attempted"
+  ATTEMPT = GUARD.parent / "attempts" / SOURCE_BOOT / "attempt.json"
+  ENTERED = "OmarchyT2RestoreHookEntered" + VECTOR[:24] + "-" + BACKEND.RESTORE_HOOK_GUID
+  ARMED = "OmarchyT2RestoreHookArmed" + VECTOR[:24] + "-" + BACKEND.RESTORE_HOOK_GUID
 
 
 def path(root, relative):
@@ -187,10 +220,12 @@ def main():
   modes = parser.add_mutually_exclusive_group(required=True)
   modes.add_argument("--validate-only", action="store_true")
   modes.add_argument("--execute", action="store_true")
+  parser.add_argument("--terminal-vector", choices=tuple(TERMINALS), default=VECTOR)
   args = parser.parse_args()
   if os.geteuid() != 0:
     raise SystemExit("Root required")
   try:
+    select_terminal(args.terminal_vector)
     result = execute(Path("/")) if args.execute else validate(Path("/"))
   except (OSError, ValueError) as error:
     raise SystemExit("Terminal marker cleanup refused: " + str(error)) from error

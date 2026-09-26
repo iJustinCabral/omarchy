@@ -26,7 +26,7 @@ def write(root, relative, value, mode=0o600):
 def fixture(root):
   values = {
     m.SOURCE_VAR: b"\x07\0\0\0MBPW" + bytes.fromhex(m.VECTOR[:24]) + b"\x04",
-    m.RESTORE_VAR: b"\x07\0\0\0MBRS" + bytes.fromhex(m.VECTOR[:24]) + b"\x00",
+    m.RESTORE_VAR: b"\x07\0\0\0MBRS" + bytes.fromhex(m.VECTOR[:24]) + bytes((m.RESTORE_STAGE,)),
     m.ENTERED: b"\x07\0\0\0MBRH" + m.VECTOR[:24].encode() + b"\x01",
     m.ARMED: b"\x07\0\0\0MBRH" + m.VECTOR[:24].encode() + b"\x02",
     "receipt.json": b'{"fixture":"archived receipt"}\n',
@@ -66,8 +66,11 @@ def refused(function):
 
 with tempfile.TemporaryDirectory(prefix="terminal-witness-cleanup-") as temporary:
   base = Path(temporary)
-  for case in ("success", "archive", "live", "guard", "missing", "symlink", "mode", "witness", "intent", "partial", "boot"):
-    root = base / case
+  cases = ("success", "archive", "live", "guard", "missing", "symlink", "mode", "witness", "intent", "partial", "boot")
+  refused(lambda: m.select_terminal("0" * 64))
+  for vector, case in ((vector, case) for vector in m.TERMINALS for case in cases):
+    m.select_terminal(vector)
+    root = base / vector / case
     fixture(root)
     if case == "success":
       before = {name: (root / m.ARCHIVE / name).read_bytes() for name in m.PINS}
