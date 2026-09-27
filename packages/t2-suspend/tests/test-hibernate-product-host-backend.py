@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 """Fixed backend operations against synthetic files; never executes host commands."""
 import copy
+import errno
 import importlib.util
 from pathlib import Path
 import subprocess
@@ -170,6 +171,59 @@ class Backends(unittest.TestCase):
                                      health=self.host.retirement_health(sampler, collector.binding))
     self.assertEqual(retired["cycle"]["state"], "reconciled")
     self.assertTrue(all(self.host.read_slot(name) is None for name in backend.RETIRE.SLOTS.values()))
+
+  def test_native_nonseekable_retirement_reopens_exact_slots(self):
+    result, writer, archive, sampler, collector = self.run_workflow()
+    read, delete = self.host.retirement_callbacks(self.ledger, result["cycle"], archive)
+    # Exercise native immutable/sync branches against tempdir bytes only.
+    self.host.live = True
+    with patch.object(backend.os, "lseek", side_effect=OSError(errno.ESPIPE, "nonseekable efivar fixture")) as seek, \
+         patch.object(backend, "_clear_immutable", return_value=0), patch.object(backend.os, "sync"):
+      retired = trial.RETIREMENT.retire(self.ledger, result["cycle"], archive, read_slot=read, compare_delete_slot=delete,
+                                       health=self.host.retirement_health(sampler, collector.binding))
+    seek.assert_not_called()
+    self.assertEqual(retired["cycle"]["state"], "reconciled")
+    self.assertTrue(all(self.host.read_slot(name) is None for name in backend.RETIRE.SLOTS.values()))
+
+  def test_reopened_changed_bytes_preserve_owned_immutable_protection(self):
+    result, writer, archive, sampler, collector = self.run_workflow()
+    name = backend.RETIRE.SLOTS["source"]
+    path = self.root / backend.HOST.EFI / name
+    expected = path.read_bytes()
+    read, delete = self.host.retirement_callbacks(self.ledger, result["cycle"], archive)
+    self.host.live = True
+    def clear(fd):
+      path.write_bytes(b"foreign bytes")
+      return backend.FS_IMMUTABLE_FL
+    def execute(advance):
+      delete.bind_locked(advance)
+      with patch.object(backend, "_clear_immutable", side_effect=clear), patch.object(backend.fcntl, "ioctl") as restore:
+        with self.assertRaises(ValueError): delete(name, expected)
+        restore.assert_called_once()
+        self.assertEqual(restore.call_args.args[1], backend.FS_IOC_SETFLAGS)
+        self.assertEqual(restore.call_args.args[2][0], backend.FS_IMMUTABLE_FL)
+    self.ledger.compare_and_run(result["cycle"], execute)
+    self.assertEqual(path.read_bytes(), b"foreign bytes")
+
+  def test_reopened_replacement_inode_refuses_even_identical_bytes(self):
+    result, writer, archive, sampler, collector = self.run_workflow()
+    name = backend.RETIRE.SLOTS["source"]
+    path = self.root / backend.HOST.EFI / name
+    expected = path.read_bytes()
+    read, delete = self.host.retirement_callbacks(self.ledger, result["cycle"], archive)
+    self.host.live = True
+    def clear(fd):
+      path.rename(path.with_name("preserved-original-slot"))
+      path.write_bytes(expected)
+      return backend.FS_IMMUTABLE_FL
+    def execute(advance):
+      delete.bind_locked(advance)
+      with patch.object(backend, "_clear_immutable", side_effect=clear), patch.object(backend.fcntl, "ioctl") as restore:
+        with self.assertRaises(ValueError): delete(name, expected)
+        restore.assert_called_once()
+    self.ledger.compare_and_run(result["cycle"], execute)
+    self.assertEqual(path.read_bytes(), expected)
+    self.assertTrue(path.with_name("preserved-original-slot").exists())
 
   def test_no_scope_or_expired_scope_never_writes(self):
     preparation, prepared, sampler, collector = self.prepare()

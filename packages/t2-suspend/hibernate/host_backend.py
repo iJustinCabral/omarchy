@@ -424,6 +424,7 @@ class _SlotDelete:
     path = self.backend._path(HOST.EFI / name)
     parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     fd = None
+    reopened = None
     original_flags = None
     removed = False
     try:
@@ -434,8 +435,14 @@ class _SlotDelete:
       current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
       if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino): raise ValueError("Owned slot path changed")
       if self.backend.live: original_flags = _clear_immutable(fd)
-      os.lseek(fd, 0, os.SEEK_SET)
-      CT.exact(os.read(fd, MAX_BYTES + 1), expected, "Owned slot after immutable handling")
+      # Native efivarfs descriptors need not be seekable. Reopen at offset zero
+      # while retaining the original inode descriptor for protection recovery.
+      reopened = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+      repeated = os.fstat(reopened)
+      if (not stat.S_ISREG(repeated.st_mode) or repeated.st_size > MAX_BYTES or
+          (repeated.st_dev, repeated.st_ino) != (info.st_dev, info.st_ino)):
+        raise ValueError("Owned slot changed while reopening")
+      CT.exact(os.read(reopened, MAX_BYTES + 1), expected, "Owned slot after immutable handling")
       current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
       if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino): raise ValueError("Owned slot path changed before unlink")
       os.unlink(path.name, dir_fd=parent)
@@ -450,6 +457,7 @@ class _SlotDelete:
           flags = array.array("L", [original_flags])
           fcntl.ioctl(fd, FS_IOC_SETFLAGS, flags, True)
       finally:
+        if reopened is not None: os.close(reopened)
         if fd is not None: os.close(fd)
         os.close(parent)
 
