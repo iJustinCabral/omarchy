@@ -147,6 +147,21 @@ def _publish_manifest(directory, manifest):
   os.fsync(directory)
 
 
+def _entries(directory):
+  # Btrfs can retain an empty enumeration boundary on a descriptor opened
+  # before these entries were created. A new open of '.' refreshes that view,
+  # without trusting the mutable pathname or sharing the old directory offset.
+  scan = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+  try:
+    _private(scan, directory=True)
+    original, current = os.fstat(directory), os.fstat(scan)
+    if (original.st_dev, original.st_ino) != (current.st_dev, current.st_ino):
+      raise ValueError("Archive enumeration inode changed")
+    return set(os.listdir(scan))
+  finally:
+    os.close(scan)
+
+
 def _verify(directory, binding, expected_receipt_sha256=None):
   manifest_raw = _read_private(directory, COMPLETION)
   manifest = json.loads(manifest_raw, object_pairs_hook=TX.no_duplicates,
@@ -158,7 +173,7 @@ def _verify(directory, binding, expected_receipt_sha256=None):
   files = manifest["files"]
   if type(files) is not dict or not REQUIRED_NAMES <= set(files) <= REQUIRED_NAMES | OPTIONAL_NAMES:
     raise ValueError("Archive completion evidence names differ")
-  if set(os.listdir(directory)) != set(files) | {COMPLETION}:
+  if _entries(directory) != set(files) | {COMPLETION}:
     raise ValueError("Archive is partial or contains unexpected entries")
   for name, identity in files.items():
     if type(identity) is not dict or set(identity) != {"size", "sha256"}:

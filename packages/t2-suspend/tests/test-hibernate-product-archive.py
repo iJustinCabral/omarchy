@@ -60,6 +60,50 @@ class Archives(unittest.TestCase):
     self.evidence["recovery-acceptance.bin"] = b"attended acceptance"
     self.assertIn("recovery-acceptance.bin", self.create()["files"])
 
+  def test_creation_on_project_filesystem_after_opening_empty_directory(self):
+    # /tmp may be tmpfs while the real state lives on Btrfs. Exercise the
+    # repository's filesystem too, using only disposable private directories.
+    with tempfile.TemporaryDirectory(dir=Path(__file__).parents[3]) as temporary:
+      parent = Path(temporary) / "archives"
+      parent.mkdir(mode=0o700)
+      receipt = archive.create_archive(parent, self.cycle, self.evidence)
+      self.assertEqual(receipt, archive.verify_archive(parent, self.cycle, receipt["manifest_sha256"]))
+      unexpected = parent / self.target.name / "unexpected"
+      unexpected.write_bytes(b"foreign")
+      unexpected.chmod(0o600)
+      with self.assertRaises(ValueError): archive.verify_archive(parent, self.cycle)
+
+  def test_stale_creation_descriptor_is_not_used_to_enumerate_archive(self):
+    original_open_child = archive._open_child
+    original_listdir = archive.os.listdir
+    stale = set()
+    scans = []
+    def child(parent, cycle_id):
+      fd = original_open_child(parent, cycle_id)
+      stale.add(fd)
+      return fd
+    def listdir(fd):
+      scans.append(fd)
+      # Faithful first-enumeration snapshot: the creator's fd saw an empty
+      # directory on open. Reopening the same inode gets the complete view.
+      return [] if fd in stale else original_listdir(fd)
+    with mock.patch.object(archive, "_open_child", side_effect=child), mock.patch.object(archive.os, "listdir", side_effect=listdir):
+      receipt = self.create()
+    self.assertTrue(scans)
+    self.assertTrue(all(fd not in stale for fd in scans))
+    self.assertEqual(set(receipt["files"]), archive.REQUIRED_NAMES)
+
+  def test_fresh_directory_enumeration_failure_cannot_report_archive_success(self):
+    original_open = archive.os.open
+    def fail_scan(name, flags, *args, **kwargs):
+      if name == ".": raise OSError("synthetic fresh enumeration failure")
+      return original_open(name, flags, *args, **kwargs)
+    with mock.patch.object(archive.os, "open", side_effect=fail_scan):
+      with self.assertRaises(OSError): self.create()
+    self.assertTrue((self.target / archive.COMPLETION).exists())
+    with self.assertRaises(FileExistsError): self.create()
+    archive.verify_archive(self.parent, self.cycle)
+
   def test_witness_bytes_must_match_ledger_return_receipt(self):
     evidence = {**self.evidence, "source-return-witness.bin": b"unrelated witness"}
     with self.assertRaises(ValueError):

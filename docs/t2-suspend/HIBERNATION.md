@@ -1,6 +1,14 @@
 # T2 hibernation investigation
 
+## First product-cycle S4 return: post-return archive failure
+
+Product cycle `d8923d12-7794-483f-8746-91face7e2ab9`, vector `8946b182fa68d358ce5efc50091c3f17189e276ef847bab054f1d0278241a67e`, restored its original source boot `b795a460-bf57-4ff6-84b7-4ebc415a9350`. The original process continued past the power write, validated its return and completed driver/PM cleanup with no errors and healthy post-cleanup observations. Kernel journal records hibernation entry at 14:32:34 and ACPI waking from S4 followed by hibernation exit at 14:32:37 on September 27. The user reported “we're backadn working!” Independent read-only audit corroborates actual S4 restoration, not a controlled diagnostic abort.
+
+The service subsequently failed in archive verification at 14:32:43, after the successful restore and cleanup. The ledger correctly latched this operational failure; it must not be reset or its power attempt repeated. The archive actually contains all eight required evidence files with matching sizes and hashes, and a fresh-descriptor verification passes. Source-return witness SHA-256 is `32212abd215adeed5302585a6152fb96d1c62c7862d56fd1023197c4953f115f`; archive completion SHA-256 is `c08fd4c135441016f4558abe2a8f9a29c21882d96f5ada55e27c8e7e529ca87a`. Original capture, cleanup and failure records, consumed guard, repair intent and live vector-bound EFI witnesses remain preserved. The unresolved task is post-return archival reconciliation and routine integration, not another kernel rebuild or repetition of this S4 vector. Successful restoration does not by itself make the normal Hibernate command qualified or enabled.
+
 ## First v16 full-restoration return
+
+The archive failure was reproduced on the workspace Btrfs filesystem: the old 16-test archive suite failed ten creation cases there while passing on `/tmp` tmpfs. A directory descriptor opened before the evidence files existed returned an empty first listing; a fresh directory-relative descriptor returned the complete inventory. Verification now opens `.` relative to the retained archive descriptor, checks owner/mode/device/inode identity, and uses that fresh view while retaining the exact entry allowlist and all byte/hash/canonical checks. All 19 expanded archive tests pass on both tmpfs and Btrfs, including stale-view and scan-failure regressions. No live evidence or failed ledger was rewritten by this fix.
 
 The operator subsequently confirmed that this successful attempt restored after one power-button press (“Just pressed the power button once, it was great”), rather than requiring the previously observed extra Apple-logo power-off and second power-on. This is operator-observed single-press cold-start behavior for this one cycle, not repeatability or detailed peripheral qualification.
 
