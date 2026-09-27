@@ -45,11 +45,11 @@ def _identity(info):
           info.st_mode, info.st_uid, info.st_nlink)
 
 
-def _file(root, path, owner):
+def _file(root, path, owner, *, allow_empty=False):
   _ancestors(root, path, owner)
   named = path.lstat()
   if (not stat.S_ISREG(named.st_mode) or named.st_uid != owner or named.st_mode & 0o022 or
-      named.st_nlink != 1 or not 0 < named.st_size <= MAX_FILE):
+      named.st_nlink != 1 or not (0 if allow_empty else 1) <= named.st_size <= MAX_FILE):
     raise ValueError("Bounded owned regular driver bytes required")
   fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
   try:
