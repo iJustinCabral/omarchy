@@ -1,0 +1,37 @@
+#!/bin/bash
+
+# omarchy:summary=Hibernate using the explicitly opted-in T2 lifecycle or system default
+
+# This marker selects a route, not qualification or permission to touch power.
+# Provision it only after installing the root-owned runtime and reviewed unit.
+OPT_IN="/etc/omarchy/t2-hibernate-product.enabled"
+MODEL="/sys/class/dmi/id/product_name"
+SYSTEMCTL="/usr/bin/systemctl"
+UNIT="omarchy-t2-hibernate-product.service"
+
+if (( $# != 0 )); then
+  echo "Usage: omarchy system hibernate" >&2
+  exit 2
+fi
+
+if [[ ! -e $OPT_IN && ! -L $OPT_IN ]]; then
+  systemctl hibernate
+else
+  if [[ -L $OPT_IN || ! -f $OPT_IN ]] || [[ $(stat -c '%u:%g:%a:%s' -- "$OPT_IN") != "0:0:644:0" ]]; then
+    echo "Invalid T2 hibernation opt-in marker; refusing fallback" >&2
+    exit 1
+  fi
+  if [[ $(cat "$MODEL") != "MacBookAir9,1" ]] || ! omarchy-hw-t2; then
+    echo "T2 hibernation opt-in is qualified only for MacBookAir9,1; refusing fallback" >&2
+    exit 1
+  fi
+  # Start waits for the oneshot's return verification, archive and retirement.
+  # No reset-failed, retry, stock fallback or caller-supplied privileged path.
+  if (( EUID == 0 )); then
+    "$SYSTEMCTL" start "$UNIT"
+  elif [[ -t 0 && -t 2 ]]; then
+    sudo "$SYSTEMCTL" start "$UNIT"
+  else
+    pkexec "$SYSTEMCTL" start "$UNIT"
+  fi
+fi

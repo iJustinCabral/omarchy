@@ -1,0 +1,16 @@
+[Unit]
+Description=Qualified opt-in MacBookAir9,1 hibernation lifecycle
+# No Conditions: missing configuration/runtime must fail, not silently skip.
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=PATH=/usr/bin:/bin LC_ALL=C LANG=C
+ExecStart=/usr/bin/python3 -B /var/lib/omarchy/t2-hibernate-product/runtime/packages/t2-suspend/hibernate/product.py hibernate
+TimeoutStartSec=infinity
+Restart=no
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+# No Install section: this unit is explicitly invoked, never boot-enabled.
