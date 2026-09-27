@@ -1,6 +1,8 @@
 # Repeatable hibernation integration
 
-This directory contains an offline-tested integration and explicit host backend, not an installed hibernation service. The first v16 experiment restored the original source session successfully; its consumed test vector remains immutable. See [hardware evidence](../../../docs/t2-suspend/HIBERNATION.md).
+This directory contains the integration and explicit host backend used by the installed, reviewed MacBookAir9,1 prototype. Two normal-logind S4 cycles and ordinary source-default boot have succeeded. Permanent support remains unfinished: current AC-only admission and all-package update blocking are temporary restrictions, not accepted production requirements. Start with the [human/agent guide](../../../docs/t2-suspend/HIBERNATION-GUIDE.md), [mechanism](../../../docs/t2-suspend/HIBERNATION-MECHANISM.md), and [production plan](../../../docs/t2-suspend/HIBERNATION-PRODUCTION-PLAN.md). See the [historical evidence](../../../docs/t2-suspend/HIBERNATION.md) for exact deployment and consumed vectors.
+
+The component notes below include earlier implementation boundaries and do not establish current deployment status or permission for a live operation. The guide and production plan define the current scope; none of the historical guards or qualification flags may be reset to manufacture broader support.
 
 `transaction.py` models a separate product-cycle ledger using explicitly supplied directories. It has no CLI, EFI operations, module loading, power transitions or imports of the historical experimental runner. Synthetic tests exercise it in temporary directories. No actual MacBookAir9,1 product qualification is supplied or created.
 

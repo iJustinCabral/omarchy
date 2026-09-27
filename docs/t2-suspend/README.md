@@ -2,7 +2,7 @@
 
 The driver series enabled real S3 suspend and working Wi-Fi/Bluetooth recovery on the tested MacBookAir9,1. Repeated automatic AirPods reconnection and audible stereo playback were confirmed. The latest Wi-Fi-off suspend/re-enable cycle also passed. Earlier Wi-Fi-off failures and one unexplained reboot remain part of the record. The automatic installer subsequently passed normal boot and a short S3 cycle with working Bluetooth/audio; see the [deployment validation](VALIDATION.md).
 
-This is S3 support work, not yet a solution to the original hibernation boot loop. A guarded MacBookAir9,1 diagnostic has now validated snapshot creation, writing and integrity-checked readback of a 2,716,000 KiB hibernation image. The unresolved reset is localized after readback, in the device-quiesce and atomic memory-restoration path described in the [hibernation investigation](HIBERNATION.md). Cold-boot restoration and ACPI S4 remain unvalidated. Other T2 models, kernel versions and fresh installation of the new driver package are not qualified.
+The S3 work below is distinct from the subsequent S4 investigation. The MacBookAir9,1 hibernation prototype has now completed two normal-logind S4 restores, including one after a verified ordinary source-default boot. It is not a permanent fix: AC-only admission and a blanket package-update block remain temporary restrictions, and other T2 models are unqualified. Start with the [hibernation guide](HIBERNATION-GUIDE.md), [mechanism diagrams](HIBERNATION-MECHANISM.md), and [battery/update/portability plan](HIBERNATION-PRODUCTION-PLAN.md); use the [investigation journal](HIBERNATION.md) for historical details.
 
 ## 1. Why the old sleep workaround was removed
 
@@ -72,7 +72,7 @@ The first test with this image unexpectedly rebooted after Wi-Fi enable, accordi
 | Normal-image short S3 cycle | Passed | Actual S3; Bluetooth recovery and audio confirmed; Wi-Fi interface up, no separate traffic probe |
 | Hibernation image write/readback | Passed intended diagnostic boundary | 2,716,000 KiB written and read with the kernel integrity checks before an opt-in stop ahead of memory restore |
 | Package 1.5 T2-audio device freeze/thaw | Passed | Patched audio suspended and resumed around the stateful BCE/VHCI sequence; internal input, T2 audio and both radios were available afterward |
-| Hibernation memory restore/S4 | Unresolved | Earlier tests reset after the now-qualified readback boundary; cold-boot restore and ACPI S4 remain unvalidated |
+| Hibernation memory restore/S4 | Working MBA9,1 prototype; permanent support unfinished | Two normal-logind S4 restores and ordinary source-default boot verified; battery, normal updates and other-model support remain unvalidated |
 
 Latest isolated Wi-Fi-off test boot ID: `ae9bd36d-1ee0-41af-86da-e5e3772f1851`. Interrupted boot: `439b59fc-6efa-4cc6-ab2f-4a759ef080e3`. Laboratory outcome commit: `68bf7e0`. No new suspend or reboot was requested or initiated during consolidation.
 
