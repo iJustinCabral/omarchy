@@ -64,6 +64,14 @@ RETURN_BOOTS = {
   "529d919f498f44aee33c92f63604a85fd6e5c447e8e84740df6c340feb074f32": "aec7b794-2684-4277-b6ff-2050493f3932",
   "538d486ba4a44f7e41227526e28e9d545b0b705a226d4d0c0fe8f2eae65ff66a": "911e153f-ce56-4baa-97b2-2d5e7d93f6bf",
   "9c973c61402167014599b656d6689c62a46a8c10b596a0fde89c542d0f1ec676": "539f1798-06d8-437f-928b-c66449efc98d",
+  "eee5baa3afc51afbf488b487418da9ab3cc167949ff62ab0013390362645f18a": "7190b6ee-e716-4c80-8aed-ba241aa788c5",
+}
+ABSENT_WITNESSES = {
+  "eee5baa3afc51afbf488b487418da9ab3cc167949ff62ab0013390362645f18a": (
+    "OmarchyT2RestoreHookEntered", "OmarchyT2RestoreHookArmed",
+    "OmarchyT2ColdPciPreArchReturned", "OmarchyT2ColdPreArchReturned",
+    "OmarchyT2ColdPreSyscoreReturned", "OmarchyT2ColdPreCpuReturned",
+  ),
 }
 NO_CURRENT_MODULES = (
   "mba_hibernate_efi_postwrite_marker", "mba_hibernate_efi_restore_marker",
@@ -162,6 +170,24 @@ TERMINALS = {
     "fdec7f9a6e74221fd4ba4d63593d2bbdb5250ad739173309697af05b83632e00",
     7,
   ),
+  # Pending-image guard insertion/binding failed before either hook witness.
+  "eee5baa3afc51afbf488b487418da9ab3cc167949ff62ab0013390362645f18a": (
+    "226f51bf-4896-48e2-9a4c-78a588dbcb11",
+    Path("var/lib/omarchy-t2-postwrite-marker/archive-v3-eee5baa3afc51afb"),
+    {
+      SOURCE_VAR: "e03c7c6f59a0fbf948a238a83bf00297c42371e9e568155558c8c538a2a8642c",
+      RESTORE_VAR: "e18044e9041263337bc38dc03c28dca0509d206cc9fe3b6cc256a62563c29cb2",
+      "receipt.json": "e40feb55b6a71a46cab746fb1c26a841b80760e1f8ac4127139221baa3849bae",
+      "recovery-acceptance-v3.json": "2215ace66131b070c8a115f38e3ebbe769b7106b8c3d3c604021b425a7be8959",
+      "s4-attempted": "d2188ef6ef7bfb78f2bc1366bb6343cc06a42a1f8aef0db509bd1921d086654c",
+      "attempt.json": "9a7022ae1833c1703a40a9e6c53e9022b66ed9d5bdc250aec1c89ad948232c5d",
+      "postwrite-efi-identity.json": "c33b63ca1c0d101d31805200111df0e6ca72dd4ef90668968c342dd6b5f00ed3",
+      "restore-efi-identity.json": "0dd2cb867dd6784810fa22cd1de93dd395e0fe3a208409009ec8a1cb0f04225b",
+    },
+    "d2188ef6ef7bfb78f2bc1366bb6343cc06a42a1f8aef0db509bd1921d086654c",
+    "9a7022ae1833c1703a40a9e6c53e9022b66ed9d5bdc250aec1c89ad948232c5d",
+    0,
+  ),
 }
 
 
@@ -184,6 +210,11 @@ def preserved_live_pins():
   # extend the preservation set or provide alternative live evidence hashes.
   prefixes = tuple(prefix + VECTOR[:24] + "-" for prefix in PRESERVED_LIVE_PREFIXES)
   return {name: expected for name, expected in PINS.items() if name.startswith(prefixes)}
+
+
+def absent_witness_names():
+  return tuple(prefix + VECTOR[:24] + "-" + BACKEND.RESTORE_HOOK_GUID
+               for prefix in ABSENT_WITNESSES.get(VECTOR, ()))
 
 
 def path(root, relative):
@@ -263,9 +294,17 @@ def validate(root, stock_validator=current_stock):
     raise ValueError("Not the pinned terminal S4 attempt")
   for name, expected in preserved_live_pins().items():
     exact(root, Path("sys/firmware/efi/efivars") / name, expected)
+  for name in absent_witness_names():
+    # path() refuses even dangling symlinks; any new archived or live witness
+    # invalidates this specifically pinned pre-arming terminal boundary.
+    for relative in (Path("sys/firmware/efi/efivars") / name, ARCHIVE / name):
+      if path(root, relative).exists():
+        raise ValueError("Unexpected witness for pre-arming terminal attempt: " + name)
   record = {"kind": "archived-terminal-marker-slot-clear-v1", "vector": VECTOR,
             "return_boot_id": current, "archive_sha256": PINS,
             "guard_sha256": GUARD_SHA, "attempt_sha256": ATTEMPT_SHA}
+  if absent_witness_names():
+    record["absent_witnesses"] = list(absent_witness_names())
   intent = path(root, ARCHIVE / "slot-clear-intent.json")
   if intent.exists() and json.loads(read(root, ARCHIVE / intent.name, True)) != record:
     raise ValueError("Cleanup intent differs from current boot/evidence")

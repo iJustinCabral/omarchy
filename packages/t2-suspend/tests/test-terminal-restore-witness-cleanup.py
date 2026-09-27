@@ -52,6 +52,7 @@ def fixture(root):
       else:
         assert name.endswith(".json"), name
         values[name] = json.dumps({"fixture": name, "vector": m.VECTOR}).encode()
+  values = {name: value for name, value in values.items() if name in m.PINS}
   for name, value in values.items():
     if name.endswith(".json"):
       m.PINS[name] = hashlib.sha256(value).hexdigest()
@@ -83,7 +84,15 @@ with tempfile.TemporaryDirectory(prefix="terminal-witness-cleanup-") as temporar
   base = Path(temporary)
   cases = ("success", "archive", "live", "guard", "missing", "symlink", "mode", "witness", "intent", "partial", "boot",
            "live-returned", "archive-returned", "missing-returned", "symlink-returned", "wrong-return-boot")
-  assert len(m.TERMINALS) == 6
+  assert len(m.TERMINALS) == 7
+  pci_vector = "eee5baa3afc51afbf488b487418da9ab3cc167949ff62ab0013390362645f18a"
+  assert m.RETURN_BOOTS[pci_vector] == "7190b6ee-e716-4c80-8aed-ba241aa788c5"
+  source_boot, archive, pins, guard_sha, attempt_sha, restore_stage = m.TERMINALS[pci_vector]
+  assert source_boot == "226f51bf-4896-48e2-9a4c-78a588dbcb11" and restore_stage == 0
+  assert archive == Path("var/lib/omarchy-t2-postwrite-marker/archive-v3-eee5baa3afc51afb")
+  assert len(pins) == 8 and pins["s4-attempted"] == guard_sha and pins["attempt.json"] == attempt_sha
+  assert "return-audit.json" not in pins
+  assert len(m.ABSENT_WITNESSES[pci_vector]) == 6
   pre_arch_vector = "9c973c61402167014599b656d6689c62a46a8c10b596a0fde89c542d0f1ec676"
   assert m.RETURN_BOOTS[pre_arch_vector] == "539f1798-06d8-437f-928b-c66449efc98d"
   source_boot, archive, pins, guard_sha, attempt_sha, restore_stage = m.TERMINALS[pre_arch_vector]
@@ -167,6 +176,51 @@ with tempfile.TemporaryDirectory(prefix="terminal-witness-cleanup-") as temporar
       refused(lambda: m.execute(root, stock, Path.unlink))
       if case != "intent":
         assert not (root / m.ARCHIVE / "slot-clear-intent.json").exists()
+
+  # A pre-arming failure profile must refuse any newly appearing same-vector
+  # hook/positive-protocol witness, before intent, after partial removal and
+  # after completion. Historical witnesses and the extra audit are preserved.
+  m.select_terminal(pci_vector)
+  absent_names = m.absent_witness_names()
+  assert not m.preserved_live_pins()
+  for name in absent_names:
+    for location in ("live", "archive"):
+      for form in ("file", "directory", "symlink"):
+        for phase in ("initial", "partial", "complete"):
+          m.select_terminal(pci_vector)
+          root = base / "absent-witness" / name / location / form / phase
+          fixture(root)
+          audit = write(root, m.ARCHIVE / "return-audit.json", b'{"fixture":"audit"}\n')
+          old = write(root, Path("sys/firmware/efi/efivars") / name.replace(pci_vector[:24], "0" * 24), b"historical witness")
+          original_guard = (root / m.GUARD).read_bytes()
+          original_attempt = (root / m.ATTEMPT).read_bytes()
+          if phase == "partial":
+            calls = []
+            def fail_second_absent(target):
+              calls.append(target)
+              if len(calls) == 2:
+                raise OSError("simulated removal fault")
+              target.unlink()
+            refused(lambda: m.execute(root, stock, fail_second_absent))
+          elif phase == "complete":
+            m.execute(root, stock, Path.unlink)
+          relative = Path("sys/firmware/efi/efivars") / name if location == "live" else m.ARCHIVE / name
+          unexpected = root / relative
+          unexpected.parent.mkdir(parents=True, exist_ok=True)
+          if form == "file":
+            unexpected.write_bytes(b"unexpected witness")
+          elif form == "directory":
+            unexpected.mkdir()
+          else:
+            unexpected.symlink_to(root / "does-not-exist")
+          before = {relative: (root / relative).read_bytes() for relative in m.TARGETS.values() if (root / relative).exists()}
+          refused(lambda: m.execute(root, stock, Path.unlink))
+          assert all((root / relative).read_bytes() == value for relative, value in before.items())
+          assert (root / m.GUARD).read_bytes() == original_guard
+          assert (root / m.ATTEMPT).read_bytes() == original_attempt
+          assert old.read_bytes() == b"historical witness" and audit.read_bytes() == b'{"fixture":"audit"}\n'
+          if phase == "initial":
+            assert not (root / m.ARCHIVE / "slot-clear-intent.json").exists()
 
   # Exercise current_stock itself on a portable filesystem. Only selected-entry
   # lookup and physical-root inspection are stubbed; PM/kernel/resume/module
