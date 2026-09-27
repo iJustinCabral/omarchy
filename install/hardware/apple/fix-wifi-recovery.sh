@@ -1,8 +1,14 @@
 # Recover the confirmed BCM4377 firmware-query stall without rebooting.
 # Other Broadcom chips must never use this reset policy. Model opt-in does
 # not bypass the Apple T2/14e4:4488 hardware checks in the helper.
+# `omarchy setup t2-wifi-recovery --disable` leaves an opt-out that only
+# explicit setup (OMARCHY_T2_WIFI_START_NOW=1) overrides.
 
-if omarchy-t2-wifi-recovery --supported >/dev/null 2>&1; then
+opt_out="${OMARCHY_T2_WIFI_OPT_OUT:-/var/lib/omarchy/t2-wifi-recovery-disabled}"
+
+if [[ -e $opt_out && ${OMARCHY_T2_WIFI_START_NOW:-0} != "1" ]]; then
+  echo "T2 Wi-Fi recovery was disabled by an administrator; leaving it off."
+elif omarchy-t2-wifi-recovery --supported >/dev/null 2>&1; then
   unit="${OMARCHY_T2_WIFI_UNIT:-/etc/systemd/system/omarchy-t2-wifi-recovery.service}"
   source_unit="$OMARCHY_INSTALL/hardware/apple/omarchy-t2-wifi-recovery.service"
   legacy_unit="${OMARCHY_T2_WIFI_LEGACY_UNIT:-/etc/systemd/system/t2-wifi-recovery.service}"

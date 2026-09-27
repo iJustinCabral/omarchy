@@ -15,6 +15,7 @@ export OMARCHY_PATH="$ROOT" OMARCHY_INSTALL="$ROOT/install"
 export OMARCHY_T2_WIFI_UNIT="$test_tmp/unit.service"
 export OMARCHY_T2_WIFI_LEGACY_UNIT="$test_tmp/legacy.service"
 export OMARCHY_T2_WIFI_ALLOW_UNTESTED_MODEL=0
+export OMARCHY_T2_WIFI_OPT_OUT="$test_tmp/state/t2-wifi-recovery-disabled"
 
 cat > "$test_tmp/bin/omarchy-t2-wifi-recovery" <<'SH'
 #!/bin/bash
@@ -79,4 +80,23 @@ pass "migration shares setup and skips unsupported hardware"
 : > "$TEST_CALLS"
 "$ROOT/bin/omarchy-setup-t2-wifi-recovery" --disable
 grep -Fxq 'disable --now omarchy-t2-wifi-recovery.service' "$TEST_CALLS" || fail "disable stops only the recovery service"
+[[ -e $OMARCHY_T2_WIFI_OPT_OUT ]] || fail "disable records a persistent opt-out"
 pass "disable leaves radio and kernel policy alone"
+
+: > "$TEST_CALLS"
+bash -euo pipefail "$leaf" >/dev/null
+[[ ! -s $TEST_CALLS ]] || fail "a later hardware setup pass honors the opt-out" "$(cat "$TEST_CALLS")"
+bash -euo pipefail "$ROOT/migrations/1788636425.sh" >/dev/null
+[[ ! -s $TEST_CALLS ]] || fail "another user's pending migration honors the opt-out" "$(cat "$TEST_CALLS")"
+pass "disable persists across hardware setup and pending migrations"
+
+"$ROOT/bin/omarchy-setup-t2-wifi-recovery" >/dev/null
+grep -Fxq 'enable --now omarchy-t2-wifi-recovery.service' "$TEST_CALLS" || fail "explicit setup re-enables recovery"
+[[ ! -e $OMARCHY_T2_WIFI_OPT_OUT ]] || fail "explicit setup clears the opt-out"
+pass "explicit setup re-enables recovery and clears the opt-out"
+
+"$ROOT/bin/omarchy-setup-t2-wifi-recovery" --disable
+printf 'administrator unit\n' > "$OMARCHY_T2_WIFI_UNIT"
+if "$ROOT/bin/omarchy-setup-t2-wifi-recovery" >/dev/null 2>&1; then fail "setup refuses a custom unit"; fi
+[[ -e $OMARCHY_T2_WIFI_OPT_OUT ]] || fail "a refused setup keeps the opt-out"
+pass "a refused explicit setup keeps the opt-out"

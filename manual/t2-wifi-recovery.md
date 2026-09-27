@@ -24,6 +24,8 @@ To stop automatic recovery:
 omarchy setup t2-wifi-recovery --disable
 ```
 
+It stays off through updates until you run `omarchy setup t2-wifi-recovery` again.
+
 Recovery makes at most three attempts per boot, at least two minutes apart. If it still cannot connect, inspect its status and retain its logs when reporting the failure:
 
 ```bash

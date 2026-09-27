@@ -53,7 +53,7 @@ The root hardware leaf enables the unit for the next boot on validated hardware.
 
 Setup refuses an existing standalone `t2-wifi-recovery.service` rather than leaving two recovery daemons active. Remove the laboratory service with its own verified installer before enabling the packaged service. Setup also refuses a masked/symlinked unit, a unit differing from the supplied template, or a conflicting model opt-in drop-in. Other administrator drop-ins are preserved. Model opt-in persists in `10-model-opt-in.conf`.
 
-Disable with `omarchy setup t2-wifi-recovery --disable`. This stops/disables only recovery, retaining configuration and the per-boot retry budget. Packaged files are removed through normal package management; there is no kernel or bootloader rollback for this change.
+Disable with `omarchy setup t2-wifi-recovery --disable`. This stops/disables only recovery, retaining configuration and the per-boot retry budget. It also records a machine-wide opt-out at `/var/lib/omarchy/t2-wifi-recovery-disabled`; later hardware setup passes and every user's pending migration leave recovery off while it exists. Running `omarchy setup t2-wifi-recovery` again re-enables recovery and removes the opt-out only once setup succeeds. Packaged files are removed through normal package management; there is no kernel or bootloader rollback for this change.
 
 ## Verification before broad distribution
 
