@@ -1,14 +1,11 @@
-"""Fixture-only source-default transition engine, never a live activation CLI.
+"""Source-default transition core; public API remains fixture-only.
 
-Live `/` and its aliases are unconditionally refused. An injected fixture
-precheck must exercise the existing pair/readiness checks; its result cannot
-establish real admission. Native fixed-root authority wiring and application
-review remain required before this engine can operate on a host. No kernel,
-EFI, modules, power, qualification issuance or automatic retry occurs here.
-Native deactivation also needs a real logind block inhibitor, inactive power
-units and entry-router interruption veto: absent opt-in otherwise selects stock
-sleep outside the product physical lock. This fixture engine supplies none of
-those live power exclusions and cannot be activated by installing its source.
+Public transition() unconditionally refuses live `/` and aliases. Its injected
+fixture precheck cannot establish real admission. The separate installed native
+adapter supplies fixed host verification and real logind power exclusion to the
+internal core, after reviewed snapshot verification. No kernel, EFI, modules,
+power, qualification issuance or automatic retry occurs here. Source tests and
+installation alone do not approve or execute any native policy transition.
 """
 from contextlib import contextmanager
 import fcntl
@@ -150,13 +147,14 @@ def _opt_in(root):
   return raw
 
 
-def _replace(root, expected, replacement, transition_id):
+def _replace(root, expected, replacement, transition_id, *, guard=lambda: None):
   target = root / P.LIMINE
   if _read(root, P.LIMINE, private=False) != expected: raise ValueError("Configuration changed before replacement")
   temporary = target.with_name("limine.conf.source-default-" + transition_id)
   _new(temporary, replacement, stat.S_IMODE(target.lstat().st_mode))
   # The exclusion covers cooperating boot/package writers, not hostile root.
   if _read(root, P.LIMINE, private=False) != expected: raise ValueError("Configuration changed immediately before replacement")
+  guard()
   os.replace(temporary, target)
   _sync(target.parent)
   if _read(root, P.LIMINE, private=False) != replacement: raise ValueError("Configuration replacement readback failed")
@@ -167,6 +165,12 @@ def transition(root, action, *, precheck):
   if not root.is_absolute() or root.resolve() != root or not root.is_dir() or root.resolve() == Path("/"):
     raise ValueError("Fixture-only transition refuses live root and aliases")
   if action not in PENDINGS or not callable(precheck): raise ValueError("Explicit fixture action/precheck required")
+  return _transition(root, action, precheck=precheck, guard=lambda: None)
+
+
+def _transition(root, action, *, precheck, guard):
+  """Internal core; only the fixed native adapter supplies live authority."""
+  guard()
   for path in PENDINGS.values():
     G._ancestors(root, root / path, os.geteuid())
     if _present(root / path): raise ValueError("Incomplete transition preserved; no automatic retry")
@@ -191,35 +195,50 @@ def transition(root, action, *, precheck):
       P.validate(policy, before, actual, receipt_raw)
       after = before
     precheck(root, action, "before")
+    guard()
     transition_id = str(uuid.uuid4())
     intent = _encoded({"protocol": "omarchy-t2-source-default-transition-v1", "transition_id": transition_id,
       "action": action, "policy_sha256": P.digest(policy_raw), "from_sha256": P.digest(actual), "to_sha256": P.digest(after)})
     pending = root / PENDINGS[action]
     _new(pending, intent)
+    guard()
     history = root / HISTORY
     if not _present(history):
+      guard()
       history.mkdir(mode=0o700)
       _sync(history.parent)
     G._ancestors(root, history / "member", os.geteuid())
     archive = history / transition_id
+    guard()
     archive.mkdir(mode=0o700)
     _sync(history)
+    guard()
     _new(archive / "policy.json", policy_raw)
+    guard()
     _new(archive / "opt-in", opt_in, 0o644)
+    guard()
     _new(archive / "intent.json", intent)
+    guard()
     if action == "activation":
       if _present(root / P.BACKUP):
         if _read(root, P.BACKUP) != before: raise ValueError("Retained source-default backup differs")
-      else: _new(root / P.BACKUP, before)
+      else:
+        guard()
+        _new(root / P.BACKUP, before)
+      guard()
       _new(root / P.POLICY, policy_raw)
-      _replace(root, actual, after, transition_id)
+      guard()
+      _replace(root, actual, after, transition_id, guard=guard)
       P.verify(root, P.digest(receipt_raw))
     else:
       if _opt_in(root) != opt_in: raise ValueError("Opt-in changed before disable")
+      guard()
       (root / OPT_IN).unlink()
       _sync((root / OPT_IN).parent)
-      _replace(root, actual, after, transition_id)
+      guard()
+      _replace(root, actual, after, transition_id, guard=guard)
       if _read(root, P.POLICY) != policy_raw: raise ValueError("Active policy changed before retirement")
+      guard()
       (root / P.POLICY).unlink()
       _sync((root / P.POLICY).parent)
     _idle(root)
@@ -236,14 +255,17 @@ def transition(root, action, *, precheck):
       if _opt_in(root) != opt_in: raise ValueError("Activation did not preserve opt-in")
     completion = {"protocol": "omarchy-t2-source-default-transition-complete-v1", "transition_id": transition_id,
                   "action": action, "intent_sha256": P.digest(intent), "configuration_sha256": P.digest(after)}
+    guard()
     _new(archive / "completion.json", _encoded(completion))
     # Both exclusions remain owned through durable pending cleanup. A failure
     # releasing our package lock reinstates pending and never deletes a foreign
     # replacement; only cooperating writers are within this lock contract.
     release_db(verify_only=True)
     try:
+      guard()
       pending.unlink()
       _sync(pending.parent)
+      guard()
       release_db()
     except BaseException:
       if not _present(pending): _new(pending, intent)

@@ -153,7 +153,7 @@ class Transitions(unittest.TestCase):
 
   def test_deactivation_fault_after_marker_removal_preserves_pending(self):
     self.run_action()
-    def fault(*args): raise OSError("after opt-in removal")
+    def fault(*args, **kwargs): raise OSError("after opt-in removal")
     with patch.object(T, "_replace", side_effect=fault):
       with self.assertRaises(OSError): self.run_action("deactivation")
     self.assertFalse((self.root / T.OPT_IN).exists())

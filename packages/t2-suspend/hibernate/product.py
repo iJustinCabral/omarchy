@@ -84,6 +84,11 @@ def check(config, qualification, report, *, ledger, archive_directory, root, que
     raise ValueError("No injected live product admission")
   receipt = validate(config, qualification, report)
   deployment_check(root, config, report)
+  return _admission_state(config, receipt, report, ledger=ledger, archive_directory=archive_directory, root=root, query=query)
+
+
+def _admission_state(config, receipt, report, *, ledger, archive_directory, root, query=None):
+  """Shared read-only host/ledger checks; callers separately verify deployment."""
   BACKEND.verify_readiness(root, report, command_runner=query)
   boot = TX.uuid_value(HOST._raw(root / "proc/sys/kernel/random/boot_id").decode().strip())
   selected_raw = HOST._raw(root / HOST.EFI / ("LoaderEntrySelected-" + HOST.LOADER_GUID))
