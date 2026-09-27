@@ -15,7 +15,6 @@ order. Completed preparation is not a power transition or hardware qualification
 import copy
 import hashlib
 import importlib.util
-import re
 from pathlib import Path
 
 
@@ -50,8 +49,7 @@ class Preparation:
     CT.exact(self.cycle["state"], "reserved", "Reserved preparation cycle")
     CT.fields(marker_pin, ("sha256", "srcversion", "vermagic", "variable_version"), "Source marker pin")
     TX.hash_value(marker_pin["sha256"])
-    if type(marker_pin["srcversion"]) is not str or not re.fullmatch(r"[0-9A-F]{23,24}", marker_pin["srcversion"]):
-      raise ValueError("Invalid source marker srcversion")
+    CT.srcversion_value(marker_pin["srcversion"])
     if type(marker_pin["vermagic"]) is not str or not marker_pin["vermagic"].split():
       raise ValueError("Invalid source marker vermagic")
     CT.exact(marker_pin["variable_version"], "v3", "Source marker protocol")

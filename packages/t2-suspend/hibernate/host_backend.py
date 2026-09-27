@@ -115,6 +115,11 @@ def validate_static_inputs(report, manifest, marker_file, marker_pin):
   CT.exact(report["audited_details"]["manifest_sha256"], TX.digest(manifest), "Backend details manifest")
   CT.exact(report["hardware_qualified"], False, "No artifact hardware qualification")
   CT.exact(report["usable_hibernation_qualified"], False, "No artifact usability qualification")
+  modules = report["audited_details"]["runtime_modules"]
+  if type(modules) is not dict or not modules:
+    raise ValueError("Missing audited runtime module pins")
+  for metadata in modules.values():
+    CT.srcversion_value(metadata["srcversion"])
   if not Path(marker_file).is_absolute():
     raise ValueError("Explicit absolute marker file required")
   CT.fields(marker_pin, ("sha256", "srcversion", "vermagic", "variable_version"), "Backend marker pin")
@@ -123,8 +128,7 @@ def validate_static_inputs(report, manifest, marker_file, marker_pin):
   # whose terminating NUL leaves 23 uppercase hex characters. Other module
   # toolchains emit 24. Format admission does not relax exact modinfo/pin
   # comparison or the independently pinned module byte hash.
-  if type(marker_pin["srcversion"]) is not str or not re.fullmatch(r"[0-9A-F]{23,24}", marker_pin["srcversion"]):
-    raise ValueError("Invalid backend marker srcversion")
+  CT.srcversion_value(marker_pin["srcversion"])
   if (type(marker_pin["vermagic"]) is not str or not marker_pin["vermagic"].split() or
       marker_pin["vermagic"].split()[0] != report["audited_details"]["kernel_release"]):
     raise ValueError("Marker static production ABI differs")

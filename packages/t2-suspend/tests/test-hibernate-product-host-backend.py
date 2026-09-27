@@ -173,6 +173,19 @@ class Backends(unittest.TestCase):
                             command_runner=self.command, sysfs_writer=self.write)
     self.assertEqual(self.calls, [])
 
+  def test_static_runtime_srcversion_admission_before_backend_actions(self):
+    for value in ("1A72ABF3A3BFC778FC5A9C6", "A" * 24, None, "A" * 22, "G" * 23):
+      report = copy.deepcopy(self.o.report)
+      report["audited_details"]["runtime_modules"]["t2bce_core"]["srcversion"] = value
+      report["audited_details_sha256"] = backend.TX.digest(report["audited_details"])
+      with self.subTest(value=value):
+        if value in ("1A72ABF3A3BFC778FC5A9C6", "A" * 24):
+          backend.validate_static_inputs(report, self.cycle["manifest"], self.o.marker, self.o.marker_pin)
+        else:
+          with self.assertRaises(ValueError):
+            backend.validate_static_inputs(report, self.cycle["manifest"], self.o.marker, self.o.marker_pin)
+    self.assertEqual(self.calls, [])
+
   def test_stage_zero_is_exclusive_and_wrong_vector_cannot_arm(self):
     raw = b"\x07\0\0\0MBPW" + bytes.fromhex(self.cycle["prefix"]) + b"\0"
     self.host.write("source_stage", raw)

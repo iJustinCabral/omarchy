@@ -90,6 +90,12 @@ def exact(actual, expected, label):
     raise ValueError(label + " differs")
 
 
+def srcversion_value(value):
+  if type(value) is not str or not re.fullmatch(r"[0-9A-F]{23,24}", value):
+    raise ValueError("Invalid module srcversion")
+  return value
+
+
 def runtime_value(value):
   fields(value, ("kernel_release", "cmdline_sha256", "modules", "loaded_modules"), "Runtime")
   if type(value["kernel_release"]) is not str or not value["kernel_release"]:
@@ -108,8 +114,7 @@ def runtime_value(value):
   for name, identity in modules.items():
     fields(identity, ("sha256", "srcversion"), "Module " + name)
     TX.hash_value(identity["sha256"])
-    if type(identity["srcversion"]) is not str or not re.fullmatch(r"[0-9A-F]{23,24}", identity["srcversion"]):
-      raise ValueError("Invalid module srcversion")
+    srcversion_value(identity["srcversion"])
   return copy.deepcopy(value)
 
 
