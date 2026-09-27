@@ -213,6 +213,7 @@ def install(root, runner=run, selection=check_selection, fetch=fetcher.fetch):
   if bt.read(root, RECEIPT) is not None:
     receipt = load(root)
     if receipt['state'] == 'installed':
+      safe(root, SOURCE).chmod(0o755)
       verify(root, runner, selection)
       return
     if receipt['state'] != 'rolled-back':
@@ -255,6 +256,7 @@ def install(root, runner=run, selection=check_selection, fetch=fetcher.fetch):
         staged = Path(directory) / 'source'
         shutil.copytree(work / 'source', staged)
         staged.rename(source)
+        source.chmod(0o755)
       receipt['dkms_added'] = True
       save(root, receipt)
       runner(['dkms', 'add', '-m', NAME, '-v', VERSION])
