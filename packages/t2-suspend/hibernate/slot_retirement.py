@@ -103,6 +103,7 @@ def _archived_evidence(directory, cycle):
   CONTINUITY.exact(witness["capture"]["binding"], original_binding, "Archived capture binding")
   CONTINUITY.exact(witness["cleanup_health"], _decode(evidence["cleanup-health.bin"]), "Archived cleanup health bytes")
   CONTINUITY.exact(witness["cleanup_health"]["binding"], original_binding, "Archived health binding")
+  CONTINUITY.healthy_devices_value(witness["cleanup_health"]["devices"])
   CONTINUITY.consumed_records(cycle, evidence["consumed-guard.bin"], evidence["consumed-attempt.bin"])
   for name, field in (("consumed-guard.bin", "consumed_guard"), ("consumed-attempt.bin", "consumed_attempt")):
     CONTINUITY.exact(witness["capture"][field], {"raw_hex": evidence[name].hex()}, "Archived consumed raw bytes")
@@ -122,11 +123,11 @@ def _archived_evidence(directory, cycle):
   return binding, expected, baseline
 
 
-def _health_expected(binding, baseline):
+def _health_expected(binding, baseline, *, ac_online=True):
   return {"schema": HEALTH_SCHEMA, "binding": binding, "boot_id": binding["original_boot_id"],
           "after_slot_retirement": True,
           "devices": {"primary_encrypted_root": True, "internal_keyboard": True, "internal_trackpad": True,
-                      "wifi": True, "bluetooth": True, "ac_online": True},
+                      "wifi": True, "bluetooth": True, "ac_online": CONTINUITY.ac_online_value(ac_online)},
           "services": {"NetworkManager.service": "active", "bluetooth.service": "active", "sddm.service": "active"},
           "failed_units": [], "pm": baseline}
 
@@ -219,7 +220,8 @@ def retire(ledger, cycle, archive_directory, *, read_slot, compare_delete_slot, 
       for name in SLOTS.values():
         CONTINUITY.exact(read_slot(name), None, "Both reusable slots absent")
       sampled_health = health(copy.deepcopy(binding))
-      CONTINUITY.exact(sampled_health, _health_expected(binding, baseline), "Healthy post-retirement source")
+      devices = CONTINUITY.healthy_devices_value(sampled_health["devices"])
+      CONTINUITY.exact(sampled_health, _health_expected(binding, baseline, ac_online=devices["ac_online"]), "Healthy post-retirement source")
       completion = {"schema": PROTOCOL, "state": "complete", "binding": binding,
                     "intent_sha256": intent_hash, "confirmed_slots": confirmations,
                     "health": copy.deepcopy(sampled_health)}
@@ -238,7 +240,8 @@ def retire(ledger, cycle, archive_directory, *, read_slot, compare_delete_slot, 
       for name in SLOTS.values():
         CONTINUITY.exact(read_slot(name), None, "Slots remain absent before reconciliation")
       final_health = health(copy.deepcopy(binding))
-      CONTINUITY.exact(final_health, _health_expected(binding, baseline), "Healthy source before reconciliation")
+      devices = CONTINUITY.healthy_devices_value(final_health["devices"])
+      CONTINUITY.exact(final_health, _health_expected(binding, baseline, ac_online=devices["ac_online"]), "Healthy source before reconciliation")
       reconciliation = {"schema": PROTOCOL, "state": "reconciled", "binding": binding,
                         "completion_sha256": completion_hash, "health": copy.deepcopy(final_health)}
       phase = "reconciliation"

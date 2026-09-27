@@ -23,6 +23,8 @@ The all-package guard is [the `PreTransaction`/`AbortOnFail` hook](../../package
 
 ## Battery admission: all current gates
 
+The following inventory describes the installed `608464dd` runtime. Subsequent source work now separates post-return device health from the observed AC state: continuity, slot retirement and the archived-retirement adapter accept either strict boolean value for `ac_online`, retain that actual value in evidence, and continue to require every other healthy-device predicate. Fixture tests cover battery returns and power changes between cleanup samples. This source change is not deployed, does not remove initial AC admission, and is not battery hardware qualification.
+
 - [Product `_admission_state`](../../packages/t2-suspend/hibernate/product.py) requires a `Mains` supply with `online=1`. Native activation and deactivation reuse product admission, so their current pre/post checks inherit the requirement.
 - [Trial `_ready`](../../packages/t2-suspend/hibernate/trial.py) independently requires live mains for the historical attended trial path.
 - [Host observation](../../packages/t2-suspend/hibernate/host_observation.py) reports `devices.ac_online`; this is an observation, not itself a rejection.
@@ -31,6 +33,8 @@ The all-package guard is [the `PreTransaction`/`AbortOnFail` hook](../../package
 - Historical [successful-v16 cleanup](../../packages/t2-suspend/experiments/cleanup-successful-v16-slots.py), [readback runner](../../packages/t2-suspend/experiments/hibernate-readback-ftrace/run-live-readback.py), [EFI boundary runner](../../packages/t2-suspend/experiments/hibernate-pre-write-ftrace/run-efi-boundary.py) and [cold-PCI proof](../../packages/t2-suspend/experiments/cold-pci-restore-proof.py) contain separate AC checks or AC-bound evidence. Preserve their historical semantics; do not silently relabel old diagnostic receipts as battery qualification.
 
 Proposed battery policy records mains, battery presence, measurement validity, state of charge, energy reserve and charging/discharging state separately from device health. Choose and document thresholds from measured worst-case image write, shutdown and recovery needs; percentages alone are not an established safety margin. Missing/stale readings, low reserve or inconsistent supplies reject admission without consuming a cycle. Recheck immediately before image writing; an unplug event must lead to either a still-safe battery admission or a controlled pre-write refusal with owned cleanup. A healthy battery return must reconcile without requiring a charger to be reconnected.
+
+A read-only snapshot on the current MBA found charge/current/voltage fields, but no energy/power or capacity-level fields. While `status=Full` and mains was online, `charge_now=3440000`, `charge_full=3518000`, `charge_full_design=4381000`, `current_now=0`, `voltage_now=12507000`, and `capacity=79`. Charge/full is approximately 97.8%, whereas charge/design is approximately 78.5%; this snapshot does not establish how firmware computed `capacity`, a discharge budget or a safe reserve threshold. [Linux power-supply documentation](https://docs.kernel.org/power/power_supply_class.html) defines charge in microamp-hours, energy in microwatt-hours and voltage in microvolts; do not interchange them or invent an energy measurement from a percentage. Initial policy belongs before cycle allocation; a fresh check also belongs at the final writer after preparation/hooks and other slow work.
 
 ```mermaid
 flowchart TD

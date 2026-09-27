@@ -389,7 +389,8 @@ class HostBackend:
       CT.exact(data["boot_id"], cycle["original_boot_id"], "Fresh health sampled original boot")
       CT.exact(data["pm"], baseline, "Fresh health archived PM baseline")
       result = {**data, "schema": RETIRE.HEALTH_SCHEMA, "binding": copy.deepcopy(binding), "after_slot_retirement": True}
-      CT.exact(result, RETIRE._health_expected(expected, baseline), "Fresh retirement health")
+      devices = CT.healthy_devices_value(result["devices"])
+      CT.exact(result, RETIRE._health_expected(expected, baseline, ac_online=devices["ac_online"]), "Fresh retirement health")
       RETIRE._archived_evidence(archive_directory, cycle)
       return result
     return observe

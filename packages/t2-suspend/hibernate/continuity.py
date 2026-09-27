@@ -96,6 +96,22 @@ def srcversion_value(value):
   return value
 
 
+def ac_online_value(value):
+  """Power-source observation, not a post-return device-health predicate."""
+  if type(value) is not bool:
+    raise ValueError("AC observation must be a strict boolean")
+  return value
+
+
+def healthy_devices_value(value):
+  expected = {"primary_encrypted_root": True, "internal_keyboard": True,
+              "internal_trackpad": True, "wifi": True, "bluetooth": True, "ac_online": True}
+  fields(value, expected, "Healthy devices")
+  expected["ac_online"] = ac_online_value(value["ac_online"])
+  exact(value, expected, "Healthy devices")
+  return copy.deepcopy(value)
+
+
 def runtime_value(value):
   fields(value, ("kernel_release", "cmdline_sha256", "modules", "loaded_modules"), "Runtime")
   if type(value["kernel_release"]) is not str or not value["kernel_release"]:
@@ -239,8 +255,7 @@ class Collector:
     exact(health["binding"], self._binding, "Health retained context")
     exact(health["boot_id"], self._cycle["original_boot_id"], "Health original boot")
     exact(health["after_cleanup"], True, "Health sampling order")
-    exact(health["devices"], {"primary_encrypted_root": True, "internal_keyboard": True,
-                             "internal_trackpad": True, "wifi": True, "bluetooth": True, "ac_online": True}, "Healthy devices")
+    healthy_devices_value(health["devices"])
     exact(health["services"], {"NetworkManager.service": "active", "bluetooth.service": "active", "sddm.service": "active"}, "Healthy services")
     exact(health["failed_units"], [], "Failed units")
     exact(health["pm"], self._pm, "Restored PM baseline")

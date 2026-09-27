@@ -242,6 +242,45 @@ class Backends(unittest.TestCase):
     (archive / ("cycle-" + cycle["cycle_id"]) / "source-stage.bin").write_bytes(b"tampered")
     with self.assertRaises(ValueError): observe(binding)
 
+  def test_battery_post_return_workflow_and_fresh_retirement_preserve_actual_power(self):
+    original_writer = self.host._writer
+    def return_on_battery(path, raw):
+      original_writer(path, raw)
+      if path == self.root / "sys/power/state":
+        self.o.write("sys/class/power_supply/AC/online", "0")
+    self.host._writer = return_on_battery
+    result, writer, archive, sampler, collector = self.run_workflow()
+    cycle = result["cycle"]
+    self.assertIs(collector.retained_evidence()["write_returned"], True)
+    archived = backend.RETIRE._decode((archive / ("cycle-" + cycle["cycle_id"]) / "cleanup-health.bin").read_bytes())
+    self.assertIs(archived["devices"]["ac_online"], False)
+    observe = self.host.archived_retirement_health(cycle, archive)
+    binding = backend.RETIRE.ARCHIVE.cycle_binding(cycle)
+    self.assertIs(observe(binding)["devices"]["ac_online"], False)
+    read, delete = self.host.retirement_callbacks(self.ledger, cycle, archive)
+    retired = backend.RETIRE.retire(self.ledger, cycle, archive, read_slot=read, compare_delete_slot=delete, health=observe)
+    self.assertEqual(retired["cycle"]["state"], "reconciled")
+    self.assertEqual(self.power_count, 1)
+    self.assertFalse(retired["hardware_qualified"])
+
+  def test_fresh_retirement_power_must_be_strict_boolean_and_devices_healthy(self):
+    result, writer, archive, sampler, collector = self.run_workflow()
+    cycle = result["cycle"]
+    observe = self.host.archived_retirement_health(cycle, archive)
+    binding = backend.RETIRE.ARCHIVE.cycle_binding(cycle)
+    original = backend.HOST.observe_current_health
+    for value in (None, 0, 1, "false", "missing", "unhealthy"):
+      with self.subTest(value=value):
+        def malformed(*args, **kwargs):
+          data = original(*args, **kwargs)
+          data["devices"]["ac_online"] = False
+          if value == "missing": data["devices"].pop("ac_online")
+          elif value == "unhealthy": data["devices"]["wifi"] = False
+          else: data["devices"]["ac_online"] = value
+          return data
+        with patch.object(backend.HOST, "observe_current_health", side_effect=malformed):
+          with self.assertRaises(ValueError): observe(binding)
+
   def test_native_nonseekable_retirement_reopens_exact_slots(self):
     result, writer, archive, sampler, collector = self.run_workflow()
     read, delete = self.host.retirement_callbacks(self.ledger, result["cycle"], archive)

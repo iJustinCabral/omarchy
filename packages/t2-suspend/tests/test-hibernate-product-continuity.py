@@ -68,6 +68,31 @@ class Continuity(unittest.TestCase):
     self.assertEqual(proof["binding"]["vector"], self.cycle["vector"])
     with self.assertRaises(ValueError): self.collector.finish(self.health(), [])
 
+  def test_battery_return_retains_false_power_observation_and_proof_limits(self):
+    self.collector.write_and_capture(self.write, self.capture)
+    health = self.health()
+    health["devices"]["ac_online"] = False
+    proposal = self.collector.returned_transition(health, [])
+    self.assertIs(proposal["witness"]["cleanup_health"]["devices"]["ac_online"], False)
+    self.assertEqual(proposal["evidence_sha256"], tx.digest(proposal["witness"]))
+    for name in ("hardware_qualified", "physical_input_confirmed", "usable_hibernation_qualified"):
+      self.assertIs(proposal["witness"]["proof"][name], False)
+
+  def test_battery_return_still_rejects_malformed_power_and_unhealthy_devices(self):
+    mutations = [lambda devices, value=value: devices.update(ac_online=value)
+                 for value in (None, 0, 1, "false", [], {})]
+    mutations += [lambda devices: devices.pop("ac_online"), lambda devices: devices.update(extra=True)]
+    mutations += [lambda devices, name=name: devices.update({name: False})
+                  for name in ("primary_encrypted_root", "internal_keyboard", "internal_trackpad", "wifi", "bluetooth")]
+    for mutate in mutations:
+      with self.subTest(mutate=mutate):
+        self.collector = self.new_collector()
+        self.collector.write_and_capture(self.write, self.capture)
+        health = self.health()
+        health["devices"]["ac_online"] = False
+        mutate(health["devices"])
+        with self.assertRaises(ValueError): self.collector.finish(health, [])
+
   def test_no_finish_before_write_and_no_serialized_context(self):
     with self.assertRaises(ValueError): self.collector.finish(self.health(), [])
     with self.assertRaises(TypeError): pickle.dumps(self.collector)

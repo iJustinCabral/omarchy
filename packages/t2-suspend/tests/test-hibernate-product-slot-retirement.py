@@ -27,7 +27,11 @@ class Retirement(unittest.TestCase):
   def setUp(self):
     self.fixture = fixtures.Workflows(methodName="runTest")
     self.fixture.setUp()
-    result = self.fixture.run_workflow()
+    def cleanup_health(binding):
+      data = self.fixture.health(binding)
+      data["devices"]["ac_online"] = getattr(self, "cleanup_ac_online", True)
+      return data
+    result = self.fixture.run_workflow(health=cleanup_health)
     self.cycle = result["cycle"]
     self.ledger = self.fixture.ledger
     self.archives = self.fixture.archives
@@ -101,6 +105,52 @@ class Retirement(unittest.TestCase):
     next_cycle = self.ledger.begin(self.cycle["original_boot_id"])
     self.assertNotEqual(next_cycle["vector"], self.cycle["vector"])
     self.assertEqual(next_cycle["qualification_vector"], self.cycle["qualification_vector"])
+
+  def test_battery_and_mains_changes_preserve_each_archived_and_fresh_observation(self):
+    for archived_ac, first_ac, final_ac in ((False, False, False), (True, False, True), (False, True, False)):
+      with self.subTest(observations=(archived_ac, first_ac, final_ac)):
+        case = Retirement(methodName="runTest")
+        case.cleanup_ac_online = archived_ac
+        case.setUp()
+        try:
+          before = {path: path.read_bytes() for path in case.target.iterdir()}
+          def changing_health(binding):
+            data = case.health(binding)
+            data["devices"]["ac_online"] = first_ac if case.health_calls == 1 else final_ac
+            return data
+          result = case.run_retirement(health=changing_health)
+          self.assertEqual(result["cycle"]["state"], "reconciled")
+          stem = "slot-retirement-" + case.cycle["cycle_id"]
+          self.assertIs(case.ledger._read(stem + "-complete.json")["health"]["devices"]["ac_online"], first_ac)
+          self.assertIs(case.ledger._read(stem + "-reconcile.json")["health"]["devices"]["ac_online"], final_ac)
+          self.assertEqual(before, {path: path.read_bytes() for path in case.target.iterdir()})
+          self.assertFalse(result["hardware_qualified"])
+          self.assertFalse(result["usable_hibernation_qualified"])
+          self.assertEqual(case.ledger.begin(case.cycle["original_boot_id"])["state"], "reserved")
+        finally:
+          case.tearDown()
+
+  def test_malformed_power_refuses_at_both_retirement_health_boundaries(self):
+    for sample in (1, 2):
+      for invalid in (None, 0, 1, "false", [], {}, "missing"):
+        with self.subTest(sample=sample, invalid=invalid):
+          case = Retirement(methodName="runTest")
+          case.setUp()
+          try:
+            def bad_health(binding):
+              data = case.health(binding)
+              data["devices"]["ac_online"] = False
+              if case.health_calls == sample:
+                if invalid == "missing": data["devices"].pop("ac_online")
+                else: data["devices"]["ac_online"] = invalid
+              return data
+            with self.assertRaises(ValueError): case.run_retirement(health=bad_health)
+            case.assert_blocked()
+            record = case.ledger._read("cycle-" + case.cycle["cycle_id"] + ".json")
+            self.assertNotIn("reconcile_evidence_sha256", record)
+            self.assertEqual("release_evidence_sha256" in record, sample == 2)
+          finally:
+            case.tearDown()
 
   def test_nonarchived_stale_and_historical_cycles_refuse_before_delete(self):
     for changed in ({"state": "returned"}, {"protocol": "cold-pci-guard-fullrestore-v1"},

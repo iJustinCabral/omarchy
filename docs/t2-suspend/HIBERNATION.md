@@ -6,6 +6,10 @@ The earlier goal-complete declaration was incorrect. Two real normal-logind S4 r
 
 Start with the [human/agent guide](HIBERNATION-GUIDE.md), then read the diagrammed [failure and solution mechanism](HIBERNATION-MECHANISM.md) and [production/portability plan](HIBERNATION-PRODUCTION-PLAN.md). This file remains the detailed investigation journal, not the primary tutorial. Documentation changes do not remove live safeguards or authorize another physical test.
 
+## Battery return health separated from AC observation in source
+
+The source collector, slot-retirement verifier and archived-retirement host adapter now accept truthful `ac_online=false` without weakening the other device, service, binding, PM or evidence checks. Missing values and non-booleans, including integer `0`/`1`, remain rejected. Cleanup and both retirement observations retain their actual independently sampled power state; a charger change does not force a false health failure or rewrite historical receipts. Focused fixtures exercise battery return through archive/retirement, power changes between samples, malformed observations and genuine unhealthy devices. Initial product/trial AC admission and pre-write policy remain separate unfinished work. The installed `608464dd` runtime has not changed, and no battery hardware test has occurred.
+
 ## Repeat normal S4 succeeded after ordinary source-default boot
 
 Fresh cycle `12f886c4-fecb-41ef-ad12-31374e63677d`, vector `d450d1fcf025d79db2cb2bdbd083d0adbd8c78a71d2ec5e76964804e21b33736`, successfully restored original boot `0f909934-0ecf-4407-863d-6822c81cb2df`. The normal user command secured the lock and requested logind hibernation; original vendor-service process `4336` returned and reported `qualified-product-cycle-reconciled` at 17:31:01 on September 27. Kernel records show hibernation entry at 17:30:53, ACPI S4 wake at 17:30:57 and hibernation exit at 17:30:58. The user reported returning. No manual repair was needed. This is the second distinct successful normal-logind cycle, following the verified ordinary source-default boot; both cycles remain consumed.
