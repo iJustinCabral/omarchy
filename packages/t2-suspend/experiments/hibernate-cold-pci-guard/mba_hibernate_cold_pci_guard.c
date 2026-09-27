@@ -10,6 +10,8 @@
 
 #define ANS_CC 0x14
 #define ANS_CSTS 0x1c
+/* Apple 106b:2005 binds nvme by device ID, with storage-other class. */
+#define MBA_ANS_CLASS 0x018002
 struct mba_guard {
   struct pci_dev *functions[4];
   void __iomem *ans_regs;
@@ -221,7 +223,7 @@ static int mba_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     if (i == 0) {
       if (!guard->functions[i]->driver ||
           strcmp(guard->functions[i]->driver->name, "nvme") ||
-          guard->functions[i]->class != PCI_CLASS_STORAGE_EXPRESS ||
+          guard->functions[i]->class != MBA_ANS_CLASS ||
           !(pci_resource_flags(guard->functions[i], 0) & IORESOURCE_MEM) ||
           pci_resource_len(guard->functions[i], 0) < ANS_CSTS + 4)
         goto fail;

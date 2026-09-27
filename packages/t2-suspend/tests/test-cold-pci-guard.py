@@ -151,6 +151,7 @@ static void pci_refresh_power_state(struct pci_dev *p){(void)p;}
 static void pm_request_resume(struct device *d){(void)d;assert(false);}
 static void dev_pm_set_strict_midlayer(struct device *d,bool enabled){(void)d;(void)enabled;}
 '''
+harness += re.search(r"^#define MBA_ANS_CLASS .+$", source, re.M).group(0) + "\n"
 harness += "".join(function(source, name) for name in (
   "mba_set_arm_prefix", "mba_get_arm_prefix", "mba_prepare", "mba_freeze",
   "mba_freeze_noirq", "mba_thaw_noirq", "mba_complete", "mba_release", "mba_probe", "mba_remove"))
@@ -166,7 +167,8 @@ static void reset(void) {
     devices[i].index=i;devices[i].devfn=i;devices[i].vendor=PCI_VENDOR_ID_APPLE;devices[i].device=ids[i];
     devices[i].dev.pdev=&devices[i];devices[i].dev.async=true;devices[i].command=0x100|PCI_COMMAND_MASTER;
   }
-  devices[0].driver=&nvme;devices[0].class=PCI_CLASS_STORAGE_EXPRESS;devices[1].dev.driver=&bus_driver;
+  // Actual MacBookAir9,1 ANS class; keep independent of the guard constant.
+  devices[0].driver=&nvme;devices[0].class=0x018002;devices[1].dev.driver=&bus_driver;
   devices[0].command=0x100;
   armed=arm_consumed=false;gates=0;vector_prefix[0]=0;
   gate_active=gate_failed=false;generic_reenables=0;
@@ -204,6 +206,34 @@ static void remove_guard(void) {
 }
 int main(void) {
   reset();assert(mba_set_arm_prefix("0123456789abcdef01234567",NULL)==-EPERM);
+  reset();assert(mba_probe(&devices[1],NULL)==0);remove_guard();
+  for(int sibling=0;sibling<4;sibling++) {
+    for(int identity=0;identity<2;identity++) {
+      reset();
+      if(identity==0)devices[sibling].vendor^=1;else devices[sibling].device^=1;
+      assert(mba_probe(&devices[1],NULL)==-ENODEV && !instance && !maps);
+      for(int i=0;i<4;i++) {
+        assert(!devices[i].refs && devices[i].dev.async && !clear_calls[i] && !set_calls[i]);
+        assert(devices[i].command==(0x100|(i ? PCI_COMMAND_MASTER : 0)));
+      }
+    }
+  }
+  const u32 wrong_classes[]={PCI_CLASS_STORAGE_EXPRESS,0x018000,0x018001,0x018003,0xffffff};
+  for(size_t invalid=0;invalid<ARRAY_SIZE(wrong_classes);invalid++) {
+    reset();devices[0].class=wrong_classes[invalid];
+    assert(mba_probe(&devices[1],NULL)==-ENODEV && !instance && !maps);
+    for(int i=0;i<4;i++) {
+      assert(!devices[i].refs && devices[i].dev.async && !clear_calls[i] && !set_calls[i]);
+      assert(devices[i].command==(0x100|(i ? PCI_COMMAND_MASTER : 0)));
+    }
+  }
+  reset();devices[0].driver=NULL;
+  assert(mba_probe(&devices[1],NULL)==-ENODEV && !instance && !maps);
+  for(int i=0;i<4;i++) {
+    assert(!devices[i].refs && devices[i].dev.async && !clear_calls[i] && !set_calls[i]);
+    assert(devices[i].command==(0x100|(i ? PCI_COMMAND_MASTER : 0)));
+  }
+  reset();
   assert(pci_pm_thaw(&devices[2].dev)==0 && generic_reenables==1);
   for(int absent=0;absent<4;absent++) {
     reset();missing=absent;assert(mba_probe(&devices[1],NULL)==-ENODEV);
