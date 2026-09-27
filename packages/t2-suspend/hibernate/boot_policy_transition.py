@@ -81,6 +81,7 @@ def _locks(root):
   G._ancestors(root, db, os.geteuid())
   fd = os.open(db, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
   released = False
+  scoped = True
   physical = None
   try:
     os.fchmod(fd, 0o600)
@@ -100,8 +101,17 @@ def _locks(root):
       db.unlink()
       released = True
       _sync(db.parent)
+    def check_physical():
+      if not scoped: raise ValueError("Physical exclusion scope ended")
+      current, held = (root / PHYSICAL_LOCK).lstat(), os.fstat(physical)
+      if (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino):
+        raise ValueError("Physical exclusion inode changed")
+      if not stat.S_ISREG(held.st_mode) or held.st_uid != os.geteuid() or stat.S_IMODE(held.st_mode) != 0o600 or held.st_nlink != 1:
+        raise ValueError("Owned physical exclusion changed")
+    release_db.check_physical = check_physical
     yield release_db
   finally:
+    scoped = False
     try:
       if not released:
         _owned_lock(db, fd)
@@ -164,17 +174,19 @@ def _replace(root, expected, replacement, transition_id, *, guard=lambda: None):
   if _read(root, P.LIMINE, private=False) != replacement: raise ValueError("Configuration replacement readback failed")
 
 
-def transition(root, action, *, precheck):
+def transition(root, action, *, precheck, maintenance_continuation=None):
   root = Path(root)
   if not root.is_absolute() or root.resolve() != root or not root.is_dir() or root.resolve() == Path("/"):
     raise ValueError("Fixture-only transition refuses live root and aliases")
   if action not in (*PENDINGS, "maintenance") or not callable(precheck): raise ValueError("Explicit fixture action/precheck required")
-  return _transition(root, action, precheck=precheck, guard=lambda: None)
+  return _transition(root, action, precheck=precheck, guard=lambda: None, maintenance_continuation=maintenance_continuation)
 
 
-def _transition(root, action, *, precheck, guard):
+def _transition(root, action, *, precheck, guard, maintenance_continuation=None):
   """Internal core; maintenance is fixture-only groundwork, not update permission."""
   root = Path(root)
+  if maintenance_continuation is not None and (root.resolve() == Path("/") or action != "maintenance" or not callable(maintenance_continuation)):
+    raise ValueError("Explicit fixture-only maintenance continuation required")
   if action == "maintenance" and root.resolve() == Path("/"):
     raise ValueError("Live maintenance entry requires a separately reviewed native coordinator")
   if action not in (*PENDINGS, "maintenance"):
@@ -301,4 +313,22 @@ def _transition(root, action, *, precheck, guard):
       raise
     result = {**completion, "live_execution": False, "qualification_issued": False}
     if maintenance_intent is not None: result["maintenance_intent_sha256"] = P.digest(maintenance_intent)
+    if maintenance_continuation is not None:
+      # Deactivation is already complete. Pipeline errors retain maintenance's
+      # durable veto, not a fabricated incomplete deactivation. Keep physical
+      # exclusion continuously held while actual package callbacks own db.lck.
+      release_db.check_physical()
+      try:
+        result["maintenance"] = maintenance_continuation(archive, maintenance_intent, release_db.check_physical)
+      finally:
+        # A failed pipeline may have removed its veto. Rearm only an absent
+        # marker under retained physical exclusion; never replace foreign data.
+        try:
+          G._ancestors(root, root / MAINTENANCE, os.geteuid())
+          if not _present(root / MAINTENANCE):
+            _new(root / MAINTENANCE, maintenance_intent)
+            if _read(root, MAINTENANCE) != maintenance_intent:
+              raise ValueError("Rearmed maintenance veto readback differs")
+        except BaseException as error:
+          raise RuntimeError("Maintenance veto durability unconfirmed") from error
     return result
