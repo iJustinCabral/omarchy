@@ -126,13 +126,16 @@ class Backends(unittest.TestCase):
                                                    prepared["guard_file"].read_bytes(), prepared["attempt_file"].read_bytes())
     return preparation, prepared, sampler, collector
 
-  def run_workflow(self, *, tamper=False):
+  def run_workflow(self, *, tamper=False, power_evidence=False):
     preparation, prepared, sampler, collector = self.prepare()
     writer = self.host.power_writer(self.ledger, prepared["cycle"], prepared["receipt"])
     if tamper: prepared["guard_file"].write_bytes(b"foreign")
     archive = self.o.base / "backend-archives"
     archive.mkdir(mode=0o700)
-    result = trial.WORKFLOW.run(self.ledger, collector, archive, power_write=writer, capture=sampler.capture,
+    def capture(binding):
+      if power_evidence: writer.record_returned_power()
+      return sampler.capture(binding)
+    result = trial.WORKFLOW.run(self.ledger, collector, archive, power_write=writer, capture=capture,
                                 cleanup=preparation.cleanup, health=sampler.health)
     return result, writer, archive, sampler, collector
 
@@ -144,6 +147,22 @@ class Backends(unittest.TestCase):
                       lambda: self.host.write("state", "disk"), lambda: self.host.read_slot("foreign")):
       with self.assertRaises(ValueError): operation()
     self.assertEqual(self.calls, [])
+
+  def test_power_evidence_requires_actual_return_and_active_workflow_lock(self):
+    preparation, prepared, _sampler, _collector = self.prepare()
+    writer = self.host.power_writer(self.ledger, prepared["cycle"], prepared["receipt"])
+    with self.assertRaises(ValueError): writer.record_returned_power()
+    self.assertFalse(any(self.ledger.directory.glob("power-*.json")))
+    preparation.cleanup()
+
+  def test_power_evidence_publishes_in_workflow_scope_once_only(self):
+    result, writer, _archive, _sampler, collector = self.run_workflow(power_evidence=True)
+    self.assertTrue(collector.retained_evidence()["write_returned"])
+    record = self.ledger._read("power-prewrite-returned-" + result["cycle"]["cycle_id"] + ".json")
+    self.assertEqual(record["observation"]["decision"], {"source": "mains", "policy": "legacy-ac-only"})
+    self.assertEqual(record["binding"], {key: result["cycle"][key] for key in backend.CT.BINDING_KEYS})
+    with self.assertRaises(ValueError): writer.record_returned_power()
+    self.assertEqual(len(list(self.ledger.directory.glob("power-prewrite-returned-*.json"))), 1)
 
   def test_actual_marker_hash_loaded_identity_and_efi_framing(self):
     self.assertEqual(self.host.read("marker_file_identity"), self.o.marker_pin)

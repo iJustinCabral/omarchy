@@ -112,7 +112,7 @@ def _admission_state(config, receipt, report, *, ledger, archive_directory, root
   mounts = [line.split() for line in HOST._raw(root / "proc/self/mounts").decode().splitlines() if len(line.split()) >= 4 and line.split()[1] == "/"]
   if len(mounts) != 1 or mounts[0][:3] != ["/dev/mapper/root", "/", "btrfs"] or "subvol=/@" not in mounts[0][3].split(","):
     raise ValueError("Qualified product requires primary encrypted root")
-  power_decision = POWER_POLICY.check(root, config.get("power_policy"))
+  power_observation = POWER_POLICY.observe(root, config.get("power_policy"))
   with ledger._lock():
     state, previous = _head(ledger)
     if previous is not None:
@@ -126,7 +126,7 @@ def _admission_state(config, receipt, report, *, ledger, archive_directory, root
       ledger._read("slot-retirement-" + previous["cycle_id"] + "-intent.json")
   return {"qualification": receipt, "original_boot_id": boot, "manifest_sha256": TX.digest(report["manifest"]),
           "predecessor_cycle_id": None if previous is None else previous["cycle_id"], "execute": False,
-          "power_decision": power_decision}
+          "power_decision": power_observation["decision"], "power_observation": power_observation}
 
 
 def execute(config, qualification, report, *, ledger, archive_directory, root, backend_factory, sleeper,
@@ -150,8 +150,17 @@ def execute(config, qualification, report, *, ledger, archive_directory, root, b
   ledger.qualify(receipt)
   cycle = ledger.begin(admitted["original_boot_id"])
   preparation = None
-  phase = "backend-constructor"
+  phase = "power-admission-evidence"
   try:
+    def record_admission(advance):
+      HOST.CT.exact(advance.check_current(), cycle, "Current admission evidence cycle")
+      ledger._write("power-admission-" + cycle["cycle_id"] + ".json",
+                    {"schema": "omarchy-t2-product-power-evidence-v1", "phase": "admission",
+                     "binding": {key: cycle[key] for key in HOST.CT.BINDING_KEYS}, "power_policy": power_policy,
+                     "observation": admitted["power_observation"],
+                     "final_prewrite_persistence": "only-after-write-return; unavailable-on-reset-or-no-return"}, exclusive=True)
+    ledger.compare_and_run(cycle, record_admission)
+    phase = "backend-constructor"
     backend = backend_factory(root, report, cycle, config["marker_file"], config["marker_pin"])
     phase = "preparation"
     preparation = PREPARATION.Preparation(ledger, cycle, backend, config["marker_file"], config["marker_pin"],
@@ -195,7 +204,12 @@ def execute(config, qualification, report, *, ledger, archive_directory, root, b
     try: ledger.advance(cycle["cycle_id"], "failed", TX.digest({"phase": phase, "error": type(error).__name__, "cleanup": errors}))
     except BaseException as latch: error.add_note("Cycle remains blocked/incomplete: " + type(latch).__name__)
     raise
-  result = WORKFLOW.run(ledger, collector, archive_directory, power_write=writer, capture=sampler.capture,
+  def capture_with_power(binding):
+    # Collector has already marked the actual callback return. A sidecar failure
+    # must retain write_returned=true, not pretend the power write never returned.
+    native_writer.record_returned_power()
+    return sampler.capture(binding)
+  result = WORKFLOW.run(ledger, collector, archive_directory, power_write=writer, capture=capture_with_power,
                         cleanup=writer.cleanup, health=sampler.health)
   read_slot, delete = backend.retirement_callbacks(ledger, result["cycle"], archive_directory)
   retired = RETIREMENT.retire(ledger, result["cycle"], archive_directory, read_slot=read_slot, compare_delete_slot=delete,

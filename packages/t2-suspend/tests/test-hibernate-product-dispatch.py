@@ -151,6 +151,113 @@ class Dispatch(unittest.TestCase):
     self.assertEqual(events, ["sync"], str(failure.exception))
     self.assertEqual(self.host.power_count, 0)
     self.assertTrue(self.ledger._state()["blocked"])
+    self.assertEqual(len(list(self.ledger.directory.glob("power-admission-*.json"))), 1)
+    self.assertFalse(any(self.ledger.directory.glob("power-prewrite-returned-*.json")))
+
+  def test_cycle_power_records_preserve_distinct_native_reserves_without_return_gate(self):
+    self.enable_battery_policy()
+    self.battery(charge_now=70)
+    events = []
+    original_write, original_observe, ledger_write = self.host.write, fixture.backend.POWER_POLICY.observe, self.ledger._write
+    def factory(*args):
+      self.battery(charge_now=60)
+      return self.factory(*args)
+    def observe(*args):
+      result = original_observe(*args)
+      events.append("final-sample")
+      return result
+    def write(path, raw):
+      if path.relative_to(self.root) == Path("sys/power/state"): events.append("disk")
+      original_write(path, raw)
+      if path.relative_to(self.root) == Path("sys/power/state"): self.battery(charge_now=20)
+    def persist(name, value, **kwargs):
+      if name.startswith("power-"): events.append(name.split("-")[1])
+      return ledger_write(name, value, **kwargs)
+    with patch.object(self.host, "write", side_effect=write), patch.object(self.ledger, "_write", side_effect=persist), \
+         patch.object(fixture.backend.POWER_POLICY, "observe", side_effect=observe):
+      result = self.execute(backend_factory=factory)
+    cycle = result["cycle"]
+    binding = {key: cycle[key] for key in product.HOST.CT.BINDING_KEYS}
+    admission = self.ledger._read("power-admission-" + cycle["cycle_id"] + ".json")
+    final = self.ledger._read("power-prewrite-returned-" + cycle["cycle_id"] + ".json")
+    returned = self.ledger._read("power-postreturn-" + cycle["cycle_id"] + ".json")
+    self.assertEqual(admission["observation"]["decision"]["reserve_now"], 70)
+    self.assertEqual(final["observation"]["decision"]["reserve_now"], 60)
+    self.assertEqual(final["persistence_phase"], "after-write-return")
+    self.assertTrue(final["power_write_returned"])
+    self.assertEqual(returned["observation"]["status"], "sampled")
+    battery = next(item for item in returned["observation"]["snapshot"]["supplies"] if item["type"] == "Battery")
+    self.assertEqual(battery["charge_now_uah"], 20)
+    self.assertEqual(battery["charge_full_uah"], 100)
+    for record in (admission, final, returned): self.assertEqual(record["binding"], binding)
+    self.assertEqual(events, ["admission", "final-sample", "disk", "prewrite", "postreturn"])
+    self.assertEqual(cycle["state"], "reconciled")
+    self.assertEqual(product.WORKFLOW.ARCHIVE.REQUIRED_NAMES, set(path.name for path in (self.archives / ("cycle-" + cycle["cycle_id"])).iterdir()) - {"completion.json"})
+
+  def test_postreturn_power_sample_unavailable_is_observation_not_failure(self):
+    original_sample = fixture.backend.POWER_POLICY.SUPPLY.sample_power_supply
+    def sample(root):
+      if self.host.power_count: raise ValueError("synthetic unavailable telemetry")
+      return original_sample(root)
+    with patch.object(fixture.backend.POWER_POLICY.SUPPLY, "sample_power_supply", side_effect=sample):
+      result = self.execute()
+    record = self.ledger._read("power-postreturn-" + result["cycle"]["cycle_id"] + ".json")
+    self.assertEqual(record["observation"], {"status": "unavailable", "error_type": "ValueError"})
+    self.assertEqual(result["cycle"]["state"], "reconciled")
+
+  def test_admission_power_record_sync_failure_blocks_before_preparation(self):
+    sync = self.ledger._sync
+    failed = False
+    def fail_sync():
+      nonlocal failed
+      if not failed and any(self.ledger.directory.glob("power-admission-*.json")):
+        failed = True
+        raise OSError("synthetic admission sync failure")
+      return sync()
+    with patch.object(self.ledger, "_sync", side_effect=fail_sync), self.assertRaises(OSError): self.execute()
+    self.assertEqual(self.host.power_count, 0)
+    self.assertFalse(any(self.ledger.directory.glob("preparation-*.json")))
+    self.assertTrue(self.ledger._state()["blocked"])
+    self.assertEqual(self.ledger._cycles()[0]["state"], "failed")
+    with self.assertRaises(ValueError): self.execute()
+
+  def test_return_power_persistence_failures_keep_truthful_return_and_cleanup(self):
+    for prefix in ("power-prewrite-returned-", "power-postreturn-"):
+      with self.subTest(prefix=prefix):
+        case = Dispatch("test_check_has_no_cycle_preparation_or_power_and_requires_external_receipt")
+        case.setUp()
+        try:
+          write = case.ledger._write
+          def fail(name, value, **kwargs):
+            if name.startswith(prefix): raise OSError("synthetic returned evidence failure")
+            return write(name, value, **kwargs)
+          with patch.object(case.ledger, "_write", side_effect=fail), self.assertRaises(OSError): case.execute()
+          cycle = case.ledger._cycles()[0]
+          failure = case.ledger._read("workflow-failure-" + cycle["cycle_id"] + ".json")
+          self.assertTrue(failure["snapshot"]["retained"]["write_returned"])
+          self.assertFalse(failure["snapshot"]["retained"]["capture_valid"])
+          self.assertEqual(failure["snapshot"]["cleanup_errors"], [])
+          self.assertFalse(case.host.host.read("source_marker_loaded"))
+          self.assertTrue(case.ledger._state()["blocked"])
+          with self.assertRaises(ValueError): case.execute()
+        finally: case.doCleanups()
+
+  def test_exclusive_power_sidecars_never_overwrite_existing_evidence(self):
+    for prefix in ("power-admission-", "power-prewrite-returned-", "power-postreturn-"):
+      with self.subTest(prefix=prefix):
+        case = Dispatch("test_check_has_no_cycle_preparation_or_power_and_requires_external_receipt")
+        case.setUp()
+        try:
+          write = case.ledger._write
+          def collide(name, value, **kwargs):
+            if name.startswith(prefix): write(name, {"preserved": "existing evidence"}, exclusive=True)
+            return write(name, value, **kwargs)
+          with patch.object(case.ledger, "_write", side_effect=collide), self.assertRaises(FileExistsError): case.execute()
+          record = next(case.ledger.directory.glob(prefix + "*.json"))
+          self.assertEqual(case.ledger._read(record.name), {"preserved": "existing evidence"})
+          self.assertEqual(case.host.power_count, 0 if prefix == "power-admission-" else 1)
+          self.assertTrue(case.ledger._state()["blocked"])
+        finally: case.doCleanups()
 
   def test_two_real_backend_cycles_sameboot_restore_selection_fresh_uuid_vectors(self):
     first = self.execute()
@@ -229,6 +336,8 @@ class Dispatch(unittest.TestCase):
     cycle = self.ledger._cycles()[0]
     self.assertTrue((self.ledger.directory / ("preparation-" + cycle["cycle_id"] + "-guard.json")).is_file())
     self.assertTrue((self.ledger.directory / ("workflow-failure-" + cycle["cycle_id"] + ".json")).is_file())
+    self.assertTrue((self.ledger.directory / ("power-admission-" + cycle["cycle_id"] + ".json")).is_file())
+    self.assertFalse(any(self.ledger.directory.glob("power-prewrite-returned-*.json")))
 
   def test_no_cli_bypass_help_or_nonroot_hibernate_has_no_global_access(self):
     with patch.object(product.TRIAL, "_global_lock", side_effect=AssertionError("Unexpected global access")):

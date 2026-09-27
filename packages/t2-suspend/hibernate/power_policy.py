@@ -69,5 +69,11 @@ def decide(snapshot, policy=None):
           "reserve_now": now, "reserve_full": full, "min_charge_percent": minimum}
 
 
+def observe(root, policy=None):
+  """Retain the exact native-unit sample used for one admission decision."""
+  snapshot = SUPPLY.sample_power_supply(root)
+  return {"snapshot": snapshot, "decision": decide(snapshot, policy)}
+
+
 def check(root, policy=None):
-  return decide(SUPPLY.sample_power_supply(root), policy)
+  return observe(root, policy)["decision"]

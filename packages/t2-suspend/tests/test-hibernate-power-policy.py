@@ -3,6 +3,7 @@
 import importlib.util
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("tested_power_policy", Path(__file__).parents[1] / "hibernate/power_policy.py")
 policy = importlib.util.module_from_spec(spec)
@@ -44,6 +45,13 @@ class PowerPolicy(unittest.TestCase):
       with self.subTest(value=value), self.assertRaises(ValueError):
         policy.validate({"schema": policy.SCHEMA, "min_charge_percent": value})
     with self.assertRaises(ValueError): policy.validate({**self.policy, "extra": True})
+
+  def test_observe_retains_the_single_exact_native_sample_used_for_decision(self):
+    with patch.object(policy.SUPPLY, "sample_power_supply", return_value=self.sample) as sample:
+      observed = policy.observe(Path("/synthetic"), self.policy)
+    sample.assert_called_once_with(Path("/synthetic"))
+    self.assertIs(observed["snapshot"], self.sample)
+    self.assertEqual(observed["decision"], policy.decide(self.sample, self.policy))
 
 
 if __name__ == "__main__": unittest.main()

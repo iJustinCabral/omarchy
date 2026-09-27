@@ -407,6 +407,9 @@ class _PowerWrite:
     self.power_policy = POWER_POLICY.validate(power_policy)
     self._advance = None
     self._used = False
+    self._final_power_observation = None
+    self._actual_write_returned = False
+    self._power_evidence_used = False
 
   def bind_locked(self, advance):
     if self._advance is not None or self._used: raise ValueError("Power capability already consumed")
@@ -450,8 +453,37 @@ class _PowerWrite:
     for key, magic in (("source_stage", b"MBPW"), ("restore_stage", b"MBRS")):
       CT.exact(backend.read(key), b"\x07\0\0\0" + magic + bytes.fromhex(self.cycle["prefix"]) + b"\0", "Exact staged power prefix")
     os.sync() if backend.live else None
-    POWER_POLICY.check(backend.root, self.power_policy)
+    # Keep only original-process memory between this last gate and disk. Durable
+    # evidence is deliberately deferred until return; reset may lose this sample.
+    self._final_power_observation = POWER_POLICY.observe(backend.root, self.power_policy)
     backend._write_bytes("sys/power/state", b"disk")
+    self._actual_write_returned = True
+
+  def record_returned_power(self):
+    """Publish additive evidence under the existing workflow lock, not a gate.
+
+    Called by routine capture only after Collector marks write_returned. Samples
+    use native units; monotonic timestamps do not measure powered-off duration.
+    Neither these sidecars nor a returned syscall qualify a successful restore.
+    """
+    if self._advance is None or not self._actual_write_returned or self._power_evidence_used:
+      raise ValueError("One actual locked power-write return required")
+    CT.exact(self._advance.check_current(), self.cycle, "Current returned power evidence cycle")
+    self._power_evidence_used = True
+    common = {"schema": "omarchy-t2-product-power-evidence-v1",
+              "binding": {key: self.cycle[key] for key in CT.BINDING_KEYS}}
+    self.ledger._write("power-prewrite-returned-" + self.cycle["cycle_id"] + ".json",
+                      {**common, "phase": "final-prewrite", "persistence_phase": "after-write-return",
+                       "power_write_returned": True, "power_policy": self.power_policy,
+                       "observation": self._final_power_observation}, exclusive=True)
+    # Return reserve is observational: below-threshold reserve or unknown status
+    # must not turn a healthy restored session into another admission refusal.
+    try:
+      returned = {"status": "sampled", "snapshot": POWER_POLICY.SUPPLY.sample_power_supply(self.backend.root)}
+    except (OSError, ValueError) as error:
+      returned = {"status": "unavailable", "error_type": type(error).__name__}
+    self.ledger._write("power-postreturn-" + self.cycle["cycle_id"] + ".json",
+                      {**common, "phase": "postreturn", "observation": returned}, exclusive=True)
 
 
 class _SlotDelete:
