@@ -6,6 +6,10 @@ The earlier goal-complete declaration was incorrect. Two real normal-logind S4 r
 
 Start with the [human/agent guide](HIBERNATION-GUIDE.md), then read the diagrammed [failure and solution mechanism](HIBERNATION-MECHANISM.md) and [production/portability plan](HIBERNATION-PRODUCTION-PLAN.md). This file remains the detailed investigation journal, not the primary tutorial. Documentation changes do not remove live safeguards or authorize another physical test.
 
+## Native runtime upgrade adapter implemented and reviewed
+
+`runtime_upgrade_native.py` adds the fixed root-private deployment entry outside the replaceable runtime. Separate external approval pins its own code, the current boot, old/new review/bootstrap/configuration bytes and unchanged qualification, boot policy, Limine, opt-in and package hook. It imports only verified root-private code, reuses the installed reviewed logind idle checks, validates the real inhibitor owner and holds package/physical exclusion around the core transaction. New-runtime admission is checked under the pending veto before ordinary admission after publication; a final admission or package-lock-release failure restores the veto while the physical lock is still held. Independent review and 14 adapter fixtures passed. Concrete candidate staging and live deployment are separate steps, and this does not establish battery S4 or safe ordinary package updates.
+
 ## Runtime upgrade prepared in source; installed battery policy still unchanged
 
 Read-only reconciliation still passed on boot `0f909934-0ecf-4407-863d-6822c81cb2df`: the installed dispatcher accepted reconciled predecessor `12f886c4-fecb-41ef-ad12-31374e63677d` with `execute=false`, and no systemd units were failed. Runtime review `801f00176195b2628c112b5c9798d87ed08e615061cc4c9faa874d456391df78`, bootstrap `878f1501de9f181affa00312050e4977d69d38849033cd2a867c65c01b37ad90`, v1 configuration `d13d08fdb35de48e30970742ab99e6add13dc4466db54413c287349b1d119281`, qualification `ffa9bc8244395943eafa8cae94ba9927c43306cc54a09d3eb4be32ed72fdfe64`, boot policy and Limine bytes remain unchanged.
