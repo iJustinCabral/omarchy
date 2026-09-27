@@ -151,20 +151,66 @@ class Native(unittest.TestCase):
   def test_precheck_reuses_admission_and_only_internal_postcheck_crosses_pending(self):
     product = Mock()
     config = {"source_directory": "/source", "restore_directory": "/restore", "production_uki": "/production", "staged_receipt_sha256": "a" * 64}
+    resume = {"device": "/dev/mapper/root", "devnum": "253:0", "offset": 1923214}
+    report = {"audited_details": {"restore_protocol": {"resume": resume}}}
+    product.ARTIFACTS.derive_artifacts.return_value = report
     product.TRIAL._private_json.side_effect = lambda path: config if path.name == "config.json" else {"approved": True}
     product.BOOT_POLICY.verify.return_value = True
+    image_state = Mock()
+    engine = SimpleNamespace(PRODUCT=product, IMAGE_STATE=image_state)
     metadata = SimpleNamespace(st_mode=0o40700, st_uid=0)
     with patch.object(Path, "lstat", return_value=metadata):
-      N._precheck(SimpleNamespace(PRODUCT=product), "activation", "before")
+      N._precheck(engine, "activation", "before")
       product.check.assert_called_once()
       product._admission_state.assert_not_called()
-      N._precheck(SimpleNamespace(PRODUCT=product), "activation", "after")
-      product.TRIAL._verify_deployment.assert_called_once_with(N.ROOT, config, product.ARTIFACTS.derive_artifacts.return_value, source_default=True)
+      N._precheck(engine, "activation", "after")
+      product.TRIAL._verify_deployment.assert_called_once_with(N.ROOT, config, report, source_default=True)
       arguments = product._admission_state.call_args.kwargs
       self.assertEqual(arguments["root"], Path("/"))
       self.assertNotIn("query", arguments)
       self.assertEqual(product.check.call_count, 1)
-      with self.assertRaises(ValueError): N._precheck(SimpleNamespace(PRODUCT=product), "deactivation", "after")
+      self.assertEqual(image_state.require_no_image.call_args_list[0].args, (N.ROOT, resume))
+      self.assertEqual(image_state.require_no_image.call_count, 2)
+      with self.assertRaises(ValueError): N._precheck(engine, "deactivation", "after")
+      self.assertEqual(image_state.require_no_image.call_count, 2)
+
+  def test_no_image_required_after_admission_for_both_actions_and_phases(self):
+    resume = {"device": "/dev/mapper/root", "devnum": "253:0", "offset": 1923214}
+    report = {"audited_details": {"restore_protocol": {"resume": resume}}}
+    metadata = SimpleNamespace(st_mode=0o40700, st_uid=0)
+    for action in ("activation", "deactivation"):
+      for phase in ("before", "after"):
+        with self.subTest(action=action, phase=phase):
+          product, image_state = Mock(), Mock()
+          product.TRIAL._private_json.side_effect = lambda path: {
+            "source_directory": "/source", "restore_directory": "/restore", "production_uki": "/production",
+            "staged_receipt_sha256": "a" * 64} if path.name == "config.json" else {"approved": True}
+          product.ARTIFACTS.derive_artifacts.return_value = report
+          product.BOOT_POLICY.verify.return_value = action == "activation"
+          image_state.require_no_image.side_effect = ValueError("pending image")
+          with patch.object(Path, "lstat", return_value=metadata), self.assertRaisesRegex(ValueError, "pending image"):
+            N._precheck(SimpleNamespace(PRODUCT=product, IMAGE_STATE=image_state), action, phase)
+          image_state.require_no_image.assert_called_once_with(N.ROOT, resume)
+          if phase == "before":
+            product.check.assert_called_once()
+            product._admission_state.assert_not_called()
+          else:
+            product._admission_state.assert_called_once()
+
+  def test_failed_product_admission_never_calls_image_check_as_substitute(self):
+    metadata = SimpleNamespace(st_mode=0o40700, st_uid=0)
+    for phase in ("before", "after"):
+      product, image_state = Mock(), Mock()
+      product.TRIAL._private_json.side_effect = lambda path: {
+        "source_directory": "/source", "restore_directory": "/restore", "production_uki": "/production",
+        "staged_receipt_sha256": "a" * 64} if path.name == "config.json" else {"approved": True}
+      product.ARTIFACTS.derive_artifacts.return_value = {"audited_details": {"restore_protocol": {"resume": {"device": "/dev/mapper/root", "devnum": "253:0", "offset": 1}}}}
+      product.BOOT_POLICY.verify.return_value = True
+      if phase == "before": product.check.side_effect = ValueError("admission failed")
+      else: product._admission_state.side_effect = ValueError("admission failed")
+      with self.subTest(phase=phase), patch.object(Path, "lstat", return_value=metadata), self.assertRaisesRegex(ValueError, "admission failed"):
+        N._precheck(SimpleNamespace(PRODUCT=product, IMAGE_STATE=image_state), "activation", phase)
+      image_state.require_no_image.assert_not_called()
 
   def test_untrusted_dependency_metadata_blocks_before_any_import(self):
     fixture = F.Transitions("test_activation_then_exact_fallback_preserves_all_authority_and_evidence")
@@ -208,6 +254,27 @@ class Native(unittest.TestCase):
       bootstrap.write_bytes(b"changed bootstrap\n")
       with patch.object(N.importlib.util, "spec_from_file_location", side_effect=AssertionError("changed bootstrap must never import")):
         with self.assertRaises(ValueError): N._reviewed_tree()
+
+  def test_installed_image_import_follows_complete_inventory_gate(self):
+    script = HERE / "hibernate/boot_policy_native.py"
+    events = []
+    engine = SimpleNamespace(_runtime=lambda root: events.append("engine runtime"))
+    image = SimpleNamespace(require_no_image=Mock())
+    def metadata(path):
+      mode = 0o100600 if path == script else 0o40700
+      return SimpleNamespace(st_mode=mode, st_uid=0, st_nlink=1)
+    def specification(name, filename):
+      events.append("import " + name)
+      return SimpleNamespace(name=name, loader=SimpleNamespace(exec_module=lambda module: None))
+    def module(specification):
+      return engine if specification.name == "native_transition" else image
+    with patch.object(N, "SCRIPT", script), patch.object(N.os, "geteuid", return_value=0), \
+         patch.object(N.sys, "flags", SimpleNamespace(isolated=1)), patch.object(Path, "lstat", autospec=True, side_effect=metadata), \
+         patch.object(Path, "is_symlink", return_value=False), patch.object(N, "_reviewed_tree", side_effect=lambda: events.append("reviewed tree")), \
+         patch.object(N.importlib.util, "spec_from_file_location", side_effect=specification), \
+         patch.object(N.importlib.util, "module_from_spec", side_effect=module):
+      self.assertIs(N._installed().IMAGE_STATE, image)
+    self.assertEqual(events, ["reviewed tree", "import native_transition", "engine runtime", "import native_reviewed_image_state"])
 
   def test_engine_exclusion_loss_after_optin_unlink_preserves_pending(self):
     fixture = F.Transitions("test_activation_then_exact_fallback_preserves_all_authority_and_evidence")

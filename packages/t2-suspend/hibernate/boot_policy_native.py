@@ -62,6 +62,11 @@ def _installed():
   engine = importlib.util.module_from_spec(spec)
   spec.loader.exec_module(engine)
   engine._runtime(ROOT)
+  # Only the reviewed root-private tree may supply the read-only image check.
+  spec = importlib.util.spec_from_file_location("native_reviewed_image_state", SCRIPT.with_name("image_state.py"))
+  image_state = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(image_state)
+  engine.IMAGE_STATE = image_state
   return engine
 
 
@@ -198,7 +203,9 @@ def _precheck(engine, action, phase):
   ledger = product.TX.Ledger(STATE / "ledger")
   arguments = {"ledger": ledger, "archive_directory": STATE / "archives", "root": ROOT}
   if phase == "before":
-    return product.check(config, qualification, report, **arguments)
+    result = product.check(config, qualification, report, **arguments)
+    engine.IMAGE_STATE.require_no_image(ROOT, report["audited_details"]["restore_protocol"]["resume"])
+    return result
   # Only this internal postcheck crosses our own pending admission veto. The
   # exact approved byte transition is verified separately by the engine; reuse
   # all original structural, artifact, readiness, session and ledger checks.
@@ -207,7 +214,9 @@ def _precheck(engine, action, phase):
   if product.BOOT_POLICY.verify(ROOT, config["staged_receipt_sha256"]) != source_default:
     raise ValueError("Post-transition policy state differs from action")
   product.TRIAL._verify_deployment(ROOT, config, report, source_default=source_default)
-  return product._admission_state(config, receipt, report, **arguments)
+  result = product._admission_state(config, receipt, report, **arguments)
+  engine.IMAGE_STATE.require_no_image(ROOT, report["audited_details"]["restore_protocol"]["resume"])
+  return result
 
 
 def native(action):
