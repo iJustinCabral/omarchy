@@ -10,6 +10,7 @@ Ordinary boot verification remains separate: restored EFI selection is restore I
 """
 
 import contextlib
+import copy
 import fcntl
 import hashlib
 import json
@@ -232,35 +233,66 @@ class Ledger:
     """Record abstract outcomes; slot-release only records permission, never writes EFI."""
     cycle_id = uuid_value(cycle_id)
     hash_value(evidence_sha256)
+    with self._lock():
+      return self._advance_locked(cycle_id, action, evidence_sha256)
+
+  def compare_and_run(self, expected, callback):
+    """Run a bounded adapter under one lock with exact compare-and-advance.
+
+    Callbacks are trusted code, not serialized proposals. A process crash leaves
+    its current incomplete cycle blocking future allocation. No PM is supplied.
+    """
+    expected = copy.deepcopy(cycle_value(expected))
+    with self._lock():
+      current = self._read("cycle-" + expected["cycle_id"] + ".json")
+      if digest(current) != digest(expected):
+        raise ValueError("Adapter cycle snapshot is stale")
+      state = self._state()
+      if state["blocked"] or state["qualification"] is None or state["manifest"] != expected["manifest"] or digest(state["qualification"]) != expected["qualification_sha256"]:
+        raise ValueError("Adapter qualification changed")
+      active = True
+      def advance(action, evidence_sha256):
+        nonlocal current
+        if not active or digest(self._read("cycle-" + current["cycle_id"] + ".json")) != digest(current):
+          raise ValueError("Adapter lock scope ended or cycle changed")
+        current = self._advance_locked(current["cycle_id"], action, evidence_sha256)
+        return copy.deepcopy(current)
+      try:
+        return callback(advance)
+      finally:
+        active = False
+
+  def _advance_locked(self, cycle_id, action, evidence_sha256):
+    uuid_value(cycle_id)
+    hash_value(evidence_sha256)
     transitions = {"prepared": "reserved", "returned": "prepared", "archive": "returned",
                    "release": "archived", "reconcile": "released"}
-    with self._lock():
-      state = self._state()
-      name = "cycle-" + cycle_id + ".json"
-      record = cycle_value(self._read(name))
-      if record["cycle_id"] != cycle_id:
-        raise ValueError("Cycle filename differs")
-      if record.get("manifest") != state["manifest"] or record.get("qualification_sha256") != digest(state["qualification"]):
-        raise ValueError("Cycle qualification changed")
-      if action in ("failed", "ambiguous"):
-        if record.get("state") == "reconciled":
-          raise ValueError("Reconciled cycle is immutable")
-        state["blocked"] = True
-        state["qualification"] = None
-        self._write("state.json", state)
-        record["state"] = action
-      else:
-        if state["blocked"] or action not in transitions or record.get("state") != transitions[action]:
-          raise ValueError("Invalid cycle transition")
-        if action == "archive":
-          record["archive_evidence_sha256"] = evidence_sha256
-          self._write("archive-" + cycle_id + ".json", record, exclusive=True)
-          record["archive_sha256"] = digest(record)
-        if action in ("release", "reconcile"):
-          archived = cycle_value(self._read("archive-" + cycle_id + ".json"))
-          if archived["state"] != "returned" or archived["cycle_id"] != cycle_id or digest(archived) != record.get("archive_sha256"):
-            raise ValueError("Archive changed; reusable slots remain blocked")
-        record["state"] = {"archive": "archived", "release": "released", "reconcile": "reconciled"}.get(action, action)
-      record[action + "_evidence_sha256"] = evidence_sha256
-      self._write(name, record)
-      return record
+    state = self._state()
+    name = "cycle-" + cycle_id + ".json"
+    record = cycle_value(self._read(name))
+    if record["cycle_id"] != cycle_id:
+      raise ValueError("Cycle filename differs")
+    if record.get("manifest") != state["manifest"] or record.get("qualification_sha256") != digest(state["qualification"]):
+      raise ValueError("Cycle qualification changed")
+    if action in ("failed", "ambiguous"):
+      if record.get("state") == "reconciled":
+        raise ValueError("Reconciled cycle is immutable")
+      state["blocked"] = True
+      state["qualification"] = None
+      self._write("state.json", state)
+      record["state"] = action
+    else:
+      if state["blocked"] or action not in transitions or record.get("state") != transitions[action]:
+        raise ValueError("Invalid cycle transition")
+      if action == "archive":
+        record["archive_evidence_sha256"] = evidence_sha256
+        self._write("archive-" + cycle_id + ".json", record, exclusive=True)
+        record["archive_sha256"] = digest(record)
+      if action in ("release", "reconcile"):
+        archived = cycle_value(self._read("archive-" + cycle_id + ".json"))
+        if archived["state"] != "returned" or archived["cycle_id"] != cycle_id or digest(archived) != record.get("archive_sha256"):
+          raise ValueError("Archive changed; reusable slots remain blocked")
+      record["state"] = {"archive": "archived", "release": "released", "reconcile": "reconciled"}.get(action, action)
+    record[action + "_evidence_sha256"] = evidence_sha256
+    self._write(name, record)
+    return record

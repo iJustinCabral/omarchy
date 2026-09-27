@@ -152,7 +152,9 @@ class Collector:
     self._used = False
     self._returned = False
     self._capture = None
+    self._capture_valid = False
     self._finished = False
+    self._workflow_started = False
 
   def __reduce__(self):
     raise TypeError("Original-process context cannot be serialized")
@@ -174,8 +176,27 @@ class Collector:
     power_write("/sys/power/state", "disk")
     self._returned = True
     observed = copy.deepcopy(capture(self.binding))
-    self._validate_capture(observed)
     self._capture = observed
+    self._validate_capture(observed)
+    self._capture_valid = True
+
+  def prepared_cycle(self):
+    self._original_process()
+    return copy.deepcopy(self._cycle)
+
+  def claim_workflow(self):
+    """Consume the adapter entry even if persistence fails before the write."""
+    self._original_process()
+    if self._workflow_started or self._used or self._finished:
+      raise ValueError("Collector workflow is already consumed")
+    self._workflow_started = True
+
+  def retained_evidence(self):
+    """Preserve raw inputs even after rejected capture; never a success receipt."""
+    self._original_process()
+    return {"binding": self.binding, "consumed_guard": self._guard, "consumed_attempt": self._attempt,
+            "capture": copy.deepcopy(self._capture), "capture_valid": self._capture_valid,
+            "write_used": self._used, "write_returned": self._returned}
 
   def _validate_capture(self, observed):
     fields(observed, ("schema", "binding", "boot_id", "manifest", "runtime_stack_sha256", "source_runtime",
@@ -204,7 +225,7 @@ class Collector:
 
   def finish(self, health, cleanup_errors):
     self._original_process()
-    if not self._returned or self._capture is None or self._finished:
+    if not self._returned or not self._capture_valid or self._finished:
       raise ValueError("Missing original return or already finished")
     self._finished = True
     exact(cleanup_errors, [], "Cleanup errors")
