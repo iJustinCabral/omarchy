@@ -66,6 +66,16 @@ Acceptance requires meaningful fixtures for unknown/low reserve, disappearing su
 
 ## Normal updates: proposed generation transaction
 
+### Runtime-only upgrade groundwork
+
+The source `runtime_deployment.py` now contains a bounded runtime/configuration upgrade core, with a fixture-only public entry until a separately reviewed native adapter supplies real sleep/shutdown inhibition, package and physical locks, and current-boot checks. This is preparation for deploying the battery policy, **not implementation of ordinary package-update compatibility**. It must preserve the existing image pair, boot policy, opt-in, package hook, qualification and consumed-cycle evidence. The configuration change is restricted to v1 → v2 plus the explicit battery policy; all artifact fields stay identical.
+
+The installed old runtime does not recognize a new upgrade-specific pending filename. For this migration, an exclusively created `source-default-activation.pending` file therefore serves as a backwards-compatible admission veto. Its payload explicitly identifies a runtime upgrade, not a boot-policy activation; never feed it to the boot-policy transition engine or interpret it as a completed boot transition. A separate upgrade intent tracks the operation. Keep the opt-in present: removing it could select stock hibernation instead of refusing the incomplete upgrade. Retain old runtime, review, bootstrap and configuration bytes; validate the complete replacement under the still-present barrier; only a completed, verified transaction may remove its own barriers. An interrupted upgrade needs evidence-led reconciliation, not an automatic retry or deletion of pending files.
+
+The existing qualification receipt remains historical authority for the exact image pair and its attended AC evidence. Neither a runtime upgrade nor a v2 configuration turns it into battery validation. Record approval and the result of a distinct battery test separately, without rewriting previous qualification or consumed guards.
+
+### Package and artifact generations
+
 [The current DKMS installer](INSTALLATION.md) builds against matching headers, verifies selected replacement modules and initrd provenance, preserves rollback receipts and avoids live module loading. Its post-transaction hooks cannot roll back an entire package transaction. [Package source policy](../../packages/t2-suspend/README.md) and [source-default policy](../../packages/t2-suspend/hibernate/boot_policy.py) must therefore be integrated with a new update coordinator rather than assumed to provide image compatibility already.
 
 Define a generation containing production/source/restore UKIs, exact kernel and command-line sections, kernel release, selected root and initrd module identities, firmware, restore hooks, reviewed runtime, root-unlock method, resume device and physical offset, and qualification evidence. Include dependency and filesystem state needed to restore an old memory image safely. Kernel ABI equality alone is insufficient; an old restored userspace must not run against silently changed root files or modules.
