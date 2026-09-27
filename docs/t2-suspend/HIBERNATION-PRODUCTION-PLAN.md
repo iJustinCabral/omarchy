@@ -1,6 +1,6 @@
 # T2 hibernation production plan
 
-Status: **GOAL NOT DONE**. The goal is permanent hibernation on battery, ordinary safe updates, and a maintainable route to other T2 models. This document is a proposed implementation and evidence plan, not deployed functionality or permission for a hardware transition.
+Status: **GOAL NOT DONE**. The goal is permanent hibernation on battery, ordinary safe updates, and a maintainable route to other T2 models. This document distinguishes deployed prototype components from proposed production work; it is not permission for a hardware transition.
 
 ## What the prototype proves
 
@@ -12,8 +12,8 @@ This establishes an attended, AC-powered prototype on the exact source/v16 resto
 
 | Current condition | Meaning | Required production work |
 | --- | --- | --- |
-| Product and trial require live mains | Conservative admission policy; the AC-only evidence does not prove battery operation impossible | Implement a measured battery policy and validate battery S4 |
-| Return and retirement require `ac_online=true` | Unplugging can prevent reconciliation even after successful restoration | Make power observations truthful without treating a healthy battery return as failure |
+| V2 product has provisional battery admission; historical trial remains AC-only | Battery-aware runtime is deployed, but successful S4 evidence is still AC-only | Validate battery S4 and refine reserve policy from measurements |
+| Return and retirement accept truthful AC or battery observations | Deployed software no longer treats unplugging alone as unhealthy | Verify actual battery return and reconciliation on hardware |
 | Every package transaction is blocked while enabled | Temporary protection against an obsolete source default or changed runtime dependencies | Replace with a reviewed update lifecycle, not deletion or bypass of the guard |
 | Exact pair, modules, initrd and resume identities are pinned | Compatibility boundary for a saved memory image and cold restore | Generate, publish and qualify coherent generations after relevant updates |
 | Production `.linux` and `.cmdline` must match private images byte-for-byte | Current hardware safety requirement; replacement-kernel images repeatedly failed to mount physical root | Preserve this rule; do not retry rejected replacement images |
@@ -23,7 +23,7 @@ The all-package guard is [the `PreTransaction`/`AbortOnFail` hook](../../package
 
 ## Battery admission: all current gates
 
-The following inventory describes the installed `608464dd` runtime. Subsequent source work now separates post-return device health from the observed AC state: continuity, slot retirement and the archived-retirement adapter accept either strict boolean value for `ac_online`, retain that actual value in evidence, and continue to require every other healthy-device predicate. Fixture tests cover battery returns and power changes between cleanup samples. This source change is not deployed, does not remove initial AC admission, and is not battery hardware qualification.
+The following inventory describes the previous `608464dd` runtime and explains why deleting one mains check was insufficient. Runtime `e489bab7` is now deployed with v2 battery admission and truthful post-return AC observations: continuity, slot retirement and the archived-retirement adapter accept either strict boolean value for `ac_online` while retaining every other healthy-device predicate. Fixture tests cover battery returns and power changes between cleanup samples. Deployment passed ordinary admission on AC; it is not battery hardware qualification.
 
 - [Product `_admission_state`](../../packages/t2-suspend/hibernate/product.py) requires a `Mains` supply with `online=1`. Native activation and deactivation reuse product admission, so their current pre/post checks inherit the requirement.
 - [Trial `_ready`](../../packages/t2-suspend/hibernate/trial.py) independently requires live mains for the historical attended trial path.
@@ -42,7 +42,7 @@ The production battery policy must record mains, battery presence, measurement v
 
 Off mains, the policy requires exactly one present battery with a known noncharging status and sufficient native `charge_now/charge_full` reserve, or `energy_now/energy_full` only when charge readings are absent. It never substitutes firmware `capacity`, mixes charge and energy units, or accepts an incomplete charge pair by falling back to energy. Valid mains permits missing battery reserve; malformed present telemetry remains a refusal even on mains. Initial admission precedes cycle allocation; the backend rechecks after synchronization and immediately before writing `disk`. A late refusal uses existing cleanup and failure evidence and does not reset or replay the consumed vector.
 
-This source implementation is not installed battery support. Deployment, an explicitly approved battery-to-battery S4 test, boundary tests and measured refinement remain necessary. Low reserve can also refuse native activation/deactivation because those operations reuse admission; separating maintenance power requirements remains production work.
+This implementation is now installed as runtime `e489bab7` with a 30% threshold. An explicitly approved battery-to-battery S4 test, boundary tests and measured refinement remain necessary before claiming working battery hibernation. Low reserve can also refuse native activation/deactivation because those operations reuse admission; separating maintenance power requirements remains production work.
 
 A read-only snapshot on the current MBA found charge/current/voltage fields, but no energy/power or capacity-level fields. While `status=Full` and mains was online, `charge_now=3440000`, `charge_full=3518000`, `charge_full_design=4381000`, `current_now=0`, `voltage_now=12507000`, and `capacity=79`. Charge/full is approximately 97.8%, whereas charge/design is approximately 78.5%; this snapshot does not establish how firmware computed `capacity`, a discharge budget or a safe reserve threshold. [Linux power-supply documentation](https://docs.kernel.org/power/power_supply_class.html) defines charge in microamp-hours, energy in microwatt-hours and voltage in microvolts; do not interchange them or invent an energy measurement from a percentage. Initial policy belongs before cycle allocation; a fresh check also belongs at the final writer after preparation/hooks and other slow work.
 

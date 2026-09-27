@@ -2,7 +2,7 @@
 
 Status as of 2026-09-27: **working MacBookAir9,1 prototype; permanent fix unfinished**.
 
-We have demonstrated real S4 power-off and restoration of the original Linux session, twice through the normal desktop/logind route, with an ordinary boot into the working source image between those cycles. That is meaningful hardware evidence. It is not a finished product: the current implementation requires AC power, blocks package transactions, uses a machine-specific reviewed image pair, and has not qualified other T2 models. The earlier declaration that the goal was complete was incorrect.
+We have demonstrated real S4 power-off and restoration of the original Linux session, twice through the normal desktop/logind route, with an ordinary boot into the working source image between those cycles. That is meaningful hardware evidence. Battery-aware runtime `e489bab7` is now deployed, but a real battery S4 test is still pending. The prototype still blocks package transactions, uses a machine-specific reviewed image pair, and has not qualified other T2 models. The earlier declaration that the goal was complete was incorrect.
 
 The target is normal, persistent hibernation on battery as well as AC, maintained safely through ordinary updates, with an explicit path to support other T2 Macs. Do not redefine that target around the prototype's restrictions.
 
@@ -50,7 +50,7 @@ Both private images retain the production Linux kernel and command line byte-for
 
 ### AC-only is a software admission rule, not a proved T2 hardware requirement
 
-The installed routine path and legacy v1 configuration reject a machine without an online mains supply in [`product.py`, `_admission_state`](../../packages/t2-suspend/hibernate/product.py). Source now has an explicit v2 battery policy with native reserve checks before allocation and again immediately before writing the image; it has not been deployed or hardware-qualified. See the [source implementation and provisional limits](HIBERNATION-PRODUCTION-PLAN.md#source-implementation-for-attended-battery-qualification). The historical trial retains its own AC rule in [`trial.py`](../../packages/t2-suspend/hibernate/trial.py).
+The previous installed routine path and legacy v1 configuration rejected a machine without an online mains supply in [`product.py`, `_admission_state`](../../packages/t2-suspend/hibernate/product.py). Runtime `e489bab7` and explicit v2 battery policy are now installed, with native reserve checks before allocation and again immediately before writing the image; battery hardware qualification remains pending. The current threshold is 30% of measured charge/full reserve, an explicitly provisional engineering policy, not the firmware's displayed percentage or measured endurance assurance. See the [implementation and provisional limits](HIBERNATION-PRODUCTION-PLAN.md#source-implementation-for-attended-battery-qualification). The historical trial retains its own AC rule in [`trial.py`](../../packages/t2-suspend/hibernate/trial.py).
 
 The successful tests were run with AC connected. They do not demonstrate that hibernation needs AC; they also do not validate battery operation. The permanent fix must replace experimental AC-only admission with an appropriate battery-aware policy and verify actual battery write, power-off, wake, restore and recovery. Deleting one check without doing that work would only hide the limitation.
 
