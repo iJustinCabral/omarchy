@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 """Pinned historical-success cleanup fixtures; no real EFI or command calls."""
 import hashlib
+import errno
 import importlib.util
 import json
 from pathlib import Path
@@ -158,6 +159,103 @@ class Cleanup(unittest.TestCase):
       with self.assertRaises(OSError): self.execute()
     for name in (cleanup.SOURCE, cleanup.RESTORE): self.assertEqual((self.root / cleanup.EFI / name).read_bytes(), self.stages[name])
     with self.assertRaises(ValueError): self.execute()
+
+  def test_nonseekable_efi_descriptors_complete_without_seek(self):
+    with patch.object(cleanup.os, "lseek", side_effect=OSError(errno.ESPIPE, "synthetic efivarfs cannot seek")) as seek:
+      result = self.execute()
+      self.assertTrue(result["slots_cleared"])
+      seek.assert_not_called()
+
+  def test_changed_inode_on_reopen_is_preserved_not_deleted(self):
+    target = self.root / cleanup.EFI / cleanup.SOURCE
+    original_inode = target.stat().st_ino
+    original_open = cleanup.os.open
+    opens = []
+    def replace_on_reopen(name, flags, *args, **kwargs):
+      if Path(name) == target:
+        opens.append(name)
+        if len(opens) == 2:
+          target.unlink()
+          target.write_bytes(self.stages[cleanup.SOURCE])
+      return original_open(name, flags, *args, **kwargs)
+    restored = []
+    def restore_flags(fd, operation, flags, mutate):
+      self.assertEqual(operation, cleanup.HOST.FS_IOC_SETFLAGS)
+      restored.append((cleanup.os.fstat(fd).st_ino, flags[0]))
+    # Exercise the native branch only against redirected fixture files and
+    # mocked ioctl/sync; not a single live filesystem operation is possible.
+    with patch.object(cleanup.os, "open", side_effect=replace_on_reopen), patch.object(cleanup, "path", return_value=target), \
+         patch.object(cleanup.HOST, "_clear_immutable", return_value=cleanup.HOST.FS_IMMUTABLE_FL), \
+         patch.object(cleanup.fcntl, "ioctl", side_effect=restore_flags), patch.object(cleanup.os, "sync", side_effect=AssertionError("No live sync")):
+      with self.assertRaises(ValueError): cleanup.owned_delete(Path("/"), cleanup.SOURCE, self.stages[cleanup.SOURCE])
+    self.assertEqual(target.read_bytes(), self.stages[cleanup.SOURCE])
+    self.assertEqual(restored, [(original_inode, cleanup.HOST.FS_IMMUTABLE_FL)])
+
+  def pending_preunlink(self):
+    def fail_before_unlink(target, raw):
+      raise OSError(errno.ESPIPE, "known synthetic pre-unlink failure")
+    with self.assertRaises(OSError): self.execute(remover=fail_before_unlink)
+    directory = self.root / cleanup.CLEANUP
+    patch.object(cleanup, "PREUNLINK_INTENT_SHA", hashlib.sha256((directory / "intent.json").read_bytes()).hexdigest()).start()
+    patch.object(cleanup, "PREUNLINK_SOURCE_INTENT_SHA", hashlib.sha256((directory / (cleanup.SOURCE + ".delete-intent.json")).read_bytes()).hexdigest()).start()
+    patch.object(cleanup, "owned_flags", return_value=cleanup.HOST.FS_IMMUTABLE_FL).start()
+    return directory
+
+  def recover(self, **changes):
+    return cleanup.complete_preunlink_espipe(self.root, query=self.query, **changes)
+
+  def test_exact_preunlink_recovery_preserves_intents_and_is_exclusive(self):
+    directory = self.pending_preunlink()
+    original = {name: (directory / name).read_bytes() for name in ("intent.json", cleanup.SOURCE + ".delete-intent.json")}
+    with self.assertRaises(ValueError): self.execute()
+    result = self.recover()
+    self.assertTrue(result["slots_cleared"])
+    for name, raw in original.items(): self.assertEqual((directory / name).read_bytes(), raw)
+    self.assertTrue((directory / "preunlink-espipe-recovery-intent.json").is_file())
+    self.validate()
+    with self.assertRaises(ValueError): self.recover()
+
+  def test_recovery_refuses_any_extra_or_missing_journal_and_changed_intent(self):
+    directory = self.pending_preunlink()
+    deletions = []
+    for extra in (cleanup.RESTORE + ".delete-intent.json", cleanup.SOURCE + ".absent.json", "complete.json", "preunlink-espipe-recovery-intent.json", "unknown"):
+      target = directory / extra
+      target.write_bytes(b"{}")
+      with self.assertRaises(ValueError): self.recover(remover=lambda *args: deletions.append(args))
+      target.unlink()
+    target = directory / (cleanup.SOURCE + ".delete-intent.json")
+    original = target.read_bytes()
+    target.unlink()
+    with self.assertRaises(ValueError): self.recover(remover=lambda *args: deletions.append(args))
+    target.write_bytes(original + b" ")
+    target.chmod(0o600)
+    with self.assertRaises(ValueError): self.recover(remover=lambda *args: deletions.append(args))
+    self.assertEqual(deletions, [])
+
+  def test_recovery_refuses_missing_changed_slots_or_missing_immutable(self):
+    directory = self.pending_preunlink()
+    deletions = []
+    for name in (cleanup.SOURCE, cleanup.RESTORE):
+      target = self.root / cleanup.EFI / name
+      raw = target.read_bytes()
+      target.unlink()
+      with self.assertRaises(ValueError): self.recover(remover=lambda *args: deletions.append(args))
+      target.write_bytes(b"foreign")
+      with self.assertRaises(ValueError): self.recover(remover=lambda *args: deletions.append(args))
+      target.write_bytes(raw)
+    with patch.object(cleanup, "owned_flags", return_value=0):
+      with self.assertRaises(ValueError): self.recover(remover=lambda *args: deletions.append(args))
+    self.assertEqual(deletions, [])
+    self.assertFalse((directory / "preunlink-espipe-recovery-intent.json").exists())
+
+  def test_recovery_interrupted_after_first_delete_cannot_retry(self):
+    directory = self.pending_preunlink()
+    def fail_after_unlink(target, raw):
+      target.unlink()
+      raise OSError("synthetic interrupted recovery")
+    with self.assertRaises(OSError): self.recover(remover=fail_after_unlink)
+    with self.assertRaises(ValueError): self.recover()
+    self.assertTrue((self.root / cleanup.EFI / cleanup.RESTORE).is_file())
 
   def test_archive_tamper_during_first_delete_blocks_second(self):
     def tamper(target, raw):

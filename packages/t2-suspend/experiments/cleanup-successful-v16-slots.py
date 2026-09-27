@@ -46,6 +46,8 @@ RUNTIME = "bd51428b459e25d429507261c52bb52e717ed9c93416f19e65a0e8675e7191db"
 # Raw /proc/cmdline framing, pinned by the original-process witness; this is
 # neither the stripped preflight hash nor the UKI .cmdline section hash.
 CMDLINE = "6e3547f99532e335104dea2d5fc148a6ee61e43ebffa77fdeeac3e8e6a7b0b75"
+PREUNLINK_INTENT_SHA = "2ba611bb511ea76886e30449e6b8d00e6a2b59e4283f35be5c794e9cd1b3f184"
+PREUNLINK_SOURCE_INTENT_SHA = "75daf32f22af7ad6dc7310ebb8269db5b480e040b68bd6f4239d2ddf501cfe5f"
 PINS = {"receipt.json": "a67740d063f88d68c8aa519ffb93e1f20fd59d7faf670f27980bb0ece2ef8973",
         "recovery-acceptance-v3.json": "04b0934b85d733b9ef101b93f03e3440038b55d7f0cb16f6f341fa99f3006911",
         "vector/s4-attempted": "7b94fff80d66ad2ce25753dc0cb832e5d5b8ef1475e22c0b54d94477dad6c41f"}
@@ -239,11 +241,19 @@ def owned_delete(root, name, expected):
   deleted = False
   try:
     info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode): raise ValueError("Owned EFI slot is not regular")
     exact(os.read(fd, 1024), expected)
     if (target.stat().st_dev, target.stat().st_ino) != (info.st_dev, info.st_ino): raise ValueError("Slot inode changed")
     if root == Path("/"): original_flags = HOST._clear_immutable(fd)
-    os.lseek(fd, 0, os.SEEK_SET)
-    exact(os.read(fd, 1024), expected)
+    # efivarfs is non-seekable. Keep the original descriptor for ownership and
+    # immutable rollback, and independently reopen the same pinned inode.
+    reread = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+      reopened = os.fstat(reread)
+      if not stat.S_ISREG(reopened.st_mode): raise ValueError("Reopened EFI slot is not regular")
+      if (reopened.st_dev, reopened.st_ino) != (info.st_dev, info.st_ino): raise ValueError("Slot inode changed on reopen")
+      exact(os.read(reread, 1024), expected)
+    finally: os.close(reread)
     if (target.stat().st_dev, target.stat().st_ino) != (info.st_dev, info.st_ino): raise ValueError("Slot path changed before removal")
     target.unlink()
     deleted = True
@@ -283,12 +293,66 @@ def execute(root=Path("/"), *, query=None, remover=None):
   finally: os.close(fd)
 
 
+def owned_flags(root, name):
+  fd = os.open(path(root, EFI / name), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+  try:
+    flags = array.array("L", [0])
+    fcntl.ioctl(fd, HOST.FS_IOC_GETFLAGS, flags, True)
+    return flags[0]
+  finally: os.close(fd)
+
+
+def complete_preunlink_espipe(root=Path("/"), *, query=None, remover=None):
+  """One reviewed recovery of the exact 99555104 pre-unlink ESPIPE journal.
+
+  This neither resets the original execution nor resumes arbitrary partial
+  cleanup. Any changed/missing slot or any started recovery refuses execution.
+  """
+  root = Path(root)
+  if root == Path("/") and remover is not None: raise ValueError("No injected live deletion backend")
+  fd = os.open(path(root, ARCHIVE), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+  try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    result, stages = validate(root, query=query)
+    directory = path(root, CLEANUP)
+    exact({item.name for item in directory.iterdir()}, {*stages, "intent.json", SOURCE + ".delete-intent.json"})
+    exact(hashlib.sha256(read(root, CLEANUP / "intent.json", True)).hexdigest(), PREUNLINK_INTENT_SHA)
+    exact(hashlib.sha256(read(root, CLEANUP / (SOURCE + ".delete-intent.json"), True)).hexdigest(), PREUNLINK_SOURCE_INTENT_SHA)
+    flags = {}
+    for name, expected in stages.items():
+      exact(read(root, EFI / name), expected)
+      flags[name] = owned_flags(root, name)
+      exact(flags[name], HOST.FS_IMMUTABLE_FL)
+    recovery = {"schema": "successful-v16-preunlink-espipe-recovery-v1", "boot_id": BOOT, "vector": VECTOR,
+                "original_intent_sha256": PREUNLINK_INTENT_SHA, "original_source_delete_intent_sha256": PREUNLINK_SOURCE_INTENT_SHA,
+                "observed_immutable_flags": flags, "raw_markers_sha256": {name: hashlib.sha256(raw).hexdigest() for name, raw in stages.items()},
+                "reviewed_failure": "ESPIPE-before-unlink", "product_qualified": False}
+    new_json(directory / "preunlink-espipe-recovery-intent.json", recovery)
+    for name in (SOURCE, RESTORE):
+      validate(root, query=query)
+      if name == RESTORE:
+        new_json(directory / (name + ".delete-intent.json"), {"slot": name, "sha256": hashlib.sha256(stages[name]).hexdigest()})
+      if remover is None: owned_delete(root, name, stages[name])
+      else: remover(path(root, EFI / name), stages[name])
+      if path(root, EFI / name).exists(): raise ValueError("Slot remains after reviewed deletion")
+      new_json(directory / (name + ".absent.json"), {"slot": name, "sha256": hashlib.sha256(stages[name]).hexdigest(), "absent": True})
+    validate(root, query=query)
+    completion = {**result, "slots_cleared": True, "guards_and_witnesses_preserved": True}
+    new_json(directory / "complete.json", completion)
+    return completion
+  finally: os.close(fd)
+
+
 def main():
   parser = argparse.ArgumentParser(description=__doc__)
-  parser.add_argument("--execute", action="store_true")
+  modes = parser.add_mutually_exclusive_group()
+  modes.add_argument("--execute", action="store_true")
+  modes.add_argument("--complete-preunlink-espipe", action="store_true", help="Complete only the pinned, reviewed pre-unlink failure; never retry partial cleanup")
   args = parser.parse_args()
   if os.geteuid() != 0: raise SystemExit("Root required for historical private evidence")
-  try: result = execute() if args.execute else validate()[0]
+  try:
+    if args.complete_preunlink_espipe: result = complete_preunlink_espipe()
+    else: result = execute() if args.execute else validate()[0]
   except (OSError, ValueError, KeyError) as error: raise SystemExit("Successful-v16 cleanup refused: " + str(error)) from error
   print(json.dumps(result, sort_keys=True, indent=2))
 
