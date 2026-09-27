@@ -63,6 +63,18 @@ class Native(unittest.TestCase):
         self.responses["ScheduledShutdown"] = invalid
         with self.assertRaises(ValueError): N._power_idle(321)
 
+  def test_fresh_empty_action_infinity_is_no_schedule_exactly(self):
+    with patch.object(N, "_command", side_effect=self.query):
+      self.responses["ScheduledShutdown"] = '(st) "" 18446744073709551615'
+      N._power_idle(321)
+      for invalid in ('(st) "hibernate" 18446744073709551615', '(st) "reboot" 18446744073709551615',
+                      '(st) "" 18446744073709551614', '(st) "" 18446744073709551616',
+                      '(st) "" 018446744073709551615', '(st) "" -1', '(st) "" 100',
+                      '(st) ""', '(st) "" 18446744073709551615 extra'):
+        with self.subTest(invalid=invalid):
+          self.responses["ScheduledShutdown"] = invalid
+          with self.assertRaises(ValueError): N._power_idle(321)
+
   def test_wrong_pid_uid_mask_and_mode_refuse(self):
     original = self.responses["ListInhibitors"]
     for invalid in (original.replace(" 321", " 322"), original.replace(" 0 321", " 1000 321"),

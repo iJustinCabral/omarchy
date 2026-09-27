@@ -148,9 +148,14 @@ def _power_idle(pid):
   scheduled = _bus("get-property", LOGIN, "ScheduledShutdown")
   # v261 logind retains the immediate operation's action with timeout zero
   # after return (logind-dbus.c property_get_scheduled_shutdown). A real
-  # scheduled operation has a nonzero time; preparing/units/jobs are separate.
+  # scheduled operation has a finite nonzero time. Reset/initial no-schedule
+  # state is the exact empty-action USEC_INFINITY tuple (v261
+  # logind-shutdown.c manager_reset_scheduled_shutdown); other combinations
+  # remain rejected. Preparing/units/jobs are checked independently.
   retained_actions = ("", "poweroff", "reboot", "halt", "kexec", "soft-reboot", "suspend", "hibernate", "hybrid-sleep", "suspend-then-hibernate")
-  if len(scheduled) != 3 or scheduled[0] != "(st)" or scheduled[1] not in retained_actions or scheduled[2] != "0":
+  no_schedule = scheduled == ["(st)", "", "18446744073709551615"]
+  retained_idle = len(scheduled) == 3 and scheduled[0] == "(st)" and scheduled[1] in retained_actions and scheduled[2] == "0"
+  if not (no_schedule or retained_idle):
     raise ValueError("Scheduled shutdown prevents policy transition")
   if _bus("call", MANAGER, "ListJobs") != ["a(usssoo)", "0"]:
     raise ValueError("Queued system jobs prevent policy transition")
