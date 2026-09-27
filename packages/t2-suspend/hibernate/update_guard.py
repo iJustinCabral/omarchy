@@ -1,9 +1,9 @@
 """Read-only ALPM admission while the qualified source boot policy is inactive.
 
-Presence of boot-policy.json, source-default-activation.pending or
-source-default-deactivation.pending in the fixed product state blocks updates,
-regardless of contents. Routine opt-in and EFI loader overrides must also be
-absent, with efivarfs visible. Future
+Presence of boot-policy.json, source-default-activation.pending,
+source-default-deactivation.pending or package-maintenance.pending in the fixed
+product state blocks updates, regardless of contents. Routine opt-in and EFI
+loader overrides must also be absent, with efivarfs visible. Future
 activation/deactivation must retain evidence elsewhere and exclusively own both
 pacman's actual db.lck and the shared physical lock throughout their transition;
 this one-shot guard cannot close an independently privileged activation race.
@@ -23,7 +23,8 @@ STATE = Path("var/lib/omarchy/t2-hibernate-product")
 EFI = Path("sys/firmware/efi/efivars")
 LOADER_GUID = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
 ACTIVE = (STATE / "boot-policy.json", STATE / "source-default-activation.pending",
-          STATE / "source-default-deactivation.pending", Path("etc/omarchy/t2-hibernate-product.enabled"),
+          STATE / "source-default-deactivation.pending", STATE / "package-maintenance.pending",
+          Path("etc/omarchy/t2-hibernate-product.enabled"),
           EFI / ("LoaderEntryOneShot-" + LOADER_GUID), EFI / ("LoaderEntryDefault-" + LOADER_GUID))
 LIMINE = Path("boot/limine.conf")
 PRODUCTION = "boot():/EFI/Linux/omarchy_linux-t2.efi"

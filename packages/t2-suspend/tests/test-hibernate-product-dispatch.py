@@ -321,12 +321,12 @@ class Dispatch(unittest.TestCase):
   def test_pending_boot_policy_transitions_veto_before_deployment_and_power(self):
     directory = self.root / product.BOOT_POLICY.STATE
     directory.mkdir(parents=True, mode=0o700)
-    for name in ("source-default-activation.pending", "source-default-deactivation.pending"):
+    for name in ("source-default-activation.pending", "source-default-deactivation.pending", "package-maintenance.pending"):
       pending = directory / name
-      for symlink in (False, True):
-        if symlink: pending.symlink_to("missing-transition")
-        else: pending.write_bytes(b"interrupted or malformed")
-        with self.assertRaisesRegex(ValueError, "Incomplete source-default"):
+      for variant in ("empty", "malformed", "dangling"):
+        if variant == "dangling": pending.symlink_to("missing-transition")
+        else: pending.write_bytes(b"" if variant == "empty" else b"interrupted or malformed")
+        with self.subTest(name=name, variant=variant), self.assertRaisesRegex(ValueError, "Incomplete source-default"):
           product.verify_deployment(self.root, {}, {})
         pending.unlink()
     directory.rmdir()

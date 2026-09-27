@@ -6,6 +6,8 @@ adapter supplies fixed host verification and real logind power exclusion to the
 internal core, after reviewed snapshot verification. No kernel, EFI, modules,
 power, qualification issuance or automatic retry occurs here. Source tests and
 installation alone do not approve or execute any native policy transition.
+The explicit maintenance action is fixture-only groundwork: it leaves a durable
+sleep/update veto but grants no package admission or live maintenance route.
 """
 from contextlib import contextmanager
 import fcntl
@@ -35,6 +37,8 @@ OPT_IN = Path("etc/omarchy/t2-hibernate-product.enabled")
 HOOK = Path("etc/pacman.d/hooks/00-omarchy-t2-hibernate-guard.hook")
 HISTORY = P.STATE / "boot-policy-transitions"
 PENDINGS = {action: P.STATE / ("source-default-" + action + ".pending") for action in ("activation", "deactivation")}
+MAINTENANCE = P.STATE / "package-maintenance.pending"
+MAINTENANCE_SCHEMA = "omarchy-t2-package-maintenance-intent-v1"
 
 
 def _sync(directory):
@@ -164,26 +168,35 @@ def transition(root, action, *, precheck):
   root = Path(root)
   if not root.is_absolute() or root.resolve() != root or not root.is_dir() or root.resolve() == Path("/"):
     raise ValueError("Fixture-only transition refuses live root and aliases")
-  if action not in PENDINGS or not callable(precheck): raise ValueError("Explicit fixture action/precheck required")
+  if action not in (*PENDINGS, "maintenance") or not callable(precheck): raise ValueError("Explicit fixture action/precheck required")
   return _transition(root, action, precheck=precheck, guard=lambda: None)
 
 
 def _transition(root, action, *, precheck, guard):
-  """Internal core; only the fixed native adapter supplies live authority."""
+  """Internal core; maintenance is fixture-only groundwork, not update permission."""
+  root = Path(root)
+  if action == "maintenance" and root.resolve() == Path("/"):
+    raise ValueError("Live maintenance entry requires a separately reviewed native coordinator")
+  if action not in (*PENDINGS, "maintenance"):
+    raise ValueError("Explicit reviewed transition action required")
+  mechanics = "deactivation" if action == "maintenance" else action
   guard()
+  G._ancestors(root, root / MAINTENANCE, os.geteuid())
+  if _present(root / MAINTENANCE): raise ValueError("Existing package maintenance intent refuses new transition")
   for path in PENDINGS.values():
     G._ancestors(root, root / path, os.geteuid())
     if _present(root / path): raise ValueError("Incomplete transition preserved; no automatic retry")
   with _locks(root) as release_db:
-    if any(_present(root / path) for path in PENDINGS.values()): raise ValueError("Incomplete transition preserved")
+    if _present(root / MAINTENANCE) or any(_present(root / path) for path in PENDINGS.values()):
+      raise ValueError("Incomplete transition or maintenance intent preserved")
     runtime_review = _runtime(root)
     _idle(root)
     opt_in = _opt_in(root)
     receipt_raw = _read(root, P.RECEIPT)
-    policy_raw = _read(root, REVIEW if action == "activation" else P.POLICY)
+    policy_raw = _read(root, REVIEW if mechanics == "activation" else P.POLICY)
     policy = P._json(policy_raw)
     actual = _read(root, P.LIMINE, private=False)
-    if action == "activation":
+    if mechanics == "activation":
       if _present(root / P.POLICY): raise ValueError("Active policy cannot be overwritten")
       before = actual
       proposal = P.prepare(before, receipt_raw)
@@ -194,12 +207,12 @@ def _transition(root, action, *, precheck, guard):
       before = _read(root, P.BACKUP)
       P.validate(policy, before, actual, receipt_raw)
       after = before
-    precheck(root, action, "before")
+    precheck(root, mechanics, "before")
     guard()
     transition_id = str(uuid.uuid4())
     intent = _encoded({"protocol": "omarchy-t2-source-default-transition-v1", "transition_id": transition_id,
-      "action": action, "policy_sha256": P.digest(policy_raw), "from_sha256": P.digest(actual), "to_sha256": P.digest(after)})
-    pending = root / PENDINGS[action]
+      "action": mechanics, "policy_sha256": P.digest(policy_raw), "from_sha256": P.digest(actual), "to_sha256": P.digest(after)})
+    pending = root / PENDINGS[mechanics]
     _new(pending, intent)
     guard()
     history = root / HISTORY
@@ -219,7 +232,7 @@ def _transition(root, action, *, precheck, guard):
     guard()
     _new(archive / "intent.json", intent)
     guard()
-    if action == "activation":
+    if mechanics == "activation":
       if _present(root / P.BACKUP):
         if _read(root, P.BACKUP) != before: raise ValueError("Retained source-default backup differs")
       else:
@@ -242,11 +255,11 @@ def _transition(root, action, *, precheck, guard):
       (root / P.POLICY).unlink()
       _sync((root / P.POLICY).parent)
     _idle(root)
-    precheck(root, action, "after")
+    precheck(root, mechanics, "after")
     _idle(root)
     if _runtime(root) != runtime_review: raise ValueError("Reviewed runtime changed during transition")
     if _read(root, P.LIMINE, private=False) != after: raise ValueError("Final configuration differs from exact authorized bytes")
-    if action == "deactivation":
+    if mechanics == "deactivation":
       G._stock(after)
       if _present(root / OPT_IN) or _present(root / P.POLICY): raise ValueError("Deactivation remains active")
     else:
@@ -254,9 +267,25 @@ def _transition(root, action, *, precheck, guard):
       P.verify(root, P.digest(receipt_raw))
       if _opt_in(root) != opt_in: raise ValueError("Activation did not preserve opt-in")
     completion = {"protocol": "omarchy-t2-source-default-transition-complete-v1", "transition_id": transition_id,
-                  "action": action, "intent_sha256": P.digest(intent), "configuration_sha256": P.digest(after)}
+                  "action": mechanics, "intent_sha256": P.digest(intent), "configuration_sha256": P.digest(after)}
     guard()
     _new(archive / "completion.json", _encoded(completion))
+    maintenance_intent = None
+    if action == "maintenance":
+      if _read(root, (archive / "completion.json").relative_to(root)) != _encoded(completion):
+        raise ValueError("Deactivation completion readback differs before maintenance handoff")
+      maintenance_intent = _encoded({"protocol": MAINTENANCE_SCHEMA, "transition_id": transition_id,
+        "old_policy_sha256": P.digest(policy_raw), "runtime_review_sha256": runtime_review,
+        "staged_receipt_sha256": P.digest(receipt_raw), "fallback_limine_sha256": P.digest(after),
+        "deactivation_completion_sha256": P.digest(_encoded(completion))})
+      guard()
+      _new(archive / "maintenance-intent.json", maintenance_intent)
+      if _read(root, (archive / "maintenance-intent.json").relative_to(root)) != maintenance_intent:
+        raise ValueError("Archived maintenance intent readback differs")
+      guard()
+      _new(root / MAINTENANCE, maintenance_intent)
+      if _read(root, MAINTENANCE) != maintenance_intent:
+        raise ValueError("Package maintenance marker readback differs")
     # Both exclusions remain owned through durable pending cleanup. A failure
     # releasing our package lock reinstates pending and never deletes a foreign
     # replacement; only cooperating writers are within this lock contract.
@@ -270,4 +299,6 @@ def _transition(root, action, *, precheck, guard):
     except BaseException:
       if not _present(pending): _new(pending, intent)
       raise
-    return {**completion, "live_execution": False, "qualification_issued": False}
+    result = {**completion, "live_execution": False, "qualification_issued": False}
+    if maintenance_intent is not None: result["maintenance_intent_sha256"] = P.digest(maintenance_intent)
+    return result

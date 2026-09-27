@@ -38,7 +38,7 @@ class Native(unittest.TestCase):
 
   def test_cli_has_only_required_fixed_actions(self):
     with patch.object(N, "native") as native:
-      for args in ([], ["check"], ["activation", "--root", "/tmp"], ["deactivation", "--force"], ["activation", "--approve"]):
+      for args in ([], ["check"], ["maintenance"], ["activation", "--root", "/tmp"], ["deactivation", "--force"], ["activation", "--approve"]):
         with self.assertRaises(SystemExit): N.main(args)
       native.assert_not_called()
 

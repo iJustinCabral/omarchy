@@ -40,12 +40,12 @@ CONFIG_SCHEMA_V2 = "omarchy-t2-qualified-product-config-v2"
 def verify_deployment(root, config, report):
   """Routine-only approved default overlay; all historical checks remain."""
   root = Path(root)
-  for name in ("source-default-activation.pending", "source-default-deactivation.pending"):
+  for name in ("source-default-activation.pending", "source-default-deactivation.pending", "package-maintenance.pending"):
     path = root / BOOT_POLICY.STATE / name
     UPDATE_GUARD._ancestors(root, path, 0 if root == Path("/") else os.geteuid())
     try: path.lstat()
     except FileNotFoundError: continue
-    raise ValueError("Incomplete source-default transition blocks routine hibernation")
+    raise ValueError("Incomplete source-default transition or package maintenance blocks routine hibernation")
   source_default = BOOT_POLICY.verify(root, config["staged_receipt_sha256"])
   return TRIAL._verify_deployment(root, config, report, source_default=source_default)
 

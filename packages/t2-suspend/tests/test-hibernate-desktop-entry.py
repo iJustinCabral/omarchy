@@ -65,13 +65,14 @@ class DesktopEntry(unittest.TestCase):
       state = root / ENTRY.STATE
       state.mkdir(parents=True, mode=0o700)
       fixture_uid = os.geteuid()
+      self.assertIn("package-maintenance.pending", ENTRY.PENDING)
       for name in ENTRY.PENDING:
         path = state / name
-        for dangling in (False, True):
-          if dangling: path.symlink_to(state / "missing")
-          else: path.write_text("incomplete")
+        for variant in ("empty", "malformed", "dangling"):
+          if variant == "dangling": path.symlink_to(state / "missing")
+          else: path.write_text("" if variant == "empty" else "incomplete")
           for opted in (False, True):
-            with self.subTest(name=name, dangling=dangling, opted=opted):
+            with self.subTest(name=name, variant=variant, opted=opted):
               real_check = ENTRY.reject_pending
               def pending_check():
                 with patch.object(ENTRY.os, "geteuid", return_value=fixture_uid): real_check(root)

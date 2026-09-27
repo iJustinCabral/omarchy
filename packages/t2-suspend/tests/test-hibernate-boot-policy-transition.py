@@ -220,5 +220,123 @@ class Transitions(unittest.TestCase):
     self.assertEqual((self.root / T.DB_LOCK).read_bytes(), b"foreign transaction")
     self.assertTrue(self.pending("activation").exists())
 
+  def test_fixture_maintenance_reuses_deactivation_and_binds_retained_authority(self):
+    self.run_action()
+    policy_raw = (self.root / T.P.POLICY).read_bytes()
+    runtime_raw = (self.root / T.P.STATE / "runtime-deployment-review.json").read_bytes()
+    result = self.run_action("maintenance")
+    self.assertEqual(result["action"], "deactivation")
+    self.assertEqual(self.calls[-2:], [("deactivation", "before"), ("deactivation", "after")])
+    self.assertFalse((self.root / T.OPT_IN).exists())
+    self.assertFalse((self.root / T.P.POLICY).exists())
+    self.assertEqual((self.root / T.P.LIMINE).read_bytes(), self.f.before)
+    self.assertFalse(self.pending("deactivation").exists())
+    self.assertFalse((self.root / T.DB_LOCK).exists())
+    marker = (self.root / T.MAINTENANCE).read_bytes()
+    archive = self.root / T.HISTORY / result["transition_id"]
+    self.assertEqual((archive / "maintenance-intent.json").read_bytes(), marker)
+    self.assertEqual(T.P.digest(marker), result["maintenance_intent_sha256"])
+    self.assertEqual(json.loads((archive / "intent.json").read_bytes())["action"], "deactivation")
+    self.assertEqual(json.loads((archive / "completion.json").read_bytes())["action"], "deactivation")
+    intent = json.loads(marker)
+    self.assertEqual(intent, {"protocol": T.MAINTENANCE_SCHEMA, "transition_id": result["transition_id"],
+      "old_policy_sha256": T.P.digest(policy_raw), "runtime_review_sha256": T.P.digest(runtime_raw),
+      "staged_receipt_sha256": T.P.digest(self.f.raw), "fallback_limine_sha256": T.P.digest(self.f.before),
+      "deactivation_completion_sha256": T.P.digest((archive / "completion.json").read_bytes())})
+    self.assertEqual(marker, T._encoded(intent))
+    self.assertEqual(self.guards.read_bytes(), b"immutable guard")
+
+  def test_maintenance_marker_is_refused_by_every_new_transition(self):
+    marker = self.f.write(T.MAINTENANCE, b"foreign or interrupted")
+    for action in ("activation", "deactivation", "maintenance"):
+      with self.subTest(action=action), self.assertRaisesRegex(ValueError, "maintenance intent"):
+        self.run_action(action)
+      self.assertEqual(marker.read_bytes(), b"foreign or interrupted")
+      self.assertFalse((self.root / T.DB_LOCK).exists())
+      self.assertFalse(self.pending("activation").exists())
+
+  def test_private_live_maintenance_refuses_before_any_host_open(self):
+    with patch.object(T.os, "open", side_effect=AssertionError("no live open")):
+      with self.assertRaisesRegex(ValueError, "Live maintenance entry"):
+        T._transition(Path("/"), "maintenance", precheck=lambda *args: None, guard=lambda: None)
+
+  def test_maintenance_marker_is_durable_before_deactivation_pending_retirement(self):
+    self.run_action()
+    events = []
+    original_new, original_sync = T._new, T._sync
+    def publish(path, raw, mode=0o600):
+      if path.name == "maintenance-intent.json": events.append("archived")
+      if path == self.root / T.MAINTENANCE:
+        self.assertEqual(events, ["archived"])
+        self.assertTrue(self.pending("deactivation").exists())
+        self.assertTrue((self.root / T.DB_LOCK).exists())
+        events.append("marker")
+      return original_new(path, raw, mode)
+    def sync(directory):
+      if directory == self.root / T.P.STATE and not self.pending("deactivation").exists():
+        self.assertEqual(events, ["archived", "marker"])
+        self.assertEqual((self.root / T.MAINTENANCE).read_bytes(), next((self.root / T.HISTORY).glob("*/maintenance-intent.json")).read_bytes())
+        self.assertTrue((self.root / T.DB_LOCK).exists())
+        events.append("retired")
+      return original_sync(directory)
+    with patch.object(T, "_new", side_effect=publish), patch.object(T, "_sync", side_effect=sync):
+      self.run_action("maintenance")
+    self.assertEqual(events, ["archived", "marker", "retired"])
+
+  def test_maintenance_publication_faults_keep_old_pending_veto(self):
+    for failed_name in ("maintenance-intent.json", "package-maintenance.pending"):
+      with self.subTest(failed_name=failed_name):
+        fixture = Transitions("test_activation_then_exact_fallback_preserves_all_authority_and_evidence")
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        fixture.run_action()
+        original = T._new
+        def fail(path, raw, mode=0o600):
+          if path.name == failed_name: raise OSError("maintenance publication fault")
+          return original(path, raw, mode)
+        with patch.object(T, "_new", side_effect=fail), self.assertRaisesRegex(OSError, "maintenance publication fault"):
+          fixture.run_action("maintenance")
+        self.assertTrue(fixture.pending("deactivation").exists())
+        self.assertFalse((fixture.root / T.DB_LOCK).exists())
+        self.assertFalse((fixture.root / T.MAINTENANCE).exists())
+
+  def test_maintenance_completion_readback_fault_keeps_old_pending(self):
+    self.run_action()
+    original = T._read
+    def mismatch(root, relative, **kwargs):
+      if Path(relative).name == "completion.json": return b"foreign completion"
+      return original(root, relative, **kwargs)
+    with patch.object(T, "_read", side_effect=mismatch), self.assertRaisesRegex(ValueError, "completion readback"):
+      self.run_action("maintenance")
+    self.assertTrue(self.pending("deactivation").exists())
+    self.assertFalse((self.root / T.MAINTENANCE).exists())
+
+  def test_maintenance_marker_retirement_and_db_release_faults_fail_closed(self):
+    for boundary in ("marker_fsync", "pending_retirement", "db_release"):
+      with self.subTest(boundary=boundary):
+        fixture = Transitions("test_activation_then_exact_fallback_preserves_all_authority_and_evidence")
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        fixture.run_action()
+        original = T._sync
+        failed = []
+        def fail(directory):
+          marker = (fixture.root / T.MAINTENANCE).exists()
+          pending = fixture.pending("deactivation").exists()
+          db = (fixture.root / T.DB_LOCK).exists()
+          at_marker = boundary == "marker_fsync" and directory == fixture.root / T.P.STATE and marker and pending
+          at_retirement = boundary == "pending_retirement" and directory == fixture.root / T.P.STATE and marker and not pending
+          at_db_release = boundary == "db_release" and directory == (fixture.root / T.DB_LOCK).parent and marker and not pending and not db
+          if not failed and (at_marker or at_retirement or at_db_release):
+            failed.append(True)
+            raise OSError("maintenance " + boundary)
+          return original(directory)
+        with patch.object(T, "_sync", side_effect=fail), self.assertRaisesRegex(OSError, boundary):
+          fixture.run_action("maintenance")
+        self.assertTrue(failed)
+        self.assertTrue(fixture.pending("deactivation").exists())
+        self.assertTrue((fixture.root / T.MAINTENANCE).exists())
+        self.assertFalse((fixture.root / T.DB_LOCK).exists())
+
 
 if __name__ == "__main__": unittest.main()

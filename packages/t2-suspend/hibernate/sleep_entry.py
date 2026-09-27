@@ -11,11 +11,11 @@ STOCK = "/usr/lib/systemd/systemd-sleep"
 PRODUCT = Path("/var/lib/omarchy/t2-hibernate-product/runtime/packages/t2-suspend/hibernate/product.py")
 ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"}
 STATE = Path("var/lib/omarchy/t2-hibernate-product")
-PENDING = ("source-default-activation.pending", "source-default-deactivation.pending")
+PENDING = ("source-default-activation.pending", "source-default-deactivation.pending", "package-maintenance.pending")
 
 
 def reject_pending(root=Path("/")):
-  """Veto both routes while a cooperating boot-policy transition is incomplete.
+  """Veto both routes during a transition or unresolved package maintenance.
 
   This is admission only, not serialization with an already running writer.
   A future live transition must separately own a real block inhibitor and
@@ -36,7 +36,7 @@ def reject_pending(root=Path("/")):
       if parent == root: break
     try: path.lstat()
     except FileNotFoundError: continue
-    raise ValueError("Incomplete source-default transition blocks hibernation")
+    raise ValueError("Incomplete source-default transition or package maintenance blocks hibernation")
 
 
 def opted_in(marker=OPT_IN, model=MODEL, *, query=None):

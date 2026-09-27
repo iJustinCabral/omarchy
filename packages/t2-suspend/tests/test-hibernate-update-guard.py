@@ -46,6 +46,7 @@ class Updates(unittest.TestCase):
     self.assertEqual(guard.check(self.root)["classification"], "inactive-stock-update-admitted")
 
   def test_all_active_artifacts_block_even_invalid_empty_or_dangling(self):
+    self.assertIn(guard.STATE / "package-maintenance.pending", guard.ACTIVE)
     for relative in guard.ACTIVE:
       for content in ("", "malformed", '{"approved":false}'):
         with self.subTest(relative=relative, content=content):
