@@ -88,6 +88,26 @@ class Deployment(unittest.TestCase):
     with self.assertRaises(ValueError): D.inventory(self.source)
     self.assertFalse((self.state / "runtime").exists())
 
+  def test_only_exact_update_guard_hook_template_enters_reviewed_snapshot(self):
+    hook = self.source / D.UPDATE_GUARD_HOOK
+    raw = b"[Action]\nWhen = PreTransaction\nAbortOnFail\n"
+    hook.write_bytes(raw)
+    files = D.inventory(self.source)
+    self.assertEqual(files[D.UPDATE_GUARD_HOOK], {"size": len(raw), "sha256": D.hashlib.sha256(raw).hexdigest()})
+    self.review["files"] = files
+    self.write_review()
+    receipt = self.deploy()
+    installed = self.state / "runtime" / D.UPDATE_GUARD_HOOK
+    self.assertEqual(installed.read_bytes(), raw)
+    self.assertEqual(installed.stat().st_mode & 0o777, 0o600)
+    self.assertEqual(receipt["files"][D.UPDATE_GUARD_HOOK], files[D.UPDATE_GUARD_HOOK])
+
+  def test_other_hook_locations_extensions_and_assets_remain_refused(self):
+    for name in (D.TREES[0] + "/other.hook", D.TREES[1] + "/00-omarchy-t2-hibernate-guard.hook",
+                 D.TREES[0] + "/nested/00-omarchy-t2-hibernate-guard.hook", D.TREES[0] + "/asset.png"):
+      with self.subTest(name=name):
+        with self.assertRaises(ValueError): D._source_name(name)
+
   def test_changed_source_during_copy_leaves_preserved_partial_blocker(self):
     original = D._source_fd
     def change(source, name):
@@ -124,6 +144,8 @@ class Deployment(unittest.TestCase):
     self.assertEqual(result.returncode, 0, result.stderr)
     self.assertEqual(result.stdout.strip(), "transitive-imports-pass")
     self.assertGreater(len(receipt["files"]), 180)
+    self.assertTrue(D.UPDATE_GUARD_HOOK in receipt["files"], "Actual reviewed inventory must include the exact update guard hook")
+    self.assertEqual((runtime / D.UPDATE_GUARD_HOOK).read_bytes(), (REPO / D.UPDATE_GUARD_HOOK).read_bytes())
 
 
 if __name__ == "__main__": unittest.main()

@@ -1,0 +1,15 @@
+# Install separately as a root-owned /etc/pacman.d/hooks/ file after review.
+# All package transactions stop before module/DKMS/boot changes while active.
+# This hook does not deactivate the source default or issue qualification.
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = Checking inactive T2 source boot policy before package changes...
+When = PreTransaction
+Exec = /usr/bin/python3 -I -B /var/lib/omarchy/t2-hibernate-product/runtime/packages/t2-suspend/hibernate/update_guard.py
+AbortOnFail

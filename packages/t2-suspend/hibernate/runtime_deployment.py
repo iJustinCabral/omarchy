@@ -22,6 +22,7 @@ REVIEW = STATE / "runtime-deployment-review.json"
 SCHEMA = "omarchy-t2-product-runtime-snapshot-v1"
 TREES = ("packages/t2-suspend/hibernate", "packages/t2-suspend/experiments")
 ENTRYPOINT = TREES[0] + "/product.py"
+UPDATE_GUARD_HOOK = TREES[0] + "/00-omarchy-t2-hibernate-guard.hook"
 MANIFEST = "snapshot.json"
 PENDING = ".runtime-pending"
 MAX_FILE = 2 * 1024 * 1024
@@ -39,6 +40,8 @@ def _source_name(name):
     raise ValueError("Runtime source path outside fixed code trees")
   if any(part.startswith(".") for part in path.parts): raise ValueError("Hidden runtime source path")
   allowed = path.suffix in (".py", ".md", ".c", ".conf", ".patch", ".service", ".sh")
+  # This reviewed pacman hook template is code, not a general asset extension.
+  allowed |= name == UPDATE_GUARD_HOOK
   allowed |= path.name in ("Makefile", "Kbuild", "functions")
   allowed |= not path.suffix and (path.parent.name in ("hooks", "install") or path.name.startswith(("run-", "omarchy-")))
   if not allowed: raise ValueError("Non-source asset cannot enter runtime snapshot")
