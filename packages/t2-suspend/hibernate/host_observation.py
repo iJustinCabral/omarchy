@@ -29,6 +29,7 @@ def _module(name, filename):
 CT = _module("observation_continuity", "continuity.py")
 ARTIFACTS = _module("observation_artifacts", "artifacts.py")
 TX = CT.TX
+RETIREMENT = _module("observation_retirement", "slot_retirement.py")
 LOADER_GUID = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
 EFI = Path("sys/firmware/efi/efivars")
 MARKER = "mba_hibernate_efi_postwrite_marker"
@@ -62,6 +63,33 @@ def _raw(path, private=False):
 
 def _digest(raw):
   return hashlib.sha256(raw).hexdigest()
+
+
+def validate_source_selection(ledger, cycle, selected_entry, archive_directory=None, *, locked_advance=None):
+  """Accept source, or proven same-boot immediate product return, never fresh restore.
+
+  The optional locked capability is supplied only by Ledger.compare_and_run's
+  trusted callback, avoiding nested locks during preparation. No predecessor
+  JSON is accepted. Archive validation verifies byte integrity and the retained
+  witness, conditional on the private trusted runner; it is not qualification.
+  """
+  cycle = TX.cycle_value(cycle)
+  source = "MBA-T2-hibernation-source-" + cycle["manifest"]["source_sha256"][:16]
+  if selected_entry == source:
+    return
+  restore = "MBA-T2-hibernation-restore-" + cycle["manifest"]["restore_sha256"][:16]
+  CT.exact(selected_entry, restore, "Selected source or validated returned entry")
+  if ledger is None or archive_directory is None:
+    raise ValueError("Restore selection requires private predecessor ledger and byte archive")
+  previous = ledger.predecessor(cycle) if locked_advance is None else locked_advance.predecessor()
+  if previous is None or previous["state"] != "reconciled":
+    raise ValueError("No immediate successful product predecessor")
+  for key in ("original_boot_id", "manifest", "qualification_sha256", "qualification_vector"):
+    CT.exact(previous[key], cycle[key], "Same-session predecessor " + key)
+  # Abstract release/reconcile attestations are insufficient: require the
+  # adapter's actual terminal chain (already checked by predecessor()).
+  ledger._read("slot-retirement-" + previous["cycle_id"] + "-intent.json")
+  RETIREMENT._archived_evidence(archive_directory, previous)
 
 
 class Sampler:
@@ -213,14 +241,63 @@ class Sampler:
   def _overrides(self):
     return {name: _raw(self._path(EFI / (name + "-" + LOADER_GUID))) if self._path(EFI / (name + "-" + LOADER_GUID)).exists() or self._path(EFI / (name + "-" + LOADER_GUID)).is_symlink() else None for name in ("LoaderEntryOneShot", "LoaderEntryDefault")}
 
-  def before(self):
-    """Source-only ordinary pre-write snapshot; never accepts restore selection."""
+  def _preparation_receipt(self, receipt):
+    CT.fields(receipt, ("schema", "cycle_binding", "baseline", "actions", "owned_one_shot", "guard_sha256", "attempt_sha256"),
+              "Completed preparation receipt")
+    CT.exact(receipt["schema"], "omarchy-t2-product-preparation-v1", "Preparation protocol")
+    CT.exact(TX.digest(receipt), self.cycle["prepared_evidence_sha256"], "Ledger preparation digest")
+    CT.exact(receipt["cycle_binding"], {key: self.cycle[key] for key in CT.BINDING_KEYS}, "Prepared cycle binding")
+    baseline = receipt["baseline"]
+    CT.fields(baseline, ("bolt_active", "bluetooth_powered", "wifi_driver", "pm"), "Pre-isolation baseline")
+    if type(baseline["bolt_active"]) is not bool or type(baseline["bluetooth_powered"]) is not bool or baseline["wifi_driver"] not in (None, "brcmfmac"):
+      raise ValueError("Invalid pre-isolation service/radio baseline")
+    CT.exact(baseline["pm"], {"pm_test": "none", "disk": "platform", "pm_trace": "0"}, "Original supported PM baseline")
+    actions = receipt["actions"]
+    if type(actions) is not list or not actions:
+      raise ValueError("Preparation receipt lacks completed actions")
+    names = []
+    for action in actions:
+      CT.fields(action, ("name", "intent_sha256", "completion_sha256"), "Prepared action")
+      if type(action["name"]) is not str or not action["name"]:
+        raise ValueError("Invalid prepared action name")
+      TX.hash_value(action["intent_sha256"])
+      TX.hash_value(action["completion_sha256"])
+      names.append(action["name"])
+    if len(names) != len(set(names)):
+      raise ValueError("Duplicate prepared action")
+    entry = "MBA-T2-hibernation-restore-" + self.cycle["manifest"]["restore_sha256"][:16]
+    CT.exact(receipt["owned_one_shot"], {"entry_id": entry, "boot_id": self.cycle["original_boot_id"]}, "Owned restore one-shot")
+    CT.exact(receipt["guard_sha256"], _digest(self.guard), "Preparation guard bytes")
+    CT.exact(receipt["attempt_sha256"], _digest(self.attempt), "Preparation transition-armed attempt bytes")
+    return {"LoaderEntryOneShot": b"\x06\0\0\0" + (entry + "\0").encode("utf-16-le"), "LoaderEntryDefault": None}
+
+  def before(self, preparation_receipt=None, *, predecessor_ledger=None, predecessor_archive_directory=None):
+    """Original-source pre-write snapshot with exact optional preparation.
+
+    The ordinary path requires absent overrides. After preparation, only the
+    ledger-bound receipt's exact owned restore one-shot may be present. Its
+    pre-isolation PM baseline must already match the supported none/platform/0
+    policy; a changed post-isolation state cannot masquerade as the baseline.
+    Restore-selected repeated cycles require the immediate private reconciled
+    predecessor, actual byte archive and identical original boot/artifacts.
+    """
     CT.exact(self._boot(), self.cycle["original_boot_id"], "Original source boot")
-    entry = "MBA-T2-hibernation-source-" + self.cycle["manifest"]["source_sha256"][:16]
-    CT.exact(_raw(self._path(EFI / ("LoaderEntrySelected-" + LOADER_GUID))), b"\x06\0\0\0" + (entry + "\0").encode("utf-16-le"), "Ordinary source entry")
-    CT.exact(self._overrides(), {"LoaderEntryOneShot": None, "LoaderEntryDefault": None}, "Before-write EFI overrides")
+    selected_raw = _raw(self._path(EFI / ("LoaderEntrySelected-" + LOADER_GUID)))
+    if selected_raw[:4] != b"\x06\0\0\0":
+      raise ValueError("Selected entry attributes differ")
+    selected = selected_raw[4:].decode("utf-16-le")
+    if not selected.endswith("\0") or "\0" in selected[:-1]:
+      raise ValueError("Selected entry framing differs")
+    validate_source_selection(predecessor_ledger, self.cycle, selected[:-1], predecessor_archive_directory)
+    overrides = {"LoaderEntryOneShot": None, "LoaderEntryDefault": None}
+    if preparation_receipt is not None:
+      overrides = self._preparation_receipt(preparation_receipt)
+    CT.exact(self._overrides(), overrides, "Before-write EFI overrides")
     self._before_runtime = self.runtime()
     self._before_pm = self.pm()
+    if preparation_receipt is not None:
+      CT.exact({key: self._before_pm[key] for key in ("pm_test", "disk", "pm_trace")}, preparation_receipt["baseline"]["pm"],
+                "Current preparation policy matches original PM baseline")
     return {"boot_id": self.cycle["original_boot_id"], "source_runtime": copy.deepcopy(self._before_runtime), "baseline_pm": copy.deepcopy(self._before_pm), "audited_details_sha256": TX.digest(self.details)}
 
   def _binding(self, binding):

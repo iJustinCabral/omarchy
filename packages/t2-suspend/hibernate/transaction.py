@@ -24,6 +24,9 @@ import uuid
 PROTOCOL = "omarchy-t2-product-cycle-v1"
 HASH = re.compile(r"[0-9a-f]{64}\Z")
 PINS = ("source_sha256", "restore_sha256", "runtime_sha256", "linux_sha256", "cmdline_sha256")
+ALLOCATION_SCHEMA = "omarchy-t2-product-allocation-v1"
+ALLOCATION_BINDING_KEYS = ("protocol", "cycle_id", "original_boot_id", "manifest", "qualification_sha256",
+                           "qualification_vector", "vector", "prefix")
 
 
 def digest(value):
@@ -222,6 +225,7 @@ class Ledger:
       if any(record.get("state") != "reconciled" for record in cycles):
         raise ValueError("A previous cycle is active, failed or unreconciled")
       self._retirement_completions(cycles)
+      head = self._allocation_head(cycles)
       identity = {"protocol": PROTOCOL, "cycle_id": cycle_id, "original_boot_id": original_boot_id,
                   "manifest": state["manifest"], "qualification_sha256": digest(state["qualification"])}
       vector = digest(identity)
@@ -229,8 +233,85 @@ class Ledger:
         raise ValueError("Cycle prefix is already reserved")
       record = {**identity, "qualification_vector": qualification_vector(state["manifest"]),
                 "vector": vector, "prefix": vector[:24], "state": "reserved"}
+      previous = None if head is None else {"cycle_id": head["cycle_id"], "cycle_sha256": digest(head)}
+      allocation = {"schema": ALLOCATION_SCHEMA, "cycle_binding": {key: record[key] for key in ALLOCATION_BINDING_KEYS},
+                    "predecessor": previous}
+      # An interrupted publication leaves an orphan immutable link, an active
+      # reserved cycle or an atomic-write remnant; all refuse fresh allocation.
+      self._write("allocation-" + cycle_id + ".json", allocation, exclusive=True)
       self._write("cycle-" + cycle_id + ".json", record, exclusive=True)
+      self._write("allocation-head.json", {"schema": ALLOCATION_SCHEMA, "cycle_id": cycle_id,
+                                           "allocation_sha256": digest(allocation)})
       return record
+
+  def _allocation_head(self, cycles):
+    records = {record["cycle_id"]: record for record in cycles}
+    links = {path.name for path in self.directory.glob("allocation-*.json") if path.name != "allocation-head.json"}
+    head_exists = (self.directory / "allocation-head.json").exists() or (self.directory / "allocation-head.json").is_symlink()
+    if not records:
+      if links or head_exists:
+        raise ValueError("Orphan allocation chronology requires reconciliation")
+      return None
+    if not head_exists:
+      raise ValueError("Existing cycles lack authoritative allocation chronology")
+    head = self._read("allocation-head.json")
+    if type(head) is not dict or set(head) != {"schema", "cycle_id", "allocation_sha256"} or head["schema"] != ALLOCATION_SCHEMA:
+      raise ValueError("Malformed allocation head")
+    current = uuid_value(head["cycle_id"])
+    expected_link_hash = hash_value(head["allocation_sha256"])
+    visited = set()
+    while current is not None:
+      if current in visited or current not in records:
+        raise ValueError("Allocation chain is cyclic or references a missing cycle")
+      record = records[current]
+      link = self._read("allocation-" + current + ".json")
+      if type(link) is not dict or set(link) != {"schema", "cycle_binding", "predecessor"} or link["schema"] != ALLOCATION_SCHEMA:
+        raise ValueError("Malformed immutable allocation link")
+      if link["cycle_binding"] != {key: record[key] for key in ALLOCATION_BINDING_KEYS}:
+        raise ValueError("Allocation link differs from cycle identity")
+      if expected_link_hash is not None and digest(link) != expected_link_hash:
+        raise ValueError("Allocation head link changed")
+      visited.add(current)
+      predecessor = link["predecessor"]
+      if predecessor is None:
+        current = None
+      else:
+        if type(predecessor) is not dict or set(predecessor) != {"cycle_id", "cycle_sha256"}:
+          raise ValueError("Malformed allocation predecessor")
+        current = uuid_value(predecessor["cycle_id"])
+        previous = records.get(current)
+        if previous is None or previous["state"] != "reconciled" or digest(previous) != hash_value(predecessor["cycle_sha256"]):
+          raise ValueError("Predecessor is not the exact successful terminal cycle")
+        expected_link_hash = None
+    if visited != set(records) or links != {"allocation-" + identity + ".json" for identity in visited}:
+      raise ValueError("Allocation chronology has unlinked cycles or orphan records")
+    return records[head["cycle_id"]]
+
+  def predecessor(self, expected):
+    """Read the exact immediate predecessor from authoritative private chronology.
+
+    This proves ledger provenance/order, conditional on the trusted original
+    source runner. It cannot authenticate arbitrary memory or a malicious root.
+    No caller-supplied predecessor record or filesystem timestamp is accepted.
+    """
+    expected = copy.deepcopy(cycle_value(expected))
+    with self._lock():
+      return self._predecessor_locked(expected)
+
+  def _predecessor_locked(self, expected):
+    state = self._state()
+    if state["blocked"] or state["qualification"] is None or state["manifest"] != expected["manifest"] or digest(state["qualification"]) != expected["qualification_sha256"]:
+      raise ValueError("Predecessor qualification changed or is failure-blocked")
+    if any(self.directory.glob("slot-retirement-*-unresolved.json")):
+      raise ValueError("Unresolved retirement cannot establish a source predecessor")
+    cycles = self._cycles()
+    head = self._allocation_head(cycles)
+    if head is None or digest(head) != digest(expected):
+      raise ValueError("Expected cycle is not the exact latest allocation")
+    self._retirement_completions([record for record in cycles if record["state"] == "reconciled"])
+    link = self._read("allocation-" + expected["cycle_id"] + ".json")
+    previous = link["predecessor"]
+    return None if previous is None else copy.deepcopy(cycle_value(self._read("cycle-" + previous["cycle_id"] + ".json")))
 
   def _retirement_completions(self, cycles):
     """Verify the terminal journal chain after an owned blocker was removed.
@@ -285,6 +366,8 @@ class Ledger:
       current = self._read("cycle-" + expected["cycle_id"] + ".json")
       if digest(current) != digest(expected):
         raise ValueError("Adapter cycle snapshot is stale")
+      if digest(self._allocation_head(self._cycles())) != digest(expected):
+        raise ValueError("Adapter cycle is not the authoritative latest allocation")
       state = self._state()
       if state["blocked"] or state["qualification"] is None or state["manifest"] != expected["manifest"] or digest(state["qualification"]) != expected["qualification_sha256"]:
         raise ValueError("Adapter qualification changed")
@@ -295,6 +378,11 @@ class Ledger:
           raise ValueError("Adapter lock scope ended or cycle changed")
         current = self._advance_locked(current["cycle_id"], action, evidence_sha256)
         return copy.deepcopy(current)
+      def predecessor():
+        if not active:
+          raise ValueError("Adapter lock scope ended")
+        return self._predecessor_locked(current)
+      advance.predecessor = predecessor
       try:
         return callback(advance)
       finally:

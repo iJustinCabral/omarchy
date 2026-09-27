@@ -24,7 +24,13 @@ Artifact reads and comparisons stream in 1 MiB chunks; only small metadata/text 
 
 A durable unresolved-retirement sentinel precedes deletion and blocks new cycle allocation even if reconciliation publication and all subsequent failure writes fail. It is removed only after reconciliation is durable. Allocation also verifies the terminal retirement receipt chain; a surviving sentinel fails closed. A sentinel-cleanup error after durable reconciliation is reported separately and is not a new hardware result.
 
-The future live workflow still needs preparation/cleanup, trusted callback wiring, deployment and qualification. Callers cannot replace those steps with arbitrary hashes or JSON. No live product qualification or installed service exists yet.
+`preparation.py` implements the successful runner's preparation and cleanup order through an explicit backend: stop active bolt, power down Bluetooth if previously powered, detach owned Wi-Fi, select the qualified PM baseline, persist a consumed product guard, load and arm the pinned source marker, write exact stage-zero slots, and arm the restore one-shot. It records each action before invoking it, verifies readbacks and publishes a preparation receipt bound to the ledger. Cleanup restores only owned changes, preserves all stage evidence and guards, and still attempts recovery if a cleanup journal write fails. It never writes the hibernation power-state trigger itself.
+
+The sampler accepts an armed restore one-shot only when the completed preparation receipt hashes to the cycle's ledger receipt and names that exact entry and boot. A later cycle may accept restore-entry selection only through the immediately preceding reconciled product cycle, its actual byte archive and retirement chain, with the same original boot and artifact qualification. Immutable allocation links and a private head establish ordering without timestamps; missing or interrupted chronology fails closed. An ordinary restore boot or historical experiment record is not a substitute.
+
+The existing fullrestore initramfs reads the cycle prefix from the stage-zero EFI marker; it does not embed the experimental pair vector. This permits the same audited image to consume a fresh product cycle without rebuilding it. The historical runner's text guard format and one-use staging state remain unchanged and cannot be reused as the product backend.
+
+The future live workflow still needs trusted backend wiring, deployment and qualification. Callers cannot replace those steps with arbitrary hashes or JSON. No live product qualification or installed service exists yet.
 
 The remaining integration must connect the tested early-source and isolated-restore boot policies with normal systemd hibernation preparation/cleanup, artifact deployment and update invalidation, and failure recovery. Current Omarchy's `systemctl hibernate` menu path does not implement that workflow. Do not enable it on the strength of this library or a single experimental return. Preserve production kernel/command-line bytes and the cold guard's ANS completion, DMA ownership and terminal pending-resume protections.
 
@@ -35,3 +41,5 @@ Companion tests are `test-hibernate-product-continuity.py` and `test-hibernate-p
 The workflow and artifact adapters have corresponding `test-hibernate-product-workflow.py` and `test-hibernate-product-artifacts.py` coverage in the same directory and aggregate.
 
 The host-observation and slot-retirement tests likewise use synthetic files and injected callbacks only; they do not sample or change the running laptop.
+
+Preparation coverage is in `test-hibernate-product-preparation.py` and is registered in the same aggregate. Its injected backend exercises ordering and recovery without executing host commands.

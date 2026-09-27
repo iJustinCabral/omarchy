@@ -168,6 +168,76 @@ class Observations(unittest.TestCase):
     paths = [args[3] for args in self.query_calls if args[0] == "modinfo"]
     self.assertTrue(all(str(self.tree) in path or path == str(self.marker) or path.startswith(str(self.root / "run")) for path in paths))
 
+  def test_preparation_sampler_workflow_and_durable_next_cycle_join(self):
+    prep = host._module("observation_test_preparation", "preparation.py")
+    workflow = host._module("observation_test_workflow", "workflow.py")
+    spec = importlib.util.spec_from_file_location("prep_fixture", Path(__file__).with_name("test-hibernate-product-preparation.py"))
+    fixture = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixture)
+    ledger = tx.Ledger(self.base / "ledger")
+    ledger.configure(self.report["manifest"])
+    ledger.qualify(self.qualification)
+    cycle = ledger.begin(self.boot)
+    backend = fixture.Backend(cycle, self.marker_pin)
+    preparation = prep.Preparation(ledger, cycle, backend, self.marker, self.marker_pin, sleeper=lambda delay: None)
+    result = preparation.prepare()
+    self.cycle, self.guard, self.attempt = result["cycle"], result["guard_file"], result["attempt_file"]
+    oneshot_path = str(host.EFI / ("LoaderEntryOneShot-" + host.LOADER_GUID))
+    self.write(oneshot_path, b"\x06\0\0\0" + (backend.restore + "\0").encode("utf-16-le"))
+    self.sampler = self.new_sampler()
+    with self.assertRaises(ValueError): self.sampler.before()
+    wrong = copy.deepcopy(result["receipt"])
+    wrong["baseline"]["pm"]["disk"] = "shutdown"
+    with self.assertRaises(ValueError): self.sampler.before(wrong)
+    before = self.sampler.before(result["receipt"])
+    collector = workflow.CONTINUITY.Collector(self.cycle, self.qualification, before["source_runtime"], before["baseline_pm"], self.guard.read_bytes(), self.attempt.read_bytes())
+    archive = self.base / "archives"
+    archive.mkdir(mode=0o700)
+    def power_write(path, value):
+      self.stage_return()
+      self.root.joinpath(oneshot_path).unlink()
+      backend.values.update(oneshot=None, selected_entry=backend.restore)
+    def cleanup():
+      errors = preparation.cleanup()
+      self.loaded.remove(host.MARKER)
+      self.write("proc/modules", "\n".join(name + " 0 0 - Live 0" for name in self.loaded))
+      return errors
+    archived = workflow.run(ledger, collector, archive, power_write=power_write, capture=self.sampler.capture, cleanup=cleanup, health=self.sampler.health)
+    slots = {name: self.root.joinpath(host.EFI / name).read_bytes() for name in host.RETIREMENT.SLOTS.values()}
+    def delete(name, expected):
+      self.assertEqual(slots[name], expected)
+      slots[name] = None
+      return True
+    terminal = host.RETIREMENT.retire(ledger, archived["cycle"], archive, read_slot=slots.get, compare_delete_slot=delete,
+      health=lambda binding: host.RETIREMENT._health_expected(binding, before["baseline_pm"]))
+    next_cycle = ledger.begin(self.boot)
+    host.validate_source_selection(tx.Ledger(ledger.directory), next_cycle, backend.restore, archive)
+    with self.assertRaises(ValueError): host.validate_source_selection(ledger, next_cycle, backend.restore)
+    changed_boot = copy.deepcopy(next_cycle)
+    changed_boot["original_boot_id"] = str(uuid.uuid4())
+    with self.assertRaises(ValueError): host.validate_source_selection(ledger, changed_boot, backend.restore, archive)
+    next_backend = fixture.Backend(next_cycle, self.marker_pin)
+    next_backend.values["selected_entry"] = next_backend.restore
+    next_preparation = prep.Preparation(tx.Ledger(ledger.directory), next_cycle, next_backend, self.marker, self.marker_pin,
+      sleeper=lambda delay: None, predecessor_archive_directory=archive)
+    next_result = next_preparation.prepare()
+    self.cycle, self.guard, self.attempt = next_result["cycle"], next_result["guard_file"], next_result["attempt_file"]
+    self.loaded.append(host.MARKER)
+    self.write("proc/modules", "\n".join(name + " 0 0 - Live 0" for name in self.loaded))
+    self.write(oneshot_path, b"\x06\0\0\0" + (backend.restore + "\0").encode("utf-16-le"))
+    self.sampler = self.new_sampler()
+    with self.assertRaises(ValueError): self.sampler.before(next_result["receipt"])
+    self.sampler.before(next_result["receipt"], predecessor_ledger=tx.Ledger(ledger.directory), predecessor_archive_directory=archive)
+    self.write("proc/sys/kernel/random/boot_id", str(uuid.uuid4()))
+    with self.assertRaises(ValueError):
+      self.sampler.before(next_result["receipt"], predecessor_ledger=ledger, predecessor_archive_directory=archive)
+    self.write("proc/sys/kernel/random/boot_id", self.boot)
+    # Actual archived byte tampering cannot be masked by a caller predecessor.
+    raw = archive / ("cycle-" + terminal["cycle"]["cycle_id"]) / "source-stage.bin"
+    raw.write_bytes(b"wrong")
+    with self.assertRaises(ValueError):
+      self.sampler.before(next_result["receipt"], predecessor_ledger=ledger, predecessor_archive_directory=archive)
+
   def test_runtime_and_section_cmdline_hashes_are_distinct(self):
     before = self.sampler.before()
     self.assertNotEqual(before["source_runtime"]["cmdline_sha256"], self.report["manifest"]["cmdline_sha256"])

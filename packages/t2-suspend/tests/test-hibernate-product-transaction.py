@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 import uuid
 
 spec = importlib.util.spec_from_file_location("transaction", Path(__file__).parents[1] / "hibernate/transaction.py")
@@ -109,6 +110,51 @@ class Transactions(unittest.TestCase):
     wrong_id = str(uuid.uuid4())
     self.ledger._write("cycle-" + wrong_id + ".json", record, exclusive=True)
     with self.assertRaises(ValueError): self.ledger.advance(wrong_id, "prepared", "b" * 64)
+
+  def test_predecessor_is_exact_latest_private_chain_across_processes(self):
+    first = self.finish(self.begin())
+    second = self.ledger.begin(self.boot)
+    fresh = tx.Ledger(self.directory)
+    self.assertEqual(fresh.predecessor(second), first)
+    with self.assertRaises(ValueError): fresh.predecessor(first)
+    captured = []
+    self.ledger.compare_and_run(second, lambda advance: captured.append(advance.predecessor()))
+    self.assertEqual(captured, [first])
+
+  def test_missing_head_or_orphan_link_never_migrates_old_cycles(self):
+    self.finish(self.begin())
+    (self.directory / "allocation-head.json").unlink()
+    with self.assertRaises(ValueError): self.ledger.begin(self.boot)
+
+  def test_interrupted_allocation_publication_blocks_new_cycle_and_callbacks(self):
+    first = self.finish(self.begin())
+    self.ledger._write("allocation-" + str(uuid.uuid4()) + ".json", {}, exclusive=True)
+    with self.assertRaises(ValueError): self.ledger.begin(self.boot)
+    with self.assertRaises(ValueError): self.ledger.predecessor(first)
+
+  def test_changed_terminal_predecessor_invalidates_immutable_link(self):
+    first = self.finish(self.begin())
+    second = self.ledger.begin(self.boot)
+    changed = {**first, "reconcile_evidence_sha256": "c" * 64}
+    self.ledger._write("cycle-" + first["cycle_id"] + ".json", changed)
+    with self.assertRaises(ValueError): self.ledger.predecessor(second)
+
+  def test_allocation_crash_at_each_publication_boundary_is_fail_closed(self):
+    for fail_name in ("cycle-", "allocation-head.json"):
+      with self.subTest(fail_name=fail_name), tempfile.TemporaryDirectory() as temporary:
+        ledger = tx.Ledger(Path(temporary) / "ledger")
+        ledger.configure(self.manifest)
+        ledger.qualify(self.receipt)
+        original = ledger._write
+        def interrupted(name, record, exclusive=False):
+          if name.startswith(fail_name):
+            raise OSError("injected allocation publication interruption")
+          return original(name, record, exclusive=exclusive)
+        with patch.object(ledger, "_write", side_effect=interrupted):
+          with self.assertRaises(OSError): ledger.begin(self.boot)
+        with self.assertRaises(ValueError): ledger.begin(self.boot)
+        for record in ledger._cycles():
+          with self.assertRaises(ValueError): ledger.compare_and_run(record, lambda advance: self.fail("entered callback"))
 
 
 if __name__ == "__main__":
