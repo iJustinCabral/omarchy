@@ -29,6 +29,7 @@ def fixture():
                            for role in ("source", "restore", "production")},
               "source_runtime": {"kernel_release": "7.2.6-arch2-Watanare-T2-2-t2",
                                  "cmdline_sha256": "6e8c7c97724360fcbeb6065c6d72c7a30c3c82cea0cf9ca58cef44d6329d9e08",
+                                 "loaded_modules": ["brcmfmac_wcc", "t2bce_core"],
                                  "modules": {"t2bce_core": "ae507370dc0ee4e87cf5093340d1772cd48e2a14a878a5656ec5923952ac4db4",
                                              "brcmfmac-wcc": "0edfd9065acb349a9ed1662a34a943932fa6178bb2a30aedecd3d49d35637882"}}}
   expected["transition_vector"] = PROOF.digest(":".join(expected[key] for key in

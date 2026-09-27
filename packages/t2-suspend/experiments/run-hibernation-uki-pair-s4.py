@@ -37,6 +37,7 @@ MARKER = import_path("hibernation_efi_stage_marker", HERE / "hibernate-efi-stage
 RTC = import_path("hibernation_rtc_stage_runtime", HERE / "hibernate-rtc-stage-marker/runtime.py")
 FTRACE = import_path("hibernation_ftrace_efi_stage_runtime", HERE / "hibernate-efi-ftrace-marker/s4_backend.py")
 POSTWRITE = import_path("hibernation_postwrite_efi_stage_runtime", HERE / "hibernate-efi-postwrite-marker/s4_backend.py")
+FULLRESTORE = import_path("hibernation_fullrestore_collector", HERE / "cold-pci-restore-collector.py")
 TEST = S4.TEST
 WIFI = S4.WIFI
 VECTORS = PAIR.STATE / "s4-vectors"
@@ -282,6 +283,7 @@ def execute(
   operator_attended=False,
   input_event_waiver=False,
   allow_restore_only_revision=False,
+  fullrestore_collector_factory=FULLRESTORE.Collector,
 ):
   evidence = preflight(
     root, source_directory, restore_directory, proof_directory,
@@ -306,6 +308,21 @@ def execute(
     )
   if TEST.candidate_hash(expected_pair_vector) != evidence["transition_vector"]:
     raise ValueError("Explicit pair-wide vector does not match the staged images")
+  receipt = PAIR.load_receipt(root)
+  fullrestore_metadata = None
+  if receipt["images"]["restore"].get("experiment_id") == FULLRESTORE.PROTOCOL:
+    restore_private = PAIR.AUDIT.load_candidate(Path(restore_directory), "restore")
+    fullrestore_metadata = restore_private.get("cold_pci_restore")
+    if fullrestore_metadata is None:
+      raise ValueError("Fullrestore staged image lacks its audited protocol metadata")
+  collector = None
+  if fullrestore_metadata is not None:
+    if (not isinstance(fullrestore_metadata, dict) or fullrestore_metadata.get("version") != FULLRESTORE.PROTOCOL or
+        disk_mode != "platform" or not isinstance(marker_backend, POSTWRITE.PostwriteRestoreEfiBackend) or
+        marker_backend.source_variable_version != "v3" or marker_backend.restore_variable_version != "v2"):
+      raise ValueError("Fullrestore requires exact platform/v3-source/v2-restore protocol")
+    collector = fullrestore_collector_factory(root, source_directory, restore_directory, evidence,
+                                             marker_backend, PAIR, S4.runtime_stack_identity)
   services_verifier(runner)
   boot_id = evidence["boot_id"]
   attempts, guard = vector_paths(root, evidence["transition_vector"])
@@ -376,13 +393,17 @@ def execute(
       flush=True,
     )
     sync()
-    transition_started = True
     record["hibernate_attempted"] = True
     record["real_s4_attempted"] = True
     record["state"] = "transition-armed"
     TEST.save_attempt(attempt, record)
     sync()
+    if collector is not None:
+      collector.before_write(guard, attempt, attempt_directory)
+    transition_started = True
     power_writer(power / "state", "disk")
+    if collector is not None:
+      collector.returned()
     record["state"] = "returned"
     backend_name = getattr(marker_backend, "NAME", "efi")
     returned_stage = marker_backend.inspect(root, evidence["transition_vector"])
@@ -459,6 +480,16 @@ def execute(
     raise RuntimeError("Pair S4 returned but cleanup failed: " + "; ".join(record["cleanup_errors"]))
   record["state"] = "returned-and-cleaned"
   TEST.save_attempt(attempt, record)
+  if collector is not None:
+    try:
+      record["cold_pci_restore_proof"] = collector.finish([])
+      record["cold_pci_restore_witness"] = str(attempt_directory / "cold-pci-restored-source-witness.json")
+      TEST.save_attempt(attempt, record)
+    except Exception as error:
+      record["state"] = "restored-source-proof-failed"
+      record["error"] = str(error)
+      TEST.save_attempt(attempt, record)
+      raise
   print("omarchy-t2-hibernation-pair: S4 cleanup complete; physical input still unverified", flush=True)
   return record
 

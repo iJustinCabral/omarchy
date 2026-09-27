@@ -4,7 +4,7 @@
 Schema v1 has three independent inputs: audited ``expected`` image/stack pins,
 ``context`` retained by the original source process before its state=disk write,
 and ``observation`` captured by that process after that SAME write returns.
-Context is not a later boot's attempt.json. The future runner must construct it
+Context is not a later boot's attempt.json. The integrated runner constructs it
 in memory and call this validator from its original return path; this pure
 validator cannot authenticate a JSON producer or establish process continuity.
 It performs no host reads, EFI writes, witness writes, cleanup or PM operation.
@@ -12,6 +12,10 @@ It performs no host reads, EFI writes, witness writes, cleanup or PM operation.
 Raw EFI markers establish cold restore progress, not atomic copying by
 themselves. Combined with trusted original-call continuity, the unchanged source
 boot and exact restored stack they support a source-return observation only.
+The runtime contract records every loaded module name and independently verified
+file hashes/srcversions for the audited T2/radio stack and source marker. Ordinary
+production modules without srcversion remain in the name inventory; arbitrary
+loaded memory bytes are not authenticated by this conditional contract.
 Restore-kernel guard counters are deliberately not consulted: atomic restoration
 replaces that kernel's memory. Post-cleanup health is a separate gate; neither
 gate qualifies physical input, unattended cold start or usable hibernation.
@@ -81,11 +85,17 @@ def raw_bytes(value, label):
 
 
 def runtime(value):
-  fields(value, ("kernel_release", "cmdline_sha256", "modules"), "Source runtime")
+  fields(value, ("kernel_release", "cmdline_sha256", "modules", "loaded_modules"), "Source runtime")
   require(type(value["kernel_release"]) is str and bool(value["kernel_release"]), "Missing kernel release")
   scalar(value["cmdline_sha256"], str, "Command line hash", HASH)
   modules = value["modules"]
-  require(type(modules) is dict and bool(modules), "Missing complete source module inventory")
+  require(type(modules) is dict and bool(modules), "Missing audited source stack inventory")
+  loaded = value["loaded_modules"]
+  require(type(loaded) is list and bool(loaded) and all(type(name) is str and re.fullmatch(r"[a-zA-Z0-9_-]+", name) is not None for name in loaded), "Invalid full loaded module inventory")
+  require(loaded == sorted(set(loaded)), "Loaded module inventory is not unique and sorted")
+  for name in loaded:
+    require(not name.startswith("mba_hibernate_cold_") and "abort" not in name.lower() and name != "mba_hibernate_efi_restore_marker", "Restore-only or abort loaded module")
+  require(all(name.replace("-", "_") in {item.replace("-", "_") for item in loaded} for name in modules), "Audited stack module absent from complete loaded inventory")
   for name, identity in modules.items():
     require(type(name) is str and re.fullmatch(r"[a-zA-Z0-9_-]+", name) is not None, "Invalid module name")
     require(not name.startswith("mba_hibernate_cold_") and "abort" not in name.lower(),
