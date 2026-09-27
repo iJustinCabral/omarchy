@@ -55,6 +55,7 @@ COLD_BUNDLE_FILES = (
 COLD_HOOKS = ("omarchy-t2-cold-pre-cpu", "omarchy-t2-cold-pre-cpu-return", "resume")
 COLD = import_path("audit_cold_protocols", HERE / "cold-abort-protocols.py")
 PCI = import_path("audit_cold_pci_protocols", HERE / "cold-pci-abort-protocols.py")
+RESTORE = import_path("audit_cold_pci_restore", HERE / "cold-pci-restore-protocol.py")
 
 
 def validate_static_header_helper(data):
@@ -70,6 +71,8 @@ def validate_static_header_helper(data):
 
 
 def validate_cold_pre_cpu_metadata(provenance):
+  if RESTORE.select(provenance) == RESTORE.KEY:
+    return RESTORE.validate_metadata(provenance)
   if PCI.select(provenance) == PCI.KEY:
     return PCI.validate_metadata(provenance)
   protocol = COLD.select(provenance)
@@ -129,6 +132,12 @@ def validate_cold_pre_cpu_metadata(provenance):
 
 
 def verify_cold_pre_cpu_tree(extracted, provenance):
+  if RESTORE.select(provenance) == RESTORE.KEY:
+    class RestoreTreeAudit:
+      validate_static_header_helper = staticmethod(validate_static_header_helper)
+      verify_no_unannounced_cold_tree = staticmethod(verify_no_unannounced_cold_tree)
+    return RESTORE.verify_tree(extracted, provenance, RestoreTreeAudit)
+  RESTORE.reject_unannounced(extracted)
   if PCI.select(provenance) == PCI.KEY:
     class TreeAudit:
       validate_static_header_helper = staticmethod(validate_static_header_helper)
@@ -193,7 +202,9 @@ def verify_cold_pre_cpu_tree(extracted, provenance):
   PCI.reject_unannounced(extracted)
 
 
-def verify_no_unannounced_cold_tree(extracted, protocols=None, common=True, pci=True):
+def verify_no_unannounced_cold_tree(extracted, protocols=None, common=True, pci=True, restore=True):
+  if restore:
+    RESTORE.reject_unannounced(extracted)
   if pci:
     PCI.reject_unannounced(extracted)
   if common:
@@ -354,7 +365,7 @@ def load_candidate(directory, label):
       raise ValueError(label + " is not an offline private build: " + field)
   marker = provenance.get("restore_marker")
   minimal = "minimal_restore_policy" in provenance
-  cold = PCI.select(provenance)
+  cold = RESTORE.select(provenance)
   if minimal and marker is None:
     raise ValueError("Minimal cold-restore policy requires the restore marker")
   if cold:
@@ -401,9 +412,9 @@ def load_candidate(directory, label):
 
 
 def audit(source, restore):
-  if PCI.select(source) is not None:
+  if RESTORE.select(source) is not None:
     raise ValueError("Source image must not contain cold pre-CPU diagnostics")
-  protocol = PCI.select(restore)
+  protocol = RESTORE.select(restore)
   if protocol is not None:
     if restore.get("minimal_restore_policy") != MINIMAL_RESTORE_POLICY:
       raise ValueError("Cold pre-CPU requires the minimal private restore policy")
@@ -460,7 +471,7 @@ def audit(source, restore):
     result["minimal_restore_policy"] = restore["minimal_restore_policy"]
   if protocol is not None:
     result[protocol] = restore[protocol]
-    if protocol == PCI.KEY:
+    if protocol in (PCI.KEY, RESTORE.KEY):
       result["kernel_release"] = restore["kernel_release"]
       result["experiment_id"] = restore["experiment_id"]
   return result
