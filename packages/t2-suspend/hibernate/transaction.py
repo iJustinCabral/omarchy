@@ -216,9 +216,12 @@ class Ledger:
       state = self._state()
       if state["blocked"] or state["qualification"] is None:
         raise ValueError("Product is not qualified or is failure-blocked")
+      if any(self.directory.glob("slot-retirement-*-unresolved.json")):
+        raise ValueError("Unresolved retirement blocks new cycle allocation")
       cycles = self._cycles()
       if any(record.get("state") != "reconciled" for record in cycles):
         raise ValueError("A previous cycle is active, failed or unreconciled")
+      self._retirement_completions(cycles)
       identity = {"protocol": PROTOCOL, "cycle_id": cycle_id, "original_boot_id": original_boot_id,
                   "manifest": state["manifest"], "qualification_sha256": digest(state["qualification"])}
       vector = digest(identity)
@@ -228,6 +231,41 @@ class Ledger:
                 "vector": vector, "prefix": vector[:24], "state": "reserved"}
       self._write("cycle-" + cycle_id + ".json", record, exclusive=True)
       return record
+
+  def _retirement_completions(self, cycles):
+    """Verify the terminal journal chain after an owned blocker was removed.
+
+    The retirement adapter removes its unresolved sentinel only after successful
+    reconciliation file/directory fsync. If removal's directory fsync fails,
+    either the sentinel survives/reappears and blocks, or these already durable
+    terminal receipts prove reconciliation. This does not authenticate hardware.
+    """
+    records = {cycle["cycle_id"]: cycle for cycle in cycles}
+    protocol = "omarchy-t2-product-slot-retirement-v1"
+    for path in self.directory.glob("slot-retirement-*-intent.json"):
+      # Per-slot clear intents do not describe the transaction as a whole.
+      identity = path.name[len("slot-retirement-"):-len("-intent.json")]
+      if identity.endswith(("-source-clear", "-restore-clear")):
+        continue
+      uuid_value(identity)
+      cycle = records.get(identity)
+      if cycle is None or cycle["state"] != "reconciled":
+        raise ValueError("Retirement intent lacks reconciled cycle")
+      stem = "slot-retirement-" + identity
+      intent = self._read(stem + "-intent.json")
+      completion = self._read(stem + "-complete.json")
+      reconciliation = self._read(stem + "-reconcile.json")
+      binding = {key: cycle[key] for key in ("protocol", "cycle_id", "original_boot_id", "manifest", "qualification_sha256",
+                                           "qualification_vector", "vector", "prefix", "returned_evidence_sha256")}
+      if any(type(item) is not dict or item.get("schema") != protocol or item.get("binding") != binding
+             for item in (intent, completion, reconciliation)):
+        raise ValueError("Retirement terminal binding differs")
+      if intent.get("state") != "intent" or completion.get("state") != "complete" or reconciliation.get("state") != "reconciled":
+        raise ValueError("Retirement terminal state differs")
+      if (intent.get("archive_sha256") != cycle["archive_evidence_sha256"] or
+          completion.get("intent_sha256") != digest(intent) or reconciliation.get("completion_sha256") != digest(completion) or
+          cycle["release_evidence_sha256"] != digest(completion) or cycle["reconcile_evidence_sha256"] != digest(reconciliation)):
+        raise ValueError("Retirement terminal receipt chain differs")
 
   def advance(self, cycle_id, action, evidence_sha256):
     """Record abstract outcomes; slot-release only records permission, never writes EFI."""

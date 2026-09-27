@@ -47,6 +47,8 @@ python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-product-continuity.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-product-archive.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-product-workflow.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-product-artifacts.py"
+python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-product-host-observation.py"
+python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-product-slot-retirement.py"
 pass "T2 suspend source and installer transactions"
 
 test_tmp=$(mktemp -d)

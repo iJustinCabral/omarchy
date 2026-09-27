@@ -12,7 +12,13 @@ The completed vector tree, live transaction receipt and attendance acceptance ar
 
 Hibernation is not yet fixed or enabled by the T2 suspend driver package. The MacBookAir9,1 passed a guarded in-place `test_resume` with working internal input on candidate v9, but real platform hibernation on v9 and v10 failed before restored userspace. Earlier production-kernel probes localized a different in-place restore failure to `restore_image()` or the execution it enters; that historical boundary must not be applied to the newer cold-boot failure without evidence. This document records both boundaries, the restore problem predicted by the T2 driver architecture and the guarded tests used to distinguish them.
 
-## Current private pre-architecture image checkpoint (2026-09-26)
+## Repeatable-workflow integration after the successful return
+
+The separate offline product library now connects retained original-process continuity to byte-preserving evidence archives and streamed artifact audits. A read-only sampler joins source provenance and embedded module selections with runtime observations; rejected partial EFI reads remain journalable evidence. A narrowly scoped retirement adapter uses injected callbacks for the two reusable stage slots only after verifying the product cycle's archive, with durable progress and failure blocking. These adapters have synthetic regression coverage, not live product qualification. See [integration contracts](../../packages/t2-suspend/hibernate/README.md).
+
+The successful v16 experiment and its live markers remain untouched. No additional power transition or kernel build accompanies this integration work. Preparation/cleanup wiring, deployment, routine entry points and repeat reliability remain unfinished; ordinary `systemctl hibernate` does not yet use this workflow.
+
+## Historical private pre-architecture image checkpoint (2026-09-26)
 
 Integration commit `267457e9` adds the guarded `cold_pre_arch` profile. The full T2 suite and independent integration review passed. Private restore image `/home/jjc/.local/state/codex-mba-autonomous/hibernate-dual-restore-v13-pre-arch` built successfully: UKI SHA-256 `6f227a40c44dcceabf45a985d9b07386ea1376d1fa4a6832cd83bc8872a3a014`, provenance SHA-256 `cd7e01ae9f3f1e7c7a5f07903bac0e10f6dbae555ab84d7184901c1777211cc3`. Independent artifact audit returned `structurally-matched-private-pair-not-boot-qualified`; actual extracted `.linux` and `.cmdline` sections of both private images match production byte-for-byte. The unchanged source is `c5e6f0c9d38ff0d4dcba43e69e32bb1571c35a84ba867c983ec2cab130069ac7`, with unchanged runtime stack `bd51428b459e25d429507261c52bb52e717ed9c93416f19e65a0e8675e7191db`. No replacement kernel was built.
 
