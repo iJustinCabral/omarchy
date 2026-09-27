@@ -1,5 +1,11 @@
 # T2 hibernation investigation
 
+## Desktop integration reviewed; physical validation awaits final OK
+
+Commit `d021d08b` implements normal logind admission, secure-session checks before freezing and identity revalidation immediately before power, reviewed sleep hooks, owned user-slice freeze/thaw, and capture-before-cleanup error handling. Independent review and focused tests pass: secure-session 7, dispatcher 15, desktop entry/window 11, runtime deployment 8, command routing 22 and the CLI suite. The disposable real-logind VM harness in `df478e25` proves block and delay inhibitor behavior and balanced sleep notifications for successful and failed stub bodies; it is not a T2 hardware test. Its retained serial log is `/home/jjc/.local/state/codex-mba-autonomous/logind-vm-920f307a-serial.log`, SHA-256 `920f307a234b8f317e898cbe42f816473365eedd8ee0d04e769331b48cb9eef4`.
+
+The laptop remains on verified source boot `908ad473-3540-4d36-8f1d-cc0e57561974`. This desktop integration is not deployed: the installed private runtime remains `550bb5d7`, the direct service remains inactive, and no vendor-service drop-in, product configuration, qualified receipt or opt-in marker has been installed. The operator explicitly requested final approval before testing while away. Do not initiate physical tests, locking or reboots until that fresh OK arrives; automatic goal continuation is not approval. Then refresh the reviewed private runtime without losing the old snapshot, provision the separately reviewed exact-host authority, and validate a fresh routine cycle through logind. Preserve all previously consumed cycles and guards; no kernel or UKI rebuild is needed.
+
 ## Product trial reconciled; routine integration in progress
 
 The requested ordinary source boot returned as `908ad473-3540-4d36-8f1d-cc0e57561974` at checkpoint `15425911`. The installed root-owned runtime's read-only deployment and platform checks pass; the exact source entry is selected, its one-shot is consumed, and the reusable EFI slots and default override are absent. This is the fresh source session for routine integration, not another S4 test. The prior trial remains reconciled and must not be replayed. Normal desktop implementation is now focused on genuine logind admission, verified secure-session locking, installed sleep-hook compatibility and user-slice freeze/thaw.
