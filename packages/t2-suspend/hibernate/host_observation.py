@@ -92,6 +92,38 @@ def validate_source_selection(ledger, cycle, selected_entry, archive_directory=N
   RETIREMENT._archived_evidence(archive_directory, previous)
 
 
+def observe_current_health(root, query, pm_reader, *, require_source_marker_absent=False):
+  """Fresh read-only enumeration data, never an original-process witness."""
+  root = Path(root)
+  if not root.is_absolute(): raise ValueError("Explicit absolute health root required")
+  def path(relative): return root / relative
+  def text(relative): return _raw(path(relative)).decode().strip()
+  loaded = {line.split()[0] for line in text("proc/modules").splitlines() if line.split()}
+  sys_names = {item.name for item in path("sys/module").iterdir()}
+  if require_source_marker_absent and MARKER in loaded | sys_names:
+    raise ValueError("Source stage writer remains loaded at retirement")
+  if any(name.startswith("mba_hibernate_cold_") or "abort" in name.lower() or name == "mba_hibernate_efi_restore_marker" for name in loaded | sys_names):
+    raise ValueError("Restore-only or abort module after cleanup")
+  for address, expected in PCI.items():
+    device = path(Path("sys/bus/pci/devices") / address)
+    link = device / "driver"
+    actual = (_raw(device / "vendor").decode().strip(), _raw(device / "device").decode().strip(), Path(os.readlink(link)).name if link.is_symlink() else None)
+    CT.exact(actual, expected, "Post-cleanup PCI binding")
+  mounts = [line.split() for line in text("proc/self/mounts").splitlines() if len(line.split()) >= 4 and line.split()[1] == "/"]
+  primary = len(mounts) == 1 and mounts[0][0] == "/dev/mapper/root" and mounts[0][2] == "btrfs" and "subvol=/@" in mounts[0][3].split(",")
+  inputs = text("proc/bus/input/devices")
+  internal = inputs.count('N: Name="Apple Inc. Apple Internal Keyboard / Trackpad"') >= 2 and inputs.count("Phys=usb-t2bce_vhci-") >= 2
+  wifi = [item for item in path("sys/bus/pci/devices/0000:73:00.0/net").iterdir() if item.is_dir()]
+  if "Apple T2 Audio" not in text("proc/asound/cards"):
+    raise ValueError("T2 audio enumeration missing")
+  ac = any(_raw(item / "type").decode().strip() == "Mains" and _raw(item / "online").decode().strip() == "1" for item in path("sys/class/power_supply").iterdir() if (item / "type").is_file() and (item / "online").is_file())
+  return {"boot_id": TX.uuid_value(text("proc/sys/kernel/random/boot_id")),
+          "devices": {"primary_encrypted_root": primary, "internal_keyboard": internal, "internal_trackpad": internal,
+                      "wifi": len(wifi) == 1, "bluetooth": path("sys/class/bluetooth/hci0").exists(), "ac_online": ac},
+          "services": {name: query(("systemctl", "is-active", name)) for name in ("NetworkManager.service", "bluetooth.service", "sddm.service")},
+          "failed_units": query(("systemctl", "--failed", "--no-legend", "--plain", "--no-pager")).splitlines(), "pm": pm_reader()}
+
+
 class Sampler:
   def __init__(self, root, report, cycle, qualification, source_directory, source_tree,
                marker_file, marker_pin, guard_file, attempt_file, *, query):
@@ -358,25 +390,6 @@ class Sampler:
   def health(self, binding):
     """Post-cleanup callback: enumeration only, with no source marker required."""
     self._binding(binding)
-    loaded = {line.split()[0] for line in self._text("proc/modules").splitlines() if line.split()}
-    sys_names = {item.name for item in self._path("sys/module").iterdir()}
-    if any(name.startswith("mba_hibernate_cold_") or "abort" in name.lower() or name == "mba_hibernate_efi_restore_marker" for name in loaded | sys_names):
-      raise ValueError("Restore-only or abort module after cleanup")
-    for address, expected in PCI.items():
-      device = self._path(Path("sys/bus/pci/devices") / address)
-      link = device / "driver"
-      actual = (_raw(device / "vendor").decode().strip(), _raw(device / "device").decode().strip(), Path(os.readlink(link)).name if link.is_symlink() else None)
-      CT.exact(actual, expected, "Post-cleanup PCI binding")
-    mounts = [line.split() for line in self._text("proc/self/mounts").splitlines() if len(line.split()) >= 4 and line.split()[1] == "/"]
-    primary = len(mounts) == 1 and mounts[0][0] == "/dev/mapper/root" and mounts[0][2] == "btrfs" and "subvol=/@" in mounts[0][3].split(",")
-    inputs = self._text("proc/bus/input/devices")
-    internal = inputs.count('N: Name="Apple Inc. Apple Internal Keyboard / Trackpad"') >= 2 and inputs.count("Phys=usb-t2bce_vhci-") >= 2
-    wifi = [path for path in self._path("sys/bus/pci/devices/0000:73:00.0/net").iterdir() if path.is_dir()]
-    if "Apple T2 Audio" not in self._text("proc/asound/cards"):
-      raise ValueError("T2 audio enumeration missing")
-    ac = any(_raw(path / "type").decode().strip() == "Mains" and _raw(path / "online").decode().strip() == "1" for path in self._path("sys/class/power_supply").iterdir() if (path / "type").is_file() and (path / "online").is_file())
-    services = {name: self._query(("systemctl", "is-active", name)) for name in ("NetworkManager.service", "bluetooth.service", "sddm.service")}
-    return {"schema": CT.SCHEMA, "binding": copy.deepcopy(binding), "boot_id": self._boot(), "after_cleanup": True,
-            "devices": {"primary_encrypted_root": primary, "internal_keyboard": internal, "internal_trackpad": internal,
-                        "wifi": len(wifi) == 1, "bluetooth": self._path("sys/class/bluetooth/hci0").exists(), "ac_online": ac},
-            "services": services, "failed_units": self._query(("systemctl", "--failed", "--no-legend", "--plain", "--no-pager")).splitlines(), "pm": self.pm()}
+    data = observe_current_health(self.root, self._query, self.pm)
+    CT.exact(data["boot_id"], self._boot(), "Original sampler health boot")
+    return {**data, "schema": CT.SCHEMA, "binding": copy.deepcopy(binding), "after_cleanup": True}

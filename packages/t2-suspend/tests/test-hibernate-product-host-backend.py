@@ -206,6 +206,42 @@ class Backends(unittest.TestCase):
     self.assertEqual(retired["cycle"]["state"], "reconciled")
     self.assertTrue(all(self.host.read_slot(name) is None for name in backend.RETIRE.SLOTS.values()))
 
+  def test_fresh_archived_retirement_needs_no_retained_sampler_or_collector(self):
+    result, writer, archive, sampler, collector = self.run_workflow()
+    cycle = result["cycle"]
+    # A new backend after the original runner exits has no Sampler/Collector.
+    fresh = backend.HostBackend(self.root, self.o.report, cycle, self.o.marker, self.o.marker_pin,
+                                command_runner=self.command, sysfs_writer=self.write)
+    observe = fresh.archived_retirement_health(cycle, archive)
+    binding = backend.RETIRE.ARCHIVE.cycle_binding(cycle)
+    with patch.object(backend.HOST.Sampler, "before", side_effect=AssertionError("No reconstructed before sample")), \
+         patch.object(backend.HOST.Sampler, "_binding", side_effect=AssertionError("No manufactured continuity")):
+      self.assertTrue(observe(binding)["after_slot_retirement"])
+      read, delete = fresh.retirement_callbacks(self.ledger, cycle, archive)
+      retired = backend.RETIRE.retire(self.ledger, cycle, archive, read_slot=read, compare_delete_slot=delete, health=observe)
+    self.assertEqual(retired["cycle"]["state"], "reconciled")
+    self.assertEqual(self.power_count, 1)
+
+  def test_fresh_retirement_health_rechecks_boot_pm_binding_and_archive_each_call(self):
+    result, writer, archive, sampler, collector = self.run_workflow()
+    cycle = result["cycle"]
+    observe = self.host.archived_retirement_health(cycle, archive)
+    binding = backend.RETIRE.ARCHIVE.cycle_binding(cycle)
+    observe(binding)
+    with self.assertRaises(ValueError): observe({**binding, "vector": "0" * 64})
+    self.o.write("proc/sys/kernel/random/boot_id", str(uuid.uuid4()))
+    with self.assertRaises(ValueError): observe(binding)
+    self.o.write("proc/sys/kernel/random/boot_id", cycle["original_boot_id"])
+    self.o.write("sys/power/resume_offset", "999")
+    with self.assertRaises(ValueError): observe(binding)
+    self.o.write("sys/power/resume_offset", "123")
+    self.o.write("sys/module/" + backend.MARKER + "/srcversion", self.o.marker_pin["srcversion"])
+    with self.assertRaises(ValueError): observe(binding)
+    (self.root / "sys/module" / backend.MARKER / "srcversion").unlink()
+    (self.root / "sys/module" / backend.MARKER).rmdir()
+    (archive / ("cycle-" + cycle["cycle_id"]) / "source-stage.bin").write_bytes(b"tampered")
+    with self.assertRaises(ValueError): observe(binding)
+
   def test_native_nonseekable_retirement_reopens_exact_slots(self):
     result, writer, archive, sampler, collector = self.run_workflow()
     read, delete = self.host.retirement_callbacks(self.ledger, result["cycle"], archive)

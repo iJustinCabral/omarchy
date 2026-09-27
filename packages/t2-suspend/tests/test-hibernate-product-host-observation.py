@@ -314,6 +314,13 @@ class Observations(unittest.TestCase):
     proof = collector.finish(self.sampler.health(collector.binding), [])
     self.assertTrue(proof["post_cleanup_health_valid"])
 
+  def test_fresh_health_data_cannot_replace_retained_before_binding(self):
+    self.assertIsNone(self.sampler._before_runtime)
+    data = host.observe_current_health(self.root, self.query, self.sampler.pm)
+    self.assertEqual(set(data), {"boot_id", "devices", "services", "failed_units", "pm"})
+    self.assertNotIn("binding", data)
+    with self.assertRaises(ValueError): self.sampler.health({})
+
   def test_partial_efi_reads_preserved_in_rejected_capture(self):
     collector = self.retained()
     self.stage_return()

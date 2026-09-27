@@ -360,6 +360,40 @@ class HostBackend:
       return {**witness, "schema": RETIRE.HEALTH_SCHEMA, "binding": copy.deepcopy(binding), "after_slot_retirement": True}
     return observe
 
+  def archived_retirement_health(self, cycle, archive_directory):
+    """Fresh host health for verified archival retirement, NOT source continuity.
+
+    No retained Sampler, before-write state or Collector is reconstructed. The
+    archived witness proves the earlier return; this callback observes NOW.
+    """
+    cycle = copy.deepcopy(TX.cycle_value(cycle))
+    if cycle["state"] not in ("archived", "released"):
+      raise ValueError("Fresh retirement health requires archived cycle")
+    CT.exact(cycle["manifest"], self.report["manifest"], "Fresh health artifact pins")
+    for key in CT.BINDING_KEYS:
+      CT.exact(cycle[key], self.cycle[key], "Fresh health backend cycle")
+    def pm():
+      resume = self.report["audited_details"]["restore_protocol"]["resume"]
+      devnum = self.query(("lsblk", "--nodeps", "--noheadings", "--output", "MAJ:MIN", resume["device"]))
+      CT.exact(devnum, resume["devnum"], "Fresh health resume identity")
+      CT.exact(self._text("sys/power/resume"), devnum, "Fresh health active resume device")
+      offset = int(self._text("sys/power/resume_offset"))
+      CT.exact(offset, resume["offset"], "Fresh health resume offset")
+      return CT.pm_value({**{name: self.read(name) for name in ("pm_test", "disk", "pm_trace")},
+                          "resume_device": resume["device"], "resume_offset": offset})
+    def observe(binding):
+      expected, markers, baseline = RETIRE._archived_evidence(archive_directory, cycle)
+      CT.exact(binding, expected, "Fresh health verified archive binding")
+      CT.exact(self.read("boot_id"), cycle["original_boot_id"], "Fresh health original boot")
+      data = HOST.observe_current_health(self.root, self.query, pm, require_source_marker_absent=True)
+      CT.exact(data["boot_id"], cycle["original_boot_id"], "Fresh health sampled original boot")
+      CT.exact(data["pm"], baseline, "Fresh health archived PM baseline")
+      result = {**data, "schema": RETIRE.HEALTH_SCHEMA, "binding": copy.deepcopy(binding), "after_slot_retirement": True}
+      CT.exact(result, RETIRE._health_expected(expected, baseline), "Fresh retirement health")
+      RETIRE._archived_evidence(archive_directory, cycle)
+      return result
+    return observe
+
 
 class _PowerWrite:
   def __init__(self, backend, ledger, cycle, receipt):
