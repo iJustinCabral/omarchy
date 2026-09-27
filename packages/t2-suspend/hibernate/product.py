@@ -31,8 +31,10 @@ SECURE_SESSION = _module("product_secure_session", "secure_session.py")
 DESKTOP_SLEEP = _module("product_desktop_sleep", "desktop_sleep.py")
 BOOT_POLICY = _module("product_boot_policy", "boot_policy.py")
 UPDATE_GUARD = _module("product_update_guard", "update_guard.py")
+POWER_POLICY = _module("product_power_policy", "power_policy.py")
 STATE = Path("/var/lib/omarchy/t2-hibernate-product")
 CONFIG_SCHEMA = "omarchy-t2-qualified-product-config-v1"
+CONFIG_SCHEMA_V2 = "omarchy-t2-qualified-product-config-v2"
 
 
 def verify_deployment(root, config, report):
@@ -51,8 +53,15 @@ def verify_deployment(root, config, report):
 def validate(config, qualification, report):
   keys = {"schema", "source_directory", "restore_directory", "production_uki", "source_tree", "marker_file",
           "marker_pin", "manifest", "audited_details_sha256", "staged_receipt_sha256"}
-  HOST.CT.fields(config, keys, "Qualified product configuration")
-  HOST.CT.exact(config["schema"], CONFIG_SCHEMA, "Qualified product configuration protocol")
+  if type(config) is not dict: raise ValueError("Qualified product configuration required")
+  if config.get("schema") == CONFIG_SCHEMA_V2:
+    keys.add("power_policy")
+    HOST.CT.fields(config, keys, "Qualified product configuration")
+    if config["power_policy"] is None: raise ValueError("V2 requires explicit battery policy")
+    POWER_POLICY.validate(config["power_policy"])
+  else:
+    HOST.CT.fields(config, keys, "Qualified product configuration")
+    HOST.CT.exact(config["schema"], CONFIG_SCHEMA, "Qualified product configuration protocol")
   for key in ("source_directory", "restore_directory", "production_uki", "source_tree", "marker_file"):
     if type(config[key]) is not str or not Path(config[key]).is_absolute(): raise ValueError("Absolute product artifact paths required")
   receipt = TX.receipt_value(qualification, report["manifest"])
@@ -103,9 +112,7 @@ def _admission_state(config, receipt, report, *, ledger, archive_directory, root
   mounts = [line.split() for line in HOST._raw(root / "proc/self/mounts").decode().splitlines() if len(line.split()) >= 4 and line.split()[1] == "/"]
   if len(mounts) != 1 or mounts[0][:3] != ["/dev/mapper/root", "/", "btrfs"] or "subvol=/@" not in mounts[0][3].split(","):
     raise ValueError("Qualified product requires primary encrypted root")
-  supplies = root / "sys/class/power_supply"
-  if not any(HOST._raw(item / "type").strip() == b"Mains" and HOST._raw(item / "online").strip() == b"1" for item in supplies.iterdir() if (item / "type").is_file() and (item / "online").is_file()):
-    raise ValueError("Live AC required")
+  power_decision = POWER_POLICY.check(root, config.get("power_policy"))
   with ledger._lock():
     state, previous = _head(ledger)
     if previous is not None:
@@ -118,7 +125,8 @@ def _admission_state(config, receipt, report, *, ledger, archive_directory, root
         HOST.CT.exact(previous[key], expected, "Immediate reconciled same-session predecessor")
       ledger._read("slot-retirement-" + previous["cycle_id"] + "-intent.json")
   return {"qualification": receipt, "original_boot_id": boot, "manifest_sha256": TX.digest(report["manifest"]),
-          "predecessor_cycle_id": None if previous is None else previous["cycle_id"], "execute": False}
+          "predecessor_cycle_id": None if previous is None else previous["cycle_id"], "execute": False,
+          "power_decision": power_decision}
 
 
 def execute(config, qualification, report, *, ledger, archive_directory, root, backend_factory, sleeper,
@@ -132,6 +140,7 @@ def execute(config, qualification, report, *, ledger, archive_directory, root, b
   if root == Path("/") and backend_factory is not BACKEND.HostBackend: raise ValueError("Fixed native live product backend required")
   admitted = check(config, qualification, report, ledger=ledger, archive_directory=archive_directory, root=root,
                    query=query, deployment_check=deployment_check)
+  power_policy = POWER_POLICY.validate(config.get("power_policy"))
   if desktop:
     secure_gate = SECURE_SESSION.Gate(root) if secure_gate is None else secure_gate
     desktop_window = DESKTOP_SLEEP.window if desktop_window is None else desktop_window
@@ -154,7 +163,7 @@ def execute(config, qualification, report, *, ledger, archive_directory, root, b
     before = sampler.before(prepared["receipt"], predecessor_ledger=ledger, predecessor_archive_directory=archive_directory)
     collector = WORKFLOW.CONTINUITY.Collector(prepared["cycle"], receipt, before["source_runtime"], before["baseline_pm"],
                                              prepared["guard_file"].read_bytes(), prepared["attempt_file"].read_bytes())
-    native_writer = backend.power_writer(ledger, prepared["cycle"], prepared["receipt"])
+    native_writer = backend.power_writer(ledger, prepared["cycle"], prepared["receipt"], power_policy=power_policy)
     class DeploymentPower:
       window = None
       def bind_locked(self, advance): native_writer.bind_locked(advance)

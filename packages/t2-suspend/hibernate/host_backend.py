@@ -32,6 +32,7 @@ HOST = _module("backend_host_observation", "host_observation.py")
 CT = HOST.CT
 TX = CT.TX
 RETIRE = _module("backend_slot_retirement", "slot_retirement.py")
+POWER_POLICY = _module("backend_power_policy", "power_policy.py")
 MARKER = HOST.MARKER
 WIFI = "0000:73:00.0"
 MAX_BYTES = 2 * 1024 * 1024
@@ -337,8 +338,8 @@ class HostBackend:
       return
     raise ValueError("Unknown or prohibited fixed write key")
 
-  def power_writer(self, ledger, prepared_cycle, receipt):
-    return _PowerWrite(self, ledger, prepared_cycle, receipt)
+  def power_writer(self, ledger, prepared_cycle, receipt, *, power_policy=None):
+    return _PowerWrite(self, ledger, prepared_cycle, receipt, power_policy=power_policy)
 
   def read_slot(self, name):
     if name not in RETIRE.SLOTS.values(): raise ValueError("Only two fixed reusable slots can be read")
@@ -397,12 +398,13 @@ class HostBackend:
 
 
 class _PowerWrite:
-  def __init__(self, backend, ledger, cycle, receipt):
+  def __init__(self, backend, ledger, cycle, receipt, *, power_policy=None):
     self.backend, self.ledger = backend, ledger
     self.cycle = copy.deepcopy(TX.cycle_value(cycle))
     CT.exact(self.cycle["state"], "prepared", "Power callback prepared cycle")
     CT.exact({key: self.cycle[key] for key in CT.BINDING_KEYS}, {key: backend.cycle[key] for key in CT.BINDING_KEYS}, "Power callback backend binding")
     self.receipt = copy.deepcopy(receipt)
+    self.power_policy = POWER_POLICY.validate(power_policy)
     self._advance = None
     self._used = False
 
@@ -448,6 +450,7 @@ class _PowerWrite:
     for key, magic in (("source_stage", b"MBPW"), ("restore_stage", b"MBRS")):
       CT.exact(backend.read(key), b"\x07\0\0\0" + magic + bytes.fromhex(self.cycle["prefix"]) + b"\0", "Exact staged power prefix")
     os.sync() if backend.live else None
+    POWER_POLICY.check(backend.root, self.power_policy)
     backend._write_bytes("sys/power/state", b"disk")
 
 

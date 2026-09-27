@@ -69,6 +69,89 @@ class Dispatch(unittest.TestCase):
     for authority in (None, {**self.qualification, "qualified": False}, {**self.qualification, "protocol": tx.TRIAL_PROTOCOL}):
       with self.assertRaises(ValueError): self.check(qualification=authority)
 
+  def battery(self, *, charge_now=70, charge_full=100, status="Discharging"):
+    self.o.write("sys/class/power_supply/BAT0/type", "Battery")
+    self.o.write("sys/class/power_supply/BAT0/present", "1")
+    self.o.write("sys/class/power_supply/BAT0/status", status)
+    self.o.write("sys/class/power_supply/BAT0/charge_now", str(charge_now))
+    self.o.write("sys/class/power_supply/BAT0/charge_full", str(charge_full))
+    self.o.write("sys/class/power_supply/AC/online", "0")
+
+  def enable_battery_policy(self):
+    self.config = {**self.config, "schema": product.CONFIG_SCHEMA_V2,
+                   "power_policy": {"schema": product.POWER_POLICY.SCHEMA, "min_charge_percent": 30}}
+
+  def test_v1_stays_ac_only_and_v2_admits_valid_battery_before_allocation(self):
+    self.battery()
+    with self.assertRaises(ValueError): self.execute()
+    self.assertFalse(any(self.ledger.directory.glob("cycle-*.json")))
+    self.enable_battery_policy()
+    self.assertEqual(self.check()["power_decision"]["source"], "battery")
+    self.assertFalse(any(self.ledger.directory.glob("cycle-*.json")))
+    self.o.write("sys/class/power_supply/BAT0/charge_now", "29")
+    with self.assertRaises(ValueError): self.execute()
+    self.assertFalse(any(self.ledger.directory.glob("cycle-*.json")))
+
+  def test_v2_unplug_during_prehooks_low_reserve_cleans_without_power(self):
+    self.enable_battery_policy()
+    self.battery(charge_now=29)
+    self.o.write("sys/class/power_supply/AC/online", "1")
+    @contextmanager
+    def window(root):
+      self.o.write("sys/class/power_supply/AC/online", "0")
+      try: yield
+      finally: self.deployments.append("thawed")
+    class Gate:
+      def require_secure(self, binding=None): return "session"
+      def require_same_session(self, binding): pass
+    with self.assertRaises(ValueError): self.execute(desktop=True, secure_gate=Gate(), desktop_window=window)
+    self.assertEqual(self.host.power_count, 0)
+    self.assertIn("thawed", self.deployments)
+    self.assertFalse(self.host.host.read("source_marker_loaded"))
+    self.assertEqual(self.host.host.read("wifi_driver"), "brcmfmac")
+    self.assertTrue(self.ledger._state()["blocked"])
+
+  def test_v2_unplug_during_prehooks_with_valid_reserve_continues(self):
+    self.enable_battery_policy()
+    self.battery(charge_now=70)
+    self.o.write("sys/class/power_supply/AC/online", "1")
+    @contextmanager
+    def window(root):
+      self.o.write("sys/class/power_supply/AC/online", "0")
+      try: yield
+      finally: self.deployments.append("thawed")
+    class Gate:
+      def require_secure(self, binding=None): return "session"
+      def require_same_session(self, binding): pass
+    result = self.execute(desktop=True, secure_gate=Gate(), desktop_window=window)
+    self.assertEqual(result["cycle"]["state"], "reconciled")
+    self.assertEqual(self.host.power_count, 1)
+    self.assertIn("thawed", self.deployments)
+
+  def test_v2_final_power_sample_follows_sync_and_refuses_new_low_reserve(self):
+    self.enable_battery_policy()
+    self.battery(charge_now=29)
+    self.o.write("sys/class/power_supply/AC/online", "1")
+    original_call = fixture.backend._PowerWrite.__call__
+    events = []
+    def synced_unplug():
+      events.append("sync")
+      self.o.write("sys/class/power_supply/AC/online", "0")
+    def checked_call(writer, path, value):
+      writer.backend.live = True
+      # Only the final writer is under test. Its live marker file ownership
+      # check cannot pass in this unprivileged temp-root fixture.
+      try:
+        with patch.object(writer.backend, "_marker_identity", return_value=None):
+          return original_call(writer, path, value)
+      finally: writer.backend.live = False
+    with patch.object(fixture.backend._PowerWrite, "__call__", checked_call), \
+         patch.object(product.BACKEND.os, "sync", side_effect=synced_unplug):
+      with self.assertRaises(ValueError) as failure: self.execute()
+    self.assertEqual(events, ["sync"], str(failure.exception))
+    self.assertEqual(self.host.power_count, 0)
+    self.assertTrue(self.ledger._state()["blocked"])
+
   def test_two_real_backend_cycles_sameboot_restore_selection_fresh_uuid_vectors(self):
     first = self.execute()
     self.assertEqual(first["cycle"]["state"], "reconciled")

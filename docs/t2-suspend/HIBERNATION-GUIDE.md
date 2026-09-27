@@ -50,7 +50,7 @@ Both private images retain the production Linux kernel and command line byte-for
 
 ### AC-only is a software admission rule, not a proved T2 hardware requirement
 
-The routine path explicitly rejects a machine without an online mains supply in [`product.py`, `_admission_state`](../../packages/t2-suspend/hibernate/product.py). The historical trial has its own rule in [`trial.py`](../../packages/t2-suspend/hibernate/trial.py). Other live experimental paths must also be inventoried before changing power policy.
+The installed routine path and legacy v1 configuration reject a machine without an online mains supply in [`product.py`, `_admission_state`](../../packages/t2-suspend/hibernate/product.py). Source now has an explicit v2 battery policy with native reserve checks before allocation and again immediately before writing the image; it has not been deployed or hardware-qualified. See the [source implementation and provisional limits](HIBERNATION-PRODUCTION-PLAN.md#source-implementation-for-attended-battery-qualification). The historical trial retains its own AC rule in [`trial.py`](../../packages/t2-suspend/hibernate/trial.py).
 
 The successful tests were run with AC connected. They do not demonstrate that hibernation needs AC; they also do not validate battery operation. The permanent fix must replace experimental AC-only admission with an appropriate battery-aware policy and verify actual battery write, power-off, wake, restore and recovery. Deleting one check without doing that work would only hide the limitation.
 
