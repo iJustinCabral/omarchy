@@ -6,8 +6,6 @@
 # Provision it only after installing the root-owned runtime and reviewed unit.
 OPT_IN="/etc/omarchy/t2-hibernate-product.enabled"
 MODEL="/sys/class/dmi/id/product_name"
-SYSTEMCTL="/usr/bin/systemctl"
-UNIT="omarchy-t2-hibernate-product.service"
 
 if (( $# != 0 )); then
   echo "Usage: omarchy system hibernate" >&2
@@ -25,13 +23,19 @@ else
     echo "T2 hibernation opt-in is qualified only for MacBookAir9,1; refusing fallback" >&2
     exit 1
   fi
-  # Start waits for the oneshot's return verification, archive and retirement.
-  # No reset-failed, retry, stock fallback or caller-supplied privileged path.
-  if (( EUID == 0 )); then
-    "$SYSTEMCTL" start "$UNIT"
-  elif [[ -t 0 && -t 2 ]]; then
-    sudo "$SYSTEMCTL" start "$UNIT"
-  else
-    pkexec "$SYSTEMCTL" start "$UNIT"
+  # Requesting users confirm their own lock before logind admission. The root
+  # dispatcher independently binds and rechecks the active graphical session.
+  if (( EUID != 0 )); then
+    if ! omarchy-system-sleep-lock; then
+      echo "Desktop lock was not secured; refusing hibernation" >&2
+      exit 1
+    fi
   fi
+  # logind owns inhibitor admission, delay waiting and PrepareForSleep signals.
+  # Never start the product service/target directly or bypass inhibitors.
+  # ROOT_CHECK_INHIBITORS (1); interactive authorization is in the bus header.
+  # A direct bus call cannot fall back to an untracked target when logind fails.
+  busctl --system --allow-interactive-authorization=yes call \
+    org.freedesktop.login1 /org/freedesktop/login1 \
+    org.freedesktop.login1.Manager HibernateWithFlags t 1
 fi

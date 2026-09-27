@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 """Qualified routine lifecycle fixtures; no live commands or hardware writes."""
 import copy
+from contextlib import contextmanager
 import importlib.util
 import json
 from pathlib import Path
@@ -157,6 +158,82 @@ class Dispatch(unittest.TestCase):
 
   def test_live_injected_admission_is_rejected_before_reads(self):
     with self.assertRaises(ValueError): self.check(root=Path("/"))
+
+  def test_desktop_gate_rechecks_same_binding_before_freeze_and_power(self):
+    events = []
+    class Gate:
+      def require_secure(self, binding=None):
+        events.append(("secure", binding))
+        return "same-session"
+      def require_same_session(self, binding): events.append(("identity", binding))
+    @contextmanager
+    def window(root):
+      events.append(("freeze", self.host.power_count))
+      try: yield
+      finally: events.append(("thaw", self.host.power_count))
+    result = self.execute(desktop=True, secure_gate=Gate(), desktop_window=window)
+    self.assertEqual(result["cycle"]["state"], "reconciled")
+    self.assertEqual(events, [("secure", None), ("secure", "same-session"), ("freeze", 0),
+                              ("identity", "same-session"), ("thaw", 1)])
+
+  def test_desktop_session_failure_prevents_power_and_runs_cleanup(self):
+    class Gate:
+      def require_secure(self, binding=None):
+        if binding is not None: raise ValueError("fixture session changed")
+        return "session"
+    @contextmanager
+    def forbidden_window(root):
+      raise AssertionError("Cannot freeze after failed secure check")
+      yield
+    with self.assertRaises(ValueError): self.execute(desktop=True, secure_gate=Gate(), desktop_window=forbidden_window)
+    self.assertEqual(self.host.power_count, 0)
+    self.assertFalse(self.host.host.read("source_marker_loaded"))
+    self.assertEqual(self.host.host.read("wifi_driver"), "brcmfmac")
+    self.assertTrue(self.ledger._state()["blocked"])
+
+  def test_desktop_admission_failure_creates_no_cycle_and_live_injection_rejected(self):
+    class Gate:
+      def require_secure(self, binding=None): raise ValueError("fixture unsecured")
+    with self.assertRaises(ValueError): self.execute(desktop=True, secure_gate=Gate())
+    self.assertFalse(any(self.ledger.directory.glob("cycle-*.json")))
+    with self.assertRaises(ValueError): self.execute(root=Path("/"), desktop=True, secure_gate=Gate())
+
+  def test_desktop_post_fault_preserves_original_return_capture_and_blocks(self):
+    class Gate:
+      def require_secure(self, binding=None): return "session"
+      def require_same_session(self, binding): pass
+    @contextmanager
+    def failed_post(root):
+      try: yield
+      finally: raise OSError("fixture post-hook fault after successful power return")
+    with self.assertRaises(ValueError): self.execute(desktop=True, secure_gate=Gate(), desktop_window=failed_post)
+    self.assertEqual(self.host.power_count, 1)
+    self.assertTrue(self.ledger._state()["blocked"])
+    self.assertFalse(self.host.host.read("source_marker_loaded"))
+    cycle = self.ledger._cycles()[0]
+    captured = self.ledger._read("workflow-capture-" + cycle["cycle_id"] + ".json")
+    self.assertTrue(captured["retained"]["write_returned"])
+    self.assertTrue(captured["retained"]["capture_valid"])
+    failure = self.ledger._read("workflow-failure-" + cycle["cycle_id"] + ".json")
+    self.assertEqual(failure["snapshot"]["cleanup_errors"], ["desktop-sleep-cleanup:OSError"])
+
+  def test_desktop_session_change_during_prehooks_thaws_without_power(self):
+    events = []
+    class Gate:
+      def require_secure(self, binding=None): return "session"
+      def require_same_session(self, binding):
+        events.append("identity")
+        raise ValueError("fixture active session changed while pre-hooks ran")
+    @contextmanager
+    def window(root):
+      events.append("freeze")
+      try: yield
+      finally: events.append("thaw")
+    with self.assertRaises(ValueError): self.execute(desktop=True, secure_gate=Gate(), desktop_window=window)
+    self.assertEqual(events, ["freeze", "identity", "thaw"])
+    self.assertEqual(self.host.power_count, 0)
+    self.assertTrue(self.ledger._state()["blocked"])
+    self.assertFalse(self.host.host.read("source_marker_loaded"))
 
 
 if __name__ == "__main__": unittest.main()

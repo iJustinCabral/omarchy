@@ -27,6 +27,8 @@ TRIAL = _module("product_shared_lifecycle", "trial.py")
 TX, HOST, ARTIFACTS = TRIAL.TX, TRIAL.HOST, TRIAL.ARTIFACTS
 PREPARATION, WORKFLOW, RETIREMENT = TRIAL.PREPARATION, TRIAL.WORKFLOW, TRIAL.RETIREMENT
 BACKEND = _module("product_fixed_backend", "host_backend.py")
+SECURE_SESSION = _module("product_secure_session", "secure_session.py")
+DESKTOP_SLEEP = _module("product_desktop_sleep", "desktop_sleep.py")
 STATE = Path("/var/lib/omarchy/t2-hibernate-product")
 CONFIG_SCHEMA = "omarchy-t2-qualified-product-config-v1"
 
@@ -100,12 +102,20 @@ def check(config, qualification, report, *, ledger, archive_directory, root, que
 
 
 def execute(config, qualification, report, *, ledger, archive_directory, root, backend_factory, sleeper,
-            query=None, deployment_check=TRIAL.verify_deployment):
+            query=None, deployment_check=TRIAL.verify_deployment, desktop=False, secure_gate=None, desktop_window=None):
   """Run one fresh qualified cycle, archive and reconcile, never issue a receipt."""
   root = Path(root)
+  if root.resolve() == Path("/") and (secure_gate is not None or desktop_window is not None):
+    raise ValueError("No injected live desktop gate or sleep window")
+  if not desktop and (secure_gate is not None or desktop_window is not None):
+    raise ValueError("Desktop adapters require desktop admission")
   if root == Path("/") and backend_factory is not BACKEND.HostBackend: raise ValueError("Fixed native live product backend required")
   admitted = check(config, qualification, report, ledger=ledger, archive_directory=archive_directory, root=root,
                    query=query, deployment_check=deployment_check)
+  if desktop:
+    secure_gate = SECURE_SESSION.Gate(root) if secure_gate is None else secure_gate
+    desktop_window = DESKTOP_SLEEP.window if desktop_window is None else desktop_window
+    session_binding = secure_gate.require_secure()
   receipt = admitted["qualification"]
   ledger.configure(report["manifest"])
   ledger.qualify(receipt)
@@ -126,10 +136,30 @@ def execute(config, qualification, report, *, ledger, archive_directory, root, b
                                              prepared["guard_file"].read_bytes(), prepared["attempt_file"].read_bytes())
     native_writer = backend.power_writer(ledger, prepared["cycle"], prepared["receipt"])
     class DeploymentPower:
+      window = None
       def bind_locked(self, advance): native_writer.bind_locked(advance)
       def __call__(self, path, value):
         deployment_check(root, config, report)
+        if desktop:
+          secure_gate.require_secure(session_binding)
+          window = desktop_window(root)
+          window.__enter__()
+          self.window = window
+          # IPC was secure immediately before freezing. Pre-hooks may take
+          # time; rebind logind identity here without querying the frozen user.
+          secure_gate.require_same_session(session_binding)
         return native_writer(path, value)
+      def cleanup(self):
+        errors = []
+        try:
+          if self.window is not None:
+            window, self.window = self.window, None
+            window.__exit__(None, None, None)
+        except BaseException as error:
+          errors.append("desktop-sleep-cleanup:" + type(error).__name__)
+        finally:
+          errors.extend(preparation.cleanup())
+        return errors
     writer = DeploymentPower()
   except BaseException as error:
     errors = [] if preparation is None else preparation.cleanup()
@@ -137,7 +167,7 @@ def execute(config, qualification, report, *, ledger, archive_directory, root, b
     except BaseException as latch: error.add_note("Cycle remains blocked/incomplete: " + type(latch).__name__)
     raise
   result = WORKFLOW.run(ledger, collector, archive_directory, power_write=writer, capture=sampler.capture,
-                        cleanup=preparation.cleanup, health=sampler.health)
+                        cleanup=writer.cleanup, health=sampler.health)
   read_slot, delete = backend.retirement_callbacks(ledger, result["cycle"], archive_directory)
   retired = RETIREMENT.retire(ledger, result["cycle"], archive_directory, read_slot=read_slot, compare_delete_slot=delete,
                             health=backend.retirement_health(sampler, collector.binding))
@@ -148,7 +178,9 @@ def execute(config, qualification, report, *, ledger, archive_directory, root, b
 def main(argv=None):
   parser = argparse.ArgumentParser(description="Externally qualified routine hibernation; no qualification or recovery bypass")
   parser.add_argument("action", nargs="?", choices=("check", "hibernate"), default="check")
+  parser.add_argument("--desktop", action="store_true", help="Require the active desktop secure-session gate and sleep compatibility window")
   args = parser.parse_args(argv)
+  if args.desktop and args.action != "hibernate": parser.error("Desktop admission requires hibernate")
   if args.action == "hibernate" and os.geteuid() != 0: parser.error("Explicit root invocation required; no automatic escalation")
   # Shared with the one-use dispatcher, not a second independent lock.
   with TRIAL._global_lock():
@@ -162,7 +194,8 @@ def main(argv=None):
     ledger = TX.Ledger(STATE / "ledger")
     arguments = {"ledger": ledger, "archive_directory": STATE / "archives", "root": Path("/")}
     if args.action == "hibernate":
-      result = execute(config, qualification, report, **arguments, backend_factory=BACKEND.HostBackend, sleeper=time.sleep)
+      result = execute(config, qualification, report, **arguments, backend_factory=BACKEND.HostBackend, sleeper=time.sleep,
+                       desktop=args.desktop)
       output = {"classification": result["classification"], "cycle_id": result["cycle"]["cycle_id"], "state": result["cycle"]["state"]}
     else: output = check(config, qualification, report, **arguments)
     print(json.dumps(output, sort_keys=True))
