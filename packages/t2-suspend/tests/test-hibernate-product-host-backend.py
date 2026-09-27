@@ -152,6 +152,27 @@ class Backends(unittest.TestCase):
     self.o.write(backend.HOST.EFI / ("LoaderEntrySelected-" + backend.HOST.LOADER_GUID), b"\x07\0\0\0wrong")
     with self.assertRaises(ValueError): self.host.read("selected_entry")
 
+  def test_exact_target_23_character_srcversion_runs_without_relaxing_pin(self):
+    pin = {**self.o.marker_pin, "srcversion": "1A72ABF3A3BFC778FC5A9C6"}
+    self.assertEqual(len(pin["srcversion"]), 23)
+    self.o.marker_pin = pin
+    self.o.file_metadata[str(self.o.marker)] = pin
+    self.host = backend.HostBackend(self.root, self.o.report, self.cycle, self.o.marker, pin,
+                                    command_runner=self.command, sysfs_writer=self.write)
+    self.assertEqual(self.host.read("marker_file_identity"), pin)
+    result, writer, archive, sampler, collector = self.run_workflow()
+    self.assertEqual(result["cycle"]["state"], "archived")
+    self.assertEqual(self.power_count, 1)
+    self.o.file_metadata[str(self.o.marker)] = {**pin, "srcversion": "1A72ABF3A3BFC778FC5A9C7"}
+    with self.assertRaises(ValueError): self.host.read("marker_file_identity")
+
+  def test_malformed_marker_srcversion_rejected_before_backend_actions(self):
+    for value in (None, "", "F" * 22, "F" * 25, "G" * 23, "f" * 24, "F" * 23 + "\n"):
+      with self.subTest(value=value), self.assertRaises(ValueError):
+        backend.HostBackend(self.root, self.o.report, self.cycle, self.o.marker, {**self.o.marker_pin, "srcversion": value},
+                            command_runner=self.command, sysfs_writer=self.write)
+    self.assertEqual(self.calls, [])
+
   def test_stage_zero_is_exclusive_and_wrong_vector_cannot_arm(self):
     raw = b"\x07\0\0\0MBPW" + bytes.fromhex(self.cycle["prefix"]) + b"\0"
     self.host.write("source_stage", raw)

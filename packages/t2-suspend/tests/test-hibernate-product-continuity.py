@@ -132,6 +132,26 @@ class Continuity(unittest.TestCase):
         return data
       with self.assertRaises(ValueError): collector.write_and_capture(self.write, capture)
 
+  def test_23_character_srcversion_preserves_exact_return_identity(self):
+    tag = "1A72ABF3A3BFC778FC5A9C6"
+    self.runtime["modules"]["mba_hibernate_efi_postwrite_marker"]["srcversion"] = tag
+    self.collector = self.new_collector()
+    self.collector.write_and_capture(self.write, self.capture)
+    self.collector.finish(self.health(), [])
+    collector = self.new_collector()
+    def changed(binding):
+      evidence = self.capture(binding)
+      evidence["source_runtime"]["modules"]["mba_hibernate_efi_postwrite_marker"]["srcversion"] = "1A72ABF3A3BFC778FC5A9C7"
+      return evidence
+    with self.assertRaises(ValueError): collector.write_and_capture(self.write, changed)
+
+  def test_malformed_srcversion_rejected(self):
+    for tag in (None, "", "A" * 22, "A" * 25, "G" * 23, "a" * 24, "A" * 23 + "\n"):
+      with self.subTest(tag=tag):
+        runtime = copy.deepcopy(self.runtime)
+        runtime["modules"]["t2bce_core"]["srcversion"] = tag
+        with self.assertRaises(ValueError): ct.runtime_value(runtime)
+
   def test_health_requires_exact_typed_cleanup_gates(self):
     for modify in (lambda data: data.update(after_cleanup=1), lambda data: data.update(failed_units=["broken"]),
                    lambda data: data["devices"].update(internal_keyboard=False), lambda data: data["pm"].update(resume_offset=999)):

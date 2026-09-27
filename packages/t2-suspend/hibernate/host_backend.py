@@ -103,6 +103,34 @@ def verify_readiness(root, report, *, command_runner=None):
   if pending.exists() or pending.is_symlink(): raise ValueError("Historical Wi-Fi cleanup is pending")
 
 
+def validate_static_inputs(report, manifest, marker_file, marker_pin):
+  """Pure constructor admission shared with the pre-consumption dispatcher.
+
+  This creates no cycle and performs no filesystem, query or host mutation.
+  Actual artifact/marker bytes and metadata remain independently checked.
+  """
+  manifest = TX.manifest_value(manifest)
+  CT.exact(report["manifest"], manifest, "Backend artifact pins")
+  CT.exact(TX.digest(report["audited_details"]), report["audited_details_sha256"], "Backend computed details digest")
+  CT.exact(report["audited_details"]["manifest_sha256"], TX.digest(manifest), "Backend details manifest")
+  CT.exact(report["hardware_qualified"], False, "No artifact hardware qualification")
+  CT.exact(report["usable_hibernation_qualified"], False, "No artifact usability qualification")
+  if not Path(marker_file).is_absolute():
+    raise ValueError("Explicit absolute marker file required")
+  CT.fields(marker_pin, ("sha256", "srcversion", "vermagic", "variable_version"), "Backend marker pin")
+  TX.hash_value(marker_pin["sha256"])
+  # This target's modpost passes sizeof(srcversion[25]) - 1 to snprintf,
+  # whose terminating NUL leaves 23 uppercase hex characters. Other module
+  # toolchains emit 24. Format admission does not relax exact modinfo/pin
+  # comparison or the independently pinned module byte hash.
+  if type(marker_pin["srcversion"]) is not str or not re.fullmatch(r"[0-9A-F]{23,24}", marker_pin["srcversion"]):
+    raise ValueError("Invalid backend marker srcversion")
+  if (type(marker_pin["vermagic"]) is not str or not marker_pin["vermagic"].split() or
+      marker_pin["vermagic"].split()[0] != report["audited_details"]["kernel_release"]):
+    raise ValueError("Marker static production ABI differs")
+  CT.exact(marker_pin["variable_version"], "v3", "Backend marker protocol")
+
+
 class HostBackend:
   def __init__(self, root, report, reserved_cycle, marker_file, marker_pin, *, command_runner=None, sysfs_writer=None):
     self.root = Path(root)
@@ -117,19 +145,8 @@ class HostBackend:
     self._writer = sysfs_writer
     self.report = copy.deepcopy(report)
     self.cycle = copy.deepcopy(TX.cycle_value(reserved_cycle))
-    CT.exact(self.report["manifest"], self.cycle["manifest"], "Backend cycle artifact pins")
-    CT.exact(TX.digest(self.report["audited_details"]), self.report["audited_details_sha256"], "Backend computed details digest")
-    CT.exact(self.report["audited_details"]["manifest_sha256"], TX.digest(self.cycle["manifest"]), "Backend details manifest")
-    CT.exact(self.report["hardware_qualified"], False, "No artifact hardware qualification")
-    CT.exact(self.report["usable_hibernation_qualified"], False, "No artifact usability qualification")
     self.marker_file = Path(marker_file)
-    if not self.marker_file.is_absolute():
-      raise ValueError("Explicit absolute marker file required")
-    CT.fields(marker_pin, ("sha256", "srcversion", "vermagic", "variable_version"), "Backend marker pin")
-    TX.hash_value(marker_pin["sha256"])
-    if type(marker_pin["srcversion"]) is not str or not re.fullmatch(r"[0-9A-F]{24}", marker_pin["srcversion"]):
-      raise ValueError("Invalid backend marker srcversion")
-    CT.exact(marker_pin["variable_version"], "v3", "Backend marker protocol")
+    validate_static_inputs(self.report, self.cycle["manifest"], self.marker_file, marker_pin)
     self.marker_pin = copy.deepcopy(marker_pin)
 
   def _path(self, relative):

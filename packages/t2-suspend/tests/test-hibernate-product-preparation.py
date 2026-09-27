@@ -96,6 +96,22 @@ class Preparations(unittest.TestCase):
     self.assertTrue(all((self.ledger.directory / (self.preparation.stem + "-" + action["name"] + "-intent.json")).is_file() for action in result["receipt"]["actions"]))
     self.assert_blocked()
 
+  def test_target_23_character_marker_srcversion_is_exactly_retained(self):
+    pin = {**self.pin, "srcversion": "1A72ABF3A3BFC778FC5A9C6"}
+    backend = Backend(self.cycle, pin)
+    preparation = prep.Preparation(self.ledger, self.cycle, backend, "/synthetic/private-marker.ko", pin, sleeper=lambda delay: None)
+    result = preparation.prepare()
+    self.assertEqual(result["cycle"]["state"], "prepared")
+    self.assertEqual(preparation.marker_pin, pin)
+    self.assertEqual(backend.values["source_marker_identity"], pin)
+
+  def test_invalid_marker_srcversions_have_zero_actions(self):
+    for value in (None, "", "B" * 22, "B" * 25, "G" * 23, "b" * 24, "B" * 23 + "\n"):
+      with self.subTest(value=value), self.assertRaises(ValueError):
+        prep.Preparation(self.ledger, self.cycle, self.backend, "/synthetic/private-marker.ko",
+                         {**self.pin, "srcversion": value}, sleeper=lambda delay: None)
+    self.assertEqual(self.backend.events, [])
+
   def test_cleanup_order_and_owned_return_preserves_stage_guards(self):
     result = self.preparation.prepare()
     self.backend.events.clear()
