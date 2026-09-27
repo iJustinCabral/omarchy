@@ -1,0 +1,21 @@
+# Only this private profile replaces the stock resume dispatcher.
+run_hook() {
+  local file=${OMARCHY_T2_COLD_PCI_RESTORE_ROOT:-}/usr/lib/omarchy-t2-cold-pci-restore/functions pending=0
+  if [[ ! -f $file || -L $file ]]; then
+    err "omarchy-t2-cold-pci-restore: missing full-restore functions before resume"
+    launch_interactive_shell --exec
+    exit 1
+  fi
+  . "$file"
+  if ! fr_before_resume; then
+    fr_recovery "immediate resume gate failed"
+  fi
+  if [[ -e $fr_intent || -L $fr_intent ]]; then pending=1; fi
+  . "$fr_dir/stock-resume"
+  run_hook
+  # Latch intent before invocation: a failed resume cannot disguise its path
+  # by removing an intent or consuming the swap signature.
+  if [[ $pending == "1" ]]; then
+    fr_recovery "pending stock resume returned to restore initramfs; restoration unproven"
+  fi
+}

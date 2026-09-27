@@ -1,0 +1,8 @@
+build() {
+  . "${BASH_SOURCE[0]%/*}/bundle" || return 1
+  build_pci_restore_bundle || return 1
+  add_runscript
+}
+help() {
+  echo "Private pending-only corrected PCI guard for actual atomic image restore."
+}
