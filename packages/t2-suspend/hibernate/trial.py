@@ -35,6 +35,16 @@ WORKFLOW = _module("trial_workflow", "workflow.py")
 RETIREMENT = _module("trial_retirement", "slot_retirement.py")
 STATE = Path("/var/lib/omarchy/t2-hibernate-trial")
 CONFIG_SCHEMA = "omarchy-t2-explicit-trial-config-v1"
+REPAIR_SCHEMA = "omarchy-t2-known-constructor-repair-v1"
+REPAIR_BOOT = "b795a460-bf57-4ff6-84b7-4ebc415a9350"
+REPAIR_CYCLE = "d8923d12-7794-483f-8746-91face7e2ab9"
+REPAIR_VECTOR = "8946b182fa68d358ce5efc50091c3f17189e276ef847bab054f1d0278241a67e"
+REPAIR_GUARD_SHA = "fb529b27e9c8507d05270c4b0414c8bd4cbcdbaa42676de4a24370ac502cf2a4"
+REPAIR_CYCLE_SHA = "3b6f001a1d2269b1b285553e6a7cc4e47c3b13db04e9f4fa924d1c9bdddbaf37"
+REPAIR_UNIT = "codex-mba-product-trial-d596155a.service"
+REPAIR_INVOCATION = "4a1e4bdecb2443f6af8b619f628fc752"
+REPAIR_FAILURE_SHA = "ec77d4e23b09c8c548de8124784a58f1249b9db102be306d0e525a80de22e5a7"
+REPAIR_SYSTEMD_SHA = "5a715459c620e7795d53b5c2ad57b96ef64690e864f1fffbda7bb81fa3dfc243"
 
 
 def verify_deployment(root, config, report):
@@ -112,6 +122,8 @@ def validate(config, authorization, report, boot_id):
   for value in (config["audited_details_sha256"], authority["audited_details_sha256"]):
     HOST.CT.exact(value, report["audited_details_sha256"], "Authorized exact artifact details")
   HOST.CT.exact(config["marker_pin"], authority["marker_pin"], "Authorized exact source marker")
+  backend = _module("trial_static_backend", "host_backend.py")
+  backend.validate_static_inputs(report, report["manifest"], config["marker_file"], config["marker_pin"])
   HOST.CT.exact(boot_id, authority["original_boot_id"], "Current authorized original boot")
   HOST.CT.exact(ARTIFACTS._file_digest(config["marker_file"]), authority["marker_pin"]["sha256"], "Actual external marker bytes")
   return authority
@@ -127,6 +139,19 @@ def execute(config, authorization, report, *, ledger, guard_directory, archive_d
   ledger.configure(report["manifest"])
   ledger.authorize_trial(authority, guard_directory)
   cycle = ledger.begin(boot_id)
+  return _run_reserved(config, authority, report, cycle, ledger=ledger, archive_directory=archive_directory,
+                       root=root, backend_factory=backend_factory, sleeper=sleeper, deployment_check=deployment_check)
+
+
+def _run_reserved(config, authority, report, cycle, *, ledger, archive_directory, root, backend_factory, sleeper,
+                  deployment_check=verify_deployment):
+  """Internal execution body; this does not grant reservation or retry authority."""
+  TX.cycle_value(cycle)
+  HOST.CT.exact(cycle["state"], "reserved", "Reserved execution state")
+  HOST.CT.exact(cycle["original_boot_id"], authority["original_boot_id"], "Reserved execution boot")
+  HOST.CT.exact(cycle["manifest"], report["manifest"], "Reserved execution artifacts")
+  HOST.CT.exact(cycle["qualification_sha256"], TX.digest(authority), "Reserved execution authority")
+  ledger.compare_and_run(cycle, lambda advance: HOST.CT.exact(advance.check_current(), cycle, "Current reserved execution"))
   backend = backend_factory(root, report, cycle, config["marker_file"], config["marker_pin"])
   preparation = PREPARATION.Preparation(ledger, cycle, backend, config["marker_file"], config["marker_pin"], sleeper=sleeper)
   prepared = preparation.prepare()
@@ -157,6 +182,98 @@ def execute(config, authorization, report, *, ledger, guard_directory, archive_d
       compare_delete_slot=delete, health=backend.retirement_health(sampler, collector.binding))
   result["classification"] = "one-use-product-trial-not-usable-qualification"
   return result
+
+
+def _repair_raw(directory, name):
+  path = Path(directory) / name
+  if any(item.is_symlink() for item in (path, *path.parents)):
+    raise ValueError("Symlinked constructor repair evidence")
+  return HOST._raw(path, private=True)
+
+
+def repair_constructor(config, authorization, report, *, ledger, guard_directory, archive_directory, root,
+                       repair_directory, backend_factory, sleeper, deployment_check=verify_deployment):
+  """Continue only the pinned constructor-only failure, once, on its SAME cycle.
+
+  The external root-private repair receipt is separately reviewed permission,
+  not product qualification. Missing/changed state or any started repair blocks
+  continuation. No consumed guard, failed unit, ledger or allocation is reset.
+  The live caller holds the global physical lock; the short ledger scope ends
+  before Preparation takes that same lock independently.
+  """
+  root, repair_directory = Path(root), Path(repair_directory)
+  if root == Path("/"):
+    for actual, expected in ((repair_directory, STATE), (ledger.directory, STATE / "ledger"),
+                             (Path(guard_directory), STATE / "guards"), (Path(archive_directory), STATE / "archives")):
+      HOST.CT.exact(actual, expected, "Fixed live constructor repair paths")
+  info = repair_directory.lstat()
+  if repair_directory.is_symlink() or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+    raise ValueError("Private constructor repair directory required")
+  boot_id = HOST._raw(root / "proc/sys/kernel/random/boot_id").decode().strip()
+  HOST.CT.exact(boot_id, REPAIR_BOOT, "Known constructor failure boot")
+  authority = validate(config, authorization, report, boot_id)
+  deployment_check(root, config, report)
+  verify_readiness(root, config, authority, report)
+  receipt_raw = _repair_raw(repair_directory, "constructor-repair-authorization.json")
+  receipt = json.loads(receipt_raw, object_pairs_hook=TX.no_duplicates)
+  HOST.CT.fields(receipt, ("schema", "accepted", "boot_id", "cycle_id", "vector", "pins", "implementation_sha256"), "Constructor repair authority")
+  for key, expected in (("schema", REPAIR_SCHEMA), ("accepted", True), ("boot_id", REPAIR_BOOT), ("cycle_id", REPAIR_CYCLE), ("vector", REPAIR_VECTOR)):
+    HOST.CT.exact(receipt[key], expected, "Known constructor repair authority")
+  HOST.CT.fields(receipt["pins"], ("config_sha256", "authorization_sha256", "cycle_sha256", "consumed_guard_sha256", "failure_evidence_sha256"), "Constructor repair pins")
+  for pin in receipt["pins"].values(): TX.hash_value(pin)
+  for name, expected in (("config.json", config), ("authorization.json", authorization)):
+    raw = _repair_raw(repair_directory, name)
+    HOST.CT.exact(json.loads(raw, object_pairs_hook=TX.no_duplicates), expected, "Retained original constructor inputs")
+    HOST.CT.exact(HOST._digest(raw), receipt["pins"][name.removesuffix(".json") + "_sha256"], "Retained input raw hash")
+  failure_raw = _repair_raw(repair_directory, "constructor-only-failure.json")
+  HOST.CT.exact(HOST._digest(failure_raw), REPAIR_FAILURE_SHA, "Known constructor failure evidence hash")
+  HOST.CT.exact(REPAIR_FAILURE_SHA, receipt["pins"]["failure_evidence_sha256"], "Repair failure pin")
+  failure = json.loads(failure_raw, object_pairs_hook=TX.no_duplicates)
+  HOST.CT.exact(failure, {"schema": "omarchy-t2-constructor-only-failure-v1", "phase": "backend-constructor",
+    "error": "Invalid backend marker srcversion", "prepared": False, "power_write": False, "boot_id": REPAIR_BOOT,
+    "cycle_id": REPAIR_CYCLE, "vector": REPAIR_VECTOR, "systemd_failure_archive_sha256": REPAIR_SYSTEMD_SHA}, "Known constructor-only failure")
+  systemd_raw = _repair_raw(repair_directory, "constructor-systemd-failure.json")
+  HOST.CT.exact(HOST._digest(systemd_raw), REPAIR_SYSTEMD_SHA, "Known archived failed unit hash")
+  systemd = json.loads(systemd_raw, object_pairs_hook=TX.no_duplicates)
+  HOST.CT.fields(systemd, ("boot_id", "unit", "invocation_id", "show", "journal"), "Archived constructor unit")
+  for key, expected in (("boot_id", REPAIR_BOOT), ("unit", REPAIR_UNIT), ("invocation_id", REPAIR_INVOCATION)):
+    HOST.CT.exact(systemd[key], expected, "Known archived failed invocation")
+  if type(systemd["show"]) is not str or "Result=exit-code" not in systemd["show"] or "ExecMainStatus=1" not in systemd["show"] or type(systemd["journal"]) is not str or "Invalid backend marker srcversion" not in systemd["journal"]:
+    raise ValueError("Missing exact constructor failure trace")
+  HOST.CT.fields(receipt["implementation_sha256"], ("trial.py", "host_backend.py", "preparation.py", "continuity.py"), "Reviewed constructor repair implementation")
+  for name, pin in receipt["implementation_sha256"].items():
+    HOST.CT.exact(ARTIFACTS._file_digest(Path(__file__).with_name(name)), TX.hash_value(pin), "Reviewed exact repair code")
+  cycle_raw = _repair_raw(ledger.directory, "cycle-" + REPAIR_CYCLE + ".json")
+  HOST.CT.exact(HOST._digest(cycle_raw), REPAIR_CYCLE_SHA, "Known untouched reserved cycle bytes")
+  HOST.CT.exact(REPAIR_CYCLE_SHA, receipt["pins"]["cycle_sha256"], "Repair original cycle pin")
+  cycle = TX.cycle_value(json.loads(cycle_raw, object_pairs_hook=TX.no_duplicates))
+  for key, expected in (("state", "reserved"), ("original_boot_id", REPAIR_BOOT), ("cycle_id", REPAIR_CYCLE), ("vector", REPAIR_VECTOR)):
+    HOST.CT.exact(cycle[key], expected, "Known reserved constructor cycle")
+  guard_raw = _repair_raw(guard_directory, "trial-consumed.json")
+  HOST.CT.exact(HOST._digest(guard_raw), REPAIR_GUARD_SHA, "Known consumed trial guard")
+  HOST.CT.exact(REPAIR_GUARD_SHA, receipt["pins"]["consumed_guard_sha256"], "Repair original guard pin")
+  HOST.CT.exact(json.loads(guard_raw, object_pairs_hook=TX.no_duplicates),
+                {"protocol": TX.TRIAL_PROTOCOL, "authorization_sha256": TX.digest(authority), "cycle": cycle}, "Original guard cycle authority")
+  intent_name = "constructor-repair-intent.json"
+  intent = {"schema": REPAIR_SCHEMA, "repair_authorization_sha256": HOST._digest(receipt_raw), "cycle": cycle,
+            "constructor_only_failure_sha256": REPAIR_FAILURE_SHA, "implementation_sha256": receipt["implementation_sha256"]}
+  def consume(advance):
+    HOST.CT.exact(advance.check_current(), cycle, "Locked original constructor cycle")
+    HOST.CT.exact({item.name for item in ledger.directory.iterdir()}, {"lock", "state.json", "allocation-head.json",
+                  "allocation-" + REPAIR_CYCLE + ".json", "cycle-" + REPAIR_CYCLE + ".json"}, "Constructor-only ledger file set")
+    HOST.CT.exact({item.name for item in Path(guard_directory).iterdir()}, {"lock", "trial-consumed.json"}, "Constructor-only guard file set")
+    if any(Path(archive_directory).iterdir()): raise ValueError("Constructor failure already has archive state")
+    if (repair_directory / intent_name).exists() or (repair_directory / intent_name).is_symlink():
+      raise ValueError("Constructor repair permanently consumed; no retry")
+    HOST.CT.exact(_repair_raw(ledger.directory, "cycle-" + REPAIR_CYCLE + ".json"), cycle_raw, "Locked raw reserved cycle")
+    HOST.CT.exact(_repair_raw(guard_directory, "trial-consumed.json"), guard_raw, "Locked raw consumed guard")
+    # Dedicated private-directory writer supplies exclusive publication and
+    # file+directory fsync; no replacement or deletion of the original guard.
+    repair = TX.Ledger(repair_directory)
+    repair._write(intent_name, intent, exclusive=True)
+  ledger.compare_and_run(cycle, consume)
+  return _run_reserved(config, authority, report, cycle, ledger=ledger, archive_directory=archive_directory,
+                       root=root, backend_factory=backend_factory, sleeper=sleeper, deployment_check=deployment_check)
 
 
 def _private_json(path):
@@ -190,9 +307,9 @@ def _global_lock():
 
 def main(argv=None):
   parser = argparse.ArgumentParser(description="Explicit one-use T2 trial; no usable qualification or stock hibernate")
-  parser.add_argument("action", nargs="?", choices=("inspect", "check", "execute"), default="inspect")
+  parser.add_argument("action", nargs="?", choices=("inspect", "check", "execute", "repair-constructor"), default="inspect")
   args = parser.parse_args(argv)
-  if args.action == "execute" and os.geteuid() != 0:
+  if args.action in ("execute", "repair-constructor") and os.geteuid() != 0:
     parser.error("Explicit root invocation required; use sudo. No automatic escalation is performed.")
   with _global_lock():
     return _dispatch(args.action)
@@ -210,6 +327,13 @@ def _dispatch(action):
     if directory.is_symlink() or not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
       raise ValueError("Fixed existing root-private trial state directories required")
   guard = STATE / "guards/trial-consumed.json"
+  if action == "repair-constructor":
+    backend = _module("trial_live_backend", "host_backend.py")
+    result = repair_constructor(config, authorization, report, ledger=TX.Ledger(STATE / "ledger"), guard_directory=STATE / "guards",
+                                archive_directory=STATE / "archives", root=Path("/"), repair_directory=STATE,
+                                backend_factory=backend.HostBackend, sleeper=time.sleep)
+    print(json.dumps({"classification": result["classification"], "cycle_id": result["cycle"]["cycle_id"], "state": result["cycle"]["state"]}))
+    return 0
   if guard.exists() or guard.is_symlink():
     raise ValueError("One-use trial permanently consumed; no retry or stock fallback")
   if action != "execute":

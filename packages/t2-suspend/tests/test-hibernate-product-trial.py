@@ -103,6 +103,7 @@ class Trials(unittest.TestCase):
       self.assertEqual(result.exception.code, 0)
       with patch.object(trial.os, "geteuid", return_value=1234):
         with self.assertRaises(SystemExit): trial.main(["execute"])
+        with self.assertRaises(SystemExit): trial.main(["repair-constructor"])
     with self.assertRaises(SystemExit): trial.main(["execute", "--root", "/tmp"])
 
   def test_default_is_inspect_and_active_global_cycle_refuses_check(self):
@@ -209,6 +210,19 @@ class Trials(unittest.TestCase):
     observation = host_fixture.Observations("test_runtime_and_section_cmdline_hashes_are_distinct")
     observation.setUp()
     self.addCleanup(observation.tearDown)
+    observation.marker_pin["srcversion"] = "1A72ABF3A3BFC778FC5A9C6"
+    observation.write("sys/module/" + trial.HOST.MARKER + "/srcversion", observation.marker_pin["srcversion"])
+    for metadata in observation.modules.values(): metadata["srcversion"] = "A" * 23
+    for name in observation.selection:
+      observation.write("sys/module/" + name.replace("-", "_") + "/srcversion", "A" * 23)
+    provenance_raw = json.dumps(observation.provenance, sort_keys=True).encode()
+    (observation.source / "provenance.json").write_bytes(provenance_raw)
+    observation.report["manifest"]["runtime_sha256"] = trial.ARTIFACTS.AUDIT.S4.runtime_stack_identity(observation.provenance)
+    details = observation.report["audited_details"]
+    details["runtime_modules"] = copy.deepcopy(observation.modules)
+    details["provenance_sha256"]["source"] = hashlib.sha256(provenance_raw).hexdigest()
+    details["manifest_sha256"] = tx.digest(observation.report["manifest"])
+    observation.report["audited_details_sha256"] = tx.digest(details)
     spec = importlib.util.spec_from_file_location("trial_prep_fixture", Path(__file__).with_name("test-hibernate-product-preparation.py"))
     prep_fixture = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(prep_fixture)
@@ -248,6 +262,143 @@ class Trials(unittest.TestCase):
     with self.assertRaises(ValueError): self.ledger.begin(observation.boot)
     for change in ({"audited_details_sha256": "f" * 64}, {"marker_pin": self.authorization["marker_pin"]}):
       with self.assertRaises(ValueError): trial.validate({**config, **change}, authorization, observation.report, observation.boot)
+
+  def repair_fixture(self):
+    spec = importlib.util.spec_from_file_location("trial_repair_backend_fixture", Path(__file__).with_name("test-hibernate-product-host-backend.py"))
+    fixture = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixture)
+    host = fixture.Backends("test_fixed_keys_commands_and_unknown_power_are_rejected")
+    host.setUp()
+    self.addCleanup(host.doCleanups)
+    observation = host.o
+    observation.marker_pin["srcversion"] = "1A72ABF3A3BFC778FC5A9C6"
+    for metadata in observation.modules.values(): metadata["srcversion"] = "A" * 23
+    for name in observation.selection:
+      observation.write("sys/module/" + name.replace("-", "_") + "/srcversion", "A" * 23)
+    provenance_raw = json.dumps(observation.provenance, sort_keys=True).encode()
+    (observation.source / "provenance.json").write_bytes(provenance_raw)
+    observation.report["manifest"]["runtime_sha256"] = trial.ARTIFACTS.AUDIT.S4.runtime_stack_identity(observation.provenance)
+    details = observation.report["audited_details"]
+    details["runtime_modules"] = copy.deepcopy(observation.modules)
+    details["provenance_sha256"]["source"] = hashlib.sha256(provenance_raw).hexdigest()
+    details["manifest_sha256"] = tx.digest(observation.report["manifest"])
+    observation.report["audited_details_sha256"] = tx.digest(details)
+    authorization = copy.deepcopy(self.authorization)
+    authorization.update(manifest_sha256=tx.digest(observation.report["manifest"]), audited_details_sha256=observation.report["audited_details_sha256"],
+                         original_boot_id=observation.boot, marker_pin=observation.marker_pin)
+    authorization["physical_acceptance"]["boot_id"] = observation.boot
+    config = {"schema": trial.CONFIG_SCHEMA, "source_directory": str(observation.source), "restore_directory": str(self.base / "restore"),
+      "production_uki": str(self.base / "production.efi"), "source_tree": str(observation.tree), "marker_file": str(observation.marker),
+      "marker_pin": observation.marker_pin, "manifest": observation.report["manifest"],
+      "audited_details_sha256": observation.report["audited_details_sha256"], "staged_receipt_sha256": "e" * 64, "retire_slots": True}
+    self.ledger.configure(observation.report["manifest"])
+    self.ledger.authorize_trial(authorization, self.guard)
+    cycle = self.ledger.begin(observation.boot, cycle_id=trial.REPAIR_CYCLE)
+    observation.cycle = cycle
+    directory = self.base / "repair"
+    directory.mkdir(mode=0o700)
+    archive = self.base / "repair-archives"
+    archive.mkdir(mode=0o700)
+    def write(name, value):
+      raw = (json.dumps(value, sort_keys=True, indent=2) + "\n").encode()
+      path = directory / name
+      path.write_bytes(raw)
+      path.chmod(0o600)
+      return hashlib.sha256(raw).hexdigest()
+    config_sha = write("config.json", config)
+    authority_sha = write("authorization.json", authorization)
+    systemd_sha = write("constructor-systemd-failure.json", {"boot_id": observation.boot, "unit": trial.REPAIR_UNIT,
+      "invocation_id": trial.REPAIR_INVOCATION, "show": "Result=exit-code\nExecMainStatus=1\n", "journal": "Traceback: Invalid backend marker srcversion"})
+    failure_sha = write("constructor-only-failure.json", {"schema": "omarchy-t2-constructor-only-failure-v1", "phase": "backend-constructor",
+      "error": "Invalid backend marker srcversion", "prepared": False, "power_write": False, "boot_id": observation.boot,
+      "cycle_id": cycle["cycle_id"], "vector": cycle["vector"], "systemd_failure_archive_sha256": systemd_sha})
+    guard_raw = (self.guard / "trial-consumed.json").read_bytes()
+    cycle_raw = (self.ledger.directory / ("cycle-" + cycle["cycle_id"] + ".json")).read_bytes()
+    guard_sha, cycle_sha = hashlib.sha256(guard_raw).hexdigest(), hashlib.sha256(cycle_raw).hexdigest()
+    receipt = {"schema": trial.REPAIR_SCHEMA, "accepted": True, "boot_id": observation.boot, "cycle_id": cycle["cycle_id"], "vector": cycle["vector"],
+      "pins": {"config_sha256": config_sha, "authorization_sha256": authority_sha, "cycle_sha256": cycle_sha,
+               "consumed_guard_sha256": guard_sha, "failure_evidence_sha256": failure_sha},
+      "implementation_sha256": {name: trial.ARTIFACTS._file_digest(Path(trial.__file__).with_name(name)) for name in ("trial.py", "host_backend.py", "preparation.py", "continuity.py")}}
+    write("constructor-repair-authorization.json", receipt)
+    for name, value in (("REPAIR_BOOT", observation.boot), ("REPAIR_VECTOR", cycle["vector"]), ("REPAIR_CYCLE_SHA", cycle_sha),
+                        ("REPAIR_GUARD_SHA", guard_sha), ("REPAIR_FAILURE_SHA", failure_sha), ("REPAIR_SYSTEMD_SHA", systemd_sha)):
+      patcher = patch.object(trial, name, value)
+      patcher.start()
+      self.addCleanup(patcher.stop)
+    patcher = patch.object(trial, "_platform_readiness", side_effect=lambda root, report: fixture.backend.verify_readiness(root, report, command_runner=host.command))
+    patcher.start()
+    self.addCleanup(patcher.stop)
+    def factory(root, report, reserved, marker, pin):
+      return fixture.backend.HostBackend(root, report, reserved, marker, pin, command_runner=host.command, sysfs_writer=host.write)
+    arguments = {"ledger": self.ledger, "guard_directory": self.guard, "archive_directory": archive,
+      "root": observation.root, "repair_directory": directory, "backend_factory": factory, "sleeper": lambda duration: None,
+      "deployment_check": lambda *args: None}
+    return config, authorization, observation.report, arguments, host, directory, guard_raw, cycle_raw
+
+  def test_constructor_repair_actual23_runs_same_cycle_through_reconciled_once(self):
+    config, authority, report, args, host, directory, guard_raw, cycle_raw = self.repair_fixture()
+    result = trial.repair_constructor(config, authority, report, **args)
+    self.assertEqual(result["retirement"]["cycle"]["state"], "reconciled")
+    self.assertEqual(result["cycle"]["cycle_id"], trial.REPAIR_CYCLE)
+    self.assertEqual(result["cycle"]["vector"], trial.REPAIR_VECTOR)
+    self.assertEqual((self.guard / "trial-consumed.json").read_bytes(), guard_raw)
+    self.assertEqual(host.power_count, 1)
+    self.assertTrue((directory / "constructor-repair-intent.json").is_file())
+    with self.assertRaises(ValueError): trial.repair_constructor(config, authority, report, **args)
+    with self.assertRaises(ValueError): self.ledger.begin(trial.REPAIR_BOOT)
+
+  def test_constructor_repair_code_failure_or_prep_state_tamper_blocks_backend(self):
+    config, authority, report, args, host, directory, guard_raw, cycle_raw = self.repair_fixture()
+    args["backend_factory"] = lambda *unused: self.fail("Backend invoked")
+    target = directory / "constructor-repair-authorization.json"
+    raw = target.read_bytes()
+    receipt = json.loads(raw)
+    receipt["implementation_sha256"]["continuity.py"] = "f" * 64
+    target.write_text(json.dumps(receipt))
+    with self.assertRaises(ValueError): trial.repair_constructor(config, authority, report, **args)
+    target.write_bytes(raw)
+    failure = directory / "constructor-systemd-failure.json"
+    raw_failure = failure.read_bytes()
+    failure.write_bytes(b"foreign")
+    with self.assertRaises(ValueError): trial.repair_constructor(config, authority, report, **args)
+    failure.write_bytes(raw_failure)
+    extra = self.ledger.directory / "preparation-partial.json"
+    extra.write_bytes(b"{}")
+    extra.chmod(0o600)
+    with self.assertRaises(ValueError): trial.repair_constructor(config, authority, report, **args)
+    self.assertFalse((directory / "constructor-repair-intent.json").exists())
+    self.assertEqual(host.power_count, 0)
+
+  def test_constructor_repair_intent_fsync_failure_consumes_without_backend(self):
+    config, authority, report, args, host, directory, guard_raw, cycle_raw = self.repair_fixture()
+    args["backend_factory"] = lambda *unused: self.fail("Backend invoked")
+    original_sync = tx.Ledger._sync
+    def fail_repair_sync(ledger):
+      if ledger.directory == directory: raise OSError("synthetic repair intent directory fsync failure")
+      return original_sync(ledger)
+    with patch.object(tx.Ledger, "_sync", new=fail_repair_sync):
+      with self.assertRaises(OSError): trial.repair_constructor(config, authority, report, **args)
+    self.assertTrue((directory / "constructor-repair-intent.json").exists())
+    with self.assertRaises(ValueError): trial.repair_constructor(config, authority, report, **args)
+    self.assertEqual((self.guard / "trial-consumed.json").read_bytes(), guard_raw)
+    self.assertEqual((self.ledger.directory / ("cycle-" + trial.REPAIR_CYCLE + ".json")).read_bytes(), cycle_raw)
+    self.assertEqual(host.power_count, 0)
+
+  def test_static_backend_format_failure_never_consumes_guard(self):
+    config, authority, report, args, host, directory, guard_raw, cycle_raw = self.repair_fixture()
+    fresh = tx.Ledger(self.base / "fresh-ledger")
+    fresh_guard = self.base / "fresh-guard"
+    fresh_guard.mkdir(mode=0o700)
+    malformed = copy.deepcopy(config)
+    malformed["marker_pin"]["srcversion"] = "B" * 22
+    changed_authority = copy.deepcopy(authority)
+    changed_authority["marker_pin"] = malformed["marker_pin"]
+    with self.assertRaises(ValueError):
+      trial.execute(malformed, changed_authority, report, ledger=fresh, guard_directory=fresh_guard,
+                    archive_directory=args["archive_directory"], root=args["root"], backend_factory=lambda *unused: self.fail("Backend invoked"),
+                    sleeper=lambda duration: None, deployment_check=lambda *unused: None)
+    self.assertFalse((fresh_guard / "trial-consumed.json").exists())
+    self.assertFalse(any(fresh.directory.glob("cycle-*.json")))
 
 
 if __name__ == "__main__":
