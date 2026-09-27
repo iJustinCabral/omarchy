@@ -38,6 +38,8 @@ python3 "$ROOT/packages/t2-suspend/tests/test-cold-pre-syscore-integration.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-cold-pre-arch-integration.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-cold-pci-pre-arch-runtime.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-cold-pci-pre-arch-tooling.py"
+python3 "$ROOT/packages/t2-suspend/tests/test-cold-pci-restore-runtime.py"
+python3 "$ROOT/packages/t2-suspend/tests/test-cold-pci-restore-proof.py"
 pass "T2 suspend source and installer transactions"
 
 test_tmp=$(mktemp -d)
