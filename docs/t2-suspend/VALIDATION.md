@@ -2,6 +2,8 @@
 
 Current result: normal installed-driver boot and one short actual S3 suspend/resume passed on MacBookAir9,1. Bluetooth and audio were user-confirmed after resume; Wi-Fi was operationally up, without a separate traffic probe in that last checkpoint. A clean OS installation and hibernation remain unvalidated. See the [installer lifecycle](INSTALLATION.md) and [driver test ledger](README.md) for the other validation boundaries.
 
+All checkpoints ran on the development MacBookAir9,1 with the combined integration branch installed, including the Wi-Fi recovery watcher from the sibling `intel-mac/p10/t2-wifi-recovery` contribution, which this branch does not contain. See [branch scope](README.md#branch-scope-dependencies-and-merge-order).
+
 The dated checkpoints below preserve deployment failures and their corrections. Earlier pending statements describe the state at that checkpoint, not the current result.
 
 ### Completed integration checks
@@ -10,7 +12,7 @@ The real source fetch passed all pinned hashes. DKMS3.4.3 built all five modules
 
 A real mkinitcpio image generated under `/tmp` passed with the installed hook, all replacement Wi-Fi modules and the source-verification marker; Bluetooth was absent from early boot as intended. Missing dependencies in an earlier incomplete fixture exposed the need to terminate on accumulated build errors, which the final hook checks. No live `/boot` or system module files were modified.
 
-Twelve installer tests and five source-preparation tests passed, along with shell setup/migration/CLI/error-routing fixtures. Existing trackpad, T2 hardware, Bluetooth installer/gate, Wi-Fi recovery and sleep-retirement suites passed. The CLI suite passed; it retained its unrelated sandbox theme-lock warning. This is isolated installation/build validation, not a fresh hardware boot of the automatic installer.
+Twelve installer tests and five source-preparation tests passed, along with shell setup/migration/CLI/error-routing fixtures. On the combined integration branch, existing trackpad, T2 hardware, Bluetooth installer/gate, Wi-Fi recovery and sleep-retirement suites passed; the trackpad and Wi-Fi recovery suites belong to sibling contributions. The CLI suite passed; it retained its unrelated sandbox theme-lock warning. This is isolated installation/build validation, not a fresh hardware boot of the automatic installer.
 
 ### First live deployment: ready for ordinary boot
 
@@ -34,7 +36,7 @@ The corrected hook was deployed and the normal UKI regenerated without rebuildin
 
 ### Normal installed-driver boot passed
 
-On September12, the user returned from the normal entry and confirmed Wi-Fi, Bluetooth and audio working. Boot `fb189f6a-986d-4816-8b86-bf775f4f9a4f` uses stock kernel `7.2.4-arch1-Watanare-T2-1-t2`, without lab command-line markers or a runtime Bluetooth load override. Loaded Wi-Fi source version `E8C051F8EBDA8DE23852575` and Bluetooth `4DF58889A43B9AC7E9E3E8C` match the tested drivers; module lookup selects both from `updates/dkms`. Wi-Fi recovery policy is enabled.
+On September12, the user returned from the normal entry and confirmed Wi-Fi, Bluetooth and audio working. Boot `fb189f6a-986d-4816-8b86-bf775f4f9a4f` uses stock kernel `7.2.4-arch1-Watanare-T2-1-t2`, without lab command-line markers or a runtime Bluetooth load override. Loaded Wi-Fi source version `E8C051F8EBDA8DE23852575` and Bluetooth `4DF58889A43B9AC7E9E3E8C` match the tested drivers; module lookup selects both from `updates/dkms`. Wi-Fi recovery policy is enabled (on the combined installation).
 
 The journal confirms Wi-Fi firmware initialization, then a ready Wi-Fi interface, followed by the Bluetooth gate loading its driver and BlueZ starting successfully. An audio transport became ready and the user confirmed functionality. Existing P2P creation errors and transient BlueZ connection/cache warnings remain in the log; this pass records working normal-boot behavior, not an absence of warnings. This supersedes the pending normal-boot checkpoints above. A clean OS installation and suspend/resume on this normal image have not been validated by this boot; hibernation remains unresolved and the lab `noresume` guard remains installed.
 

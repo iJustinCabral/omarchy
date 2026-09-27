@@ -2,13 +2,25 @@
 
 The driver series enabled real S3 suspend and working Wi-Fi/Bluetooth recovery on the tested MacBookAir9,1. Repeated automatic AirPods reconnection and audible stereo playback were confirmed. The latest Wi-Fi-off suspend/re-enable cycle also passed. Earlier Wi-Fi-off failures and one unexplained reboot remain part of the record. The automatic installer subsequently passed normal boot and a short S3 cycle with working Bluetooth/audio; see the [deployment validation](VALIDATION.md).
 
-This is S3 support work, not a solution to the original hibernation boot loop. S4 image writing/restoration has not been validated. Other T2 models, kernel versions and fresh installation of the new driver package are not qualified.
+This is S3 support work, not a solution to the original hibernation boot loop. S4 image writing/restoration has not been validated. Other T2 models, kernel versions, overnight battery drain and fresh installation of the new driver package are not qualified. s2idle is a separate suspend mode and was not the subject of this work.
+
+## Branch scope, dependencies and merge order
+
+This contribution (`intel-mac/p10/t2-suspend`) is stacked on `intel-mac/p10/t2-bluetooth-startup`, which is based on `intel-mac/p10-broadcom-wifi`. The suspend installer verifies the Bluetooth startup gate before changing anything, so it requires that branch. Merge order:
+
+1. `intel-mac/p10-broadcom-wifi`
+2. `intel-mac/p10/t2-bluetooth-startup`
+3. `intel-mac/p10/t2-suspend` (this branch)
+
+The sibling `intel-mac/p10/t2-wifi-recovery` branch, which provides the saved-off Wi-Fi firmware-stall watcher, is **not** included here. This branch neither requires nor installs it; it may merge before or after this branch. The T2 touchpad and T2 module-preservation fixes are likewise separate P03 contributions.
+
+The hardware results below were recorded on the development MacBookAir9,1 running the combined integration branch (`fix-t2-vintage-mac-support`), which also carried the Wi-Fi recovery watcher, the touchpad fix and laboratory tooling. They are combined-machine evidence. No hardware boot or suspend of this branch in isolation is recorded; its standalone validation is the fixture and extracted-C suites listed under [standalone branch checks](#standalone-branch-checks-september27).
 
 ## 1. Why the old sleep workaround was removed
 
 Stock Wi-Fi failed to acknowledge its D3 suspend request, so the old workaround unloaded `brcmfmac` around sleep. It bypassed the failing device callback but introduced radio teardown/reset interactions: Bluetooth could retain a bond or appear connected while AirPods audio and discovery failed. Without the workaround, the original suspend abort returned. A bond, a blank screen, or a connected menu indicator therefore did not prove successful sleep or usable radios.
 
-Commit `12098aec` removed the unload helper and its enabling installation path. The retirement migration preserves administrator modifications and defers during an active sleep transaction. This consolidation preserves that removal. The new approach fixes driver protocol and transport lifecycle rather than reinstalling the old unload hook. The existing Wi-Fi firmware-stall watcher is a separate runtime recovery mechanism and remains on the branch.
+Commit `12098aec` removed the unload helper and its enabling installation path. The retirement migration preserves administrator modifications and defers during an active sleep transaction. This consolidation preserves that removal. The new approach fixes driver protocol and transport lifecycle rather than reinstalling the old unload hook. The Wi-Fi firmware-stall watcher is a separate runtime recovery mechanism; it lives on the sibling `intel-mac/p10/t2-wifi-recovery` branch, not on this one, although it was installed on the combined test machine.
 
 ## 2. Wi-Fi mailbox protocol and startup
 
@@ -57,17 +69,19 @@ The first test with this image unexpectedly rebooted after Wi-Fi enable, accordi
 
 ## Validation ledger
 
+Every row was recorded on the combined test machine described [above](#branch-scope-dependencies-and-merge-order). Rows that rely on the Wi-Fi recovery watcher say so.
+
 | Scenario | Result | Qualification |
 | --- | --- | --- |
 | Normal stock startup, Bluetooth icon, off/on and AirPods audio | Passed previously | Existing automatic Bluetooth installer deployed and stock boot checked |
-| Wi-Fi saved-off stock boot, then enable | Passed previously | Existing watcher recovered connectivity in about18sec, one attempt |
+| Wi-Fi saved-off stock boot, then enable | Passed previously | Combined installation only: the watcher from `intel-mac/p10/t2-wifi-recovery` (not on this branch) recovered connectivity in about18sec, one attempt |
 | Final S3 driver + ResumeDelay5, three successive auto-reconnect cycles | Passed | Captured automatic connection and user-confirmed playback |
 | Longer sleep with Bluetooth on | Passed | Measured778.410sec (12min58.410sec), not15min |
 | Bluetooth initially off | Passed | Measured1307.789sec (21min47.789sec); stayed off; later enable/audio passed |
 | Awake Wi-Fi off/on | Passed | AirPods audio preserved; Wi-Fi HTTPS204 |
 | Earlier Wi-Fi-off sleep | Failed | One abort and one real-S3/re-enable Bluetooth failure |
 | First function0-reset candidate test | Failed | User-reported unexpected reboot; fault/reset stage unknown |
-| Latest Wi-Fi-off S3/re-enable repeat | Passed | Real S3; enable about4.79sec after PM exit; Wi-Fi activation about2.95sec later; HTTPS204 and active AirPods stereo; no Wi-Fi reset |
+| Latest Wi-Fi-off S3/re-enable repeat | Passed | Real S3; enable about4.79sec after PM exit; Wi-Fi activation about2.95sec later; HTTPS204 and active AirPods stereo; no Wi-Fi reset by the driver or the watcher installed on the combined machine |
 | Normal boot with automatically installed DKMS drivers | Passed | Corrected firmware packaging; Wi-Fi, Bluetooth and audio confirmed |
 | Normal-image short S3 cycle | Passed | Actual S3; Bluetooth recovery and audio confirmed; Wi-Fi interface up, no separate traffic probe |
 | Hibernation/S4 | Unresolved | Test UKIs used `noresume` |
@@ -103,4 +117,8 @@ sequenceDiagram
 
 Both source profiles applied with zero fuzz and matched every recorded source hash, including final Bluetooth source. The source-preparation fixtures passed five publication/drift cases. Extracted-C Bluetooth tests passed configuration, ring publication, PM gating, IRQ/DMA ordering, firmware-buffer lifetime, ring reset and PTB retry cases. Wi-Fi interface-open and FLR failure-injection tests passed. No kernel rebuild or hardware transition was needed for consolidation.
 
-The existing trackpad, T2 hardware, retired-sleep migration, Wi-Fi recovery, Bluetooth gate and Bluetooth installer shell suites passed. These include31 Wi-Fi Python cases,6 Bluetooth gate cases and17 Bluetooth installer cases. This verifies preservation of the existing integrations; it is not a fresh ISO installation or another hardware suspend test.
+On the combined integration branch, the existing trackpad, T2 hardware, retired-sleep migration, Wi-Fi recovery, Bluetooth gate and Bluetooth installer shell suites passed. These include31 Wi-Fi Python cases,6 Bluetooth gate cases and17 Bluetooth installer cases. This verifies preservation of the existing integrations; it is not a fresh ISO installation or another hardware suspend test. The trackpad and Wi-Fi recovery suites are not present on this narrow branch.
+
+## Standalone branch checks (September27)
+
+On this branch alone: the T2 hardware, retired-sleep, Bluetooth startup installer/gate, suspend installer (14 installer and 5 source-preparation cases), brcmfmac suspend, sleep lock/monitor, sleep-ownership migration and Bluetooth shell suites passed, together with the CLI suite. Hash-pinned source was fetched; both profiles were prepared and matched the tested source; the extracted-C Bluetooth (including its restore and ring-creation harnesses), interface-open and FLR tests passed. These are offline checks, not a hardware boot, suspend or fresh installation.
