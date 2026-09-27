@@ -29,8 +29,15 @@ PREPARATION, WORKFLOW, RETIREMENT = TRIAL.PREPARATION, TRIAL.WORKFLOW, TRIAL.RET
 BACKEND = _module("product_fixed_backend", "host_backend.py")
 SECURE_SESSION = _module("product_secure_session", "secure_session.py")
 DESKTOP_SLEEP = _module("product_desktop_sleep", "desktop_sleep.py")
+BOOT_POLICY = _module("product_boot_policy", "boot_policy.py")
 STATE = Path("/var/lib/omarchy/t2-hibernate-product")
 CONFIG_SCHEMA = "omarchy-t2-qualified-product-config-v1"
+
+
+def verify_deployment(root, config, report):
+  """Routine-only approved default overlay; all historical checks remain."""
+  source_default = BOOT_POLICY.verify(root, config["staged_receipt_sha256"])
+  return TRIAL._verify_deployment(root, config, report, source_default=source_default)
 
 
 def validate(config, qualification, report):
@@ -62,10 +69,10 @@ def _head(ledger):
 
 
 def check(config, qualification, report, *, ledger, archive_directory, root, query=None,
-          deployment_check=TRIAL.verify_deployment):
+          deployment_check=verify_deployment):
   """Read-only admission, including the actual immediately prior return."""
   root = Path(root)
-  if root == Path("/") and (query is not None or deployment_check is not TRIAL.verify_deployment):
+  if root == Path("/") and (query is not None or deployment_check is not verify_deployment):
     raise ValueError("No injected live product admission")
   receipt = validate(config, qualification, report)
   deployment_check(root, config, report)
@@ -102,7 +109,7 @@ def check(config, qualification, report, *, ledger, archive_directory, root, que
 
 
 def execute(config, qualification, report, *, ledger, archive_directory, root, backend_factory, sleeper,
-            query=None, deployment_check=TRIAL.verify_deployment, desktop=False, secure_gate=None, desktop_window=None):
+            query=None, deployment_check=verify_deployment, desktop=False, secure_gate=None, desktop_window=None):
   """Run one fresh qualified cycle, archive and reconcile, never issue a receipt."""
   root = Path(root)
   if root.resolve() == Path("/") and (secure_gate is not None or desktop_window is not None):

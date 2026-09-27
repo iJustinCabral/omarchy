@@ -48,6 +48,11 @@ REPAIR_SYSTEMD_SHA = "5a715459c620e7795d53b5c2ad57b96ef64690e864f1fffbda7bb81fa3
 
 
 def verify_deployment(root, config, report):
+  # Historical trial entry remains strict stock-default verification.
+  return _verify_deployment(root, config, report)
+
+
+def _verify_deployment(root, config, report, *, source_default=False):
   """Read-only existing pair verification; staging state confers no authority."""
   pair = ARTIFACTS._module("trial_staged_pair", ARTIFACTS.HERE.parent / "experiments/stage-hibernation-uki-pair.py")
   def blake2(path):
@@ -67,7 +72,7 @@ def verify_deployment(root, config, report):
     HOST.CT.exact(receipt["images"][role]["sha256"], report["manifest"][role + "_sha256"], "Staged " + role + " pin")
     HOST.CT.exact(receipt["images"][role]["provenance_sha256"], report["audited_details"]["provenance_sha256"][role], "Staged " + role + " provenance")
   HOST.CT.exact(receipt["production_uki_sha256"], report["audited_details"]["production_uki_sha256"], "Staged production pin")
-  pair.verify_staged(Path(root), receipt)
+  pair.verify_staged(Path(root), receipt, source_default=source_default)
   # The older staging-only production helper requires a stock-selected boot
   # and absent one-shot. Those gates are incompatible with source preparation.
   production = Path(root) / "boot/EFI/Linux" / pair.SINGLE.PRODUCTION_IMAGE

@@ -189,17 +189,25 @@ def load_receipt(root):
   return data
 
 
-def verify_staged(root, receipt):
+def verify_staged(root, receipt, *, source_default=False):
   limine = rooted(root, SINGLE.LIMINE)
   backup = rooted(root, BACKUP)
   if not backup.is_file() or digest(backup) != receipt["original_limine_sha256"]:
     raise ValueError("Pair Limine backup changed")
-  if digest(limine) != receipt["staged_limine_sha256"]:
-    raise ValueError("Staged pair Limine configuration changed")
+  if source_default:
+    # No CLI selects this mode. The routine product verifier first verifies
+    # the fixed private external policy and retained configuration backup.
+    policy = import_path("pair_source_default_normalizer", HERE.parent / "hibernate/boot_policy.py")
+    with limine.open("rb") as stream: actual = stream.read(policy.MAX_BYTES + 1)
+    normalized = policy.normalize_source_default(actual, receipt)
+    text = normalized.decode()
+  else:
+    if digest(limine) != receipt["staged_limine_sha256"]:
+      raise ValueError("Staged pair Limine configuration changed")
+    text = limine.read_text()
   production = rooted(root, Path("boot/EFI/Linux") / SINGLE.PRODUCTION_IMAGE)
   if digest(production) != receipt["production_uki_sha256"]:
     raise ValueError("Production UKI changed during pair staging")
-  text = limine.read_text()
   if text.count(BEGIN) != 1 or text.count(END) != 1:
     raise ValueError("Managed pair block is missing or duplicated")
   if len(re.findall(r"^default_entry:\s*2\s*$", text, re.M)) != 1:
