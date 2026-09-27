@@ -1,0 +1,6 @@
+#!/bin/bash
+# omarchy:summary=Inspect an explicitly authorized one-use T2 hibernation trial
+# omarchy:args=[inspect|check|execute]
+# omarchy:hidden=true
+
+python3 -B "$OMARCHY_PATH/packages/t2-suspend/hibernate/trial.py" "$@"

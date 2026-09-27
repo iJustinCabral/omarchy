@@ -107,7 +107,7 @@ class Sampler:
     self.report = copy.deepcopy(report)
     self.cycle = copy.deepcopy(TX.cycle_value(cycle))
     CT.exact(self.cycle["state"], "prepared", "Prepared observation cycle")
-    receipt = TX.receipt_value(qualification, self.cycle["manifest"])
+    receipt = TX.authority_value(qualification, self.cycle["manifest"])
     CT.exact(TX.digest(receipt), self.cycle["qualification_sha256"], "Retained qualification binding")
     CT.fields(marker_pin, ("sha256", "srcversion", "vermagic", "variable_version"), "External marker pin")
     TX.hash_value(marker_pin["sha256"])
@@ -269,7 +269,7 @@ class Sampler:
     CT.exact(receipt["owned_one_shot"], {"entry_id": entry, "boot_id": self.cycle["original_boot_id"]}, "Owned restore one-shot")
     CT.exact(receipt["guard_sha256"], _digest(self.guard), "Preparation guard bytes")
     CT.exact(receipt["attempt_sha256"], _digest(self.attempt), "Preparation transition-armed attempt bytes")
-    return {"LoaderEntryOneShot": b"\x06\0\0\0" + (entry + "\0").encode("utf-16-le"), "LoaderEntryDefault": None}
+    return {"LoaderEntryOneShot": b"\x07\0\0\0" + (entry + "\0").encode("utf-16-le"), "LoaderEntryDefault": None}
 
   def before(self, preparation_receipt=None, *, predecessor_ledger=None, predecessor_archive_directory=None):
     """Original-source pre-write snapshot with exact optional preparation.

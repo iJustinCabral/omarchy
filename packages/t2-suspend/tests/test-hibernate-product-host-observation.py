@@ -183,12 +183,15 @@ class Observations(unittest.TestCase):
     result = preparation.prepare()
     self.cycle, self.guard, self.attempt = result["cycle"], result["guard_file"], result["attempt_file"]
     oneshot_path = str(host.EFI / ("LoaderEntryOneShot-" + host.LOADER_GUID))
-    self.write(oneshot_path, b"\x06\0\0\0" + (backend.restore + "\0").encode("utf-16-le"))
+    self.write(oneshot_path, b"\x07\0\0\0" + (backend.restore + "\0").encode("utf-16-le"))
     self.sampler = self.new_sampler()
     with self.assertRaises(ValueError): self.sampler.before()
     wrong = copy.deepcopy(result["receipt"])
     wrong["baseline"]["pm"]["disk"] = "shutdown"
     with self.assertRaises(ValueError): self.sampler.before(wrong)
+    self.write(oneshot_path, b"\x06\0\0\0" + (backend.restore + "\0").encode("utf-16-le"))
+    with self.assertRaises(ValueError): self.sampler.before(result["receipt"])
+    self.write(oneshot_path, b"\x07\0\0\0" + (backend.restore + "\0").encode("utf-16-le"))
     before = self.sampler.before(result["receipt"])
     collector = workflow.CONTINUITY.Collector(self.cycle, self.qualification, before["source_runtime"], before["baseline_pm"], self.guard.read_bytes(), self.attempt.read_bytes())
     archive = self.base / "archives"
@@ -224,7 +227,7 @@ class Observations(unittest.TestCase):
     self.cycle, self.guard, self.attempt = next_result["cycle"], next_result["guard_file"], next_result["attempt_file"]
     self.loaded.append(host.MARKER)
     self.write("proc/modules", "\n".join(name + " 0 0 - Live 0" for name in self.loaded))
-    self.write(oneshot_path, b"\x06\0\0\0" + (backend.restore + "\0").encode("utf-16-le"))
+    self.write(oneshot_path, b"\x07\0\0\0" + (backend.restore + "\0").encode("utf-16-le"))
     self.sampler = self.new_sampler()
     with self.assertRaises(ValueError): self.sampler.before(next_result["receipt"])
     self.sampler.before(next_result["receipt"], predecessor_ledger=tx.Ledger(ledger.directory), predecessor_archive_directory=archive)

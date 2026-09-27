@@ -136,7 +136,7 @@ class Collector:
   def __init__(self, cycle, qualification, source_runtime, baseline_pm, consumed_guard, consumed_attempt):
     cycle = copy.deepcopy(TX.cycle_value(cycle))
     exact(cycle["state"], "prepared", "Prepared cycle")
-    receipt = TX.receipt_value(qualification, cycle["manifest"])
+    receipt = TX.authority_value(qualification, cycle["manifest"])
     exact(TX.digest(receipt), cycle["qualification_sha256"], "Cycle qualification")
     consumed_records(cycle, consumed_guard, consumed_attempt)
     self._guard = consumed_guard

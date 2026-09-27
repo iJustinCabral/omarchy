@@ -1,7 +1,11 @@
 """Offline product-cycle ledger; never performs EFI, module or PM operations.
 
-An external reviewer supplies qualification receipts. This module validates their
-binding, not hardware evidence. Existing experimental guards are never imported.
+An external reviewer supplies qualification receipts or separately scoped
+one-use trial permission. Trial authority remains qualified=false, has its own
+protocol and permanently consumed external guard; it never permits a second
+cycle. The historical qualification_sha256 cycle field binds either authority
+receipt, not a claim that trials are qualified. This module validates binding,
+not hardware evidence. Existing experimental guards are never imported.
 Outcome hashes are caller-supplied attestations, not authenticated return proof.
 The local archive stores metadata and binds an external archive receipt hash; it
 does not collect or verify the raw EFI/PM originals behind that receipt.
@@ -22,6 +26,7 @@ import uuid
 
 
 PROTOCOL = "omarchy-t2-product-cycle-v1"
+TRIAL_PROTOCOL = "omarchy-t2-product-one-use-trial-v1"
 HASH = re.compile(r"[0-9a-f]{64}\Z")
 PINS = ("source_sha256", "restore_sha256", "runtime_sha256", "linux_sha256", "cmdline_sha256")
 ALLOCATION_SCHEMA = "omarchy-t2-product-allocation-v1"
@@ -69,6 +74,34 @@ def receipt_value(value, manifest):
     raise ValueError("Qualification is not bound to this product manifest")
   hash_value(value["evidence_sha256"])
   return dict(value)
+
+
+def trial_value(value, manifest):
+  required = {"protocol", "qualified", "manifest_sha256", "audited_details_sha256", "original_boot_id",
+              "authorization_id", "marker_pin", "physical_acceptance"}
+  if type(value) is not dict or set(value) != required or value["protocol"] != TRIAL_PROTOCOL or value["qualified"] is not False:
+    raise ValueError("One-use trial authorization fields differ")
+  if value["manifest_sha256"] != digest(manifest_value(manifest)):
+    raise ValueError("Trial artifact manifest differs")
+  hash_value(value["audited_details_sha256"])
+  uuid_value(value["original_boot_id"])
+  uuid_value(value["authorization_id"])
+  pin = value["marker_pin"]
+  if type(pin) is not dict or set(pin) != {"sha256", "srcversion", "vermagic", "variable_version"} or pin["variable_version"] != "v3":
+    raise ValueError("Trial marker pin differs")
+  hash_value(pin["sha256"])
+  if any(type(pin[key]) is not str or not pin[key] for key in ("srcversion", "vermagic")):
+    raise ValueError("Trial marker metadata missing")
+  acceptance = value["physical_acceptance"]
+  if type(acceptance) is not dict or acceptance.get("accepted") is not True or acceptance != {"boot_id": value["original_boot_id"], "authorization_id": value["authorization_id"],
+                                     "accepted": True, "method": "operator-attended-cold-power"}:
+    raise ValueError("Explicit current physical trial acceptance missing")
+  return copy.deepcopy(value)
+
+
+def authority_value(value, manifest):
+  """Validate authority without promoting one-use permission to qualification."""
+  return trial_value(value, manifest) if type(value) is dict and value.get("protocol") == TRIAL_PROTOCOL else receipt_value(value, manifest)
 
 
 def no_duplicates(pairs):
@@ -172,11 +205,13 @@ class Ledger:
 
   def _state(self):
     value = self._read("state.json")
-    if not isinstance(value, dict) or set(value) != {"manifest", "qualification", "blocked"} or type(value["blocked"]) is not bool:
+    if not isinstance(value, dict) or set(value) not in ({"manifest", "qualification", "blocked"}, {"manifest", "qualification", "blocked", "trial_guard_directory"}) or type(value["blocked"]) is not bool:
       raise ValueError("Malformed ledger state")
     manifest_value(value["manifest"])
     if value["qualification"] is not None:
-      receipt_value(value["qualification"], value["manifest"])
+      authority_value(value["qualification"], value["manifest"])
+      if value["qualification"]["protocol"] == TRIAL_PROTOCOL and ("trial_guard_directory" not in value or type(value["trial_guard_directory"]) is not str or not Path(value["trial_guard_directory"]).is_absolute()):
+        raise ValueError("Trial lacks fixed consumed guard binding")
     return value
 
   def configure(self, manifest):
@@ -201,6 +236,25 @@ class Ledger:
       state["qualification"] = receipt_value(receipt, state["manifest"])
       self._write("state.json", state)
 
+  def authorize_trial(self, authorization, consumed_guard_directory):
+    """Record explicit external trial permission, never product qualification.
+
+    The live dispatcher supplies one fixed root-private guard directory; the
+    injectable directory exists solely for synthetic/dedicated tests. The
+    exclusive consumed guard is permanent across copied receipts/ledgers.
+    """
+    guard = Path(consumed_guard_directory).absolute()
+    if not guard.is_dir() or any(path.is_symlink() for path in (guard, *guard.parents)):
+      raise ValueError("Dedicated existing private trial guard directory required")
+    self._private(guard, directory=True)
+    with self._lock():
+      state = self._state()
+      if state["blocked"] or self._cycles() or (guard / "trial-consumed.json").exists() or (guard / "trial-consumed.json").is_symlink():
+        raise ValueError("Trial authorization already consumed or lifecycle blocked")
+      state["qualification"] = trial_value(authorization, state["manifest"])
+      state["trial_guard_directory"] = str(guard)
+      self._write("state.json", state)
+
   def _cycles(self):
     if any(path.name.startswith(".pending-") for path in self.directory.iterdir()):
       raise ValueError("Incomplete durable write requires reconciliation")
@@ -218,7 +272,7 @@ class Ledger:
     with self._lock():
       state = self._state()
       if state["blocked"] or state["qualification"] is None:
-        raise ValueError("Product is not qualified or is failure-blocked")
+        raise ValueError("No reviewed product/trial authority, or failure-blocked")
       if any(self.directory.glob("slot-retirement-*-unresolved.json")):
         raise ValueError("Unresolved retirement blocks new cycle allocation")
       cycles = self._cycles()
@@ -233,6 +287,15 @@ class Ledger:
         raise ValueError("Cycle prefix is already reserved")
       record = {**identity, "qualification_vector": qualification_vector(state["manifest"]),
                 "vector": vector, "prefix": vector[:24], "state": "reserved"}
+      if state["qualification"]["protocol"] == TRIAL_PROTOCOL:
+        if original_boot_id != state["qualification"]["original_boot_id"] or cycles:
+          raise ValueError("One-use trial cannot change boot or allocate another cycle")
+        guard = Ledger(state["trial_guard_directory"])
+        # Consume before any allocation publication. Interrupted consumption or
+        # reservation is intentionally not retryable, even with another UUID.
+        with guard._lock():
+          guard._write("trial-consumed.json", {"protocol": TRIAL_PROTOCOL, "authorization_sha256": digest(state["qualification"]),
+                                               "cycle": record}, exclusive=True)
       previous = None if head is None else {"cycle_id": head["cycle_id"], "cycle_sha256": digest(head)}
       allocation = {"schema": ALLOCATION_SCHEMA, "cycle_binding": {key: record[key] for key in ALLOCATION_BINDING_KEYS},
                     "predecessor": previous}
@@ -383,6 +446,14 @@ class Ledger:
           raise ValueError("Adapter lock scope ended")
         return self._predecessor_locked(current)
       advance.predecessor = predecessor
+      def check_current():
+        if not active or digest(self._read("cycle-" + current["cycle_id"] + ".json")) != digest(current):
+          raise ValueError("Adapter lock scope ended or current cycle changed")
+        state = self._state()
+        if state["blocked"] or state["qualification"] is None or digest(state["qualification"]) != current["qualification_sha256"] or state["manifest"] != current["manifest"]:
+          raise ValueError("Adapter authority changed")
+        return copy.deepcopy(current)
+      advance.check_current = check_current
       try:
         return callback(advance)
       finally:

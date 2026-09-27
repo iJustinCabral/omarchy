@@ -71,6 +71,8 @@ def run(ledger, collector, archive_directory, *, power_write, capture, cleanup, 
     try:
       collector.claim_workflow()
       ledger._write("workflow-before-" + cycle["cycle_id"] + ".json", snapshot(), exclusive=True)
+      if hasattr(power_write, "bind_locked"):
+        power_write.bind_locked(advance)
       phase = "write-and-capture"
       collector.write_and_capture(power_write, capture)
       phase = "captured-before-cleanup"

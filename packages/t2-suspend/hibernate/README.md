@@ -1,6 +1,6 @@
 # Repeatable hibernation integration
 
-This directory is an offline foundation, not an installed hibernation service. The first v16 experiment restored the original source session successfully; its consumed test vector remains immutable. See [hardware evidence](../../../docs/t2-suspend/HIBERNATION.md).
+This directory contains an offline-tested integration and explicit host backend, not an installed hibernation service. The first v16 experiment restored the original source session successfully; its consumed test vector remains immutable. See [hardware evidence](../../../docs/t2-suspend/HIBERNATION.md).
 
 `transaction.py` models a separate product-cycle ledger using explicitly supplied directories. It has no CLI, EFI operations, module loading, power transitions or imports of the historical experimental runner. Synthetic tests exercise it in temporary directories. No actual MacBookAir9,1 product qualification is supplied or created.
 
@@ -30,7 +30,15 @@ The sampler accepts an armed restore one-shot only when the completed preparatio
 
 The existing fullrestore initramfs reads the cycle prefix from the stage-zero EFI marker; it does not embed the experimental pair vector. This permits the same audited image to consume a fresh product cycle without rebuilding it. The historical runner's text guard format and one-use staging state remain unchanged and cannot be reused as the product backend.
 
-The future live workflow still needs trusted backend wiring, deployment and qualification. Callers cannot replace those steps with arbitrary hashes or JSON. No live product qualification or installed service exists yet.
+`host_backend.py` supplies the fixed host operations used by preparation, observation, the one-use power callback and archive-authorized retirement. Live operation requires an explicit `/` root and root identity, disallows injected command/sysfs implementations, and uses fixed command allowlists and a deterministic environment. Power and retirement callbacks require an active scoped ledger capability. EFI retirement additionally relies on the dispatcher's global serialization and absence of marker writers; efivarfs does not offer a native compare-and-delete primitive. Synthetic backends cannot establish hardware qualification.
+
+Loader variables are checked individually: the owned one-shot uses nonvolatile attributes `0x07`, matching [bootctl's setter](https://github.com/systemd/systemd/blob/main/src/bootctl/bootctl-set-efivar.c) and [systemd's EFI writer](https://github.com/systemd/systemd/blob/main/src/basic/efivars.c), while the selected-entry witness uses `0x06`. Fixture coverage rejects the earlier incorrect volatile one-shot framing. Readiness allows zram alongside exactly the audited disk swapfile, whose actual Btrfs mapping must match the resume device and offset.
+
+`trial.py`, exposed through hidden `omarchy debug t2-hibernate-trial [inspect|check|execute]`, wires those operations for an explicitly authorized one-use product trial. Default inspection and checks perform no preparation or power operation. The live command uses fixed pre-provisioned root-private state under `/var/lib/omarchy/t2-hibernate-trial`, a global physical-cycle lock and a permanent consumed trial guard; there are no alternate-root, force or skip-validation CLI flags. It verifies actual staged images, production fallback, entry mapping, source readiness and the boot-bound authorization before consuming permission. Deployment is rechecked immediately before the power write. Execute requires an explicit root invocation and never prompts or escalates automatically.
+
+Trial authorization has its own protocol and `qualified=false`, including the exact artifact audit and external marker pins. Recovery attendance is an explicit boot-bound attestation, not physical-input qualification or a request to repeat keyboard/trackpad tests. The trial permits one cycle only, even after success; it cannot be replayed through a new UUID or a copied authorization in another ledger sharing the fixed live guard. The existing `qualification_sha256` cycle field binds the applicable authority receipt and does not promote trial permission into product qualification.
+
+Neither source development nor these tests provision live configuration, issue authorization or install a service. The normal hibernate menu remains unchanged. Live deployment, the first product trial, independent result review and routine qualification remain incomplete; the earlier experimental v16 proof is not silently relabeled as product qualification.
 
 The remaining integration must connect the tested early-source and isolated-restore boot policies with normal systemd hibernation preparation/cleanup, artifact deployment and update invalidation, and failure recovery. Current Omarchy's `systemctl hibernate` menu path does not implement that workflow. Do not enable it on the strength of this library or a single experimental return. Preserve production kernel/command-line bytes and the cold guard's ANS completion, DMA ownership and terminal pending-resume protections.
 
@@ -43,3 +51,5 @@ The workflow and artifact adapters have corresponding `test-hibernate-product-wo
 The host-observation and slot-retirement tests likewise use synthetic files and injected callbacks only; they do not sample or change the running laptop.
 
 Preparation coverage is in `test-hibernate-product-preparation.py` and is registered in the same aggregate. Its injected backend exercises ordering and recovery without executing host commands.
+
+`test-hibernate-product-host-backend.py` and `test-hibernate-product-trial.py` cover the fixed backend and trial dispatch, including a concrete-backend lifecycle in a synthetic root. These tests do not authorize a live execution.

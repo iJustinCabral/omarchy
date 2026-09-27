@@ -149,6 +149,8 @@ def retire(ledger, cycle, archive_directory, *, read_slot, compare_delete_slot, 
     phase = "verify-archive"
     try:
       binding, expected, baseline = _archived_evidence(archive_directory, cycle)
+      if hasattr(compare_delete_slot, "bind_locked"):
+        compare_delete_slot.bind_locked(advance)
       intent = {"schema": PROTOCOL, "state": "intent", "binding": binding,
                 "archive_sha256": cycle["archive_evidence_sha256"],
                 "slots": {SLOTS[role]: CONTINUITY.raw_digest(expected[role + "-stage.bin"]) for role in SLOTS}}
