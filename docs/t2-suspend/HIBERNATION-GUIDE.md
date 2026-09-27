@@ -2,7 +2,7 @@
 
 Status as of 2026-09-27: **working MacBookAir9,1 prototype; permanent fix unfinished**.
 
-We have demonstrated real S4 power-off and restoration of the original Linux session, twice through the normal desktop/logind route, with an ordinary boot into the working source image between those cycles. That is meaningful hardware evidence. Battery-aware runtime `e489bab7` is now deployed, but a real battery S4 test is still pending. The prototype still blocks package transactions, uses a machine-specific reviewed image pair, and has not qualified other T2 models. The earlier declaration that the goal was complete was incorrect.
+We have demonstrated real S4 power-off and restoration of the original Linux session through two AC-powered normal desktop/logind cycles, with an ordinary boot into the working source image between them, and one later attended battery-only cycle. Battery-aware runtime `e489bab7` returned the original session on battery with the same boot ID and reconciled the cycle without failed units. This is meaningful local hardware evidence, not a permanent fix: the provisional 30% reserve guard is not a measured low-battery policy, the prototype still blocks package transactions, and no other T2 model is qualified. The earlier declaration that the goal was complete was incorrect.
 
 The target is normal, persistent hibernation on battery as well as AC, maintained safely through ordinary updates, with an explicit path to support other T2 Macs. Do not redefine that target around the prototype's restrictions.
 
@@ -33,7 +33,7 @@ flowchart TD
   F --> G
 ```
 
-Text equivalent: successful boot selection and real restoration establish the prototype. Battery operation, safe normal updates, and model-specific qualification are remaining work; a new successful experiment does not silently complete them. This is a status diagram, not an implemented production architecture. Each edge means “contributes evidence or work toward,” not hardware causation.
+Text equivalent: successful boot selection, two AC returns and one attended battery-only return establish the prototype. Production-ready battery behavior, safe normal updates, and model-specific qualification are remaining work; a new successful experiment does not silently complete them. This is a status diagram, not an implemented production architecture. Each edge means “contributes evidence or work toward,” not hardware causation.
 
 ## What “hibernate” must mean here
 
@@ -48,11 +48,11 @@ Both private images retain the production Linux kernel and command line byte-for
 
 ## What the two inconvenient restrictions actually are
 
-### AC-only is a software admission rule, not a proved T2 hardware requirement
+### The earlier AC-only gate was a software rule, not a T2 hardware requirement
 
-The previous installed routine path and legacy v1 configuration rejected a machine without an online mains supply in [`product.py`, `_admission_state`](../../packages/t2-suspend/hibernate/product.py). Runtime `e489bab7` and explicit v2 battery policy are now installed, with native reserve checks before allocation and again immediately before writing the image; battery hardware qualification remains pending. The current threshold is 30% of measured charge/full reserve, an explicitly provisional engineering policy, not the firmware's displayed percentage or measured endurance assurance. See the [implementation and provisional limits](HIBERNATION-PRODUCTION-PLAN.md#source-implementation-for-attended-battery-qualification). The historical trial retains its own AC rule in [`trial.py`](../../packages/t2-suspend/hibernate/trial.py).
+The previous installed routine path and legacy v1 configuration rejected a machine without an online mains supply in [`product.py`, `_admission_state`](../../packages/t2-suspend/hibernate/product.py). Runtime `e489bab7` and explicit v2 battery policy are now installed, with native reserve checks before allocation and again immediately before writing the image; one attended battery-only S4 has now restored and reconciled. The current threshold is 30% of measured charge/full reserve, an explicitly provisional engineering policy, not the firmware's displayed percentage or measured endurance assurance. See the [implementation and provisional limits](HIBERNATION-PRODUCTION-PLAN.md#source-implementation-for-attended-battery-qualification). The historical trial retains its own AC rule in [`trial.py`](../../packages/t2-suspend/hibernate/trial.py).
 
-The successful tests were run with AC connected. They do not demonstrate that hibernation needs AC; they also do not validate battery operation. The permanent fix must replace experimental AC-only admission with an appropriate battery-aware policy and verify actual battery write, power-off, wake, restore and recovery. Deleting one check without doing that work would only hide the limitation.
+The two earlier normal cycles ran with AC connected; the later [battery-only result](HIBERNATION.md#first-attended-battery-only-s4-restored-the-original-session) demonstrates one actual write, power-off, wake, restore and original-process reconciliation without AC. It does not validate low-reserve refusal, power-source transitions or unattended recovery. The permanent policy still needs measured reserve and recovery limits rather than a one-cycle extrapolation.
 
 ### The package block protects a pinned prototype, not a usable final update design
 
@@ -72,6 +72,7 @@ These are historical measurements, not commands or permission to replay a vector
 | E02 | First normal-logind S4 cycle restored and reconciled without manual repair | [Normal-logind result](HIBERNATION.md#first-normal-logind-s4-cycle-succeeded-without-repair), cycle `064742e3-c4bd-4a5b-b00d-d69590d01837` | Battery or update support |
 | E03 | The persistent source default selected the expected existing source image and passed full admission | [Ordinary source boot](HIBERNATION.md#ordinary-source-default-boot-verified), boot `0f909934-0ecf-4407-863d-6822c81cb2df` | A hibernation restore by itself |
 | E04 | A distinct subsequent normal cycle restored the original E03 session and automatically cleaned up | [Repeat S4 result](HIBERNATION.md#repeat-normal-s4-succeeded-after-ordinary-source-default-boot), cycle `12f886c4-fecb-41ef-ad12-31374e63677d` | Long-term reliability, other kernels, or other T2 models |
+| E05 | First attended battery-only S4 returned the original session on unchanged boot and reconciled without failed units | [Battery-only result](HIBERNATION.md#first-attended-battery-only-s4-restored-the-original-session), cycle `0b8fa4cf-7055-45a5-aa9f-99538a02564e` | Measured low-battery safety, update compatibility, unattended recovery or other T2 models |
 
 E04 includes kernel S4 entry/wake/exit, return of the original service process, eight archived evidence members with verified hashes, terminal retirement/reconciliation, and healthy user slice, Wi-Fi and Bluetooth. The operator also returned to the session. Generic mechanical witness flags and historical qualification records must not be edited to manufacture broader qualification.
 
@@ -91,7 +92,7 @@ For example, the board matrix maps MacBookAir9,1 to `J230kAP` and MacBookPro16,1
 
 ## Agent entry contract
 
-1. Treat **permanent fix unfinished** as the current status. Two prototype successes do not satisfy battery, normal updates or another model's qualification.
+1. Treat **permanent fix unfinished** as the current status. Two AC successes and one attended battery-only success do not establish measured low-battery safety, normal updates or another model's qualification.
 2. Read the mechanism and production plan, then inspect the actual source and evidence for the requirement being changed. Use the journal's named checkpoint rather than assuming every older “next” paragraph is current.
 3. Before touching hardware, reconcile `/home/jjc/.local/state/codex-mba-autonomous/handoff.json`, current boot ID, selected image, repository checkpoint, installed runtime and the ledger's actual terminal cycle. Local paths are references for this development laptop, not paths to ship in a general installer.
 4. Keep physical boot, EFI, module loading and power transitions serialized under the orchestrator. Documentation and design work do not authorize new physical tests. Preserve failed/consumed vectors and guards; do not replay them under new labels.

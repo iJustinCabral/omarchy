@@ -2,11 +2,17 @@
 
 ## Current status: prototype works; permanent fix is unfinished
 
-The earlier goal-complete declaration was incorrect. Two real normal-logind S4 restores and a successful source-default boot demonstrate a working MacBookAir9,1 prototype, not the requested permanent solution. Battery operation without an AC requirement, normal update compatibility without a blanket package block, and a maintained path to other T2 models remain required work. Existing successful and failed evidence is preserved below; older “next” instructions and completion statements are historical, not current authorization.
+The earlier goal-complete declaration was incorrect. Two AC-powered normal-logind S4 restores, a successful source-default boot and one attended battery-only S4 restore demonstrate a working MacBookAir9,1 prototype, not the requested permanent solution. A measured low-battery policy, normal update compatibility without a blanket package block, and a maintained path to other T2 models remain required work. Existing successful and failed evidence is preserved below; older “next” instructions and completion statements are historical, not current authorization.
 
 Start with the [human/agent guide](HIBERNATION-GUIDE.md), then read the diagrammed [failure and solution mechanism](HIBERNATION-MECHANISM.md) and [production/portability plan](HIBERNATION-PRODUCTION-PLAN.md). This file remains the detailed investigation journal, not the primary tutorial. Documentation changes do not remove live safeguards or authorize another physical test.
 
-## Battery-aware runtime deployed; awaiting first battery S4
+## First attended battery-only S4 restored the original session
+
+Approved cycle `0b8fa4cf-7055-45a5-aa9f-99538a02564e`, vector `384edbd4ebc3069dff20c2c65a36fe01adb1e794cf726c57a5a5b8211280f919`, ran with ADP1 offline before and after S4 on unchanged installed runtime `e489bab7`. Preflight measured native charge `3418000/3518000` microamp-hours against the provisional 30% threshold. The kernel recorded S4 entry at 19:02:28, ACPI S4 wake at 19:02:39 and exit at 19:02:40 on September 27. The original vendor-service process `41931` returned and reconciled the cycle successfully at 19:02:44; original boot `0f909934-0ecf-4407-863d-6822c81cb2df` remained the same. Cleanup recorded `ac_online=false`, healthy Bluetooth, internal keyboard and trackpad, encrypted root and Wi-Fi, active NetworkManager/Bluetooth/display-manager services, and no cleanup errors; the ledger is unblocked, no units failed, and the operator reported being back and working well.
+
+The archive completion file SHA-256 is `d6f31ae7eb113f4cd7fc3c746e164269012c6a879a3ea749036aa4f6e89936cf`, source-return witness `88502d97356d84860a981a877425507b6020791ece2918d70b4f33f776661102`, and raw terminal reconciliation file `44f44c3e5e08b20a757769be0cbb1ed464d91e549f6d7f7275d8f46a7e69bbc0` (distinct from its embedded canonical-record digest). This is one attended battery-to-battery success on this exact machine and image pair, not proof of automatic low-battery behavior, update compatibility, long-term reliability or other T2 models. The cycle and vector are consumed; do not replay them.
+
+## Battery-aware runtime deployed; historical pre-test checkpoint
 
 The fixed reviewed native adapter completed runtime-only upgrade `4125726a-4847-4802-a821-953e6abe995a` with exit zero, `live_execution=true` and `power_operation=false`. Runtime `e489bab70e13bfcbbfacc8811a6f6093e7973dd0` contains 212 reviewed source files. Review SHA-256 is `947f0ce95c9eb73da0f2316f0795d5c16c8b41dacffa7a3870db771602c2ee0d`, bootstrap `85b33df9dead8a1621008074ab40bef3cffc9981529d4f1aa2d57381c8723248`, snapshot `567263922e3c387c4adb8622f3b879fcc8af2c730b6309d811e88aff1a67daf7`, and installed v2 configuration `2f66daf877d84a12c7fcb5df8de40a5722898f37be39a563c1609fbe16aa4f23`. The explicit attended battery threshold is 30% of native charge/full reserve, not a measured endurance guarantee.
 
