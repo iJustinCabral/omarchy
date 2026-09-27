@@ -7,22 +7,21 @@
 #
 # Upstream libinput (50-system-apple.quirks) already marks the keyboard
 # internal. Touchpad integration is a udev property, not a libinput
-# quirk — same pattern as fix-z13-touchpad.sh. systemd's hwdb now has this
-# device too, so install the release-gap fallback only while the packaged hwdb
-# lacks it.
+# quirk — same pattern as fix-z13-touchpad.sh. systemd's hwdb covers only some
+# T2 trackpad IDs, so install the name-matched fallback until it classifies
+# every one. An existing rule file, or an administrator mask, is left alone.
 
 if omarchy-hw-t2; then
-  touchpad_hwdb_key='touchpad:usb:v05acp0280:name:Apple Inc. Apple Internal Keyboard / Trackpad:'
-
-  if systemd-hwdb query "$touchpad_hwdb_key" |
-    grep -Fqx 'ID_INPUT_TOUCHPAD_INTEGRATION=internal'; then
-    echo "Detected T2 Mac. The systemd hwdb already marks its trackpad as internal."
+  if omarchy-hw-t2-touchpad-hwdb; then
+    echo "Detected T2 Mac. The systemd hwdb already classifies its trackpad."
   else
-    echo "Detected T2 Mac. Marking the built-in trackpad as internal."
-
-    src="$OMARCHY_INSTALL/hardware/apple"
     rule_dst="${OMARCHY_T2_TOUCHPAD_RULE:-/etc/udev/rules.d/99-omarchy-t2-touchpad.rules}"
 
-    install -Dm644 "$src/99-omarchy-t2-touchpad.rules" "$rule_dst"
+    if [[ -e $rule_dst || -L $rule_dst ]]; then
+      echo "Detected T2 Mac. Keeping the existing trackpad rule at $rule_dst."
+    else
+      echo "Detected T2 Mac. Marking the built-in trackpad as internal."
+      install -Dm644 "$OMARCHY_INSTALL/hardware/apple/99-omarchy-t2-touchpad.rules" "$rule_dst"
+    fi
   fi
 fi
