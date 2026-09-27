@@ -45,6 +45,8 @@ def fixture(root):
         values[name] = b"\x07\0\0\0MBSC" + m.VECTOR[:24].encode() + b"\x01"
       elif name.startswith("OmarchyT2ColdPreArchReturned"):
         values[name] = b"\x07\0\0\0MBAR" + m.VECTOR[:24].encode() + b"\x01"
+      elif name.startswith("OmarchyT2ColdPciPreArchReturned"):
+        values[name] = b"\x07\0\0\0MBPG" + m.VECTOR[:24].encode() + b"\x01"
       elif name == "s4-attempted":
         values[name] = guard
       elif name == "attempt.json":
@@ -66,6 +68,10 @@ def fixture(root):
     write(root, Path("sys/firmware/efi/efivars") / name, values[name])
   write(root, m.GUARD, guard)
   write(root, m.ATTEMPT, attempt)
+  if m.VECTOR == m.PCI_RETURN_VECTOR:
+    write(root, m.PAIR.STATE / "receipt.json", values["receipt.json"])
+    for name in ("postwrite-efi-identity.json", "restore-efi-identity.json"):
+      write(root, m.ATTEMPT.parent / name, values[name])
 
 
 def stock(root):
@@ -84,7 +90,17 @@ with tempfile.TemporaryDirectory(prefix="terminal-witness-cleanup-") as temporar
   base = Path(temporary)
   cases = ("success", "archive", "live", "guard", "missing", "symlink", "mode", "witness", "intent", "partial", "boot",
            "live-returned", "archive-returned", "missing-returned", "symlink-returned", "wrong-return-boot")
-  assert len(m.TERMINALS) == 7
+  assert len(m.TERMINALS) == 8
+  combined_vector = m.PCI_RETURN_VECTOR
+  assert combined_vector == "180d00065543ac9c140ce227484a45c238e4fb9d3a9ddbfa34f6b2fe66fc7723"
+  assert m.RETURN_BOOTS[combined_vector] == "8be76cad-59a5-445a-98bf-beb37041a8d9"
+  source_boot, archive, pins, guard_sha, attempt_sha, restore_stage = m.TERMINALS[combined_vector]
+  assert source_boot == "f9bd3490-1d2f-4fea-856d-019619116284" and restore_stage == 7
+  assert archive == Path("var/lib/omarchy-t2-postwrite-marker/archive-v3-180d00065543ac9c")
+  assert len(pins) == 12 and pins["s4-attempted"] == guard_sha and pins["attempt.json"] == attempt_sha
+  assert pins["return-audit.json"] == "1320fa113519534f20dbd12aee3f44becaa6aa534e3c0c58863fbcda418fcaf4"
+  combined_name = "OmarchyT2ColdPciPreArchReturned" + combined_vector[:24] + "-" + m.BACKEND.RESTORE_HOOK_GUID
+  assert pins[combined_name] == hashlib.sha256(b"\x07\0\0\0MBPG" + combined_vector[:24].encode() + b"\x01").hexdigest()
   pci_vector = "eee5baa3afc51afbf488b487418da9ab3cc167949ff62ab0013390362645f18a"
   assert m.RETURN_BOOTS[pci_vector] == "7190b6ee-e716-4c80-8aed-ba241aa788c5"
   source_boot, archive, pins, guard_sha, attempt_sha, restore_stage = m.TERMINALS[pci_vector]
@@ -104,7 +120,7 @@ with tempfile.TemporaryDirectory(prefix="terminal-witness-cleanup-") as temporar
   refused(lambda: m.select_terminal("0" * 64))
   for vector, case in ((vector, case) for vector in m.TERMINALS for case in cases):
     m.select_terminal(vector)
-    returned = next((name for name in m.preserved_live_pins() if name.startswith(("OmarchyT2ColdPreCpuReturned", "OmarchyT2ColdPreSyscoreReturned", "OmarchyT2ColdPreArchReturned"))), None)
+    returned = next((name for name in m.preserved_live_pins() if name.startswith(("OmarchyT2ColdPreCpuReturned", "OmarchyT2ColdPreSyscoreReturned", "OmarchyT2ColdPreArchReturned", "OmarchyT2ColdPciPreArchReturned"))), None)
     if case.endswith("returned") and returned is None:
       continue
     root = base / vector / case
@@ -112,6 +128,11 @@ with tempfile.TemporaryDirectory(prefix="terminal-witness-cleanup-") as temporar
     if case == "success":
       before = {name: (root / m.ARCHIVE / name).read_bytes() for name in m.PINS}
       live_before = {name: (root / "sys/firmware/efi/efivars" / name).read_bytes() for name in m.preserved_live_pins()}
+      preserved_paths = [m.GUARD, m.ATTEMPT]
+      if vector == combined_vector:
+        preserved_paths += [m.PAIR.STATE / "receipt.json", m.ATTEMPT.parent / "postwrite-efi-identity.json",
+                            m.ATTEMPT.parent / "restore-efi-identity.json"]
+      transaction_before = {relative: (root / relative).read_bytes() for relative in preserved_paths}
       unrelated = write(root, Path("sys/firmware/efi/efivars/old-stage-variable"), b"old evidence")
       m.validate(root, stock)
       assert not (root / m.ARCHIVE / "slot-clear-intent.json").exists()
@@ -120,6 +141,7 @@ with tempfile.TemporaryDirectory(prefix="terminal-witness-cleanup-") as temporar
       assert all(not (root / relative).exists() for relative in m.TARGETS.values())
       assert all((root / m.ARCHIVE / name).read_bytes() == value for name, value in before.items())
       assert all((root / "sys/firmware/efi/efivars" / name).read_bytes() == value for name, value in live_before.items())
+      assert all((root / relative).read_bytes() == value for relative, value in transaction_before.items())
       assert (root / m.GUARD).exists() and (root / m.ATTEMPT).exists() and unrelated.read_bytes() == b"old evidence"
       assert m.execute(root, stock, Path.unlink) == result
       write(root, m.BACKEND.V3_VARIABLE, before[m.SOURCE_VAR])
@@ -177,21 +199,26 @@ with tempfile.TemporaryDirectory(prefix="terminal-witness-cleanup-") as temporar
       if case != "intent":
         assert not (root / m.ARCHIVE / "slot-clear-intent.json").exists()
 
-  # A pre-arming failure profile must refuse any newly appearing same-vector
-  # hook/positive-protocol witness, before intent, after partial removal and
-  # after completion. Historical witnesses and the extra audit are preserved.
+  # A pre-arming failure forbids hook/positive witnesses; the successful PCI
+  # boundary forbids every opposite positive protocol. Check all phases.
   m.select_terminal(pci_vector)
-  absent_names = m.absent_witness_names()
   assert not m.preserved_live_pins()
-  for name in absent_names:
+  absent_cases = []
+  for vector in (pci_vector, combined_vector):
+    m.select_terminal(vector)
+    absent_cases.extend((vector, name) for name in m.absent_witness_names())
+  for vector, name in absent_cases:
     for location in ("live", "archive"):
       for form in ("file", "directory", "symlink"):
         for phase in ("initial", "partial", "complete"):
-          m.select_terminal(pci_vector)
+          m.select_terminal(vector)
           root = base / "absent-witness" / name / location / form / phase
           fixture(root)
-          audit = write(root, m.ARCHIVE / "return-audit.json", b'{"fixture":"audit"}\n')
-          old = write(root, Path("sys/firmware/efi/efivars") / name.replace(pci_vector[:24], "0" * 24), b"historical witness")
+          audit = root / m.ARCHIVE / "return-audit.json"
+          if not audit.exists():
+            write(root, m.ARCHIVE / audit.name, b'{"fixture":"audit"}\n')
+          audit_before = audit.read_bytes()
+          old = write(root, Path("sys/firmware/efi/efivars") / name.replace(vector[:24], "0" * 24), b"historical witness")
           original_guard = (root / m.GUARD).read_bytes()
           original_attempt = (root / m.ATTEMPT).read_bytes()
           if phase == "partial":
@@ -218,9 +245,36 @@ with tempfile.TemporaryDirectory(prefix="terminal-witness-cleanup-") as temporar
           assert all((root / relative).read_bytes() == value for relative, value in before.items())
           assert (root / m.GUARD).read_bytes() == original_guard
           assert (root / m.ATTEMPT).read_bytes() == original_attempt
-          assert old.read_bytes() == b"historical witness" and audit.read_bytes() == b'{"fixture":"audit"}\n'
+          assert old.read_bytes() == b"historical witness" and audit.read_bytes() == audit_before
           if phase == "initial":
             assert not (root / m.ARCHIVE / "slot-clear-intent.json").exists()
+
+  # Every additional archived original/audit and live identity is mandatory.
+  for location in ("archive", "live"):
+    names = ("receipt.json", "postwrite-efi-identity.json", "restore-efi-identity.json")
+    if location == "archive":
+      names += ("attempt.json", "recovery-acceptance-v3.json", "return-audit.json")
+    for name in names:
+      for fault in ("changed", "missing", "symlink", "mode"):
+        m.select_terminal(combined_vector)
+        root = base / "required-evidence" / location / name / fault
+        fixture(root)
+        relative = m.ARCHIVE / name if location == "archive" else (
+          m.PAIR.STATE / name if name == "receipt.json" else m.ATTEMPT.parent / name)
+        target = root / relative
+        if fault == "changed":
+          target.write_bytes(b"changed evidence")
+        elif fault == "missing":
+          target.unlink()
+        elif fault == "symlink":
+          target.unlink()
+          target.symlink_to(root / "does-not-exist")
+        else:
+          target.chmod(0o644)
+        before = {relative: (root / relative).read_bytes() for relative in m.TARGETS.values()}
+        refused(lambda: m.execute(root, stock, Path.unlink))
+        assert all((root / relative).read_bytes() == value for relative, value in before.items())
+        assert not (root / m.ARCHIVE / "slot-clear-intent.json").exists()
 
   # Exercise current_stock itself on a portable filesystem. Only selected-entry
   # lookup and physical-root inspection are stubbed; PM/kernel/resume/module

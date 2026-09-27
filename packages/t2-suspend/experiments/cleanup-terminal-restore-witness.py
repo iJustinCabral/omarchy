@@ -59,14 +59,21 @@ PRESERVED_LIVE_PREFIXES = (
   "OmarchyT2RestoreHookEntered", "OmarchyT2RestoreHookArmed", "OmarchyT2ColdPreCpuReturned",
   "OmarchyT2ColdPreSyscoreReturned",
   "OmarchyT2ColdPreArchReturned",
+  "OmarchyT2ColdPciPreArchReturned",
 )
+PCI_RETURN_VECTOR = "180d00065543ac9c140ce227484a45c238e4fb9d3a9ddbfa34f6b2fe66fc7723"
 RETURN_BOOTS = {
+  PCI_RETURN_VECTOR: "8be76cad-59a5-445a-98bf-beb37041a8d9",
   "529d919f498f44aee33c92f63604a85fd6e5c447e8e84740df6c340feb074f32": "aec7b794-2684-4277-b6ff-2050493f3932",
   "538d486ba4a44f7e41227526e28e9d545b0b705a226d4d0c0fe8f2eae65ff66a": "911e153f-ce56-4baa-97b2-2d5e7d93f6bf",
   "9c973c61402167014599b656d6689c62a46a8c10b596a0fde89c542d0f1ec676": "539f1798-06d8-437f-928b-c66449efc98d",
   "eee5baa3afc51afbf488b487418da9ab3cc167949ff62ab0013390362645f18a": "7190b6ee-e716-4c80-8aed-ba241aa788c5",
 }
 ABSENT_WITNESSES = {
+  PCI_RETURN_VECTOR: (
+    "OmarchyT2ColdPreArchReturned", "OmarchyT2ColdPreCpuReturned",
+    "OmarchyT2ColdPreSyscoreReturned",
+  ),
   "eee5baa3afc51afbf488b487418da9ab3cc167949ff62ab0013390362645f18a": (
     "OmarchyT2RestoreHookEntered", "OmarchyT2RestoreHookArmed",
     "OmarchyT2ColdPciPreArchReturned", "OmarchyT2ColdPreArchReturned",
@@ -79,6 +86,27 @@ NO_CURRENT_MODULES = (
   "mba_hibernate_cold_pre_relocate", "mba_hibernate_cold_pci_guard",
 )
 TERMINALS = {
+  PCI_RETURN_VECTOR: (
+    "f9bd3490-1d2f-4fea-856d-019619116284",
+    Path("var/lib/omarchy-t2-postwrite-marker/archive-v3-180d00065543ac9c"),
+    {
+      SOURCE_VAR: "c42cc67fefd7f11eb2c8c83ed62cc705dec116803b69d1ddc8c88f3fb0df0c25",
+      RESTORE_VAR: "743e5372838e480b1dd247c4eed6cbef41f7de4b69afb06bca0368b8bd89d0a1",
+      "OmarchyT2RestoreHookEntered180d00065543ac9c140ce227-" + BACKEND.RESTORE_HOOK_GUID: "b4b458c9f5e71447ae29c6bdcf5a69e83e6fd5f37c404d7435865d0370be6c58",
+      "OmarchyT2RestoreHookArmed180d00065543ac9c140ce227-" + BACKEND.RESTORE_HOOK_GUID: "022d8f9e6de58f581072d556058745d949d41cfde36d2f0723b440557a6d4056",
+      "OmarchyT2ColdPciPreArchReturned180d00065543ac9c140ce227-" + BACKEND.RESTORE_HOOK_GUID: "551a4de72c946b560b749cb61c06d2cb9d696b90f3c12107f6f6d2645bd878de",
+      "receipt.json": "88efa880a2b1b10e385bd254d57a413a0450b282025405838bf9b67713596f8c",
+      "recovery-acceptance-v3.json": "00a70d207bff660891410ac96cfeebaa7b7608c6f01afc5de81048025b8cacd5",
+      "s4-attempted": "f9793335d3c7db36f34e4a3943f0792c5d793237918697db1b9680c52542a36b",
+      "attempt.json": "7f0900eea7129b96fd0c6bd3680db997cff0e8d112177d549b574bd9031e1a20",
+      "postwrite-efi-identity.json": "dfc971d1368b28db62890abe52795dabf23f3981492abd3e7d59be887aae23ac",
+      "restore-efi-identity.json": "aba46456b7c46dd0de1c25bd74c9fbff93ba12adbd0989db18a73e6ec4c1ee4e",
+      "return-audit.json": "1320fa113519534f20dbd12aee3f44becaa6aa534e3c0c58863fbcda418fcaf4",
+    },
+    "f9793335d3c7db36f34e4a3943f0792c5d793237918697db1b9680c52542a36b",
+    "7f0900eea7129b96fd0c6bd3680db997cff0e8d112177d549b574bd9031e1a20",
+    7,
+  ),
   VECTOR: (SOURCE_BOOT, ARCHIVE, dict(PINS), GUARD_SHA, ATTEMPT_SHA, 0),
   "cf01e856dcab2e454332b80c96f9dd04c0698e3e8b214fe02b0b549a31623418": (
     "32072873-3fc3-499d-843d-c1e115e3bef3",
@@ -292,6 +320,12 @@ def validate(root, stock_validator=current_stock):
   if (attempt.get("transition_vector") != VECTOR or attempt.get("boot_id") != SOURCE_BOOT or
       attempt.get("state") != "transition-armed" or attempt.get("real_s4_attempted") is not True):
     raise ValueError("Not the pinned terminal S4 attempt")
+  if VECTOR == PCI_RETURN_VECTOR:
+    # Preserve and require the original live transaction and module identities,
+    # in addition to their archived copies. Only shared reusable slots clear.
+    exact(root, PAIR.STATE / "receipt.json", PINS["receipt.json"], True)
+    for name in ("postwrite-efi-identity.json", "restore-efi-identity.json"):
+      exact(root, ATTEMPT.parent / name, PINS[name], True)
   for name, expected in preserved_live_pins().items():
     exact(root, Path("sys/firmware/efi/efivars") / name, expected)
   for name in absent_witness_names():
