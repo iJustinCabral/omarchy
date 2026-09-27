@@ -43,6 +43,8 @@ python3 "$ROOT/packages/t2-suspend/tests/test-cold-pci-restore-proof.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-cold-pci-restore-tooling.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-cold-pci-restore-runner.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-product-transaction.py"
+python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-product-continuity.py"
+python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-product-archive.py"
 pass "T2 suspend source and installer transactions"
 
 test_tmp=$(mktemp -d)
