@@ -166,5 +166,16 @@ class Policy(unittest.TestCase):
     (self.root / P.POLICY).write_bytes(b'{"approved":true,"approved":false}')
     with self.assertRaises(ValueError): P.verify(self.root, P.digest(self.raw))
 
+  def test_fifo_evidence_reads_are_nonblocking_and_fail_closed(self):
+    self.activate_fixture()
+    for relative in (P.POLICY, P.BACKUP, P.RECEIPT, P.LIMINE):
+      path = self.root / relative
+      original = path.read_bytes()
+      path.unlink()
+      os.mkfifo(path, mode=0o600)
+      with self.assertRaises(ValueError): P.verify(self.root, P.digest(self.raw))
+      path.unlink()
+      self.write(relative, original)
+
 
 if __name__ == "__main__": unittest.main()

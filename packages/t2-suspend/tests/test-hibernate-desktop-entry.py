@@ -1,5 +1,6 @@
 """Synthetic route/freeze/hooks tests; never invoke host sleep commands."""
 import importlib.util
+import os
 from pathlib import Path
 import shutil
 import tempfile
@@ -19,6 +20,7 @@ ENTRY, SLEEP = load("sleep_entry"), load("desktop_sleep")
 class DesktopEntry(unittest.TestCase):
   def test_absent_marker_executes_exact_stock_without_importing_product(self):
     with patch.object(ENTRY.os, "geteuid", return_value=0), patch.object(ENTRY, "opted_in", return_value=False), \
+         patch.object(ENTRY, "reject_pending"), \
          patch.object(ENTRY.os, "execve", side_effect=RuntimeError("exec intercepted")) as execute, \
          patch.object(ENTRY.importlib.util, "spec_from_file_location") as imported:
       with self.assertRaisesRegex(RuntimeError, "intercepted"): ENTRY.main([])
@@ -49,12 +51,56 @@ class DesktopEntry(unittest.TestCase):
     def metadata(path):
       return SimpleNamespace(st_uid=0, st_mode=0o100600 if path == ENTRY.PRODUCT else 0o40755, st_nlink=1)
     with patch.object(ENTRY.os, "geteuid", return_value=0), patch.object(ENTRY, "opted_in", return_value=True), \
+         patch.object(ENTRY, "reject_pending"), \
          patch.object(Path, "lstat", metadata), patch.object(Path, "is_symlink", return_value=False), \
          patch.object(ENTRY.importlib.util, "spec_from_file_location", return_value=spec), \
          patch.object(ENTRY.importlib.util, "module_from_spec", return_value=product), \
          patch.object(ENTRY.os, "execve") as stock:
       with self.assertRaisesRegex(RuntimeError, "product failed"): ENTRY.main([])
       stock.assert_not_called()
+
+  def test_pending_veto_precedes_opt_in_choice_for_both_routes(self):
+    with tempfile.TemporaryDirectory() as directory:
+      root = Path(directory)
+      state = root / ENTRY.STATE
+      state.mkdir(parents=True, mode=0o700)
+      fixture_uid = os.geteuid()
+      for name in ENTRY.PENDING:
+        path = state / name
+        for dangling in (False, True):
+          if dangling: path.symlink_to(state / "missing")
+          else: path.write_text("incomplete")
+          for opted in (False, True):
+            with self.subTest(name=name, dangling=dangling, opted=opted):
+              real_check = ENTRY.reject_pending
+              def pending_check():
+                with patch.object(ENTRY.os, "geteuid", return_value=fixture_uid): real_check(root)
+              with patch.object(ENTRY.os, "geteuid", return_value=0), \
+                   patch.object(ENTRY, "reject_pending", side_effect=pending_check), \
+                   patch.object(ENTRY, "opted_in", return_value=opted) as route, \
+                   patch.object(ENTRY.os, "execve") as stock, \
+                   patch.object(ENTRY.importlib.util, "spec_from_file_location") as product:
+                with self.assertRaisesRegex(ValueError, "Incomplete source-default"): ENTRY.main([])
+                route.assert_not_called()
+                stock.assert_not_called()
+                product.assert_not_called()
+          path.unlink()
+
+  def test_no_pending_allows_absent_state_and_rejects_unsafe_ancestors(self):
+    with tempfile.TemporaryDirectory() as directory:
+      root = Path(directory)
+      ENTRY.reject_pending(root)
+      state = root / ENTRY.STATE
+      state.parent.mkdir(parents=True)
+      state.symlink_to(state.with_name("missing"))
+      with self.assertRaises(ValueError): ENTRY.reject_pending(root)
+      state.unlink()
+      state.mkdir(mode=0o700)
+      ENTRY.reject_pending(root)
+      state.chmod(0o777)
+      with self.assertRaises(ValueError): ENTRY.reject_pending(root)
+      state.chmod(0o700)
+      with self.assertRaises(ValueError): ENTRY.reject_pending(root / "..")
 
 
 class DesktopWindow(unittest.TestCase):

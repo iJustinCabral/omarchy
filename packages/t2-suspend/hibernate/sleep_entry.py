@@ -10,6 +10,33 @@ MODEL = Path("/sys/class/dmi/id/product_name")
 STOCK = "/usr/lib/systemd/systemd-sleep"
 PRODUCT = Path("/var/lib/omarchy/t2-hibernate-product/runtime/packages/t2-suspend/hibernate/product.py")
 ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"}
+STATE = Path("var/lib/omarchy/t2-hibernate-product")
+PENDING = ("source-default-activation.pending", "source-default-deactivation.pending")
+
+
+def reject_pending(root=Path("/")):
+  """Veto both routes while a cooperating boot-policy transition is incomplete.
+
+  This is admission only, not serialization with an already running writer.
+  A future live transition must separately own a real block inhibitor and
+  establish inactive sleep units before it changes boot policy.
+  """
+  root = Path(root)
+  if not root.is_absolute() or root.resolve() != root or not root.is_dir():
+    raise ValueError("Canonical pending-transition root required")
+  if root == Path("/") and os.geteuid() != 0: raise ValueError("Root pending admission required")
+  owner = 0 if root == Path("/") else os.geteuid()
+  for name in PENDING:
+    path = root / STATE / name
+    for parent in path.parents:
+      try: info = parent.lstat()
+      except FileNotFoundError: continue
+      if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, owner) or info.st_mode & 0o022:
+        raise ValueError("Owned nonsymlink pending-transition ancestors required")
+      if parent == root: break
+    try: path.lstat()
+    except FileNotFoundError: continue
+    raise ValueError("Incomplete source-default transition blocks hibernation")
 
 
 def opted_in(marker=OPT_IN, model=MODEL, *, query=None):
@@ -32,6 +59,7 @@ def main(argv=None):
     argv = sys.argv[1:]
   if argv: raise ValueError("No sleep-entry arguments permitted")
   if os.geteuid() != 0: raise ValueError("Root systemd sleep entry required")
+  reject_pending()
   if not opted_in():
     os.execve(STOCK, [STOCK, "hibernate"], dict(os.environ))
   else:

@@ -235,5 +235,21 @@ class Dispatch(unittest.TestCase):
     self.assertTrue(self.ledger._state()["blocked"])
     self.assertFalse(self.host.host.read("source_marker_loaded"))
 
+  def test_pending_boot_policy_transitions_veto_before_deployment_and_power(self):
+    directory = self.root / product.BOOT_POLICY.STATE
+    directory.mkdir(parents=True, mode=0o700)
+    for name in ("source-default-activation.pending", "source-default-deactivation.pending"):
+      pending = directory / name
+      for symlink in (False, True):
+        if symlink: pending.symlink_to("missing-transition")
+        else: pending.write_bytes(b"interrupted or malformed")
+        with self.assertRaisesRegex(ValueError, "Incomplete source-default"):
+          product.verify_deployment(self.root, {}, {})
+        pending.unlink()
+    directory.rmdir()
+    directory.symlink_to("missing-product-state")
+    with self.assertRaises(ValueError): product.verify_deployment(self.root, {}, {})
+    self.assertEqual(self.host.power_count, 0)
+
 
 if __name__ == "__main__": unittest.main()

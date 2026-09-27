@@ -106,7 +106,7 @@ def _read(root, relative, *, private=True):
     if parent == root / STATE and stat.S_IMODE(info.st_mode) != 0o700:
       raise ValueError("Root-private product policy state required")
     if parent == root: break
-  fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+  fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
   try:
     info = os.fstat(fd)
     if not stat.S_ISREG(info.st_mode) or info.st_uid != expected_uid or info.st_nlink != 1:

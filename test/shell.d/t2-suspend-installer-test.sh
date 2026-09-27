@@ -59,6 +59,7 @@ python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-product-secure-session.p
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-product-runtime-deployment.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-desktop-entry.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-boot-policy.py"
+python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-boot-policy-transition.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-update-guard.py"
 pass "T2 suspend source and installer transactions"
 

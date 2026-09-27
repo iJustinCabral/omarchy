@@ -30,12 +30,20 @@ BACKEND = _module("product_fixed_backend", "host_backend.py")
 SECURE_SESSION = _module("product_secure_session", "secure_session.py")
 DESKTOP_SLEEP = _module("product_desktop_sleep", "desktop_sleep.py")
 BOOT_POLICY = _module("product_boot_policy", "boot_policy.py")
+UPDATE_GUARD = _module("product_update_guard", "update_guard.py")
 STATE = Path("/var/lib/omarchy/t2-hibernate-product")
 CONFIG_SCHEMA = "omarchy-t2-qualified-product-config-v1"
 
 
 def verify_deployment(root, config, report):
   """Routine-only approved default overlay; all historical checks remain."""
+  root = Path(root)
+  for name in ("source-default-activation.pending", "source-default-deactivation.pending"):
+    path = root / BOOT_POLICY.STATE / name
+    UPDATE_GUARD._ancestors(root, path, 0 if root == Path("/") else os.geteuid())
+    try: path.lstat()
+    except FileNotFoundError: continue
+    raise ValueError("Incomplete source-default transition blocks routine hibernation")
   source_default = BOOT_POLICY.verify(root, config["staged_receipt_sha256"])
   return TRIAL._verify_deployment(root, config, report, source_default=source_default)
 
