@@ -8,11 +8,14 @@ Guest logind alone bypasses its swap-space check to admit the stub body.
 This tests notifications and inhibitor lifecycle, not hardware hibernation.
 """
 import os
+import argparse
+import hashlib
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import tempfile
+import sysconfig
 
 GUEST_TEST = r'''
 #include <systemd/sd-bus.h>
@@ -95,13 +98,17 @@ def run(*args, **kwargs):
 
 
 def main():
+  parser = argparse.ArgumentParser(description=__doc__)
+  parser.add_argument("--native-inhibitor", action="store_true", help="Prove the unchanged native adapter's read-only exclusion guard with real guest logind; no native CLI/transition")
+  args = parser.parse_args()
   work = Path(tempfile.mkdtemp(prefix="mba-logind-vm-"))
   root = work / "root"
   root.mkdir()
   print(f"Disposable guest evidence: {work}", flush=True)
-  source = work / "test.c"
-  source.write_text(GUEST_TEST)
-  run("cc", "-Wall", "-Wextra", "-Werror", "-o", str(work / "test"), str(source), "-lsystemd")
+  if not args.native_inhibitor:
+    source = work / "test.c"
+    source.write_text(GUEST_TEST)
+    run("cc", "-Wall", "-Wextra", "-Werror", "-o", str(work / "test"), str(source), "-lsystemd")
   copied = set()
 
   def copy_binary(path, target=None):
@@ -123,7 +130,29 @@ def main():
                  "/usr/bin/bash", "/usr/bin/mount", "/usr/bin/mkdir", "/usr/bin/sleep", "/usr/bin/touch",
                  "/usr/bin/systemctl"):
     copy_binary(binary)
-  copy_binary(work / "test", "/test")
+  if args.native_inhibitor:
+    for binary in ("/usr/bin/python3", "/usr/bin/systemd-inhibit", "/usr/bin/busctl"):
+      copy_binary(binary)
+    # Only public installed stdlib source/data and extension modules. Never
+    # traverse site packages, host configuration, home directories or caches.
+    stdlib = Path(sysconfig.get_path("stdlib"))
+    if stdlib.parent != Path("/usr/lib") or not re.fullmatch(r"python3\.\d+", stdlib.name):
+      raise ValueError("Expected public system Python stdlib under /usr/lib")
+    for path in sorted(stdlib.rglob("*")):
+      relative = path.relative_to(stdlib)
+      if any(part in ("site-packages", "dist-packages", "__pycache__", "test", "tests", "ensurepip", "idlelib", "tkinter", "turtledemo", "Tools") or part.startswith("config-") for part in relative.parts):
+        continue
+      if path.is_symlink():
+        raise ValueError("Unexpected symlink in public stdlib: " + str(path))
+      if path.is_file():
+        if path.suffix == ".so":
+          copy_binary(path)
+        elif path.suffix in (".py", ".json", ".txt"):
+          destination = root / str(path).lstrip("/")
+          destination.parent.mkdir(parents=True, exist_ok=True)
+          shutil.copy2(path, destination)
+  else:
+    copy_binary(work / "test", "/test")
   for directory in ("proc", "sys", "dev", "run", "tmp", "etc/systemd/system", "etc/dbus-1", "var/lib/systemd/linger"):
     (root / directory).mkdir(parents=True, exist_ok=True)
   (root / "bin").symlink_to("usr/bin")
@@ -147,13 +176,30 @@ def main():
   write("/etc/systemd/logind.conf", "[Login]\nInhibitDelayMaxSec=3\nHandlePowerKey=ignore\nHandleSuspendKey=ignore\nHandleHibernateKey=ignore\nHandleLidSwitch=ignore\n")
   write("/init", "#!/bin/bash\nmount -t proc proc /proc\nmount -t sysfs sysfs /sys\nmount -t devtmpfs devtmpfs /dev\nmkdir -p /run/dbus\nexec /usr/lib/systemd/systemd --system\n", True)
   write("/body", '#!/bin/bash\necho "BODY ENTER" >/dev/console\ntouch /run/body\nif [[ -e /run/fail ]]; then exit 1; fi\nexit 0\n', True)
-  write("/run-test", '#!/bin/bash\nsleep 2\n/test\nresult=$?\necho "LOGIND_VM_EXIT=$result" >/dev/console\nsystemctl poweroff --force\n', True)
+  if args.native_inhibitor:
+    tests = Path(__file__).resolve().parent
+    adapter = tests.parent / "hibernate/boot_policy_native.py"
+    raw = adapter.read_bytes()
+    write("/native-adapter.py", raw.decode())
+    if (root / "native-adapter.py").read_bytes() != raw:
+      raise ValueError("Guest adapter must preserve exact repository source bytes")
+    write("/native-inhibitor-test.py", (tests / "native-inhibitor-guest.py").read_text())
+    fixed_script = "/var/lib/omarchy/t2-hibernate-product/runtime/packages/t2-suspend/hibernate/boot_policy_native.py"
+    write(fixed_script, "# Guest-only stub launcher, NOT the production native CLI.\nimport runpy\nrunpy.run_path('/native-inhibitor-test.py')['worker']()\n")
+    (work / "native-adapter.sha256").write_text(hashlib.sha256(raw).hexdigest() + "  native-adapter.py\n")
+    print("Exact repository adapter SHA-256: " + hashlib.sha256(raw).hexdigest(), flush=True)
+    marker = "NATIVE_INHIBITOR_VM"
+    test_command = "/usr/bin/python3 -I -B /native-inhibitor-test.py"
+  else:
+    marker = "LOGIND_VM"
+    test_command = "/test"
+  write("/run-test", '#!/bin/bash\nsleep 2\n' + test_command + '\nresult=$?\necho "' + marker + '_EXIT=$result" >/dev/console\nsystemctl poweroff --force\n', True)
   units = {
     "default.target": "[Unit]\nRequires=dbus.service systemd-logind.service test.service\n",
     "dbus.service": "[Unit]\nDefaultDependencies=no\nRequires=dbus.socket\nAfter=dbus.socket\n[Service]\nType=simple\nExecStart=/usr/bin/dbus-daemon --nofork --address=systemd: --systemd-activation --config-file=/etc/dbus-1/system.conf\n",
     "dbus.socket": "[Unit]\nDefaultDependencies=no\n[Socket]\nListenStream=/run/dbus/system_bus_socket\n",
     "systemd-logind.service": "[Unit]\nDefaultDependencies=no\nRequires=dbus.service\nAfter=dbus.service\n[Service]\nType=notify\nExecStart=/usr/lib/systemd/systemd-logind\nEnvironment=SYSTEMD_BYPASS_HIBERNATION_MEMORY_CHECK=1\nRuntimeDirectory=systemd/sessions systemd/seats systemd/users systemd/inhibit systemd/shutdown\n",
-    "test.service": "[Unit]\nDefaultDependencies=no\nAfter=systemd-logind.service\n[Service]\nExecStart=/run-test\nStandardOutput=tty\nStandardError=tty\nTTYPath=/dev/console\n",
+    "test.service": "[Unit]\nDefaultDependencies=no\nAfter=systemd-logind.service\n[Service]\nType=simple\nExecStart=/run-test\nStandardOutput=tty\nStandardError=tty\nTTYPath=/dev/console\n",
     "systemd-hibernate.service": "[Unit]\nDefaultDependencies=no\nRequires=sleep.target\nAfter=sleep.target\n[Service]\nType=oneshot\nExecStart=/body\n",
     "hibernate.target": "[Unit]\nDefaultDependencies=no\nRequires=systemd-hibernate.service\nAfter=systemd-hibernate.service\nStopWhenUnneeded=yes\n",
     "sleep.target": "[Unit]\nDefaultDependencies=no\nRefuseManualStart=yes\nStopWhenUnneeded=yes\n",
@@ -175,9 +221,12 @@ def main():
     result = subprocess.run(["timeout", "--kill-after=5s", "60s", "qemu-system-x86_64", "-machine", "q35,accel=kvm", "-cpu", "host", "-smp", "2", "-m", "1024", "-nic", "none", "-display", "none", "-serial", "stdio", "-monitor", "none", "-no-reboot", "-kernel", str(kernel), "-initrd", str(initrd), "-append", "console=ttyS0 rdinit=/init loglevel=3 systemd.log_target=console"], stdout=log, stderr=subprocess.STDOUT)
   text = (work / "serial.log").read_text(errors="replace")
   print(text[-18000:])
-  if result.returncode or "LOGIND_VM_PASS" not in text or "LOGIND_VM_EXIT=0" not in text:
+  if result.returncode or marker + "_PASS" not in text or marker + "_EXIT=0" not in text:
     raise SystemExit("Disposable logind proof failed; retained " + str(work))
-  print("PASS: genuine logind block, delay release/timeout and failed-target lifecycle")
+  if args.native_inhibitor:
+    print("PASS: unchanged native exclusion/repeated guard, real owner rejection and FD release; not native activation or hardware S4")
+  else:
+    print("PASS: genuine logind block, delay release/timeout and failed-target lifecycle")
 
 
 if __name__ == "__main__":
