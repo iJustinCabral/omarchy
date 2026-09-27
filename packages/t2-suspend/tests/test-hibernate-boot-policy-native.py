@@ -55,6 +55,152 @@ class Native(unittest.TestCase):
     self.assertEqual(len(self.commands), 6)
     self.assertTrue(all(argv[0] in ("/usr/bin/busctl", "/usr/bin/systemctl") for argv in self.commands))
 
+  def test_nonpower_jobs_are_allowed_only_during_ongoing_checks(self):
+    self.responses["ListJobs"] = ('a(usssoo) 2 7 "dbus.service" "restart" "running" '
+                                  '"/org/freedesktop/systemd1/job/7" "/org/freedesktop/systemd1/unit/dbus_2eservice" '
+                                  '8 "1worker@package-update.service" "start" "waiting" '
+                                  '"/org/freedesktop/systemd1/job/8" "/org/freedesktop/systemd1/unit/_31worker_40package_2dupdate_2eservice"')
+    with patch.object(N, "_command", side_effect=self.query):
+      N._power_ongoing(321)
+      with self.assertRaisesRegex(ValueError, "Queued system jobs"): N._power_idle(321)
+
+  def test_ongoing_job_inventory_rejects_every_power_unit_and_job_state(self):
+    with patch.object(N, "_command", side_effect=self.query):
+      for unit in N.POWER_UNITS:
+        label = unit.replace("-", "_2d").replace(".", "_2e")
+        for state in ("waiting", "running"):
+          with self.subTest(unit=unit, state=state):
+            self.responses["ListJobs"] = ('a(usssoo) 1 7 "' + unit + '" "stop" "' + state +
+                                          '" "/org/freedesktop/systemd1/job/7" "/org/freedesktop/systemd1/unit/' + label + '"')
+            with self.assertRaisesRegex(ValueError, "Queued power jobs"): N._power_ongoing(321)
+
+  def test_ongoing_checks_allow_typed_nonpower_mount_socket_and_distinct_nop_jobs(self):
+    self.responses["ListJobs"] = ('a(usssoo) 4 7 "var-cache.mount" "start" "waiting" '
+                                  '"/org/freedesktop/systemd1/job/7" "/org/freedesktop/systemd1/unit/var_2dcache_2emount" '
+                                  '8 "package_worker.socket" "stop" "running" '
+                                  '"/org/freedesktop/systemd1/job/8" "/org/freedesktop/systemd1/unit/package_5fworker_2esocket" '
+                                  '9 "dbus.service" "restart" "running" '
+                                  '"/org/freedesktop/systemd1/job/9" "/org/freedesktop/systemd1/unit/dbus_2eservice" '
+                                  '10 "dbus.service" "nop" "waiting" '
+                                  '"/org/freedesktop/systemd1/job/10" "/org/freedesktop/systemd1/unit/dbus_2eservice"')
+    with patch.object(N, "_command", side_effect=self.query): N._power_ongoing(321)
+
+  def test_ongoing_job_inventory_requires_complete_canonical_typed_tuples(self):
+    row = '7 "dbus.service" "restart" "running" "/org/freedesktop/systemd1/job/7" "/org/freedesktop/systemd1/unit/dbus_2eservice"'
+    valid = "a(usssoo) 1 " + row
+    invalid = ["", "a(usssoo)", "a(ssssuu) 0", "a(usssoo) -1", "a(usssoo) 00", "a(usssoo) 4294967296",
+               "a(usssoo) 1", "a(usssoo) 0 " + row, "a(usssoo) 2 " + row, valid + " extra",
+               " ".join(valid.split()[:-1]), "a(usssoo) 2 " + row + " " + row,
+               valid.replace(" 7 ", " 0 ", 1), valid.replace(" 7 ", " -7 ", 1),
+               valid.replace(" 7 ", " 07 ", 1), valid.replace(" 7 ", " 4294967296 ", 1),
+               valid.replace(" 7 ", " ٧ ", 1), valid.replace('"dbus.service"', '""'),
+               valid.replace('"dbus.service"', '"dbus service"'), valid.replace('"dbus.service"', '"dbüs.service"'),
+               valid.replace('"restart"', '"unknown"'), valid.replace('"restart"', '""'),
+               valid.replace('"running"', '"finished"'), valid.replace('"running"', '""'),
+               valid.replace('"/org/freedesktop/systemd1/job/7"', '"/org/freedesktop/systemd1/job/8"'),
+               valid.replace('"/org/freedesktop/systemd1/job/7"', '"job/7"'),
+               valid.replace('"/org/freedesktop/systemd1/unit/dbus_2eservice"', '"/org/freedesktop/systemd1/unit/hibernate_2etarget"'),
+               valid.replace('"/org/freedesktop/systemd1/unit/dbus_2eservice"', '"/org/freedesktop/systemd1/unit/dbus.service"')]
+    with patch.object(N, "_command", side_effect=self.query):
+      N._power_ongoing(321)
+      for response in invalid:
+        with self.subTest(response=response):
+          self.responses["ListJobs"] = response
+          with self.assertRaises(ValueError): N._power_ongoing(321)
+
+  def test_ongoing_checks_keep_all_inhibitor_and_power_state_refusals(self):
+    inhibitor = self.responses["ListInhibitors"]
+    invalid = [("ListInhibitors", "a(ssssuu) 0"),
+               ("ListInhibitors", inhibitor.replace(" 321", " 322")),
+               ("ListInhibitors", inhibitor.replace(" 0 321", " 1000 321")),
+               ("ListInhibitors", inhibitor.replace('"block"', '"delay"')),
+               ("ListInhibitors", inhibitor.replace("shutdown:sleep", "sleep")),
+               ("ListInhibitors", inhibitor.replace(N.WHO, "foreign")),
+               ("ListInhibitors", inhibitor.replace(N.WHY, "foreign")),
+               ("PreparingForSleep", "b true"), ("PreparingForShutdown", "b true"),
+               ("ScheduledShutdown", '(st) "hibernate" 1'), ("ScheduledShutdown", '(st) "unknown" 0')]
+    with patch.object(N, "_command", side_effect=self.query):
+      for member, response in invalid:
+        original = self.responses[member]
+        with self.subTest(member=member, response=response):
+          self.responses[member] = response
+          with self.assertRaises(ValueError): N._power_ongoing(321)
+        self.responses[member] = original
+      original = self.units
+      for unit in N.POWER_UNITS:
+        with self.subTest(active_unit=unit):
+          self.units = original.replace("Id=" + unit + "\nLoadState=loaded\nActiveState=inactive", "Id=" + unit + "\nLoadState=loaded\nActiveState=active")
+          with self.assertRaises(ValueError): N._power_ongoing(321)
+
+  def test_ongoing_exclusion_entry_is_strict_then_uses_power_only_guard(self):
+    read_fd, write_fd = os.pipe()
+    self.addCleanup(os.close, read_fd)
+    self.addCleanup(os.close, write_fd)
+    jobs = 'a(usssoo) 1 7 "dbus.service" "restart" "running" "/org/freedesktop/systemd1/job/7" "/org/freedesktop/systemd1/unit/dbus_2eservice"'
+    with patch.object(N.os, "getppid", return_value=321), patch.object(N.os, "pidfd_open", side_effect=lambda pid: os.dup(read_fd)), patch.object(N, "_parent_identity", return_value="123"), patch.object(N, "_command", side_effect=self.query):
+      with N._exclusion("activation", ongoing_power=True) as guard:
+        self.responses["ListJobs"] = jobs
+        guard()
+        self.responses["ListInhibitors"] = "a(ssssuu) 0"
+        with self.assertRaises(ValueError): guard()
+      self.responses["ListInhibitors"] = 'a(ssssuu) 1 "shutdown:sleep" "' + N.WHO + '" "' + N.WHY + '" "block" 0 321'
+      with self.assertRaisesRegex(ValueError, "Queued system jobs"):
+        with N._exclusion("activation", ongoing_power=True): self.fail("nonempty startup jobs admitted")
+      self.responses["ListJobs"] = "a(usssoo) 0"
+      with N._exclusion("activation") as guard:
+        self.responses["ListJobs"] = jobs
+        with self.assertRaisesRegex(ValueError, "Queued system jobs"): guard()
+
+  def test_ongoing_exclusion_retains_parent_identity_and_lifetime_checks(self):
+    read_fd, write_fd = os.pipe()
+    self.addCleanup(os.close, read_fd)
+    self.addCleanup(os.close, write_fd)
+    with patch.object(N.os, "getppid", return_value=321), patch.object(N.os, "pidfd_open", side_effect=lambda pid: os.dup(read_fd)), patch.object(N, "_parent_identity", return_value="123") as identity, patch.object(N, "_power_idle") as idle, patch.object(N, "_power_ongoing") as ongoing:
+      with N._exclusion("activation", ongoing_power=True) as guard:
+        guard()
+        idle.assert_called_once_with(321)
+        ongoing.assert_called_once_with(321)
+        identity.return_value = "456"
+        with self.assertRaisesRegex(ValueError, "exited or changed"): guard()
+        self.assertEqual(ongoing.call_count, 1)
+        identity.return_value = "123"
+        ongoing.side_effect = lambda pid: setattr(identity, "return_value", "456")
+        with self.assertRaisesRegex(ValueError, "during exclusion checks"): guard()
+        identity.return_value = "123"
+        ongoing.side_effect = None
+        os.write(write_fd, b"dead")
+        with self.assertRaisesRegex(ValueError, "exited or changed"): guard()
+        self.assertEqual(ongoing.call_count, 2)
+      for invalid in (None, "true", 1):
+        with self.subTest(mode=invalid), self.assertRaises(ValueError):
+          with N._exclusion("activation", ongoing_power=invalid): self.fail("ambiguous mode admitted")
+
+  def test_escaped_exclusion_guard_refuses_before_queries_after_exact_fd_reuse(self):
+    read_fd, write_fd = os.pipe()
+    self.addCleanup(os.close, read_fd)
+    self.addCleanup(os.close, write_fd)
+    for mode in (False, True):
+      opened = []
+      def pidfd(pid):
+        opened.append(os.dup(read_fd))
+        return opened[-1]
+      with self.subTest(ongoing_power=mode), patch.object(N.os, "getppid", return_value=321), patch.object(N.os, "pidfd_open", side_effect=pidfd), patch.object(N, "_parent_identity", return_value="123") as identity, patch.object(N, "_power_idle") as idle, patch.object(N, "_power_ongoing") as ongoing:
+        with N._exclusion("activation", ongoing_power=mode) as guard: guard()
+        # Reuse the closed pidfd number for a live unreadable pipe: liveness
+        # and unchanged parent mocks alone would let an unscoped guard pass.
+        reused = os.dup2(read_fd, opened[0])
+        try:
+          self.assertEqual(N.select.select([reused], [], [], 0)[0], [])
+          identity.reset_mock()
+          idle.reset_mock()
+          ongoing.reset_mock()
+          with patch.object(N.select, "select", side_effect=AssertionError("expired scope must not inspect a reused fd")):
+            with self.assertRaisesRegex(ValueError, "scope has expired"): guard()
+          identity.assert_not_called()
+          idle.assert_not_called()
+          ongoing.assert_not_called()
+        finally: os.close(reused)
+
   def test_returned_hibernate_zero_schedule_is_idle_but_unknown_action_refuses(self):
     with patch.object(N, "_command", side_effect=self.query):
       self.responses["ScheduledShutdown"] = '(st) "hibernate" 0'

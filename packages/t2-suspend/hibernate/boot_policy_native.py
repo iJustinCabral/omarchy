@@ -6,7 +6,9 @@ lines 289-307); its child closes inherited FDs and has a parent-death SIGTERM.
 The worker verifies that parent and its real logind record at every write
 boundary. Direct privileged systemctl operations can bypass logind inhibitors;
 the pending router veto, physical lock and power-state checks cover cooperating
-callers, not a hostile root. All queued jobs are conservatively refused.
+callers, not a hostile root. Policy transitions and exclusion startup refuse
+all queued jobs. The explicit ongoing-power mode permits ordinary nonpower
+jobs only after validating the complete typed inventory; no live entry uses it.
 """
 import argparse
 from contextlib import contextmanager
@@ -137,7 +139,51 @@ def _parent_identity(pid, action):
   return (proc / "stat").read_text().rsplit(")", 1)[1].split()[19]
 
 
+def _uint32(value):
+  if not (value.isascii() and value.isdecimal() and len(value) <= 10 and str(int(value)) == value and int(value) <= 4294967295):
+    raise ValueError("Canonical unsigned 32-bit job inventory field required")
+  return int(value)
+
+
+def _ongoing_jobs(records):
+  # systemd v261 man/org.freedesktop.systemd1.xml and
+  # src/core/dbus-manager.c method_list_jobs: a(usssoo) is the job ID,
+  # primary unit name, type, state, job object path and unit object path.
+  # src/core/job.c defines types/states and job_dbus_path; unit paths use
+  # src/basic/bus-label.c bus_label_escape (including initial digits).
+  if len(records) < 2 or records[0] != "a(usssoo)":
+    raise ValueError("Malformed typed system job inventory")
+  count = _uint32(records[1])
+  if len(records) != 2 + count * 6:
+    raise ValueError("Incomplete system job inventory")
+  ids = set()
+  types = ("start", "verify-active", "stop", "reload", "reload-or-start", "restart", "try-restart", "try-reload", "nop")
+  for index in range(2, len(records), 6):
+    job_id, unit, job_type, job_state, job_path, unit_path = records[index:index + 6]
+    number = _uint32(job_id)
+    if number == 0 or number in ids:
+      raise ValueError("Zero or duplicate system job ID")
+    ids.add(number)
+    if not unit or not unit.isascii() or any(ord(char) < 33 or ord(char) > 126 for char in unit):
+      raise ValueError("Malformed system job unit name")
+    label = "".join(char if char.isalpha() or (offset > 0 and char.isdecimal()) else "_" + format(ord(char), "02x") for offset, char in enumerate(unit))
+    if job_type not in types or job_state not in ("waiting", "running") or job_path != "/org/freedesktop/systemd1/job/" + job_id or unit_path != "/org/freedesktop/systemd1/unit/" + label:
+      raise ValueError("Malformed or inconsistent system job tuple")
+    if unit in POWER_UNITS:
+      raise ValueError("Queued power jobs prevent ongoing exclusion")
+
+
 def _power_idle(pid):
+  """Strict startup/transition check: no queued system jobs at all."""
+  _power_state(pid, ongoing_power=False)
+
+
+def _power_ongoing(pid):
+  """Read-only ongoing check; parent identity/lifetime belongs to _exclusion."""
+  _power_state(pid, ongoing_power=True)
+
+
+def _power_state(pid, *, ongoing_power):
   records = _bus("call", LOGIN, "ListInhibitors")
   if len(records) < 2 or records[0] != "a(ssssuu)" or not records[1].isdigit():
     raise ValueError("Malformed real logind inhibitor inventory")
@@ -162,7 +208,10 @@ def _power_idle(pid):
   retained_idle = len(scheduled) == 3 and scheduled[0] == "(st)" and scheduled[1] in retained_actions and scheduled[2] == "0"
   if not (no_schedule or retained_idle):
     raise ValueError("Scheduled shutdown prevents policy transition")
-  if _bus("call", MANAGER, "ListJobs") != ["a(usssoo)", "0"]:
+  jobs = _bus("call", MANAGER, "ListJobs")
+  if ongoing_power:
+    _ongoing_jobs(jobs)
+  elif jobs != ["a(usssoo)", "0"]:
     raise ValueError("Queued system jobs prevent policy transition")
   raw = _command(("/usr/bin/systemctl", "show", "--no-pager", "--property=Id,LoadState,ActiveState", *POWER_UNITS))
   rows = []
@@ -175,20 +224,30 @@ def _power_idle(pid):
 
 
 @contextmanager
-def _exclusion(action):
+def _exclusion(action, *, ongoing_power=False):
+  """Strict entry, optionally power-only ongoing guards; no caller opts in yet."""
+  if type(ongoing_power) is not bool:
+    raise ValueError("Explicit boolean ongoing-power mode required")
   pid = os.getppid()
   identity = _parent_identity(pid, action)
   fd = os.pidfd_open(pid)
+  scope_active = True
   try:
-    def guard():
+    def check(power_check):
+      if not scope_active:
+        raise ValueError("Power exclusion scope has expired")
       if select.select([fd], [], [], 0)[0] or _parent_identity(pid, action) != identity:
         raise ValueError("Original inhibitor parent exited or changed")
-      _power_idle(pid)
+      power_check(pid)
       if select.select([fd], [], [], 0)[0] or _parent_identity(pid, action) != identity:
         raise ValueError("Original inhibitor parent changed during exclusion checks")
-    guard()
+    def guard():
+      check(_power_ongoing if ongoing_power else _power_idle)
+    check(_power_idle)
     yield guard
-  finally: os.close(fd)
+  finally:
+    scope_active = False
+    os.close(fd)
 
 
 def _precheck(engine, action, phase):
