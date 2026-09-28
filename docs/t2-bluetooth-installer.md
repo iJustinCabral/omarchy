@@ -4,7 +4,7 @@ Fresh hardware setup and the upgrade migration now install the qualified Bluetoo
 
 ## Entry points
 
-- Fresh target: `hardware/all.sh` runs `apple/fix-t2-bluetooth.sh` after `fix-t2.sh` creates the initial module list. The latter now preserves existing module configuration instead of reintroducing early HCI loading on repeat runs.
+- Fresh target: `hardware/all.sh` runs `apple/fix-t2-bluetooth.sh` after `fix-t2.sh` creates the initial module list. The latter must preserve existing module configuration instead of reintroducing early HCI loading on repeat runs; that change is the separate P03 follow-up `intel-mac/p03/preserve-t2-modules`, which must merge before this branch. Without it, a repeat hardware setup pass rewrites `t2.conf` and the gate's receipt reports a changed owned file.
 - Existing install: migration `1789070892.sh` checks hardware and calls `omarchy setup t2-bluetooth`. A failed migration propagates failure and remains pending.
 - Gate upgrade: migration `1790562468.sh` runs the manager's `upgrade` action, which replaces a recognized earlier helper on an installed gate and leaves absent or rolled-back setups untouched.
 - Explicit setup: `omarchy setup t2-bluetooth`; inspect ownership with `--verify`; restore the previous startup configuration with `--rollback`.
