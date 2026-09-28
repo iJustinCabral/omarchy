@@ -1,0 +1,10 @@
+#!/bin/bash
+
+# omarchy:summary=Recover confirmed BCM4377 firmware stalls on supported T2 Macs
+# omarchy:args=[--check|--supported]
+# omarchy:group=hw
+# omarchy:hidden=true
+# omarchy:requires-sudo=true
+
+set -euo pipefail
+exec /usr/bin/python3 "$OMARCHY_PATH/install/hardware/apple/t2-wifi-recovery.py" "$@"
