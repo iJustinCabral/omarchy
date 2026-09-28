@@ -104,12 +104,14 @@ def request(root, path, *, owner_identity, timeout=1.0):
 
 
 def run_phase(root, path, *, launch, phase_identity, owner_identity, hook_identity,
-              intermediary_identity, gate, timeout=10.0):
+              intermediary_identity, gate, release=None, timeout=10.0):
   """Run/wait one real fixture child while concurrently answering hook requests.
 
   launch(endpoint) performs a bounded synthetic readiness handshake and
   returns its direct child. Deadline includes launch; no child status is claimed
   by the hook. Negative signal returncodes are preserved, not forged as success.
+  Optional release opens a held launch only after ChildPin binds its identity;
+  it is a trusted bounded owner callback, never a hook-supplied operation.
   A new invocation never consumes an existing socket or interrupted phase.
   """
   root = _fixture(root)
@@ -122,6 +124,8 @@ def run_phase(root, path, *, launch, phase_identity, owner_identity, hook_identi
     raise ValueError("Exact intermediary UID/executable required")
   if not callable(launch) or not callable(gate) or type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= 30:
     raise ValueError("Bounded explicit fixture launcher/gate/deadline required")
+  if release is not None and not callable(release):
+    raise ValueError("Owned held-phase release callback required")
   P._match(P._identity(os.getpid()), **owner)
   deadline = time.monotonic() + timeout
   listener, process, pin, owned = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM), None, None, None
@@ -145,6 +149,9 @@ def run_phase(root, path, *, launch, phase_identity, owner_identity, hook_identi
     os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
     cleanup_owned = True
     pin = P.ChildPin(process, **phase)
+    if release is not None:
+      _budget(deadline)
+      release()
     while True:
       _budget(deadline)
       _socket(path, owned)

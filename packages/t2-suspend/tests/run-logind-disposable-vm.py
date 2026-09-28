@@ -99,13 +99,16 @@ def run(*args, **kwargs):
 
 def main():
   parser = argparse.ArgumentParser(description=__doc__)
-  parser.add_argument("--native-inhibitor", action="store_true", help="Prove the unchanged native adapter's read-only exclusion guard with real guest logind; no native CLI/transition")
+  modes = parser.add_mutually_exclusive_group()
+  modes.add_argument("--native-inhibitor", action="store_true", help="Prove the unchanged native adapter's read-only exclusion guard with real guest logind; no native CLI/transition")
+  modes.add_argument("--maintenance-launcher", action="store_true", help="Prove the unchanged source-only launcher privilege drop, held readiness and descriptor inheritance using guest-only stub commands")
   args = parser.parse_args()
   work = Path(tempfile.mkdtemp(prefix="mba-logind-vm-"))
   root = work / "root"
   root.mkdir()
   print(f"Disposable guest evidence: {work}", flush=True)
-  if not args.native_inhibitor:
+  python_guest = args.native_inhibitor or args.maintenance_launcher
+  if not python_guest:
     source = work / "test.c"
     source.write_text(GUEST_TEST)
     run("cc", "-Wall", "-Wextra", "-Werror", "-o", str(work / "test"), str(source), "-lsystemd")
@@ -130,8 +133,9 @@ def main():
                  "/usr/bin/bash", "/usr/bin/mount", "/usr/bin/mkdir", "/usr/bin/sleep", "/usr/bin/touch",
                  "/usr/bin/systemctl"):
     copy_binary(binary)
-  if args.native_inhibitor:
-    for binary in ("/usr/bin/python3", "/usr/bin/systemd-inhibit", "/usr/bin/busctl"):
+  if python_guest:
+    binaries = ("/usr/bin/python3", "/usr/bin/systemd-inhibit", "/usr/bin/busctl") if args.native_inhibitor else ("/usr/bin/python3",)
+    for binary in binaries:
       copy_binary(binary)
     # Only public installed stdlib source/data and extension modules. Never
     # traverse site packages, host configuration, home directories or caches.
@@ -169,6 +173,10 @@ def main():
 
   write("/etc/passwd", "root:x:0:0:root:/root:/bin/bash\n")
   write("/etc/group", "root:x:0:\n")
+  if args.maintenance_launcher:
+    write("/etc/passwd", "root:x:0:0:root:/root:/bin/bash\nworker:x:1000:1000:Guest worker:/home/worker:/bin/bash\n")
+    write("/etc/group", "root:x:0:\nworker:x:1000:\nfixture-extra:x:1001:worker\n")
+    (root / "home/worker").mkdir(parents=True)
   write("/etc/nsswitch.conf", "passwd: files\ngroup: files\n")
   write("/etc/os-release", "ID=arch\nNAME=Disposable-logind-test\n")
   write("/etc/machine-id", "1f0bb75b22c4490b968b906528b141b4\n")
@@ -176,7 +184,25 @@ def main():
   write("/etc/systemd/logind.conf", "[Login]\nInhibitDelayMaxSec=3\nHandlePowerKey=ignore\nHandleSuspendKey=ignore\nHandleHibernateKey=ignore\nHandleLidSwitch=ignore\n")
   write("/init", "#!/bin/bash\nmount -t proc proc /proc\nmount -t sysfs sysfs /sys\nmount -t devtmpfs devtmpfs /dev\nmkdir -p /run/dbus\nexec /usr/lib/systemd/systemd --system\n", True)
   write("/body", '#!/bin/bash\necho "BODY ENTER" >/dev/console\ntouch /run/body\nif [[ -e /run/fail ]]; then exit 1; fi\nexit 0\n', True)
-  if args.native_inhibitor:
+  if args.maintenance_launcher:
+    tests = Path(__file__).resolve().parent
+    source_hashes = {}
+    for name in ("maintenance_launcher.py", "maintenance_peer.py"):
+      raw = (tests.parent / "hibernate" / name).read_bytes()
+      target = "/var/lib/omarchy/t2-hibernate-product/runtime/packages/t2-suspend/hibernate/" + name
+      write(target, raw.decode())
+      if (root / target.lstrip("/")).read_bytes() != raw:
+        raise ValueError("Guest launcher/peer must preserve exact repository source bytes")
+      source_hashes[name] = hashlib.sha256(raw).hexdigest()
+    raw = (tests / "maintenance-launcher-guest.py").read_bytes()
+    write("/maintenance-launcher-test.py", raw.decode())
+    source_hashes["maintenance-launcher-guest.py"] = hashlib.sha256(raw).hexdigest()
+    (work / "maintenance-launcher.sha256").write_text("".join(value + "  " + name + "\n" for name, value in sorted(source_hashes.items())))
+    for name, value in sorted(source_hashes.items()):
+      print("Exact repository source SHA-256: " + value + "  " + name, flush=True)
+    marker = "MAINTENANCE_LAUNCHER_VM"
+    test_command = "/usr/bin/python3 -I -B /maintenance-launcher-test.py"
+  elif args.native_inhibitor:
     tests = Path(__file__).resolve().parent
     adapter = tests.parent / "hibernate/boot_policy_native.py"
     raw = adapter.read_bytes()
@@ -223,7 +249,9 @@ def main():
   print(text[-18000:])
   if result.returncode or marker + "_PASS" not in text or marker + "_EXIT=0" not in text:
     raise SystemExit("Disposable logind proof failed; retained " + str(work))
-  if args.native_inhibitor:
+  if args.maintenance_launcher:
+    print("PASS: guest-only real privilege drop, held launcher readiness, inherited stdio/update-lock descriptor and actual child status; no package command or live admission")
+  elif args.native_inhibitor:
     print("PASS: unchanged native exclusion/repeated guard, real owner rejection and FD release; not native activation or hardware S4")
   else:
     print("PASS: genuine logind block, delay release/timeout and failed-target lifecycle")

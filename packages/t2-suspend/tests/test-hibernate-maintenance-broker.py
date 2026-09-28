@@ -129,6 +129,27 @@ class Broker(unittest.TestCase):
     self.assertFalse(self.path.exists())
     self.assertEqual(self.gates, [])
 
+  def test_invalid_release_refuses_before_launch(self):
+    with self.assertRaisesRegex(ValueError, "release callback"):
+      self.run_broker(release=True)
+    self.assertEqual(self.children, [])
+    self.assertFalse(self.path.exists())
+
+  def test_release_failure_reaps_pinned_phase(self):
+    observed = []
+    original = B.P.ChildPin
+    def pinned(*args, **kwargs):
+      pin = original(*args, **kwargs)
+      observed.append("pinned")
+      return pin
+    def release():
+      self.assertEqual(observed, ["pinned"])
+      raise ValueError("fixture release failed")
+    with patch.object(B.P, "ChildPin", side_effect=pinned), self.assertRaisesRegex(ValueError, "release failed"):
+      self.run_broker(launch=lambda path: self.launch(path, PHASE_MODE="sleep"), release=release)
+    self.assertIsNotNone(self.children[-1].returncode)
+    self.assertFalse(self.path.exists())
+
   def test_foreign_client_exact_hook_but_outside_phase_refuses(self):
     foreign = []
     def launch(path):
