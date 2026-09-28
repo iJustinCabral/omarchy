@@ -1,7 +1,9 @@
 """Offline contract tests; no inhibitor, package lock, EFI or power operation."""
 import hashlib
+import fcntl
 import importlib.util
 import json
+import os
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -99,10 +101,10 @@ class NativeUpgrade(unittest.TestCase):
         self.assertEqual((state / core.COMPATIBLE_BARRIER).read_bytes(), core._encoded(intent))
         N._restore_veto(core, approval)
         foreign = {**approval, "approval_id": "306521e4-998e-4477-b603-31b93144d103"}
-        with self.assertRaisesRegex(ValueError, "invalid intent"):
+        with self.assertRaisesRegex(ValueError, "foreign completion"):
           N._restore_veto(core, foreign)
         (state / core.COMPATIBLE_BARRIER).write_bytes(b"foreign veto")
-        with self.assertRaisesRegex(ValueError, "Foreign compatible"):
+        with self.assertRaises(ValueError):
           N._restore_veto(core, approval)
         self.assertEqual((state / core.COMPATIBLE_BARRIER).read_bytes(), b"foreign veto")
   def test_review_requires_approved_exact_inventory_and_commit(self):
@@ -257,15 +259,20 @@ class NativeUpgrade(unittest.TestCase):
     product = object()
     core = SimpleNamespace(_upgrade_snapshot=Mock(return_value={"review_sha256": "x" * 64}), _verify_tree=Mock())
     core._upgrade_snapshot.side_effect = lambda *args, **kwargs: (events.append("core") or {"review_sha256": "x" * 64})
+    release_failed = False
     def release_db(*, verify_only=False):
+      nonlocal release_failed
       events.append("db_verify" if verify_only else "db_release")
-      if fail == "release" and not verify_only: raise ValueError("db release failed")
+      if fail == "release" and not verify_only and not release_failed:
+        release_failed = True
+        raise ValueError("db release failed")
+    release_db.check_physical = lambda: events.append("physical_check")
     @contextmanager
     def locks(root):
       events.append("locks_enter")
       try: yield release_db
       finally: events.append("locks_exit")
-    engine = SimpleNamespace(_locks=locks, PRODUCT=product)
+    engine = SimpleNamespace(_locks=locks, PRODUCT=product, DB_LOCK=Path("fixture-db.lck"))
     def product_check(*args, barrier):
       events.append("old_admission" if args[0] is product else "final_admission")
       if fail == "final" and args[0] is not product: raise ValueError("final admission failed")
@@ -279,7 +286,8 @@ class NativeUpgrade(unittest.TestCase):
          patch.object(N, "_product_check", side_effect=product_check), \
          patch.object(N, "_postcheck", return_value={}), patch.object(N, "_review", return_value={"files": {}}), \
          patch.object(N, "_private_bytes", return_value=b"review"), patch.object(N, "_load", return_value=object()), \
-         patch.object(N, "_restore_veto", side_effect=restore), patch.object(N.os, "close"):
+         patch.object(N, "_restore_veto", side_effect=restore), patch.object(N.os, "close"), \
+         patch.object(N.os.path, "lexists", return_value=True):
       if fail is None:
         result = N.native()
         self.assertEqual(result, {"review_sha256": "x" * 64, "live_execution": True, "power_operation": False})
@@ -297,12 +305,157 @@ class NativeUpgrade(unittest.TestCase):
   def test_final_admission_failure_rearms_veto_inside_physical_lock(self):
     events = self._orchestration(fail="final")
     self.assertLess(events.index("restore_veto"), events.index("locks_exit"))
-    self.assertNotIn("db_release", events)
+    self.assertLess(events.index("restore_veto"), events.index("db_release"))
 
   def test_db_release_failure_rearms_veto_inside_physical_lock(self):
     events = self._orchestration(fail="release")
     self.assertLess(events.index("db_release"), events.index("restore_veto"))
     self.assertLess(events.index("restore_veto"), events.index("locks_exit"))
+
+  def test_actual_repair_faults_retain_flock_and_preserve_original_error(self):
+    spec = importlib.util.spec_from_file_location("retained_upgrade_fixture", HERE / "tests/test-hibernate-product-runtime-deployment.py")
+    fixture = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixture)
+    for fault in ("create", "readback", "file-sync", "directory-sync", "db-sync"):
+      with self.subTest(fault=fault):
+        case = fixture.Deployment(methodName="runTest")
+        case.setUp()
+        try:
+          expected, _ = case.runtime_only_fixture()
+          case.runtime_only_upgrade(expected)
+          approval = {**self.approval(), "expected": expected, "reviewed_commit": "b" * 40, "approval_id": case.approval_id}
+          db = case.root / "var/lib/pacman/db.lck"
+          db.parent.mkdir(parents=True)
+          db.write_bytes(b"")
+          physical = case.root / "physical.lock"
+          physical.write_bytes(b"")
+          events, failures = [], 0
+          directory_synced = False
+          core = fixture.D
+          original_new, original_read, original_sync = core._new_private, core._private_read, os.fsync
+          def inject():
+            nonlocal failures
+            if failures < 2:
+              failures += 1
+              raise OSError("synthetic repair fault")
+          def write(parent, name, raw):
+            if fault == "create" and name == core.COMPATIBLE_BARRIER: inject()
+            return original_new(parent, name, raw)
+          def read(parent, name):
+            if fault == "readback" and name == core.COMPATIBLE_BARRIER and directory_synced: inject()
+            return original_read(parent, name)
+          def sync(fd):
+            nonlocal directory_synced
+            path = Path(os.readlink("/proc/self/fd/" + str(fd)))
+            if ((fault == "file-sync" and path == case.state / core.COMPATIBLE_BARRIER) or
+                (fault == "directory-sync" and path == case.state) or
+                (fault == "db-sync" and path == db.parent)): inject()
+            original_sync(fd)
+            if path == case.state: directory_synced = True
+          @contextmanager
+          def locks(root):
+            held = os.open(physical, os.O_RDONLY)
+            fcntl.flock(held, fcntl.LOCK_EX)
+            released = False
+            def release(*, verify_only=False):
+              nonlocal released
+              self.assertTrue(db.exists())
+              if verify_only: return
+              db.unlink()
+              released = True
+              directory = os.open(db.parent, os.O_RDONLY | os.O_DIRECTORY)
+              try: os.fsync(directory)
+              finally: os.close(directory)
+            release.check_physical = lambda: self.assertEqual(os.fstat(held).st_ino, physical.stat().st_ino)
+            try: yield release
+            finally:
+              self.assertTrue(released)
+              events.append("physical_release")
+              os.close(held)
+          original_error = ValueError("original upgrade fault")
+          engine = SimpleNamespace(_locks=locks, PRODUCT=object(), DB_LOCK=db.relative_to(case.root))
+          def pause(seconds):
+            self.assertEqual(seconds, 1)
+            self.assertNotIn("physical_release", events)
+            competitor = os.open(physical, os.O_RDONLY)
+            try:
+              with self.assertRaises(BlockingIOError): fcntl.flock(competitor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally: os.close(competitor)
+            events.append("retained")
+          guard_fd = os.open(physical, os.O_RDONLY)
+          with patch.object(N, "ROOT", case.root), patch.object(N, "STATE", case.state), \
+               patch.object(N, "_installed_approval", return_value=approval), patch.object(N, "_unchanged"), \
+               patch.object(Path, "readlink", return_value=Path("/usr/bin/systemd-inhibit")), \
+               patch.object(N, "_verified_engines", return_value=(core, object(), engine)), \
+               patch.object(N, "_guard", return_value=(guard_fd, lambda: None)), \
+               patch.object(core, "_upgrade_snapshot", side_effect=original_error) as upgrade, \
+               patch.object(core, "_new_private", side_effect=write), patch.object(core, "_private_read", side_effect=read), \
+               patch.object(os, "fsync", side_effect=sync), patch.object(N.time, "sleep", side_effect=pause):
+            with self.assertRaises(ValueError) as caught: N.native()
+          self.assertIs(caught.exception, original_error)
+          self.assertEqual(upgrade.call_count, 1)
+          self.assertEqual(failures, 2)
+          self.assertGreaterEqual(events.count("retained"), 2)
+          self.assertEqual(events[-1], "physical_release")
+          self.assertFalse(db.exists())
+          self.assertTrue((case.state / core.COMPATIBLE_BARRIER).exists())
+        finally: case.tearDown()
+
+  def test_prepublication_and_partial_without_completion_have_distinct_proofs(self):
+    spec = importlib.util.spec_from_file_location("partial_upgrade_fixture", HERE / "tests/test-hibernate-product-runtime-deployment.py")
+    fixture = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixture)
+    case = fixture.Deployment(methodName="runTest")
+    case.setUp()
+    try:
+      expected, _ = case.runtime_only_fixture()
+      approval = {**self.approval(), "expected": expected, "reviewed_commit": "b" * 40, "approval_id": case.approval_id}
+      with patch.object(N, "STATE", case.state):
+        N._restore_veto(fixture.D, approval)
+        self.assertFalse((case.state / fixture.D.COMPATIBLE_BARRIER).exists())
+        config = (case.state / fixture.D.CONFIG).read_bytes()
+        (case.state / fixture.D.CONFIG).write_bytes(config + b"\n")
+        with self.assertRaisesRegex(ValueError, "old authority changed"):
+          N._restore_veto(fixture.D, approval)
+        (case.state / fixture.D.CONFIG).write_bytes(config)
+        with self.assertRaises(OSError):
+          case.runtime_only_upgrade(expected, postcheck=lambda: (_ for _ in ()).throw(OSError("partial")))
+        (case.state / ("runtime-upgrade-approval-consumed-" + case.approval_id + ".json")).unlink()
+        N._restore_veto(fixture.D, approval)
+        self.assertTrue((case.state / fixture.D.COMPATIBLE_BARRIER).exists())
+        self.assertFalse((case.state / "runtime-upgrade-completed-bbbbbbbbbbbb.json").exists())
+    finally: case.tearDown()
+
+  def test_recovery_backoff_interrupt_does_not_escape_unsettled_operation(self):
+    operation = Mock(side_effect=[OSError("first fault"), OSError("second fault"), None])
+    with patch.object(N.time, "sleep", side_effect=[KeyboardInterrupt(), None, None]) as pause:
+      N._retain_recovery(operation)
+    self.assertEqual(operation.call_count, 3)
+    self.assertEqual(pause.call_count, 3)
+
+  def test_lock_entry_failure_does_not_run_repair_without_exclusion(self):
+    engine = SimpleNamespace(_locks=Mock(side_effect=ValueError("lock entry failed")))
+    with patch.object(N, "_installed_approval", return_value=self.approval()), patch.object(N, "_unchanged"), \
+         patch.object(Path, "readlink", return_value=Path("/usr/bin/systemd-inhibit")), \
+         patch.object(N, "_verified_engines", return_value=(object(), object(), engine)), \
+         patch.object(N, "_guard", return_value=(9, lambda: None)), patch.object(N.os, "close"), \
+         patch.object(N, "_restore_veto") as repair, self.assertRaisesRegex(ValueError, "lock entry"):
+      N.native()
+    repair.assert_not_called()
+
+  def test_old_engine_missing_physical_check_refuses_before_core_and_recovery(self):
+    @contextmanager
+    def locks(root): yield lambda **kwargs: None
+    engine = SimpleNamespace(_locks=locks)
+    core = SimpleNamespace(_upgrade_snapshot=Mock())
+    with patch.object(N, "_installed_approval", return_value=self.approval()), patch.object(N, "_unchanged"), \
+         patch.object(Path, "readlink", return_value=Path("/usr/bin/systemd-inhibit")), \
+         patch.object(N, "_verified_engines", return_value=(core, object(), engine)), \
+         patch.object(N, "_guard", return_value=(9, lambda: None)), patch.object(N.os, "close"), \
+         patch.object(N, "_restore_veto") as repair, self.assertRaisesRegex(ValueError, "lacks required"):
+      N.native()
+    core._upgrade_snapshot.assert_not_called()
+    repair.assert_not_called()
 
 
 if __name__ == "__main__": unittest.main()

@@ -14,6 +14,7 @@ import re
 import select
 import stat
 import sys
+import time
 import uuid
 
 sys.dont_write_bytecode = True
@@ -236,41 +237,100 @@ def _postcheck(core, approval):
   return _product_check(product, barrier=True)
 
 
+def _intent(core, approval, raw):
+  record = json.loads(raw, object_pairs_hook=_pairs)
+  expected = approval["expected"]
+  if (type(record) is not dict or set(record) != {"protocol", "transaction_id", "approval_id",
+      "old_review_sha256", "new_review_sha256", "old_config_sha256", "new_config_sha256"} or
+      record["protocol"] != "omarchy-t2-runtime-upgrade-intent-v2" or record["approval_id"] != approval["approval_id"] or
+      any(record[field + "_sha256"] != expected[pin] for field, pin in
+          (("old_review", "old_review"), ("new_review", "new_review"), ("old_config", "old_config"), ("new_config", "new_config")))):
+    raise ValueError("Cannot restore veto from invalid intent")
+  core._approval_identity(record["transaction_id"])
+  if core._encoded(record) != raw: raise ValueError("Canonical exact recovery intent required")
+  return raw
+
+
+def _durable_veto(core, state_fd, intent):
+  name = core.COMPATIBLE_BARRIER
+  try: current = core._private_read(state_fd, name)
+  except FileNotFoundError: core._new_private(state_fd, name, intent)
+  else:
+    if current != intent: raise ValueError("Foreign compatible veto must remain untouched")
+  fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=state_fd)
+  try:
+    core._private(fd)
+    def identity(info):
+      return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+              info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    opened = identity(os.fstat(fd))
+    if os.read(fd, len(intent) + 1) != intent or identity(os.stat(name, dir_fd=state_fd, follow_symlinks=False)) != opened:
+      raise ValueError("Compatible veto changed before durability check")
+    os.fsync(fd)
+    os.fsync(state_fd)
+    os.lseek(fd, 0, os.SEEK_SET)
+    if (os.read(fd, len(intent) + 1) != intent or core._private_read(state_fd, name) != intent or
+        identity(os.fstat(fd)) != opened or identity(os.stat(name, dir_fd=state_fd, follow_symlinks=False)) != opened):
+      raise ValueError("Compatible veto changed after durability check")
+  finally: os.close(fd)
+
+
 def _restore_veto(core, approval):
-  """Emergency fail-closed repair only after a durable completion was written."""
+  """Prove exact old state or a durable owned veto; never replay publication."""
   state_fd = core._open_directory(STATE)
   try:
     core._private(state_fd, directory=True)
     prefix = approval["reviewed_commit"][:12]
     completed = "runtime-upgrade-completed-" + prefix + ".json"
-    try: raw = core._private_read(state_fd, completed)
-    except FileNotFoundError: return
-    record = json.loads(raw, object_pairs_hook=_pairs)
-    if (type(record) is not dict or set(record) != {"protocol", "intent", "review_sha256", "config_sha256"} or
-        record.get("protocol") != "omarchy-t2-runtime-upgrade-completed-v2" or
-        record.get("review_sha256") != approval["expected"]["new_review"] or
-        record.get("config_sha256") != approval["expected"]["new_config"]):
-      raise ValueError("Cannot restore veto from foreign completion")
-    expected = approval["expected"]
-    if (type(record["intent"]) is not dict or set(record["intent"]) != {"protocol", "transaction_id",
-        "approval_id", "old_review_sha256", "new_review_sha256", "old_config_sha256", "new_config_sha256"} or
-        record["intent"].get("protocol") != "omarchy-t2-runtime-upgrade-intent-v2" or
-        record["intent"]["approval_id"] != approval["approval_id"] or
-        record["intent"]["old_review_sha256"] != expected["old_review"] or
-        record["intent"]["new_review_sha256"] != expected["new_review"] or
-        record["intent"]["old_config_sha256"] != expected["old_config"] or
-        record["intent"]["new_config_sha256"] != expected["new_config"]):
-      raise ValueError("Cannot restore veto from invalid intent")
-    core._approval_identity(record["intent"]["transaction_id"])
-    intent = core._encoded(record["intent"])
-    if core._private_read(state_fd, "runtime-upgrade-approval-consumed-" + approval["approval_id"] + ".json") != intent:
-      raise ValueError("Cannot restore veto from foreign consumed approval")
-    name = core.COMPATIBLE_BARRIER
-    try: current = core._private_read(state_fd, name)
-    except FileNotFoundError: core._new_private(state_fd, name, intent)
+    consumed = "runtime-upgrade-approval-consumed-" + approval["approval_id"] + ".json"
+    evidence = {}
+    for name in (completed, consumed, core.UPGRADE_PENDING, core.COMPATIBLE_BARRIER):
+      try: evidence[name] = core._private_read(state_fd, name)
+      except FileNotFoundError: pass
+    intents = []
+    if completed in evidence:
+      record = json.loads(evidence[completed], object_pairs_hook=_pairs)
+      if (type(record) is not dict or set(record) != {"protocol", "intent", "review_sha256", "config_sha256"} or
+          record["protocol"] != "omarchy-t2-runtime-upgrade-completed-v2" or
+          record["review_sha256"] != approval["expected"]["new_review"] or
+          record["config_sha256"] != approval["expected"]["new_config"] or consumed not in evidence):
+        raise ValueError("Cannot restore veto from foreign completion")
+      intents.append(_intent(core, approval, core._encoded(record["intent"])))
+    for name in (consumed, core.UPGRADE_PENDING, core.COMPATIBLE_BARRIER):
+      if name in evidence: intents.append(_intent(core, approval, evidence[name]))
+    if intents:
+      if any(raw != intents[0] for raw in intents): raise ValueError("Recovery intents differ; foreign evidence preserved")
+      _durable_veto(core, state_fd, intents[0])
     else:
-      if current != intent: raise ValueError("Foreign compatible veto must remain untouched")
+      # No completion is not proof of safety. Require all old authority bytes
+      # and the entire tree, with no partial staging or retained publication.
+      for name, pin in ((core.REVIEW.name, "old_review"), (core.BOOTSTRAP, "old_bootstrap"), (core.CONFIG, "old_config")):
+        if _digest(core._private_read(state_fd, name)) != approval["expected"][pin]:
+          raise ValueError("Prepublication old authority changed")
+      review = _review(core._private_read(state_fd, core.REVIEW.name), approval["expected"]["old_review"])
+      suffix = "-before-" + prefix
+      if any(name == core.PENDING or name.startswith(("runtime-retained-", "runtime-review-retained-", "runtime-bootstrap-retained-", "config-retained-")) and suffix in name for name in os.listdir(state_fd)):
+        raise ValueError("Partial publication cannot release without durable veto")
+      core._verify_tree(STATE / "runtime", review["files"])
   finally: os.close(state_fd)
+
+
+def _retain_recovery(operation):
+  """Keep the entered physical scope on repair faults, with paced retries.
+
+  This does not own the parent inhibitor or survive SIGTERM/SIGKILL, parent
+  loss, or context-manager exit failures. Those remain deployment limitations.
+  """
+  while True:
+    try:
+      operation()
+      return
+    except BaseException:
+      while True:
+        try:
+          time.sleep(1)
+          break
+        except BaseException: pass
 
 
 def native():
@@ -282,34 +342,51 @@ def native():
     raise RuntimeError("Inhibitor exec unexpectedly returned")
   core, old_native, engine = _verified_engines(approval)
   fd, guard = _guard(old_native, approval)
-  restored = False
   try:
-    try:
-      with engine._locks(ROOT) as release_db:
-        try:
-          guard()
-          old_product = engine.PRODUCT
-          def before(): _product_check(old_product, barrier=False)
-          def after(): _postcheck(core, approval)
-          result = core._upgrade_snapshot(approval["source_directory"], root=ROOT, expected=approval["expected"],
-                                          guard=guard, precheck=before, postcheck=after, approval_id=approval["approval_id"])
-          guard()
-          # After barrier retirement, ordinary admission and db release must
-          # pass while the physical lock remains held. Failure rearms the veto.
-          core._verify_tree(STATE / "runtime", _review(_private_bytes(STATE / "runtime-deployment-review.json"),
-            approval["expected"]["new_review"], approval["reviewed_commit"])["files"])
-          new_product = _load("reviewed_final_product", STATE / "runtime/packages/t2-suspend/hibernate/product.py")
-          _product_check(new_product, barrier=False)
-          guard()
-          release_db(verify_only=True)
-          release_db()
-        except BaseException:
+    with engine._locks(ROOT) as release_db:
+      # Reject unsupported reviewed engines before entering the publication
+      # body; recovery must never wait for an API absent from loaded code.
+      if not callable(getattr(release_db, "check_physical", None)):
+        raise ValueError("Reviewed lock engine lacks required physical exclusion check")
+      release_db.check_physical()
+      release_attempted = False
+      try:
+        guard()
+        old_product = engine.PRODUCT
+        def before(): _product_check(old_product, barrier=False)
+        def after(): _postcheck(core, approval)
+        result = core._upgrade_snapshot(approval["source_directory"], root=ROOT, expected=approval["expected"],
+                                        guard=guard, precheck=before, postcheck=after, approval_id=approval["approval_id"])
+        guard()
+        # After barrier retirement, ordinary admission and db release must
+        # pass while the physical lock remains held. Failure rearms the veto.
+        core._verify_tree(STATE / "runtime", _review(_private_bytes(STATE / "runtime-deployment-review.json"),
+          approval["expected"]["new_review"], approval["reviewed_commit"])["files"])
+        new_product = _load("reviewed_final_product", STATE / "runtime/packages/t2-suspend/hibernate/product.py")
+        _product_check(new_product, barrier=False)
+        guard()
+        release_db(verify_only=True)
+        release_attempted = True
+        release_db()
+      except BaseException:
+        def recover():
           _restore_veto(core, approval)
-          restored = True
-          raise
-    except BaseException:
-      if not restored: _restore_veto(core, approval)
-      raise
+          release_db.check_physical()
+          # A db-directory fsync can fail after the adapter's release unlinks
+          # its lock. Sync absence without touching any foreign replacement.
+          nonlocal release_attempted
+          if release_attempted and not os.path.lexists(ROOT / engine.DB_LOCK):
+            directory = core._open_directory((ROOT / engine.DB_LOCK).parent)
+            try:
+              os.fsync(directory)
+              if os.path.lexists(ROOT / engine.DB_LOCK): raise ValueError("Pacman lock appeared during release settlement")
+            finally: os.close(directory)
+          else:
+            release_db(verify_only=True)
+            release_attempted = True
+            release_db()
+        _retain_recovery(recover)
+        raise
   finally: os.close(fd)
   return {"review_sha256": result["review_sha256"], "live_execution": True, "power_operation": False}
 
