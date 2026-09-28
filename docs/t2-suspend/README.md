@@ -122,3 +122,5 @@ On the combined integration branch, the existing trackpad, T2 hardware, retired-
 ## Standalone branch checks (September27)
 
 On this branch alone: the T2 hardware, retired-sleep, Bluetooth startup installer/gate, suspend installer (14 installer and 5 source-preparation cases), brcmfmac suspend, sleep lock/monitor, sleep-ownership migration and Bluetooth shell suites passed, together with the CLI suite. Hash-pinned source was fetched; both profiles were prepared and matched the tested source; the extracted-C Bluetooth (including its restore and ring-creation harnesses), interface-open and FLR tests passed. These are offline checks, not a hardware boot, suspend or fresh installation.
+
+Eligibility now finds the BCM4377 Wi-Fi function by device ID and requires Bluetooth (`14e4:5fa0`) as function 1 of that same chip, instead of the fixed addresses `0000:73:00.0` and `0000:73:00.1`. Read-only eligibility checks against the live MacBookAir9,1 found the same pair at its usual address.

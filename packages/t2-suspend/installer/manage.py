@@ -33,8 +33,11 @@ fetcher = load_module('t2_fetch', PACKAGE / 'fetch-source.py')
 
 def supported(sys=Path('/sys')):
   if not bt.supported(sys): return False
+  wifi = bt.gate.find_wifi(sys)
+  if wifi is None: return False
   try:
-    sibling = sys / 'bus/pci/devices/0000:73:00.1'
+    # Bluetooth is function 1 of the same BCM4377 chip, wherever it enumerates.
+    sibling = wifi.with_name(wifi.name.rsplit('.', 1)[0] + '.1')
     return ((sibling / 'vendor').read_text().strip() == '0x14e4' and
             (sibling / 'device').read_text().strip() == '0x5fa0')
   except OSError:

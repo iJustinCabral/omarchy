@@ -130,15 +130,27 @@ class Installer(unittest.TestCase):
 
   def test_exact_bluetooth_sibling_scope(self):
     sys = self.root / 'sys'
-    sibling = sys / 'bus/pci/devices/0000:73:00.1'
-    sibling.mkdir(parents=True)
-    (sibling / 'vendor').write_text('0x14e4')
-    (sibling / 'device').write_text('0x5fa0')
+    def function(name, device):
+      p = sys / 'bus/pci/devices' / name
+      p.mkdir(parents=True)
+      (p / 'vendor').write_text('0x14e4')
+      (p / 'device').write_text(device)
+      return p
+    wifi = function('0000:73:00.0', '0x4488')
+    sibling = function('0000:73:00.1', '0x5fa0')
     with patch.object(m.bt, 'supported', return_value=True):
       self.assertTrue(m.supported(sys))
       (sibling / 'device').write_text('0x4364')
       self.assertFalse(m.supported(sys))
       (sibling / 'device').unlink()
+      self.assertFalse(m.supported(sys))
+      # The pair is found by ID at another bus address.
+      wifi.rename(sys / 'bus/pci/devices/0000:7a:00.0')
+      sibling.rename(sys / 'bus/pci/devices/0000:7a:00.1')
+      (sys / 'bus/pci/devices/0000:7a:00.1/device').write_text('0x5fa0')
+      self.assertTrue(m.supported(sys))
+      # Bluetooth on a different chip than the Wi-Fi is not the validated pair.
+      (sys / 'bus/pci/devices/0000:7a:00.1').rename(sys / 'bus/pci/devices/0000:7b:00.1')
       self.assertFalse(m.supported(sys))
     with patch.object(m.bt, 'supported', return_value=False):
       self.assertFalse(m.supported(sys))
