@@ -8,9 +8,10 @@ This is S3 support work, not a solution to the original hibernation boot loop. S
 
 This contribution (`intel-mac/p10/t2-suspend`) is stacked on `intel-mac/p10/t2-bluetooth-startup`, which is based on `intel-mac/p10-broadcom-wifi`. The suspend installer verifies the Bluetooth startup gate before changing anything, so it requires that branch. Merge order:
 
-1. `intel-mac/p10-broadcom-wifi`
-2. `intel-mac/p10/t2-bluetooth-startup`
-3. `intel-mac/p10/t2-suspend` (this branch)
+1. `intel-mac/p03/preserve-t2-modules` (P03 follow-up; keeps hardware setup from rewriting the Bluetooth gate's module list)
+2. `intel-mac/p10-broadcom-wifi`
+3. `intel-mac/p10/t2-bluetooth-startup`
+4. `intel-mac/p10/t2-suspend` (this branch)
 
 The sibling `intel-mac/p10/t2-wifi-recovery` branch, which provides the saved-off Wi-Fi firmware-stall watcher, is **not** included here. This branch neither requires nor installs it; it may merge before or after this branch. The T2 touchpad and T2 module-preservation fixes are likewise separate P03 contributions.
 
