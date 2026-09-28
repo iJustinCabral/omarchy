@@ -22,8 +22,10 @@ entry/package remains future integration, not enabled by this module.
 """
 import array
 import importlib.util
+import json
 import os
 from pathlib import Path
+import pwd
 import secrets
 import socket
 import stat
@@ -41,6 +43,8 @@ def _module(name, filename):
 P = _module("handoff_peer", "maintenance_peer.py")
 L = _module("handoff_launcher", "maintenance_launcher.py")
 PROTOCOL = "omarchy-t2-update-lock-handoff-v1"
+CONTEXT_PROTOCOL = "omarchy-t2-update-lock-handoff-v2"
+MAX_ENVIRONMENT = 3072
 MAX_FDS = 16
 ROOT_ENDPOINT = Path("/run/omarchy-t2-maintenance/handoff.sock")
 
@@ -64,6 +68,33 @@ def _validate(fd, directory, uid, original):
   path, current = _runtime(directory, uid)
   if current != original: raise ValueError("Runtime directory changed during handoff")
   L._lock(fd, uid, {"XDG_RUNTIME_DIR": str(path)})
+
+
+def _environment(value, uid, directory):
+  """Bounded account context, NEVER UID/PID/session authorization.
+
+  Pure validation does not invoke launch/context/root-runtime APIs. The later
+  reviewed owner independently authenticates origin/session and resolves the
+  explicit Omarchy command tree before any phase admission.
+  """
+  if type(uid) is not int or uid <= 0 or type(value) is not dict or not set(value) <= L.ENV_KEYS:
+    raise ValueError("Explicit nonroot allowlisted handoff environment required")
+  if any(type(key) is not str or type(item) is not str or "\0" in item for key, item in value.items()):
+    raise ValueError("Typed NUL-free handoff environment required")
+  try: account = pwd.getpwuid(uid)
+  except KeyError: raise ValueError("Known initiating passwd account required") from None
+  expected = {"HOME": account.pw_dir, "USER": account.pw_name, "LOGNAME": account.pw_name,
+    "SHELL": account.pw_shell, "XDG_RUNTIME_DIR": str(directory)}
+  if account.pw_gid <= 0 or any(value.get(key) != item for key, item in expected.items()):
+    raise ValueError("Actual passwd/runtime-bound handoff context required")
+  if "OMARCHY_PATH" not in value or not Path(value["OMARCHY_PATH"]).is_absolute() or "PATH" not in value or any(not part or not Path(part).is_absolute() for part in value["PATH"].split(":")):
+    raise ValueError("Explicit absolute Omarchy/PATH context required")
+  if "OMARCHY_UPDATE_UNATTENDED" in value and value["OMARCHY_UPDATE_UNATTENDED"] != "1":
+    raise ValueError("Exact unattended handoff context required")
+  snapshot = dict(value)
+  if len(json.dumps(snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()) > MAX_ENVIRONMENT:
+    raise ValueError("Bounded handoff environment required")
+  return snapshot
 
 
 def _left(deadline):
@@ -104,14 +135,20 @@ def _receive_fd(stream, deadline):
 
 
 class ReceivedLock:
-  def __init__(self, fd, peer, expected, directory, runtime_identity):
+  def __init__(self, fd, peer, expected, directory, runtime_identity, environment=None):
     self.fd, self.peer, self.expected = fd, peer, expected
     self.directory, self.runtime_identity, self.owner = directory, runtime_identity, os.getpid()
+    self._environment = None if environment is None else dict(environment)
+
+  @property
+  def environment(self):
+    return None if self._environment is None else dict(self._environment)
 
   def check(self):
     if self.fd is None or os.getpid() != self.owner: raise ValueError("Owned live lock receipt required")
     observed = self.peer.require_identity(**self.expected)
     _validate(self.fd, self.directory, self.peer.uid, self.runtime_identity)
+    if self._environment is not None: _environment(self._environment, self.peer.uid, self.directory)
     self.peer.require_identity(**self.expected)
     return observed
 
@@ -127,25 +164,33 @@ class ReceivedLock:
   def __exit__(self, *args): self.close()
 
 
-def receive_lock(stream, *, sender_identity, runtime_directory, timeout=1.0):
-  """Challenge actual fresh sender; accept only its original already-held OFD."""
+def receive_lock(stream, *, sender_identity, runtime_directory, timeout=1.0, require_environment=False):
+  """V1 unchanged; explicit V2 requires account context AND original held OFD."""
+  if type(require_environment) is not bool: raise ValueError("Explicit typed context opt-in required")
   expected, deadline, previous = _identity(sender_identity), P._timeout(timeout), stream.gettimeout()
+  protocol = CONTEXT_PROTOCOL if require_environment else PROTOCOL
   peer, fd = None, None
   try:
     peer = P.Peer(stream)
     peer.require_identity(**expected)
     directory, original = _runtime(runtime_directory, peer.uid)
     nonce = secrets.token_hex(32)
-    P.send_frame(stream, {"protocol": PROTOCOL, "challenge": nonce}, timeout=_left(deadline))
+    P.send_frame(stream, {"protocol": protocol, "challenge": nonce}, timeout=_left(deadline))
     request = P.recv_frame(stream, timeout=_left(deadline))
-    if request != {"protocol": PROTOCOL, "nonce": nonce}: raise ValueError("Exact current handoff request required")
+    if require_environment:
+      if set(request) != {"protocol", "nonce", "environment"} or request["protocol"] != protocol or request["nonce"] != nonce:
+        raise ValueError("Exact V2 context handoff request required")
+      environment = _environment(request["environment"], peer.uid, directory)
+    else:
+      if request != {"protocol": protocol, "nonce": nonce}: raise ValueError("Exact current handoff request required")
+      environment = None
     fd = _receive_fd(stream, deadline)
     peer.require_identity(**expected)
     _validate(fd, directory, peer.uid, original)
     peer.require_identity(**expected)
-    P.send_frame(stream, {"protocol": PROTOCOL, "nonce": nonce, "accepted": True}, timeout=_left(deadline))
+    P.send_frame(stream, {"protocol": protocol, "nonce": nonce, "accepted": True}, timeout=_left(deadline))
     peer.require_identity(**expected)
-    result = ReceivedLock(fd, peer, expected, directory, original)
+    result = ReceivedLock(fd, peer, expected, directory, original, environment)
     fd, peer = None, None
     return result
   finally:
@@ -156,32 +201,36 @@ def receive_lock(stream, *, sender_identity, runtime_directory, timeout=1.0):
       stream.settimeout(previous)
 
 
-def _send_exchange(stream, fd, directory, deadline, recheck):
+def _send_exchange(stream, fd, directory, deadline, recheck, environment=None):
   recheck()
   directory, original = _runtime(directory, os.geteuid())
   _validate(fd, directory, os.geteuid(), original)
+  context = None if environment is None else _environment(environment, os.geteuid(), directory)
+  protocol = PROTOCOL if context is None else CONTEXT_PROTOCOL
   challenge = P.recv_frame(stream, timeout=_left(deadline))
-  if set(challenge) != {"protocol", "challenge"} or challenge["protocol"] != PROTOCOL: raise ValueError("Exact handoff owner challenge required")
+  if set(challenge) != {"protocol", "challenge"} or challenge["protocol"] != protocol: raise ValueError("Exact handoff owner challenge required")
   nonce = _nonce(challenge["challenge"])
   recheck()
-  P.send_frame(stream, {"protocol": PROTOCOL, "nonce": nonce}, timeout=_left(deadline))
+  request = {"protocol": protocol, "nonce": nonce}
+  if context is not None: request["environment"] = context
+  P.send_frame(stream, request, timeout=_left(deadline))
   stream.settimeout(_left(deadline))
   if stream.sendmsg([b"L"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [fd]))]) != 1:
     raise ValueError("Complete descriptor token send required")
   reply = P.recv_frame(stream, timeout=_left(deadline))
-  if set(reply) != {"protocol", "nonce", "accepted"} or reply["protocol"] != PROTOCOL or reply["nonce"] != nonce or reply["accepted"] is not True:
+  if set(reply) != {"protocol", "nonce", "accepted"} or reply["protocol"] != protocol or reply["nonce"] != nonce or reply["accepted"] is not True:
     raise ValueError("Exact validated lock acceptance required")
   recheck()
   _validate(fd, directory, os.geteuid(), original)
   return reply
 
 
-def send_lock(stream, fd, *, receiver_identity, runtime_directory, timeout=1.0):
+def send_lock(stream, fd, *, receiver_identity, runtime_directory, timeout=1.0, environment=None):
   """Strict exact-peer transport, for callers able to inspect the receiver."""
   expected, deadline, previous = _identity(receiver_identity), P._timeout(timeout), stream.gettimeout()
   try:
     with P.Peer(stream) as peer:
-      return _send_exchange(stream, fd, runtime_directory, deadline, lambda: peer.require_identity(**expected))
+      return _send_exchange(stream, fd, runtime_directory, deadline, lambda: peer.require_identity(**expected), environment)
   finally: stream.settimeout(previous)
 
 
@@ -225,7 +274,7 @@ class _RootPeer:
       os.close(fd)
 
 
-def send_native_lock(fd, *, timeout=1.0):
+def send_native_lock(fd, *, timeout=1.0, environment=None):
   """Nonroot fresh client to FIXED root namespace; not sudo/session authority."""
   if os.getuid() <= 0 or os.getresuid() != (os.getuid(),) * 3: raise ValueError("Actual nonroot initiating client required")
   deadline = P._timeout(timeout)
@@ -236,5 +285,5 @@ def send_native_lock(fd, *, timeout=1.0):
     stream.connect(str(ROOT_ENDPOINT))
     if _root_endpoint() != original: raise ValueError("Root socket changed during connection")
     peer = _RootPeer(stream, original)
-    try: return _send_exchange(stream, fd, directory, deadline, peer.check)
+    try: return _send_exchange(stream, fd, directory, deadline, peer.check, environment)
     finally: peer.close()

@@ -32,7 +32,7 @@ c=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);c.connect(os.environ['ENDPOIN
 fd=int(os.environ['LOCK']);mode=os.environ.get('MODE','normal')
 try:
   if mode=='normal':
-    h.send_lock(c,fd,receiver_identity=json.loads(os.environ['OWNER']),runtime_directory=os.environ['RUNTIME'])
+    h.send_lock(c,fd,receiver_identity=json.loads(os.environ['OWNER']),runtime_directory=os.environ['RUNTIME'],environment=json.loads(os.environ['CONTEXT']) if 'CONTEXT' in os.environ else None)
   else:
     with h.P.Peer(c) as p:
       p.require_identity(**json.loads(os.environ['OWNER']))
@@ -40,7 +40,9 @@ try:
       if mode=='silent': time.sleep(2)
       elif mode=='truncated': c.sendall(b'\\0\\0');c.close()
       else:
-        h.P.send_frame(c,{'protocol':h.PROTOCOL,'nonce':'0'*64 if mode=='wrongnonce' else challenge['challenge']})
+        request={'protocol':challenge['protocol'] if mode=='badcontext' else h.PROTOCOL,'nonce':'0'*64 if mode=='wrongnonce' else challenge['challenge']}
+        if mode=='badcontext': request['environment']=json.loads(os.environ['CONTEXT'])
+        h.P.send_frame(c,request)
         if mode=='dead': c.close();sys.exit(0)
         if mode=='foreign': fd=os.open(os.environ['FOREIGN'],os.O_RDWR)
         if mode=='unheld': fd=os.open(os.environ['RUNTIME']+'/omarchy-update.lock',os.O_RDWR)
@@ -129,6 +131,62 @@ class Handoff(unittest.TestCase):
     receipt.close()
     self.assert_original_held()
     with self.assertRaises(ValueError): receipt.check()
+
+  def environment(self):
+    account = pwd.getpwuid(os.getuid())
+    return {"HOME": account.pw_dir, "USER": account.pw_name, "LOGNAME": account.pw_name,
+      "SHELL": account.pw_shell, "PATH": "/usr/bin:/bin", "OMARCHY_PATH": str(self.root),
+      "XDG_RUNTIME_DIR": str(self.runtime), "TERM": "fixture", "OMARCHY_UPDATE_UNATTENDED": "1"}
+
+  def test_v2_real_same_client_context_and_original_ofd_snapshot(self):
+    environment = self.environment()
+    child, stream, expected = self.spawn(CONTEXT=json.dumps(environment))
+    receipt = H.receive_lock(stream, sender_identity=expected, runtime_directory=self.runtime, require_environment=True)
+    self.receipts.append(receipt)
+    self.assertTrue(select.select([child.stdout], [], [], 2)[0])
+    self.assertEqual(child.stdout.readline(), b"accepted\n")
+    self.assertEqual(receipt.environment, environment)
+    environment["TERM"] = "mutated source"
+    returned = receipt.environment
+    returned["HOME"] = "/wrong"
+    self.assertEqual(receipt.environment["TERM"], "fixture")
+    self.assertEqual(receipt.environment["HOME"], self.environment()["HOME"])
+    os.lseek(self.fd, 71, os.SEEK_SET)
+    self.assertEqual(os.lseek(receipt.fd, 0, os.SEEK_CUR), 71)
+    receipt.check()
+    self.assert_original_held()
+
+  def test_v1_receipt_environment_remains_none(self):
+    child, receipt = self.receive()
+    self.assertIsNone(receipt.environment)
+
+  def test_v1_v2_mixing_refuses_explicitly(self):
+    for sender_context, require_context in ((None, True), (self.environment(), False)):
+      options = {} if sender_context is None else {"CONTEXT": json.dumps(sender_context)}
+      child, stream, expected = self.spawn(**options)
+      with self.assertRaises((OSError, ValueError)):
+        H.receive_lock(stream, sender_identity=expected, runtime_directory=self.runtime, timeout=.2, require_environment=require_context)
+      stream.close()
+      self.assert_original_held()
+
+  def test_v2_invalid_context_refuses_before_installing_received_fd(self):
+    for changed in ({"HOME": "/root"}, {"USER": "root"}, {"LOGNAME": "root"}, {"SHELL": "/wrong"},
+      {"XDG_RUNTIME_DIR": "/tmp"}, {"SUDO_UID": "0"}, {"PATH": "relative:/usr/bin"},
+      {"OMARCHY_PATH": "relative"}, {"TERM": "x\0y"}, {"TERM": 7}, {"TERM": "x" * 3500}):
+      with self.subTest(changed=changed):
+        context = dict(self.environment(), **changed)
+        child, stream, expected = self.spawn("badcontext", CONTEXT=json.dumps(context))
+        before = len(os.listdir("/proc/self/fd"))
+        with self.assertRaises(ValueError):
+          H.receive_lock(stream, sender_identity=expected, runtime_directory=self.runtime, require_environment=True)
+        self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+        stream.close()
+        self.assert_original_held()
+
+  def test_v2_opt_in_requires_boolean(self):
+    child, stream, expected = self.spawn()
+    with self.assertRaises(ValueError):
+      H.receive_lock(stream, sender_identity=expected, runtime_directory=self.runtime, require_environment=1)
 
   def test_sender_death_invalidates_receipt_but_original_parent_lock_survives(self):
     child, receipt = self.receive()
