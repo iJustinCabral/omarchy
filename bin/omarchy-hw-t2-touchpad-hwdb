@@ -1,0 +1,38 @@
+#!/bin/bash
+
+# omarchy:summary=Detect whether the systemd hwdb classifies every T2 built-in trackpad.
+# omarchy:hidden=true
+
+# Exits 0 only when the compiled hwdb (packaged entries plus administrator
+# overrides in /etc/udev/hwdb.d) sets ID_INPUT_TOUCHPAD_INTEGRATION for every
+# T2 internal keyboard/trackpad ID, known or present. Any value counts: an
+# administrator who marked the pad external must not be overridden by our rule.
+#
+# systemd only ships entries for some T2 models (05ac:0280 and 05ac:0340), so
+# checking one ID skips the fallback on others such as the MacBookPro15,2
+# (05ac:027b). The known list covers setups where the input devices are not
+# visible, such as an install chroot.
+
+input_devices_path="${OMARCHY_INPUT_DEVICES_PATH:-/sys/class/input}"
+t2_name="Apple Inc. Apple Internal Keyboard / Trackpad"
+
+# hid-apple WELLSPRINGT2 IDs: J140K, J132, J680, J213, J214K, J223, J230K, J152F
+products=(027a 027b 027c 027d 027e 027f 0280 0340)
+
+shopt -s nullglob
+
+for device in "$input_devices_path"/input*; do
+  name=$(cat "$device/name" 2>/dev/null) || continue
+  [[ $name == "$t2_name" ]] || continue
+  vendor=$(cat "$device/id/vendor" 2>/dev/null) || continue
+  [[ ${vendor,,} == "05ac" ]] || continue
+  product=$(cat "$device/id/product" 2>/dev/null) || continue
+  products+=("${product,,}")
+done
+
+for product in $(printf '%s\n' "${products[@]}" | sort -u); do
+  systemd-hwdb query "touchpad:usb:v05acp$product:name:$t2_name:" |
+    grep -q '^ID_INPUT_TOUCHPAD_INTEGRATION=' || exit 1
+done
+
+exit 0
