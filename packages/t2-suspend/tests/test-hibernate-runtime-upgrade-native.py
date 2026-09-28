@@ -160,10 +160,15 @@ class NativeUpgrade(unittest.TestCase):
     product = Mock()
     product.TRIAL._private_json.side_effect = [{"source_directory": "/source", "restore_directory": "/restore",
                                                  "production_uki": "/uki", "staged_receipt_sha256": "a" * 64}, {"receipt": True}]
-    product.ARTIFACTS.derive_artifacts.return_value = {"manifest": {}}
+    resume = {"device": "/dev/mapper/root", "devnum": "253:0", "offset": 10}
+    product.ARTIFACTS.derive_artifacts.return_value = {"manifest": {}, "audited_details": {"restore_protocol": {"resume": resume}}}
     product.validate.return_value = "receipt"
     product.BOOT_POLICY.verify.return_value = True
-    N._product_check(product, barrier=True)
+    image_state = Mock()
+    with patch.object(N, "_load", return_value=image_state) as load:
+      N._product_check(product, barrier=True)
+    load.assert_called_once_with("reviewed_upgrade_image_state", N.STATE / "runtime/packages/t2-suspend/hibernate/image_state.py")
+    image_state.require_no_image.assert_called_once_with(N.ROOT, resume)
     product.check.assert_not_called()
     product.TRIAL._verify_deployment.assert_called_once()
     product._admission_state.assert_called_once()
@@ -172,9 +177,55 @@ class NativeUpgrade(unittest.TestCase):
     product = Mock()
     product.TRIAL._private_json.side_effect = [{"source_directory": "/source", "restore_directory": "/restore",
                                                  "production_uki": "/uki"}, {"receipt": True}]
-    N._product_check(product, barrier=False)
+    resume = {"device": "/dev/mapper/root", "devnum": "253:0", "offset": 10}
+    product.ARTIFACTS.derive_artifacts.return_value = {"audited_details": {"restore_protocol": {"resume": resume}}}
+    image_state = Mock()
+    with patch.object(N, "_load", return_value=image_state):
+      N._product_check(product, barrier=False)
+    image_state.require_no_image.assert_called_once_with(N.ROOT, resume)
     product.check.assert_called_once()
     product._admission_state.assert_not_called()
+
+  def test_pending_and_unknown_image_refuse_normal_and_barrier_admission(self):
+    for barrier in (False, True):
+      for classification in ("pending", "unknown"):
+        with self.subTest(barrier=barrier, classification=classification):
+          product, image_state = Mock(), Mock()
+          product.TRIAL._private_json.side_effect = [{"source_directory": "/source", "restore_directory": "/restore", "production_uki": "/uki"}, {}]
+          product.ARTIFACTS.derive_artifacts.return_value = {"audited_details": {"restore_protocol": {"resume": {"device": "/dev/mapper/root", "devnum": "253:0", "offset": 10}}}}
+          image_state.require_no_image.side_effect = ValueError(classification + " image")
+          with patch.object(N, "_load", return_value=image_state), self.assertRaisesRegex(ValueError, classification):
+            N._product_check(product, barrier=barrier)
+          product.check.assert_not_called()
+          product.validate.assert_not_called()
+          product._admission_state.assert_not_called()
+
+  def test_image_refusal_precedes_mutation_or_retains_published_barrier(self):
+    spec = importlib.util.spec_from_file_location("image_upgrade_fixture", HERE / "tests/test-hibernate-product-runtime-deployment.py")
+    fixture = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixture)
+    for stage in ("precheck", "postcheck"):
+      with self.subTest(stage=stage):
+        case = fixture.Deployment(methodName="runTest")
+        case.setUp()
+        try:
+          expected, config = case.runtime_only_fixture()
+          product, image_state = Mock(), Mock()
+          product.TRIAL._private_json.side_effect = [{"source_directory": "/source", "restore_directory": "/restore", "production_uki": "/uki"}, {}]
+          product.ARTIFACTS.derive_artifacts.return_value = {"audited_details": {"restore_protocol": {"resume": {"device": "/dev/mapper/root", "devnum": "253:0", "offset": 10}}}}
+          image_state.require_no_image.side_effect = ValueError("Pending or unknown image")
+          check = lambda: N._product_check(product, barrier=stage == "postcheck")
+          with patch.object(N, "_load", return_value=image_state), self.assertRaisesRegex(ValueError, "Pending or unknown"):
+            fixture.D.upgrade_snapshot(case.source, root=case.root, expected=expected, approval_id=case.approval_id,
+              guard=lambda: None, precheck=check if stage == "precheck" else lambda: None,
+              postcheck=check if stage == "postcheck" else lambda: None)
+          self.assertEqual((case.state / fixture.D.CONFIG).read_bytes(), config)
+          self.assertEqual((case.state / fixture.D.COMPATIBLE_BARRIER).exists(), stage == "postcheck")
+          self.assertEqual((case.state / fixture.D.UPGRADE_PENDING).exists(), stage == "postcheck")
+          self.assertFalse((case.state / "runtime-upgrade-completed-bbbbbbbbbbbb.json").exists())
+          installed = (case.state / "runtime" / fixture.D.ENTRYPOINT).read_bytes()
+          self.assertIn(b"New source" if stage == "postcheck" else b"Source must", installed)
+        finally: case.tearDown()
 
   def test_guard_checks_parent_before_and_after_real_idle_record(self):
     native = SimpleNamespace(_power_idle=Mock())

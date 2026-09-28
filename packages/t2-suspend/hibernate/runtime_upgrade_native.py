@@ -214,6 +214,11 @@ def _product_check(product, *, barrier):
   config = product.TRIAL._private_json(STATE / "config.json")
   qualification = product.TRIAL._private_json(STATE / "qualification.json")
   report = product.ARTIFACTS.derive_artifacts(config["source_directory"], config["restore_directory"], config["production_uki"])
+  # Every caller holds both native exclusions and has verified this installed
+  # runtime tree. Never load a helper from the incoming workspace. Ledger
+  # reconciliation alone cannot establish that the resume page has no image.
+  image_state = _load("reviewed_upgrade_image_state", STATE / "runtime/packages/t2-suspend/hibernate/image_state.py")
+  image_state.require_no_image(ROOT, report["audited_details"]["restore_protocol"]["resume"])
   arguments = {"ledger": product.TX.Ledger(STATE / "ledger"), "archive_directory": STATE / "archives", "root": ROOT}
   if not barrier: return product.check(config, qualification, report, **arguments)
   receipt = product.validate(config, qualification, report)
