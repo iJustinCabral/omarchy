@@ -106,12 +106,14 @@ def main():
   modes.add_argument("--maintenance-entry", action="store_true", help="Trace real guest sudo/inhibitor ancestry and original-client lock handoff with and without sudo PTY; no native admission or password proof")
   modes.add_argument("--maintenance-scope", action="store_true", help="Test real transient scope placement/draining of held user stub descendants; no package command or native admission")
   modes.add_argument("--maintenance-recovery", action="store_true", help="Join fixture maintenance coordinator, real user scopes and retained veto recovery under real logind exclusion; no package/native admission")
+  modes.add_argument("--maintenance-owner", action="store_true", help="Prove actual owner-held logind FD and latched stop signals survive original inhibitor-parent death in the guest; no package/native admission")
+  modes.add_argument("--maintenance-alpm", action="store_true", help="Test a real tiny disposable pacman transaction and fixture maintenance hook under an owner-held inhibitor; no host packages or native admission")
   args = parser.parse_args()
   work = Path(tempfile.mkdtemp(prefix="mba-logind-vm-"))
   root = work / "root"
   root.mkdir()
   print(f"Disposable guest evidence: {work}", flush=True)
-  python_guest = args.native_inhibitor or args.maintenance_launcher or args.maintenance_handoff or args.maintenance_entry or args.maintenance_scope or args.maintenance_recovery
+  python_guest = args.native_inhibitor or args.maintenance_launcher or args.maintenance_handoff or args.maintenance_entry or args.maintenance_scope or args.maintenance_recovery or args.maintenance_owner or args.maintenance_alpm
   if not python_guest:
     source = work / "test.c"
     source.write_text(GUEST_TEST)
@@ -138,9 +140,13 @@ def main():
                  "/usr/bin/systemctl"):
     copy_binary(binary)
   if python_guest:
-    binaries = ("/usr/bin/python3", "/usr/bin/systemd-inhibit", "/usr/bin/busctl") if args.native_inhibitor or args.maintenance_entry or args.maintenance_scope or args.maintenance_recovery else ("/usr/bin/python3",)
+    binaries = ("/usr/bin/python3", "/usr/bin/systemd-inhibit", "/usr/bin/busctl") if args.native_inhibitor or args.maintenance_entry or args.maintenance_scope or args.maintenance_recovery or args.maintenance_owner or args.maintenance_alpm else ("/usr/bin/python3",)
     for binary in binaries:
       copy_binary(binary)
+    if args.maintenance_owner or args.maintenance_alpm:
+      copy_binary("/usr/lib/libsystemd.so.0")
+    if args.maintenance_alpm:
+      copy_binary("/usr/bin/pacman")
     # Only public installed stdlib source/data and extension modules. Never
     # traverse site packages, host configuration, home directories or caches.
     stdlib = Path(sysconfig.get_path("stdlib"))
@@ -197,9 +203,31 @@ def main():
     write("/etc/pam.d/sudo", "auth required pam_permit.so\naccount required pam_permit.so\nsession required pam_permit.so\n")
     write("/init", "#!/bin/bash\nmount -t proc proc /proc\nmount -t sysfs sysfs /sys\nmount -t devtmpfs devtmpfs /dev\nmkdir -p /dev/pts /run/dbus\nmount -t devpts devpts /dev/pts\nexec /usr/lib/systemd/systemd --system\n", True)
   write("/body", '#!/bin/bash\necho "BODY ENTER" >/dev/console\ntouch /run/body\nif [[ -e /run/fail ]]; then exit 1; fi\nexit 0\n', True)
-  if args.maintenance_recovery:
+  if args.maintenance_owner:
     tests = Path(__file__).resolve().parent
     source_hashes = {}
+    destination = "/var/lib/omarchy/t2-hibernate-product/runtime/packages/t2-suspend/hibernate/"
+    for name in ("maintenance_inhibitor.py", "boot_policy_native.py", "maintenance_peer.py"):
+      raw = (tests.parent / "hibernate" / name).read_bytes()
+      write(destination + name, raw.decode())
+      target = root / (destination + name).lstrip("/")
+      target.chmod(0o600)
+      if target.read_bytes() != raw:
+        raise ValueError("Guest owner dependencies must preserve exact public source bytes")
+      source_hashes[name] = hashlib.sha256(raw).hexdigest()
+    raw = (tests / "maintenance-owner-guest.py").read_bytes()
+    write("/maintenance-owner-test.py", raw.decode())
+    source_hashes["maintenance-owner-guest.py"] = hashlib.sha256(raw).hexdigest()
+    manifest = "".join(value + "  " + name + "\n" for name, value in sorted(source_hashes.items()))
+    (work / "maintenance-owner.sha256").write_text(manifest)
+    print("Exact public owner manifest: " + str(work / "maintenance-owner.sha256") + " (SHA-256 " + hashlib.sha256(manifest.encode()).hexdigest() + ")", flush=True)
+    print("Exact owner guest SHA-256: " + hashlib.sha256(raw).hexdigest(), flush=True)
+    marker = "MAINTENANCE_OWNER_VM"
+    test_command = "/usr/bin/python3 -I -B /maintenance-owner-test.py"
+  elif args.maintenance_recovery or args.maintenance_alpm:
+    tests = Path(__file__).resolve().parent
+    source_hashes = {}
+    mode = "maintenance-alpm" if args.maintenance_alpm else "maintenance-recovery"
     destination = "/var/lib/omarchy/t2-hibernate-product/runtime/packages/t2-suspend/"
     extensionless = {"experiments/0008-wifi-hibernate-isolation/omarchy-t2-hibernate-wifi"}
     # Only public repository Python/hook bytes, never installed private state,
@@ -210,18 +238,20 @@ def main():
       relative = path.relative_to(tests.parent).as_posix()
       raw = path.read_bytes()
       write(destination + relative, raw.decode())
+      if relative == "hibernate/maintenance_inhibitor.py":
+        (root / (destination + relative).lstrip("/")).chmod(0o600)
       if (root / (destination + relative).lstrip("/")).read_bytes() != raw:
-        raise ValueError("Guest recovery dependencies must preserve exact repository bytes")
+        raise ValueError("Guest fixture dependencies must preserve exact repository bytes")
       source_hashes[relative] = hashlib.sha256(raw).hexdigest()
-    raw = (tests / "maintenance-recovery-guest.py").read_bytes()
-    write("/maintenance-recovery-test.py", raw.decode())
-    source_hashes["maintenance-recovery-guest.py"] = hashlib.sha256(raw).hexdigest()
+    raw = (tests / (mode + "-guest.py")).read_bytes()
+    write("/" + mode + "-test.py", raw.decode())
+    source_hashes[mode + "-guest.py"] = hashlib.sha256(raw).hexdigest()
     manifest = "".join(value + "  " + name + "\n" for name, value in sorted(source_hashes.items()))
-    (work / "maintenance-recovery.sha256").write_text(manifest)
-    print("Exact public dependency manifest: " + str(work / "maintenance-recovery.sha256") + " (" + str(len(source_hashes)) + " entries, SHA-256 " + hashlib.sha256(manifest.encode()).hexdigest() + ")", flush=True)
-    print("Exact recovery guest SHA-256: " + hashlib.sha256(raw).hexdigest(), flush=True)
-    marker = "MAINTENANCE_RECOVERY_VM"
-    test_command = "/usr/bin/python3 -I -B /maintenance-recovery-test.py"
+    (work / (mode + ".sha256")).write_text(manifest)
+    print("Exact public dependency manifest: " + str(work / (mode + ".sha256")) + " (" + str(len(source_hashes)) + " entries, SHA-256 " + hashlib.sha256(manifest.encode()).hexdigest() + ")", flush=True)
+    print("Exact " + mode + " guest SHA-256: " + hashlib.sha256(raw).hexdigest(), flush=True)
+    marker = "MAINTENANCE_ALPM_VM" if args.maintenance_alpm else "MAINTENANCE_RECOVERY_VM"
+    test_command = "/usr/bin/python3 -I -B /" + mode + "-test.py"
   elif args.maintenance_scope:
     tests = Path(__file__).resolve().parent
     source_hashes = {}
@@ -348,7 +378,11 @@ def main():
   print(text[-18000:])
   if result.returncode or marker + "_PASS" not in text or marker + "_EXIT=0" not in text:
     raise SystemExit("Disposable logind proof failed; retained " + str(work))
-  if args.maintenance_recovery:
+  if args.maintenance_owner:
+    print("PASS: guest-only actual owner-held logind FD and latched stop requests retained across original parent death, with explicit simulated safe release; no package/native admission")
+  elif args.maintenance_alpm:
+    print("PASS: real disposable pacman hook/transaction fixture under retained owner-held inhibitor; no host packages, native admission or reactivation proof")
+  elif args.maintenance_recovery:
     print("PASS: guest-only integrated fixture maintenance, user scope settlement and exact veto recovery under retained real inhibitor/locks; no native admission or package action")
   elif args.maintenance_scope:
     print("PASS: guest-only held user phase placement, recursive descendant drain and preserved outside owner/sentinel; no package command or native admission")
