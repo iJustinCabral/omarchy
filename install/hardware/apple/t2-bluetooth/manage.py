@@ -1,6 +1,8 @@
 """Install Bluetooth boot ordering for the validated T2 model, without starting it."""
 import argparse
 import fcntl
+import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -15,6 +17,14 @@ DROPIN = 'etc/systemd/system/bluetooth.service.d/50-t2-startup.conf'
 BLACKLIST = 'etc/modprobe.d/t2-bluetooth-order.conf'
 LINK = 'etc/systemd/system/multi-user.target.wants/bluetooth-after-wifi.service'
 RECEIPT = 'var/lib/omarchy-t2-bluetooth/receipt.json'
+# Earlier packaged helpers that setup replaces in place, by SHA-256.
+PREVIOUS_HELPERS = {
+  'cf4eb4a6584ce95b73ec0685c04a5ead11a34cb640f41eb63da0978f717e5360',  # fixed PCI address 0000:73:00.0
+}
+
+_spec = importlib.util.spec_from_file_location('omarchy_t2_bluetooth_gate', ASSETS/'gate.py')
+gate = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(gate)
 
 
 def supported(sys=Path('/sys')):
@@ -27,9 +37,7 @@ def supported(sys=Path('/sys')):
     if not any((p/'vendor').read_text().strip() == '0x106b' and
         (p/'device').read_text().strip() in ('0x1801', '0x1802') for p in pci.iterdir()):
       return False
-    wifi = pci/'0000:73:00.0'
-    return ((wifi/'vendor').read_text().strip() == '0x14e4' and
-        (wifi/'device').read_text().strip() == '0x4488')
+    return gate.find_wifi(sys) is not None
   except OSError:
     return False
 
@@ -115,8 +123,12 @@ def verify(root, receipt):
 
 def restore(root, receipt):
   # Validate all paths before restoring any: never overwrite administrator edits.
+  # An interrupted helper upgrade may still hold the previous helper.
   for name, original in receipt['original'].items():
-    if read(root, name) not in (original, receipt['installed'][name]):
+    expected = [original, receipt['installed'][name]]
+    if name in receipt.get('previous', {}):
+      expected.append(receipt['previous'][name])
+    if read(root, name) not in expected:
       raise ValueError('Changed transaction file: ' + name)
   for name, original in reversed(list(receipt['original'].items())):
     write(root, name, original)
@@ -124,18 +136,28 @@ def restore(root, receipt):
   save(root, receipt)
 
 
+def upgradable(installed, files):
+  """An earlier packaged revision that differs only by a known helper."""
+  helper = installed.get(HELPER) or {}
+  rest = lambda payload: {n: v for n, v in payload.items() if n != HELPER}
+  return (rest(installed) == rest(files) and helper.get('mode') == 0o755 and 'hex' in helper and
+      hashlib.sha256(bytes.fromhex(helper['hex'])).hexdigest() in PREVIOUS_HELPERS)
+
+
 def preflight(root, files):
   receipt = None
   if read(root, RECEIPT) is not None:
     receipt = load(root)
     verify(root, receipt)
-    if receipt['installed'] != files:
+    if receipt['installed'] != files and not upgradable(receipt['installed'], files):
       raise ValueError('Installed revision differs; review upgrade before replacing it')
   # Known lab revision 2 can be adopted in place, with full rollback to it.
   qualified = ASSETS.parents[3]/'docs/t2-bluetooth-qualified'
   allowed = {name: [None, value] for name, value in files.items()}
   allowed[CONFIG] = [file(b't2bce_vhci\nhci_bcm4377\n'), file(b't2bce_vhci\n')]
   allowed[HELPER].append(file((qualified/'bluetooth-after-wifi.py').read_bytes(), 0o755))
+  if receipt is not None:
+    allowed[HELPER].append(receipt['installed'][HELPER])
   for name in files:
     if read(root, name) not in allowed[name]:
       raise ValueError('Preserving unrecognized configuration: ' + name)
@@ -178,9 +200,33 @@ def check_images(root, fresh, run=subprocess.run):
       raise ValueError('Early Bluetooth in boot image: ' + str(image))
 
 
+def upgrade(root, receipt, files, validate):
+  # Only the helper changes. 'original' is kept, so rollback still restores the
+  # pre-installation state; a failed upgrade leaves the previous revision installed.
+  previous = receipt['installed']
+  receipt.update(state='preparing', installed=files, previous={HELPER: previous[HELPER]})
+  save(root, receipt)
+  try:
+    write(root, HELPER, files[HELPER])
+    validate()
+    receipt['state'] = 'installed'
+    del receipt['previous']
+    save(root, receipt)
+    verify(root, receipt)
+  except BaseException:
+    write(root, HELPER, previous[HELPER])
+    receipt.update(state='installed', installed=previous)
+    receipt.pop('previous', None)
+    save(root, receipt)
+    raise
+
+
 def install(root, validate=lambda: None):
   files = payload()
-  if preflight(root, files) is not None:
+  receipt = preflight(root, files)
+  if receipt is not None:
+    if receipt['installed'] != files:
+      upgrade(root, receipt, files, validate)
     return
   receipt = {'state': 'preparing', 'original': {n: read(root, n) for n in files}, 'installed': files}
   save(root, receipt)
@@ -196,9 +242,17 @@ def install(root, validate=lambda: None):
     raise
 
 
+def upgrade_installed(root, validate=lambda: None):
+  """Replace a recognized earlier helper; leave absent or rolled-back installs alone."""
+  if read(root, RECEIPT) is None or load(root)['state'] != 'installed':
+    return False
+  install(root, validate)
+  return True
+
+
 def main():
   parser = argparse.ArgumentParser(description=__doc__)
-  parser.add_argument('action', choices=['supported', 'install', 'verify', 'rollback'])
+  parser.add_argument('action', choices=['supported', 'install', 'upgrade', 'verify', 'rollback'])
   parser.add_argument('--fresh', action='store_true', help='Allow a target whose boot image has not been generated yet')
   args = parser.parse_args()
   if args.action == 'supported':
@@ -209,17 +263,21 @@ def main():
   os.umask(0o077)
   with open('/run/lock/omarchy-t2-bluetooth.lock', 'a') as lock:
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    if args.action == 'install':
+    def validate():
+      subprocess.run(['/usr/bin/systemd-analyze', 'verify', '/' + UNIT,
+          'bluetooth.service', 'systemd-user-sessions.service'], check=True, timeout=30)
+      subprocess.run(['/usr/bin/systemctl', 'daemon-reload'], check=True, timeout=30)
+    if args.action in ('install', 'upgrade'):
       if not supported():
         raise SystemExit('Requires validated MacBookAir9,1 with T2 and BCM4377b')
-      preflight(root, payload())
-      check_images(root, args.fresh)
-      def validate():
-        subprocess.run(['/usr/bin/systemd-analyze', 'verify', '/' + UNIT,
-            'bluetooth.service', 'systemd-user-sessions.service'], check=True, timeout=30)
-        subprocess.run(['/usr/bin/systemctl', 'daemon-reload'], check=True, timeout=30)
       try:
-        install(root, validate)
+        if args.action == 'install':
+          preflight(root, payload())
+          check_images(root, args.fresh)
+          install(root, validate)
+        elif not upgrade_installed(root, validate):
+          print('upgrade: no installed Bluetooth startup gate; nothing changed')
+          return
       except BaseException:
         subprocess.run(['/usr/bin/systemctl', 'daemon-reload'], check=False, timeout=30)
         raise

@@ -4,29 +4,11 @@ from pathlib import Path
 import subprocess
 import time
 
-WIFI = ('0x14e4', '0x4488')
-
-
-def find_wifi(sys=Path('/sys')):
-  """Return the single BCM4377 Wi-Fi function; its PCI address depends on enumeration."""
-  matches = []
-  try:
-    devices = list((sys/'bus/pci/devices').iterdir())
-  except OSError:
-    return None
-  for dev in devices:
-    try:
-      if ((dev/'vendor').read_text().strip(), (dev/'device').read_text().strip()) == WIFI:
-        matches.append(dev)
-    except OSError:
-      continue
-  return matches[0] if len(matches) == 1 else None
+PCI = '0000:73:00.0'
 
 
 def wifi_ready(sys=Path('/sys')):
-  dev = find_wifi(sys)
-  if dev is None:
-    return None
+  dev = sys/'bus/pci/devices'/PCI
   try:
     if (dev/'vendor').read_text().strip() != '0x14e4' or (dev/'device').read_text().strip() != '0x4488':
       return None

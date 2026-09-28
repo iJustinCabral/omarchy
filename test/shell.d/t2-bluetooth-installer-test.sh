@@ -43,3 +43,15 @@ bash -euo pipefail "$ROOT/migrations/1789070892.sh"
 grep -qx 'setup' "$TEST_CALLS" || fail "migration uses setup"
 if TEST_INSTALL_STATUS=1 bash -euo pipefail "$ROOT/migrations/1789070892.sh"; then fail "migration failure must remain pending"; fi
 pass "fresh install, setup, and migration share manager and propagate failures"
+
+upgrade_migration="$ROOT/migrations/1790562468.sh"
+[[ $(stat -c %a "$upgrade_migration") == "644" ]] || fail "upgrade migration is not executable"
+: > "$TEST_CALLS"
+bash -euo pipefail "$upgrade_migration" >/dev/null
+grep -q '^sudo /usr/bin/python3 .*/t2-bluetooth/manage.py upgrade$' "$TEST_CALLS" || fail "upgrade migration uses the upgrade-only action"
+! grep -qx 'setup' "$TEST_CALLS" || fail "upgrade migration does not reinstall a rolled-back gate"
+: > "$TEST_CALLS"
+TEST_SUPPORTED=1 bash -euo pipefail "$upgrade_migration" >/dev/null
+! grep -q 'upgrade$' "$TEST_CALLS" || fail "upgrade migration skips unsupported hardware"
+if TEST_INSTALL_STATUS=1 bash -euo pipefail "$upgrade_migration" >/dev/null 2>&1; then fail "upgrade failure must remain pending"; fi
+pass "gate upgrade migration touches only installed gates on supported hardware"
