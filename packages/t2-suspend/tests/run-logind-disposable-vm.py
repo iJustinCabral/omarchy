@@ -102,12 +102,13 @@ def main():
   modes = parser.add_mutually_exclusive_group()
   modes.add_argument("--native-inhibitor", action="store_true", help="Prove the unchanged native adapter's read-only exclusion guard with real guest logind; no native CLI/transition")
   modes.add_argument("--maintenance-launcher", action="store_true", help="Prove the unchanged source-only launcher privilege drop, held readiness and descriptor inheritance using guest-only stub commands")
+  modes.add_argument("--maintenance-handoff", action="store_true", help="Prove an authenticated nonroot-to-root original update-lock handoff inside the guest; no package or native admission")
   args = parser.parse_args()
   work = Path(tempfile.mkdtemp(prefix="mba-logind-vm-"))
   root = work / "root"
   root.mkdir()
   print(f"Disposable guest evidence: {work}", flush=True)
-  python_guest = args.native_inhibitor or args.maintenance_launcher
+  python_guest = args.native_inhibitor or args.maintenance_launcher or args.maintenance_handoff
   if not python_guest:
     source = work / "test.c"
     source.write_text(GUEST_TEST)
@@ -173,7 +174,7 @@ def main():
 
   write("/etc/passwd", "root:x:0:0:root:/root:/bin/bash\n")
   write("/etc/group", "root:x:0:\n")
-  if args.maintenance_launcher:
+  if args.maintenance_launcher or args.maintenance_handoff:
     write("/etc/passwd", "root:x:0:0:root:/root:/bin/bash\nworker:x:1000:1000:Guest worker:/home/worker:/bin/bash\n")
     write("/etc/group", "root:x:0:\nworker:x:1000:\nfixture-extra:x:1001:worker\n")
     (root / "home/worker").mkdir(parents=True)
@@ -184,7 +185,25 @@ def main():
   write("/etc/systemd/logind.conf", "[Login]\nInhibitDelayMaxSec=3\nHandlePowerKey=ignore\nHandleSuspendKey=ignore\nHandleHibernateKey=ignore\nHandleLidSwitch=ignore\n")
   write("/init", "#!/bin/bash\nmount -t proc proc /proc\nmount -t sysfs sysfs /sys\nmount -t devtmpfs devtmpfs /dev\nmkdir -p /run/dbus\nexec /usr/lib/systemd/systemd --system\n", True)
   write("/body", '#!/bin/bash\necho "BODY ENTER" >/dev/console\ntouch /run/body\nif [[ -e /run/fail ]]; then exit 1; fi\nexit 0\n', True)
-  if args.maintenance_launcher:
+  if args.maintenance_handoff:
+    tests = Path(__file__).resolve().parent
+    source_hashes = {}
+    for name in ("maintenance_handoff.py", "maintenance_launcher.py", "maintenance_peer.py"):
+      raw = (tests.parent / "hibernate" / name).read_bytes()
+      target = "/var/lib/omarchy/t2-hibernate-product/runtime/packages/t2-suspend/hibernate/" + name
+      write(target, raw.decode())
+      if (root / target.lstrip("/")).read_bytes() != raw:
+        raise ValueError("Guest handoff sources must preserve exact repository bytes")
+      source_hashes[name] = hashlib.sha256(raw).hexdigest()
+    raw = (tests / "maintenance-handoff-guest.py").read_bytes()
+    write("/maintenance-handoff-test.py", raw.decode())
+    source_hashes["maintenance-handoff-guest.py"] = hashlib.sha256(raw).hexdigest()
+    (work / "maintenance-handoff.sha256").write_text("".join(value + "  " + name + "\n" for name, value in sorted(source_hashes.items())))
+    for name, value in sorted(source_hashes.items()):
+      print("Exact repository source SHA-256: " + value + "  " + name, flush=True)
+    marker = "MAINTENANCE_HANDOFF_VM"
+    test_command = "/usr/bin/python3 -I -B /maintenance-handoff-test.py"
+  elif args.maintenance_launcher:
     tests = Path(__file__).resolve().parent
     source_hashes = {}
     for name in ("maintenance_launcher.py", "maintenance_peer.py"):
@@ -249,7 +268,9 @@ def main():
   print(text[-18000:])
   if result.returncode or marker + "_PASS" not in text or marker + "_EXIT=0" not in text:
     raise SystemExit("Disposable logind proof failed; retained " + str(work))
-  if args.maintenance_launcher:
+  if args.maintenance_handoff:
+    print("PASS: guest-only nonroot-to-root authenticated update-lock OFD handoff, CLOEXEC and sender lifetime; no package command or native admission")
+  elif args.maintenance_launcher:
     print("PASS: guest-only real privilege drop, held launcher readiness, inherited stdio/update-lock descriptor and actual child status; no package command or live admission")
   elif args.native_inhibitor:
     print("PASS: unchanged native exclusion/repeated guard, real owner rejection and FD release; not native activation or hardware S4")
