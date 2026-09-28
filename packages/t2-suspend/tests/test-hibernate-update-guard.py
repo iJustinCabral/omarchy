@@ -1,6 +1,8 @@
 """Offline update admission fixtures; never run pacman, power or boot tools."""
 import configparser
 import importlib.util
+import hashlib
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -155,6 +157,162 @@ class Updates(unittest.TestCase):
     self.assertNotIn("NeedsTargets", parser["Action"])
     self.assertLess(filename.name, "10-linux-modules-pre.hook")
     self.assertLess(filename.name, "11-glibc-remove-ldconfig-cache.hook")
+
+
+class MaintenanceEvidence(unittest.TestCase):
+  def setUp(self):
+    spec = importlib.util.spec_from_file_location("guard_transition_fixture", Path(__file__).with_name("test-hibernate-boot-policy-transition.py"))
+    self.fixture_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(self.fixture_module)
+    self.fixture = self.fixture_module.Transitions("test_activation_then_exact_fallback_preserves_all_authority_and_evidence")
+    self.fixture.setUp()
+    self.addCleanup(self.fixture.doCleanups)
+    self.root, self.f, self.T = self.fixture.root, self.fixture.f, self.fixture_module.T
+    self.fixture.run_action()
+    self.fixture.run_action("maintenance")
+    self.marker = self.root / self.T.MAINTENANCE
+    self.raw = self.marker.read_bytes()
+    self.intent = json.loads(self.raw)
+    self.archive = self.T.HISTORY / self.intent["transition_id"]
+
+  def check(self): return guard.check_inactive_maintenance(self.root)
+
+  def test_real_seeded_chain_is_read_only_and_native_guard_still_refuses(self):
+    before = {str(path): path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+    result = self.check()
+    self.assertEqual(result["classification"], "fixture-inactive-maintenance-verified")
+    self.assertFalse(result["qualification_issued"])
+    self.assertFalse(result["reactivation_evaluated"])
+    self.assertEqual(result["maintenance_intent_sha256"], hashlib.sha256(self.raw).hexdigest())
+    self.assertEqual(before, {str(path): path.read_bytes() for path in self.root.rglob("*") if path.is_file()})
+    with self.assertRaises(ValueError): guard.check(self.root)
+
+  def test_coherent_updated_production_is_evidence_not_old_generation_reuse(self):
+    image = b"updated synthetic production UKI"
+    path = Path("boot/EFI/Linux/omarchy_linux-t2.efi")
+    old_hash = hashlib.blake2b((self.root / path).read_bytes()).hexdigest()
+    self.f.write(path, image)
+    config = (self.root / guard.LIMINE).read_bytes().replace(old_hash.encode(), hashlib.blake2b(image).hexdigest().encode())
+    self.f.write(guard.LIMINE, config)
+    result = self.check()
+    self.assertEqual(result["fallback"]["production"]["sha256"], hashlib.sha256(image).hexdigest())
+    self.assertFalse(result["reactivation_evaluated"])
+    self.assertEqual(self.marker.read_bytes(), self.raw)
+
+  def test_live_root_aliases_refuse_before_import_or_open(self):
+    alias = self.root.parent / "live-alias"
+    alias.symlink_to("/")
+    with patch.object(guard.importlib.util, "spec_from_file_location", side_effect=AssertionError("No live import")):
+      for root in ("/", "/tmp/..", alias, "relative", self.root / ".."):
+        with self.assertRaises(ValueError): guard.check_inactive_maintenance(root)
+
+  def test_malformed_empty_noncanonical_and_foreign_marker_refuse(self):
+    for raw in (b"", b"malformed", b"{}", json.dumps(self.intent).encode(), self.T._encoded({**self.intent, "transition_id": "../foreign"}), self.T._encoded({**self.intent, "runtime_review_sha256": "bad"})):
+      self.f.write(self.T.MAINTENANCE, raw)
+      with self.assertRaises((ValueError, KeyError)): self.check()
+    self.marker.unlink()
+    self.marker.symlink_to(self.root / self.archive / "maintenance-intent.json")
+    with self.assertRaises((OSError, ValueError)): self.check()
+
+  def test_private_metadata_and_missing_archive_refuse(self):
+    self.marker.chmod(0o644)
+    with self.assertRaises(ValueError): self.check()
+    self.marker.chmod(0o600)
+    archive = self.root / self.archive
+    archive.chmod(0o755)
+    with self.assertRaises(ValueError): self.check()
+    archive.chmod(0o700)
+    (archive / "completion.json").unlink()
+    with self.assertRaises(FileNotFoundError): self.check()
+
+  def test_symlink_archive_and_hardlinked_marker_refuse(self):
+    archive = self.root / self.archive
+    retained = archive.with_name("foreign-archive")
+    archive.rename(retained)
+    archive.symlink_to(retained, target_is_directory=True)
+    with self.assertRaises(ValueError): self.check()
+    archive.unlink()
+    retained.rename(archive)
+    os.link(self.marker, self.marker.with_name("marker-hardlink"))
+    with self.assertRaises(ValueError): self.check()
+
+  def test_repeated_hashes_do_not_make_false_completion_valid(self):
+    completion_path = self.archive / "completion.json"
+    original = json.loads((self.root / completion_path).read_bytes())
+    for changed in ({**original, "action": "activation"}, {**original, "extra": "claim"}, {**original, "configuration_sha256": "f" * 64}):
+      raw = self.T._encoded(changed)
+      self.f.write(completion_path, raw)
+      marker = self.T._encoded({**self.intent, "deactivation_completion_sha256": hashlib.sha256(raw).hexdigest()})
+      self.f.write(self.T.MAINTENANCE, marker)
+      self.f.write(self.archive / "maintenance-intent.json", marker)
+      with self.assertRaises(ValueError): self.check()
+
+  def test_old_policy_receipt_runtime_and_optin_drift_refuse(self):
+    relatives = (self.archive / "policy.json", self.T.P.RECEIPT,
+                 self.T.P.STATE / "runtime-deployment-review.json", self.archive / "opt-in")
+    for relative in relatives:
+      path = self.root / relative
+      raw, mode = path.read_bytes(), path.stat().st_mode & 0o777
+      self.f.write(relative, b"changed")
+      if relative.name == "opt-in": path.chmod(0o644)
+      with self.assertRaises((ValueError, KeyError)): self.check()
+      self.f.write(relative, raw).chmod(mode)
+
+  def test_active_markers_and_reusable_efi_refuse(self):
+    for relative in (*[item for item in guard.ACTIVE if item != self.T.MAINTENANCE],
+                     guard.EFI / self.T.PRODUCT.HOST.CT.SOURCE_VARIABLE):
+      path = self.f.write(relative, b"")
+      with self.assertRaises(ValueError): self.check()
+      path.unlink()
+
+  def test_unresolved_ledger_and_missing_efi_view_refuse(self):
+    unresolved = self.f.write(self.T.P.STATE / "ledger/slot-retirement-001-unresolved.json", b"unresolved")
+    with self.assertRaises(ValueError): self.check()
+    unresolved.unlink()
+    efi = self.root / guard.EFI
+    retained = efi.with_name("unavailable-efivars")
+    efi.rename(retained)
+    with self.assertRaises(FileNotFoundError): self.check()
+
+  def during_fallback(self, mutation):
+    original_spec = guard.importlib.util.spec_from_file_location
+    def load(name, path):
+      spec = original_spec(name, path)
+      if name == "guard_maintenance_evidence":
+        execute = spec.loader.exec_module
+        def loaded(module):
+          execute(module)
+          fallback = module._fallback
+          def changed(root):
+            result = fallback(root)
+            mutation()
+            return result
+          module._fallback = changed
+        spec.loader.exec_module = loaded
+      return spec
+    with patch.object(guard.importlib.util, "spec_from_file_location", side_effect=load):
+      with self.assertRaises(ValueError): self.check()
+
+  def test_marker_drift_after_fallback_hashing_refuses(self):
+    self.during_fallback(lambda: self.f.write(self.T.MAINTENANCE, b"changed after hashing"))
+
+  def test_private_directory_and_archived_optin_mode_drift_refuses(self):
+    for relative, changed, original in ((self.archive, 0o755, 0o700),
+                                        (self.T.HISTORY, 0o755, 0o700),
+                                        (self.T.P.STATE / "ledger", 0o755, 0o700),
+                                        (self.archive / "opt-in", 0o600, 0o644)):
+      with self.subTest(relative=relative):
+        path = self.root / relative
+        try: self.during_fallback(lambda: path.chmod(changed))
+        finally: path.chmod(original)
+
+  def test_actual_image_or_stock_hash_drift_refuse_but_foreign_db_is_preserved(self):
+    lock = self.f.write(self.T.DB_LOCK, b"existing actual pacman lock fixture")
+    self.check()  # read-only pre-hooks do not own/remove pacman's lock
+    self.assertEqual(lock.read_bytes(), b"existing actual pacman lock fixture")
+    self.f.write("boot/EFI/Linux/omarchy_linux-t2.efi", b"unbound replacement")
+    with self.assertRaises(ValueError): self.check()
+    self.assertEqual(lock.read_bytes(), b"existing actual pacman lock fixture")
 
 
 if __name__ == "__main__": unittest.main()

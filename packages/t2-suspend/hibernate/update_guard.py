@@ -13,6 +13,7 @@ The fixed root CLI accepts no arguments or environment-based bypass. Explicit
 canonical fixture roots are available only to imported offline tests.
 """
 import os
+import importlib.util
 from pathlib import Path
 import re
 import stat
@@ -99,6 +100,89 @@ def check(root):
     _stock(raw)
   finally: os.close(descriptor)
   return {"classification": "inactive-stock-update-admitted", "default_entry": 2}
+
+
+def check_inactive_maintenance(root):
+  """Read-only fixture evidence for a future inactive-maintenance ALPM path.
+
+  No live root/alias, Session, bypass flag, package grant or reactivation. The
+  future reviewed publisher must prove no image BEFORE durable publication;
+  neither this historical chain nor matching UKI bytes proves that condition
+  or ordinary bootability. Its caller must hold the required exclusion: repeated
+  reads detect observed drift, not an atomic snapshot. check/main stay unchanged.
+  """
+  root = Path(root)
+  if not root.is_absolute() or root.resolve() != root or not root.is_dir() or root == Path("/"):
+    raise ValueError("Fixture-only inactive maintenance refuses live roots and aliases")
+  # Lazy reuse avoids import-time cycles (the transition itself imports us).
+  spec = importlib.util.spec_from_file_location("guard_maintenance_evidence", Path(__file__).with_name("package_maintenance.py"))
+  maintenance = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(maintenance)
+  transition, policy = maintenance.T, maintenance.T.P
+  for relative in ACTIVE:
+    if relative == transition.MAINTENANCE: continue
+    _ancestors(root, root / relative, os.geteuid())
+    if transition._present(root / relative):
+      raise ValueError("Active or incomplete source state prevents maintenance evidence")
+  raw = transition._read(root, transition.MAINTENANCE)
+  intent = policy._json(raw)
+  fields = {"protocol", "transition_id", "old_policy_sha256", "runtime_review_sha256", "staged_receipt_sha256", "fallback_limine_sha256", "deactivation_completion_sha256"}
+  if type(intent) is not dict or set(intent) != fields or intent["protocol"] != transition.MAINTENANCE_SCHEMA or transition._encoded(intent) != raw:
+    raise ValueError("Exact canonical maintenance intent required")
+  identifier = transition.PRODUCT.TX.uuid_value(intent["transition_id"])
+  for name in fields - {"protocol", "transition_id"}: policy._hash(intent[name])
+  archive = transition.HISTORY / identifier
+  def private_directories():
+    for relative in (STATE, transition.HISTORY, archive, STATE / "ledger"):
+      info = (root / relative).lstat()
+      if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise ValueError("Owned private maintenance evidence directories required")
+  private_directories()
+  paths = (transition.MAINTENANCE, archive / "maintenance-intent.json", archive / "policy.json",
+           archive / "intent.json", archive / "completion.json", policy.RECEIPT, policy.BACKUP)
+  evidence = {path: transition._read(root, path) for path in paths}
+  if evidence[transition.MAINTENANCE] != raw or evidence[archive / "maintenance-intent.json"] != raw:
+    raise ValueError("Maintenance marker/archive bytes differ")
+  old_raw, receipt = evidence[archive / "policy.json"], evidence[policy.RECEIPT]
+  if policy.digest(old_raw) != intent["old_policy_sha256"] or policy.digest(receipt) != intent["staged_receipt_sha256"]:
+    raise ValueError("Retained policy or staged receipt pin differs")
+  old = policy._json(old_raw)
+  before = evidence[policy.BACKUP]
+  proposal = policy.prepare(before, receipt)
+  policy.validate(old, before, proposal["after"], receipt)
+  expected_transition = {"protocol": "omarchy-t2-source-default-transition-v1", "transition_id": identifier,
+    "action": "deactivation", "policy_sha256": policy.digest(old_raw),
+    "from_sha256": old["after_limine_sha256"], "to_sha256": old["before_limine_sha256"]}
+  if evidence[archive / "intent.json"] != transition._encoded(expected_transition):
+    raise ValueError("Exact historical deactivation intent required")
+  expected_completion = {"protocol": "omarchy-t2-source-default-transition-complete-v1", "transition_id": identifier,
+    "action": "deactivation", "intent_sha256": policy.digest(evidence[archive / "intent.json"]),
+    "configuration_sha256": old["before_limine_sha256"]}
+  completion = evidence[archive / "completion.json"]
+  if (completion != transition._encoded(expected_completion) or policy.digest(completion) != intent["deactivation_completion_sha256"] or
+      intent["fallback_limine_sha256"] != old["before_limine_sha256"]):
+    raise ValueError("Exact completed stock deactivation chain required")
+  opt_in = transition._read(root, archive / "opt-in", private=False)
+  if opt_in != b"" or stat.S_IMODE((root / archive / "opt-in").lstat().st_mode) != 0o644:
+    raise ValueError("Historical routine opt-in differs")
+  if transition._runtime(root) != intent["runtime_review_sha256"]:
+    raise ValueError("Reviewed runtime differs from maintenance intent")
+  transition._idle(root)
+  fallback = maintenance._fallback(root)  # current coherent bytes may legitimately be NEW
+  transition._idle(root)
+  if any(transition._read(root, path) != value for path, value in evidence.items()):
+    raise ValueError("Maintenance evidence changed during verification")
+  if transition._read(root, archive / "opt-in", private=False) != opt_in or transition._runtime(root) != intent["runtime_review_sha256"]:
+    raise ValueError("Maintenance authority changed during verification")
+  private_directories()
+  if stat.S_IMODE((root / archive / "opt-in").lstat().st_mode) != 0o644:
+    raise ValueError("Historical routine opt-in metadata changed")
+  for relative in ACTIVE:
+    if relative != transition.MAINTENANCE and transition._present(root / relative):
+      raise ValueError("Source state appeared during maintenance verification")
+  return {"classification": "fixture-inactive-maintenance-verified", "transition_id": identifier,
+    "maintenance_intent_sha256": policy.digest(raw), "fallback": fallback,
+    "qualification_issued": False, "reactivation_evaluated": False}
 
 
 def main(argv=None):
