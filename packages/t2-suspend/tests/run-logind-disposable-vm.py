@@ -105,12 +105,13 @@ def main():
   modes.add_argument("--maintenance-handoff", action="store_true", help="Prove an authenticated nonroot-to-root original update-lock handoff inside the guest; no package or native admission")
   modes.add_argument("--maintenance-entry", action="store_true", help="Trace real guest sudo/inhibitor ancestry and original-client lock handoff with and without sudo PTY; no native admission or password proof")
   modes.add_argument("--maintenance-scope", action="store_true", help="Test real transient scope placement/draining of held user stub descendants; no package command or native admission")
+  modes.add_argument("--maintenance-recovery", action="store_true", help="Join fixture maintenance coordinator, real user scopes and retained veto recovery under real logind exclusion; no package/native admission")
   args = parser.parse_args()
   work = Path(tempfile.mkdtemp(prefix="mba-logind-vm-"))
   root = work / "root"
   root.mkdir()
   print(f"Disposable guest evidence: {work}", flush=True)
-  python_guest = args.native_inhibitor or args.maintenance_launcher or args.maintenance_handoff or args.maintenance_entry or args.maintenance_scope
+  python_guest = args.native_inhibitor or args.maintenance_launcher or args.maintenance_handoff or args.maintenance_entry or args.maintenance_scope or args.maintenance_recovery
   if not python_guest:
     source = work / "test.c"
     source.write_text(GUEST_TEST)
@@ -137,7 +138,7 @@ def main():
                  "/usr/bin/systemctl"):
     copy_binary(binary)
   if python_guest:
-    binaries = ("/usr/bin/python3", "/usr/bin/systemd-inhibit", "/usr/bin/busctl") if args.native_inhibitor or args.maintenance_entry or args.maintenance_scope else ("/usr/bin/python3",)
+    binaries = ("/usr/bin/python3", "/usr/bin/systemd-inhibit", "/usr/bin/busctl") if args.native_inhibitor or args.maintenance_entry or args.maintenance_scope or args.maintenance_recovery else ("/usr/bin/python3",)
     for binary in binaries:
       copy_binary(binary)
     # Only public installed stdlib source/data and extension modules. Never
@@ -181,7 +182,7 @@ def main():
 
   write("/etc/passwd", "root:x:0:0:root:/root:/bin/bash\n")
   write("/etc/group", "root:x:0:\n")
-  if args.maintenance_launcher or args.maintenance_handoff or args.maintenance_entry or args.maintenance_scope:
+  if args.maintenance_launcher or args.maintenance_handoff or args.maintenance_entry or args.maintenance_scope or args.maintenance_recovery:
     write("/etc/passwd", "root:x:0:0:root:/root:/bin/bash\nworker:x:1000:1000:Guest worker:/home/worker:/bin/bash\n")
     write("/etc/group", "root:x:0:\nworker:x:1000:\nfixture-extra:x:1001:worker\n")
     (root / "home/worker").mkdir(parents=True)
@@ -196,7 +197,32 @@ def main():
     write("/etc/pam.d/sudo", "auth required pam_permit.so\naccount required pam_permit.so\nsession required pam_permit.so\n")
     write("/init", "#!/bin/bash\nmount -t proc proc /proc\nmount -t sysfs sysfs /sys\nmount -t devtmpfs devtmpfs /dev\nmkdir -p /dev/pts /run/dbus\nmount -t devpts devpts /dev/pts\nexec /usr/lib/systemd/systemd --system\n", True)
   write("/body", '#!/bin/bash\necho "BODY ENTER" >/dev/console\ntouch /run/body\nif [[ -e /run/fail ]]; then exit 1; fi\nexit 0\n', True)
-  if args.maintenance_scope:
+  if args.maintenance_recovery:
+    tests = Path(__file__).resolve().parent
+    source_hashes = {}
+    destination = "/var/lib/omarchy/t2-hibernate-product/runtime/packages/t2-suspend/"
+    extensionless = {"experiments/0008-wifi-hibernate-isolation/omarchy-t2-hibernate-wifi"}
+    # Only public repository Python/hook bytes, never installed private state,
+    # home directories, qualification assets or a host boot image.
+    for path in sorted(tests.parent.rglob("*")):
+      if path.suffix not in (".py", ".hook") and path.relative_to(tests.parent).as_posix() not in extensionless: continue
+      if path.is_symlink() or not path.is_file(): raise ValueError("Regular public repository fixture dependency required")
+      relative = path.relative_to(tests.parent).as_posix()
+      raw = path.read_bytes()
+      write(destination + relative, raw.decode())
+      if (root / (destination + relative).lstrip("/")).read_bytes() != raw:
+        raise ValueError("Guest recovery dependencies must preserve exact repository bytes")
+      source_hashes[relative] = hashlib.sha256(raw).hexdigest()
+    raw = (tests / "maintenance-recovery-guest.py").read_bytes()
+    write("/maintenance-recovery-test.py", raw.decode())
+    source_hashes["maintenance-recovery-guest.py"] = hashlib.sha256(raw).hexdigest()
+    manifest = "".join(value + "  " + name + "\n" for name, value in sorted(source_hashes.items()))
+    (work / "maintenance-recovery.sha256").write_text(manifest)
+    print("Exact public dependency manifest: " + str(work / "maintenance-recovery.sha256") + " (" + str(len(source_hashes)) + " entries, SHA-256 " + hashlib.sha256(manifest.encode()).hexdigest() + ")", flush=True)
+    print("Exact recovery guest SHA-256: " + hashlib.sha256(raw).hexdigest(), flush=True)
+    marker = "MAINTENANCE_RECOVERY_VM"
+    test_command = "/usr/bin/python3 -I -B /maintenance-recovery-test.py"
+  elif args.maintenance_scope:
     tests = Path(__file__).resolve().parent
     source_hashes = {}
     for name in ("maintenance_scope.py", "maintenance_launcher.py", "maintenance_peer.py"):
@@ -322,7 +348,9 @@ def main():
   print(text[-18000:])
   if result.returncode or marker + "_PASS" not in text or marker + "_EXIT=0" not in text:
     raise SystemExit("Disposable logind proof failed; retained " + str(work))
-  if args.maintenance_scope:
+  if args.maintenance_recovery:
+    print("PASS: guest-only integrated fixture maintenance, user scope settlement and exact veto recovery under retained real inhibitor/locks; no native admission or package action")
+  elif args.maintenance_scope:
     print("PASS: guest-only held user phase placement, recursive descendant drain and preserved outside owner/sentinel; no package command or native admission")
   elif args.maintenance_entry:
     print("PASS: real guest sudo/inhibitor topology in both PTY modes and retained original-client update lock; synthetic NOPASSWD/PAM, no password/session admission or package/power operation")

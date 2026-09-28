@@ -194,6 +194,67 @@ class Maintenance(unittest.TestCase):
       self.coordinate(phase)
     self.assertTrue((self.root / M.T.MAINTENANCE).exists())
 
+  def test_retained_recovery_sync_and_wait_interrupt_never_release_physical(self):
+    saved, sessions, attempts = [], [], []
+    broken = True
+    def phase(name, session):
+      saved.append(session.intent)
+      sessions.append(session)
+      (self.root / M.T.MAINTENANCE).unlink()
+      raise OSError("original phase failure")
+    sync = M.T._sync
+    def fail(directory):
+      if saved and broken and directory == self.root / M.T.P.STATE:
+        raise OSError("retained directory fault")
+      return sync(directory)
+    def assert_held():
+      fd = os.open(self.root / M.T.PHYSICAL_LOCK, os.O_RDONLY)
+      try:
+        with self.assertRaises(BlockingIOError): fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+      finally: os.close(fd)
+      self.assertFalse(sessions[0].active)
+      self.assertIsNone(sessions[0].phase)
+    def recover(error, attempt):
+      nonlocal broken
+      assert_held()
+      attempts.append(attempt)
+      if attempt == 1: raise KeyboardInterrupt("notification cannot cancel retention")
+      broken = False
+    sleep = M.T.time.sleep
+    interrupted = False
+    def pause(seconds):
+      nonlocal interrupted
+      assert_held()
+      if not interrupted:
+        interrupted = True
+        raise KeyboardInterrupt("retry backoff cannot cancel retention")
+      return sleep(seconds)
+    with patch.object(M.T, "_sync", side_effect=fail), patch.object(M.T.time, "sleep", side_effect=pause):
+      with self.assertRaisesRegex(OSError, "original phase failure"):
+        M.coordinate(self.root, precheck=self.fixture.check, run_phase=phase, recover=recover)
+    self.assertEqual(attempts, [1, 2])
+    self.assertTrue(interrupted)
+    self.assertEqual((self.root / M.T.MAINTENANCE).read_bytes(), saved[0])
+
+  def test_retained_foreign_marker_waits_for_exact_external_repair_without_overwrite(self):
+    raw = []
+    def phase(name, session):
+      raw.append(session.intent)
+      (self.root / M.T.MAINTENANCE).write_bytes(b"foreign presence veto")
+      raise OSError("original foreign marker failure")
+    def repair(error, attempt):
+      self.assertEqual(attempt, 1)
+      self.assertEqual((self.root / M.T.MAINTENANCE).read_bytes(), b"foreign presence veto")
+      fd = os.open(self.root / M.T.PHYSICAL_LOCK, os.O_RDONLY)
+      try:
+        with self.assertRaises(BlockingIOError): fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+      finally: os.close(fd)
+      # Explicit trusted fixture resolution; core never overwrites foreign data.
+      (self.root / M.T.MAINTENANCE).write_bytes(raw[0])
+    with self.assertRaisesRegex(OSError, "original foreign marker failure"):
+      M.coordinate(self.root, precheck=self.fixture.check, run_phase=phase, recover=repair)
+    self.assertEqual((self.root / M.T.MAINTENANCE).read_bytes(), raw[0])
+
   def test_invalid_result_types_and_phase_exception_are_not_success(self):
     for result in (True, None, "0", 0.0, -1, 256):
       case = Maintenance("test_coherent_dispatch_keeps_marker_and_exact_old_evidence")

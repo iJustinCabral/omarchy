@@ -117,6 +117,29 @@ class Broker(unittest.TestCase):
     self.assertEqual(self.children[0].returncode, 0)
     self.assertFalse(self.path.exists())
 
+  def test_owned_settlement_precedes_sole_reaper_status_and_final_cleanup(self):
+    events = []
+    def launch(endpoint):
+      child = self.launch(endpoint)
+      wait = child.wait
+      def reap(*args, **kwargs):
+        events.append("wait")
+        return wait(*args, **kwargs)
+      child.wait = reap
+      return child
+    def settle():
+      events.append("settle")
+      if "wait" not in events: self.assertIsNone(self.children[0].returncode)
+    self.assertEqual(self.run_broker(launch=launch, settle=settle), 0)
+    self.assertEqual(events, ["settle", "wait", "settle"])
+
+  def test_settlement_callback_error_still_cleans_only_owned_direct_child(self):
+    def fail(): raise OSError("fixture settlement error")
+    with self.assertRaisesRegex(OSError, "settlement error"):
+      self.run_broker(launch=lambda endpoint: self.launch(endpoint, PHASE_MODE="sleep"), timeout=.1, settle=fail)
+    self.assertIsNotNone(self.children[0].returncode)
+    self.assertFalse(self.path.exists())
+
   def test_actual_nonzero_and_signal_status_not_claimed_by_hook(self):
     self.assertEqual(self.run_broker(launch=lambda path: self.launch(path, PHASE_RC="7")), 7)
     self.assertEqual(self.run_broker(launch=lambda path: self.launch(path, PHASE_MODE="signal")), -signal.SIGTERM)

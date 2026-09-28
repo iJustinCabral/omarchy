@@ -104,7 +104,7 @@ def request(root, path, *, owner_identity, timeout=1.0):
 
 
 def run_phase(root, path, *, launch, phase_identity, owner_identity, hook_identity,
-              intermediary_identity, gate, release=None, watch=None, cancel_fd=None, timeout=10.0):
+              intermediary_identity, gate, release=None, watch=None, cancel_fd=None, settle=None, timeout=10.0):
   """Run/wait one real fixture child while concurrently answering hook requests.
 
   launch(endpoint) performs a bounded synthetic readiness handshake and
@@ -114,6 +114,9 @@ def run_phase(root, path, *, launch, phase_identity, owner_identity, hook_identi
   it is a trusted bounded owner callback, never a hook-supplied operation.
   watch refreshes owner exclusion/client lifetime even without a hook request.
   cancel_fd is a borrowed client pidfd; its readiness always cancels the phase.
+  settle is an owner-only raising/retained callback, never a reaper: it runs
+  before accepting status and on failure with listener servicing stopped.
+  Native retention is not established by arbitrary fixture callbacks.
   A new invocation never consumes an existing socket or interrupted phase.
   """
   root = _fixture(root)
@@ -130,6 +133,7 @@ def run_phase(root, path, *, launch, phase_identity, owner_identity, hook_identi
     raise ValueError("Owned held-phase release callback required")
   if watch is not None and not callable(watch):
     raise ValueError("Trusted bounded owner watch required")
+  if settle is not None and not callable(settle): raise ValueError("Owned phase settlement callback required")
   if cancel_fd is not None:
     if type(cancel_fd) is not int or cancel_fd < 0 or watch is None:
       raise ValueError("Borrowed client pidfd requires an owner watch")
@@ -176,6 +180,7 @@ def run_phase(root, path, *, launch, phase_identity, owner_identity, hook_identi
         raise ValueError("Initiating client exited during phase")
       if pin.fd in ready:
         if watch is not None: watch()
+        if settle is not None: settle()
         return process.wait()  # the only reaper, actual kernel child status
       if listener not in ready: continue
       with listener.accept()[0] as stream, P.Peer(stream) as peer:
@@ -195,12 +200,17 @@ def run_phase(root, path, *, launch, phase_identity, owner_identity, hook_identi
     # Child remains an owned, unreaped direct child until wait; no foreign PID or
     # process-tree kill. Popen retained returncode skips an already reaped child.
     try:
-      if cleanup_owned and process.returncode is None:
-        process.terminate()
-        try: process.wait(timeout=1)
-        except P.subprocess.TimeoutExpired:
-          process.kill()
-          process.wait(timeout=1)
+      # No listener servicing/grants occur during retained scope recovery.
+      # Settlement owns neither wait nor Popen status; this broker alone reaps.
+      try:
+        if settle is not None: settle()
+      finally:
+        if cleanup_owned and process.returncode is None:
+          process.terminate()
+          try: process.wait(timeout=1)
+          except P.subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=1)
     finally:
       try:
         if pin is not None: pin.close()

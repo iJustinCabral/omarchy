@@ -4,7 +4,9 @@ Public transition() unconditionally refuses live `/` and aliases. Its injected
 fixture precheck cannot establish real admission. The separate installed native
 adapter supplies fixed host verification and real logind power exclusion to the
 internal core, after reviewed snapshot verification. No kernel, EFI, modules,
-power, qualification issuance or automatic retry occurs here. Source tests and
+power, qualification issuance or phase replay occurs here. Retained fixture
+recovery retries only settlement/veto repair under the original exclusions.
+Source tests and
 installation alone do not approve or execute any native policy transition.
 The explicit maintenance action is fixture-only groundwork: it leaves a durable
 sleep/update veto but grants no package admission or live maintenance route.
@@ -16,6 +18,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import time
 import uuid
 
 
@@ -64,6 +67,46 @@ def _present(path):
   try: path.lstat()
   except FileNotFoundError: return False
   return True
+
+
+def _retained(operation, recover):
+  """Fixture retained retry: notification is not permission to drop exclusion.
+
+  No deadline/interrupt converts an unresolved condition into safe exit. The
+  reviewed native owner is still unavailable; old fixtures without this seam
+  do NOT establish retained native failure behavior.
+  """
+  attempt = 0
+  while True:
+    try: return operation()
+    except BaseException as error:
+      attempt += 1
+      try: recover(error, attempt)
+      except BaseException: pass
+      try: time.sleep(0.01)
+      except BaseException: pass
+
+
+def _veto(root, intent, *, durable=False):
+  G._ancestors(root, root / MAINTENANCE, os.geteuid())
+  if not _present(root / MAINTENANCE):
+    _new(root / MAINTENANCE, intent)
+    if _read(root, MAINTENANCE) != intent: raise ValueError("Rearmed maintenance veto readback differs")
+  if not durable: return  # legacy fixture presence-only behavior, NOT native
+  fd = os.open(root / MAINTENANCE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+  try:
+    opened, named = os.fstat(fd), (root / MAINTENANCE).lstat()
+    def metadata(info):
+      return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+              info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    if not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.geteuid() or stat.S_IMODE(opened.st_mode) != 0o600 or opened.st_nlink != 1 or opened.st_size != len(intent) or metadata(opened) != metadata(named) or os.read(fd, len(intent) + 1) != intent:
+      raise ValueError("Foreign maintenance veto preserved; exact private repair required")
+    os.fsync(fd)
+    _sync((root / MAINTENANCE).parent)
+    os.lseek(fd, 0, os.SEEK_SET)
+    if os.read(fd, len(intent) + 1) != intent or metadata(os.fstat(fd)) != metadata(opened) or metadata((root / MAINTENANCE).lstat()) != metadata(opened):
+      raise ValueError("Maintenance veto changed after durability check")
+  finally: os.close(fd)
 
 
 _read = P._read
@@ -174,22 +217,26 @@ def _replace(root, expected, replacement, transition_id, *, guard=lambda: None):
   if _read(root, P.LIMINE, private=False) != replacement: raise ValueError("Configuration replacement readback failed")
 
 
-def transition(root, action, *, precheck, maintenance_continuation=None, guard=None):
+def transition(root, action, *, precheck, maintenance_continuation=None, guard=None, recover=None):
   root = Path(root)
   if not root.is_absolute() or root.resolve() != root or not root.is_dir() or root.resolve() == Path("/"):
     raise ValueError("Fixture-only transition refuses live root and aliases")
   if action not in (*PENDINGS, "maintenance") or not callable(precheck): raise ValueError("Explicit fixture action/precheck required")
   if guard is not None and not callable(guard): raise ValueError("Explicit fixture exclusion guard required")
-  return _transition(root, action, precheck=precheck, guard=(lambda: None) if guard is None else guard, maintenance_continuation=maintenance_continuation)
+  if recover is not None and (action != "maintenance" or not callable(recover)):
+    raise ValueError("Explicit fixture maintenance recovery required")
+  return _transition(root, action, precheck=precheck, guard=(lambda: None) if guard is None else guard, maintenance_continuation=maintenance_continuation, recover=recover)
 
 
-def _transition(root, action, *, precheck, guard, maintenance_continuation=None):
+def _transition(root, action, *, precheck, guard, maintenance_continuation=None, recover=None):
   """Internal core; maintenance is fixture-only groundwork, not update permission."""
   root = Path(root)
   if maintenance_continuation is not None and (root.resolve() == Path("/") or action != "maintenance" or not callable(maintenance_continuation)):
     raise ValueError("Explicit fixture-only maintenance continuation required")
   if action == "maintenance" and root.resolve() == Path("/"):
     raise ValueError("Live maintenance entry requires a separately reviewed native coordinator")
+  if recover is not None and (root.resolve() == Path("/") or action != "maintenance" or not callable(recover)):
+    raise ValueError("Explicit fixture-only retained recovery required")
   if action not in (*PENDINGS, "maintenance"):
     raise ValueError("Explicit reviewed transition action required")
   mechanics = "deactivation" if action == "maintenance" else action
@@ -325,11 +372,13 @@ def _transition(root, action, *, precheck, guard, maintenance_continuation=None)
         # A failed pipeline may have removed its veto. Rearm only an absent
         # marker under retained physical exclusion; never replace foreign data.
         try:
-          G._ancestors(root, root / MAINTENANCE, os.geteuid())
-          if not _present(root / MAINTENANCE):
-            _new(root / MAINTENANCE, maintenance_intent)
-            if _read(root, MAINTENANCE) != maintenance_intent:
-              raise ValueError("Rearmed maintenance veto readback differs")
+          def confirm_veto():
+            release_db.check_physical()
+            if recover is not None and _read(root, (archive / "maintenance-intent.json").relative_to(root)) != maintenance_intent:
+              raise ValueError("Original archived maintenance intent changed")
+            _veto(root, maintenance_intent, durable=recover is not None)
+          if recover is None: confirm_veto()
+          else: _retained(confirm_veto, recover)
         except BaseException as error:
           raise RuntimeError("Maintenance veto durability unconfirmed") from error
     return result

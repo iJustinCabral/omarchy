@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import stat
 import unittest
 from unittest.mock import patch
 
@@ -259,6 +260,22 @@ class Transitions(unittest.TestCase):
     with patch.object(T.os, "open", side_effect=AssertionError("no live open")):
       with self.assertRaisesRegex(ValueError, "Live maintenance entry"):
         T._transition(Path("/"), "maintenance", precheck=lambda *args: None, guard=lambda: None)
+
+  def test_durable_veto_refuses_special_or_linked_leaf_without_opening_device(self):
+    path = self.root / T.MAINTENANCE
+    os.mkfifo(path, 0o600)
+    try:
+      with self.assertRaisesRegex(ValueError, "exact private repair"):
+        T._veto(self.root, b"expected", durable=True)
+      self.assertTrue(stat.S_ISFIFO(path.lstat().st_mode))
+    finally: path.unlink()
+    path.write_bytes(b"expected")
+    path.chmod(0o600)
+    link = path.with_name("foreign-link")
+    os.link(path, link)
+    with self.assertRaisesRegex(ValueError, "exact private repair"):
+      T._veto(self.root, b"expected", durable=True)
+    self.assertEqual(path.read_bytes(), b"expected")
 
   def test_maintenance_marker_is_durable_before_deactivation_pending_retirement(self):
     self.run_action()
