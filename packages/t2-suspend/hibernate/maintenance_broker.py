@@ -104,7 +104,7 @@ def request(root, path, *, owner_identity, timeout=1.0):
 
 
 def run_phase(root, path, *, launch, phase_identity, owner_identity, hook_identity,
-              intermediary_identity, gate, release=None, timeout=10.0):
+              intermediary_identity, gate, release=None, watch=None, cancel_fd=None, timeout=10.0):
   """Run/wait one real fixture child while concurrently answering hook requests.
 
   launch(endpoint) performs a bounded synthetic readiness handshake and
@@ -112,6 +112,8 @@ def run_phase(root, path, *, launch, phase_identity, owner_identity, hook_identi
   by the hook. Negative signal returncodes are preserved, not forged as success.
   Optional release opens a held launch only after ChildPin binds its identity;
   it is a trusted bounded owner callback, never a hook-supplied operation.
+  watch refreshes owner exclusion/client lifetime even without a hook request.
+  cancel_fd is a borrowed client pidfd; its readiness always cancels the phase.
   A new invocation never consumes an existing socket or interrupted phase.
   """
   root = _fixture(root)
@@ -126,8 +128,16 @@ def run_phase(root, path, *, launch, phase_identity, owner_identity, hook_identi
     raise ValueError("Bounded explicit fixture launcher/gate/deadline required")
   if release is not None and not callable(release):
     raise ValueError("Owned held-phase release callback required")
+  if watch is not None and not callable(watch):
+    raise ValueError("Trusted bounded owner watch required")
+  if cancel_fd is not None:
+    if type(cancel_fd) is not int or cancel_fd < 0 or watch is None:
+      raise ValueError("Borrowed client pidfd requires an owner watch")
+    P._pidfd_pid(cancel_fd)
+    P._alive(cancel_fd)
   P._match(P._identity(os.getpid()), **owner)
   deadline = time.monotonic() + timeout
+  if watch is not None: watch()
   listener, process, pin, owned = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM), None, None, None
   cleanup_owned = False
   try:
@@ -151,13 +161,21 @@ def run_phase(root, path, *, launch, phase_identity, owner_identity, hook_identi
     pin = P.ChildPin(process, **phase)
     if release is not None:
       _budget(deadline)
+      if watch is not None: watch()
+      if cancel_fd is not None: P._alive(cancel_fd)
       release()
     while True:
       _budget(deadline)
+      if watch is not None: watch()
       _socket(path, owned)
       P._match(P._identity(os.getpid()), **owner)
-      ready = select.select([listener, pin.fd], [], [], _budget(deadline))[0]
+      watched = [listener, pin.fd] + ([] if cancel_fd is None else [cancel_fd])
+      ready = select.select(watched, [], [], _budget(deadline))[0]
+      if cancel_fd is not None and cancel_fd in ready:
+        if watch is not None: watch()
+        raise ValueError("Initiating client exited during phase")
       if pin.fd in ready:
+        if watch is not None: watch()
         return process.wait()  # the only reaper, actual kernel child status
       if listener not in ready: continue
       with listener.accept()[0] as stream, P.Peer(stream) as peer:

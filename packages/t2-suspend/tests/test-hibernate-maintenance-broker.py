@@ -135,6 +135,36 @@ class Broker(unittest.TestCase):
     self.assertEqual(self.children, [])
     self.assertFalse(self.path.exists())
 
+  def test_watch_refusal_prevents_launch(self):
+    def refuse(): raise ValueError("fixture owner no longer admitted")
+    with self.assertRaisesRegex(ValueError, "no longer admitted"):
+      self.run_broker(watch=refuse)
+    self.assertEqual(self.children, [])
+    self.assertFalse(self.path.exists())
+
+  def test_borrowed_client_pidfd_cancels_no_hook_phase_without_closing_pin(self):
+    client = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+    self.children.append(client)
+    fd = os.pidfd_open(client.pid)
+    self.addCleanup(os.close, fd)
+    with self.assertRaisesRegex(ValueError, "Initiating client exited"):
+      self.run_broker(launch=lambda path: self.launch(path, PHASE_MODE="sleep"),
+                      release=client.terminate, watch=lambda: None, cancel_fd=fd)
+    self.assertIsNotNone(self.children[-1].returncode)
+    os.fstat(fd)  # Borrowed lifetime descriptor remains the caller's property.
+    self.assertFalse(self.path.exists())
+
+  def test_owner_watch_rechecked_before_accepting_actual_child_exit(self):
+    calls = []
+    def watch():
+      calls.append(True)
+      if len(calls) == 3: raise ValueError("fixture exclusion lost at exit")
+    with self.assertRaisesRegex(ValueError, "lost at exit"):
+      self.run_broker(launch=lambda path: self.launch(path, PHASE_MODE="signal"), watch=watch)
+    self.assertEqual(len(calls), 3)
+    self.assertIsNotNone(self.children[-1].returncode)
+    self.assertEqual(self.gates, [])
+
   def test_release_failure_reaps_pinned_phase(self):
     observed = []
     original = B.P.ChildPin

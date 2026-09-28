@@ -124,7 +124,7 @@ def check_maintenance(root, session):
   return _fallback(root)
 
 
-def coordinate(root, *, precheck, run_phase):
+def coordinate(root, *, precheck, run_phase, guard=None):
   """Run the fixed mutation phases once under a retained sleep veto, fixtures only.
 
   run_phase(name, session) must return the actual strict integer command status.
@@ -133,6 +133,7 @@ def coordinate(root, *, precheck, run_phase):
   """
   root = _fixture(root)
   if not callable(precheck) or not callable(run_phase): raise ValueError("Explicit fixture precheck/phase dispatcher required")
+  if guard is not None and not callable(guard): raise ValueError("Explicit fixture exclusion guard required")
   def continuation(archive, raw_intent, physical):
     intent = T.P._json(raw_intent)
     if set(intent) != {"protocol", "transition_id", "old_policy_sha256", "runtime_review_sha256", "staged_receipt_sha256", "fallback_limine_sha256", "deactivation_completion_sha256"} or intent["protocol"] != T.MAINTENANCE_SCHEMA:
@@ -183,4 +184,4 @@ def coordinate(root, *, precheck, run_phase):
       raise
     finally:
       session.active, session.phase = False, None
-  return T.transition(root, "maintenance", precheck=precheck, maintenance_continuation=continuation)
+  return T.transition(root, "maintenance", precheck=precheck, maintenance_continuation=continuation, guard=guard)

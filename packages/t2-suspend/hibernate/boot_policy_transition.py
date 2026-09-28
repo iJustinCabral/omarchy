@@ -174,12 +174,13 @@ def _replace(root, expected, replacement, transition_id, *, guard=lambda: None):
   if _read(root, P.LIMINE, private=False) != replacement: raise ValueError("Configuration replacement readback failed")
 
 
-def transition(root, action, *, precheck, maintenance_continuation=None):
+def transition(root, action, *, precheck, maintenance_continuation=None, guard=None):
   root = Path(root)
   if not root.is_absolute() or root.resolve() != root or not root.is_dir() or root.resolve() == Path("/"):
     raise ValueError("Fixture-only transition refuses live root and aliases")
   if action not in (*PENDINGS, "maintenance") or not callable(precheck): raise ValueError("Explicit fixture action/precheck required")
-  return _transition(root, action, precheck=precheck, guard=lambda: None, maintenance_continuation=maintenance_continuation)
+  if guard is not None and not callable(guard): raise ValueError("Explicit fixture exclusion guard required")
+  return _transition(root, action, precheck=precheck, guard=(lambda: None) if guard is None else guard, maintenance_continuation=maintenance_continuation)
 
 
 def _transition(root, action, *, precheck, guard, maintenance_continuation=None):

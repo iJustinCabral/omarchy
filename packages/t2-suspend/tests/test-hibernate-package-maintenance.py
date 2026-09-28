@@ -80,6 +80,26 @@ class Maintenance(unittest.TestCase):
       with self.assertRaises(ValueError): self.fixture.run_action(action)
     with self.assertRaises(ValueError): self.coordinate()
 
+  def test_exclusion_guard_reaches_transition_write_boundaries(self):
+    observations = []
+    def guard():
+      observations.append((self.root / M.T.MAINTENANCE).exists())
+    M.coordinate(self.root, precheck=self.fixture.check, run_phase=self.phase, guard=guard)
+    self.assertGreater(len(observations), 5)
+    self.assertFalse(observations[0])
+    self.assertTrue(observations[-1])
+    self.assertEqual(self.calls, list(M.PHASES))
+
+  def test_failed_initial_exclusion_prevents_transition_and_phase_launch(self):
+    original = (self.root / M.T.P.LIMINE).read_bytes()
+    def refuse(): raise ValueError("fixture exclusion unavailable")
+    with self.assertRaisesRegex(ValueError, "exclusion unavailable"):
+      M.coordinate(self.root, precheck=self.fixture.check, run_phase=self.phase, guard=refuse)
+    self.assertEqual(self.calls, [])
+    self.assertEqual((self.root / M.T.P.LIMINE).read_bytes(), original)
+    self.assertFalse((self.root / M.T.MAINTENANCE).exists())
+    self.assertFalse((self.root / M.T.DB_LOCK).exists())
+
   def test_snapshot_absence_and_failure_record_actual_nonfatal_status(self):
     for code, expected in ((127, "snapshot-absent"), (1, "snapshot-failed-nonfatal")):
       case = Maintenance("test_coherent_dispatch_keeps_marker_and_exact_old_evidence")
