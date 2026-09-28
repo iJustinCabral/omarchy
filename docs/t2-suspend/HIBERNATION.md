@@ -1,5 +1,7 @@
 # T2 hibernation investigation
 
+**Resuming after a break? Read [RESUME.md](RESUME.md) first** for the current checkpoint, exact next tasks and non-repeatable hardware constraints. Older entries below are historical.
+
 ## Current status: prototype works; permanent fix is unfinished
 
 The earlier goal-complete declaration was incorrect. Two AC-powered normal-logind S4 restores, a successful source-default boot and one attended battery-only S4 restore demonstrate a working MacBookAir9,1 prototype, not the requested permanent solution. A measured low-battery policy, normal update compatibility without a blanket package block, and a maintained path to other T2 models remain required work. Existing successful and failed evidence is preserved below; older “next” instructions and completion statements are historical, not current authorization.
