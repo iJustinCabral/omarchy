@@ -366,5 +366,92 @@ class Deployment(unittest.TestCase):
       D.upgrade_snapshot(self.source, root=self.root, expected=expected, guard=lambda: None,
                          precheck=lambda: None, postcheck=lambda: None)
 
+  def runtime_only_fixture(self):
+    expected, _, _, _, _, _, config = self.upgrade_fixture()
+    (self.state / D.CONFIG).write_bytes(config)
+    expected["old_config"] = expected["new_config"]
+    self.approval_id = "306521e4-998e-4477-b603-31b93144d101"
+    # Evidence from a consumed historical deployment remains untouched.
+    self.historical = self.state / "runtime-upgrade-completed-cccccccccccc.json"
+    self.historical.write_bytes(b"consumed v1-to-v2 evidence")
+    self.historical.chmod(0o600)
+    return expected, config
+
+  def runtime_only_upgrade(self, expected, **kwargs):
+    return D.upgrade_snapshot(self.source, root=self.root, expected=expected,
+      approval_id=self.approval_id, guard=lambda: None, precheck=lambda: None,
+      postcheck=kwargs.get("postcheck", lambda: None))
+
+  def test_v2_runtime_upgrade_preserves_exact_config_and_consumes_fresh_approval(self):
+    expected, config = self.runtime_only_fixture()
+    self.runtime_only_upgrade(expected)
+    self.assertEqual((self.state / D.CONFIG).read_bytes(), config)
+    self.assertEqual((self.state / "config-retained-aaaaaaaaaaaa-before-bbbbbbbbbbbb.json").read_bytes(), config)
+    self.assertEqual(self.historical.read_bytes(), b"consumed v1-to-v2 evidence")
+    consumed = (self.state / ("runtime-upgrade-approval-consumed-" + self.approval_id + ".json")).read_bytes()
+    completed = json.loads((self.state / "runtime-upgrade-completed-bbbbbbbbbbbb.json").read_bytes())
+    self.assertEqual(completed["protocol"], "omarchy-t2-runtime-upgrade-completed-v2")
+    self.assertEqual(completed["intent"], json.loads(consumed))
+    self.assertEqual(completed["intent"]["approval_id"], self.approval_id)
+    self.assertNotEqual(completed["intent"]["transaction_id"], self.approval_id)
+    self.assertEqual(completed["intent"]["old_config_sha256"], completed["intent"]["new_config_sha256"])
+    with self.assertRaises(ValueError): self.runtime_only_upgrade(expected)
+
+  def test_v2_config_mutation_and_equivalent_reencoding_refuse_before_barrier(self):
+    expected, config = self.runtime_only_fixture()
+    for changed in (config + b"\n", config.replace(b'"min_charge_percent":30', b'"min_charge_percent":40')):
+      with self.subTest(changed=changed):
+        (self.state / D.CANDIDATE_CONFIG).write_bytes(changed)
+        expected["new_config"] = D.hashlib.sha256(changed).hexdigest()
+        with self.assertRaisesRegex(ValueError, "exact configuration bytes"):
+          self.runtime_only_upgrade(expected)
+        self.assertFalse((self.state / D.COMPATIBLE_BARRIER).exists())
+        self.assertEqual((self.state / D.CONFIG).read_bytes(), config)
+
+  def test_v2_missing_reused_and_malformed_approval_refuse_before_retention(self):
+    expected, _ = self.runtime_only_fixture()
+    for identity in (None, "not-an-id", "306521e4-998e-1477-b603-31b93144d101"):
+      with self.subTest(identity=identity), self.assertRaisesRegex(ValueError, "UUID4"):
+        D.upgrade_snapshot(self.source, root=self.root, expected=expected, approval_id=identity,
+          guard=lambda: None, precheck=lambda: None, postcheck=lambda: None)
+    consumed = self.state / ("runtime-upgrade-approval-consumed-" + self.approval_id + ".json")
+    consumed.write_bytes(b"already consumed")
+    consumed.chmod(0o600)
+    with self.assertRaisesRegex(ValueError, "automatic retry"):
+      self.runtime_only_upgrade(expected)
+    self.assertEqual(consumed.read_bytes(), b"already consumed")
+    self.assertTrue((self.state / "runtime").is_dir())
+    self.assertFalse((self.state / D.COMPATIBLE_BARRIER).exists())
+
+  def test_v2_maintenance_marker_vetoes_even_with_unaware_old_consumers(self):
+    expected, _ = self.runtime_only_fixture()
+    marker = self.state / D.MAINTENANCE_PENDING
+    marker.write_bytes(b"original maintenance intent")
+    with self.assertRaisesRegex(ValueError, "automatic retry"):
+      self.runtime_only_upgrade(expected, postcheck=lambda: self.fail("Must not admit maintenance"))
+    self.assertEqual(marker.read_bytes(), b"original maintenance intent")
+    self.assertFalse((self.state / D.COMPATIBLE_BARRIER).exists())
+
+  def test_v2_consumption_fault_and_postcheck_fault_keep_veto_without_replay(self):
+    for fault in ("consume", "postcheck"):
+      with self.subTest(fault=fault):
+        case = Deployment(methodName="runTest")
+        case.setUp()
+        try:
+          expected, _ = case.runtime_only_fixture()
+          original = D._new_private
+          def write(parent, name, raw):
+            if fault == "consume" and name.startswith("runtime-upgrade-approval-consumed-"):
+              raise OSError("consumption fault")
+            return original(parent, name, raw)
+          def postcheck(): raise OSError("postcheck fault")
+          with patch.object(D, "_new_private", side_effect=write), self.assertRaises(OSError):
+            case.runtime_only_upgrade(expected, postcheck=postcheck)
+          self.assertTrue((case.state / D.COMPATIBLE_BARRIER).exists())
+          self.assertTrue((case.state / D.UPGRADE_PENDING).exists())
+          self.assertEqual(case.historical.read_bytes(), b"consumed v1-to-v2 evidence")
+          with self.assertRaises(ValueError): case.runtime_only_upgrade(expected)
+        finally: case.tearDown()
+
 
 if __name__ == "__main__": unittest.main()

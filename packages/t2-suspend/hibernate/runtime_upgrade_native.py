@@ -1,4 +1,4 @@
-"""Fixed, externally approved live adapter for one reviewed runtime/config upgrade.
+"""Fixed, externally approved live adapter for one exact v2 runtime upgrade.
 
 Install this file root-private outside the replaceable runtime. The only public
 entrypoint has no flags or alternate roots. It never changes EFI, modules,
@@ -14,6 +14,7 @@ import re
 import select
 import stat
 import sys
+import uuid
 
 sys.dont_write_bytecode = True
 ROOT = Path("/")
@@ -22,7 +23,7 @@ SCRIPT = STATE / "runtime-upgrade-native.py"
 APPROVAL = STATE / "runtime-upgrade-approval.json"
 BOOTSTRAP = STATE / "runtime-upgrade-bootstrap.py"
 WHO = "omarchy-t2-runtime-upgrade"
-WHY = "reviewed-runtime-config-upgrade"
+WHY = "reviewed-v2-runtime-upgrade"
 ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"}
 RUNTIME_REL = "packages/t2-suspend/hibernate/runtime_deployment.py"
 HASHES = {"old_review", "old_bootstrap", "old_config", "new_review", "new_bootstrap", "new_config"}
@@ -68,12 +69,17 @@ def _pin(value):
 def _parse_approval(raw, adapter_raw):
   approval = json.loads(raw, object_pairs_hook=_pairs)
   if (type(approval) is not dict or set(approval) != {"protocol", "approved", "current_boot_id", "source_directory",
-      "reviewed_commit", "adapter_sha256", "expected", "unchanged"} or
-      approval["protocol"] != "omarchy-t2-runtime-upgrade-approval-v1" or approval["approved"] is not True):
+      "reviewed_commit", "adapter_sha256", "expected", "unchanged", "approval_id"} or
+      approval["protocol"] != "omarchy-t2-runtime-upgrade-approval-v2" or approval["approved"] is not True):
     raise ValueError("Exact external runtime upgrade approval required")
+  identity = approval["approval_id"]
+  if type(identity) is not str or not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", identity) or uuid.UUID(identity).version != 4:
+    raise ValueError("Fresh canonical UUID4 runtime upgrade approval required")
   if type(approval["expected"]) is not dict or set(approval["expected"]) != HASHES:
     raise ValueError("Six exact old/new authority pins required")
   for value in approval["expected"].values(): _pin(value)
+  if approval["expected"]["old_config"] != approval["expected"]["new_config"]:
+    raise ValueError("Runtime-only approval must preserve exact configuration pin")
   if type(approval["unchanged"]) is not dict or set(approval["unchanged"]) != set(UNCHANGED):
     raise ValueError("Exact unchanged host pins required")
   for value in approval["unchanged"].values(): _pin(value)
@@ -235,20 +241,25 @@ def _restore_veto(core, approval):
     try: raw = core._private_read(state_fd, completed)
     except FileNotFoundError: return
     record = json.loads(raw, object_pairs_hook=_pairs)
-    if (record.get("protocol") != "omarchy-t2-runtime-upgrade-completed-v1" or
+    if (type(record) is not dict or set(record) != {"protocol", "intent", "review_sha256", "config_sha256"} or
+        record.get("protocol") != "omarchy-t2-runtime-upgrade-completed-v2" or
         record.get("review_sha256") != approval["expected"]["new_review"] or
         record.get("config_sha256") != approval["expected"]["new_config"]):
       raise ValueError("Cannot restore veto from foreign completion")
-    intent = core._encoded(record["intent"])
     expected = approval["expected"]
     if (type(record["intent"]) is not dict or set(record["intent"]) != {"protocol", "transaction_id",
-        "old_review_sha256", "new_review_sha256", "old_config_sha256", "new_config_sha256"} or
-        record["intent"].get("protocol") != "omarchy-t2-runtime-upgrade-intent-v1" or
+        "approval_id", "old_review_sha256", "new_review_sha256", "old_config_sha256", "new_config_sha256"} or
+        record["intent"].get("protocol") != "omarchy-t2-runtime-upgrade-intent-v2" or
+        record["intent"]["approval_id"] != approval["approval_id"] or
         record["intent"]["old_review_sha256"] != expected["old_review"] or
         record["intent"]["new_review_sha256"] != expected["new_review"] or
         record["intent"]["old_config_sha256"] != expected["old_config"] or
         record["intent"]["new_config_sha256"] != expected["new_config"]):
       raise ValueError("Cannot restore veto from invalid intent")
+    core._approval_identity(record["intent"]["transaction_id"])
+    intent = core._encoded(record["intent"])
+    if core._private_read(state_fd, "runtime-upgrade-approval-consumed-" + approval["approval_id"] + ".json") != intent:
+      raise ValueError("Cannot restore veto from foreign consumed approval")
     name = core.COMPATIBLE_BARRIER
     try: current = core._private_read(state_fd, name)
     except FileNotFoundError: core._new_private(state_fd, name, intent)
@@ -276,7 +287,7 @@ def native():
           def before(): _product_check(old_product, barrier=False)
           def after(): _postcheck(core, approval)
           result = core._upgrade_snapshot(approval["source_directory"], root=ROOT, expected=approval["expected"],
-                                          guard=guard, precheck=before, postcheck=after)
+                                          guard=guard, precheck=before, postcheck=after, approval_id=approval["approval_id"])
           guard()
           # After barrier retirement, ordinary admission and db release must
           # pass while the physical lock remains held. Failure rearms the veto.

@@ -5,8 +5,9 @@ qualification, copies UKIs/unlock assets or performs host power operations.
 Source may be user-owned: externally reviewed exact byte hashes are the boundary.
 Only the root-owned, verified snapshot is suitable for privileged execution.
 Fresh deployment refuses overwrite. A separate bounded fixture upgrade retains
-old runtime/authority/config and requires a compatible admission barrier;
-there is no live upgrade adapter or automatic interrupted-upgrade replay.
+old runtime/authority/config and requires a compatible admission barrier.
+Live upgrades require a separately reviewed adapter; interrupted upgrades never
+replay automatically. Runtime-only v2 upgrades preserve exact config bytes.
 """
 
 import fcntl
@@ -37,6 +38,7 @@ CANDIDATE_CONFIG = "runtime-upgrade-config.json"
 CANDIDATE_BOOTSTRAP = "runtime-upgrade-bootstrap.py"
 HOOK = Path("etc/pacman.d/hooks/00-omarchy-t2-hibernate-guard.hook")
 DEACTIVATION_PENDING = "source-default-deactivation.pending"
+MAINTENANCE_PENDING = "package-maintenance.pending"
 MAX_FILE = 2 * 1024 * 1024
 MAX_TOTAL = 16 * 1024 * 1024
 CHUNK = 1024 * 1024
@@ -284,7 +286,13 @@ def _installed_hook(root):
   finally: os.close(fd)
 
 
-def _upgrade_snapshot(source_directory, *, root, expected, guard, precheck, postcheck):
+def _approval_identity(value):
+  if type(value) is not str or not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", value) or uuid.UUID(value).version != 4:
+    raise ValueError("Fresh canonical UUID4 runtime upgrade approval required")
+  return value
+
+
+def _upgrade_snapshot(source_directory, *, root, expected, guard, precheck, postcheck, approval_id=None):
   """Internal core; live caller must be a separately reviewed fixed native adapter.
 
   The adapter must own a real sleep:shutdown block inhibitor, pacman db.lck and
@@ -314,7 +322,7 @@ def _upgrade_snapshot(source_directory, *, root, expected, guard, precheck, post
     _private(lock)
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     guard()
-    if any(os.path.lexists(state / name) for name in (UPGRADE_PENDING, COMPATIBLE_BARRIER, DEACTIVATION_PENDING, PENDING)):
+    if any(os.path.lexists(state / name) for name in (UPGRADE_PENDING, COMPATIBLE_BARRIER, DEACTIVATION_PENDING, MAINTENANCE_PENDING, PENDING)):
       raise ValueError("Existing or partial runtime upgrade refuses automatic retry")
     old_raw = _private_read(parent, REVIEW.name)
     bootstrap = _private_read(parent, BOOTSTRAP)
@@ -345,10 +353,20 @@ def _upgrade_snapshot(source_directory, *, root, expected, guard, precheck, post
       raise ValueError("New source differs from exact approved inventory")
     old_config = json.loads(config, object_pairs_hook=_pairs)
     new_config = json.loads(incoming_config, object_pairs_hook=_pairs)
-    if type(old_config) is not dict or old_config.get("schema") != "omarchy-t2-qualified-product-config-v1" or type(new_config) is not dict or new_config.get("schema") != "omarchy-t2-qualified-product-config-v2":
-      raise ValueError("Expected v1 to explicit v2 product configuration upgrade")
-    if set(new_config) != set(old_config) | {"power_policy"} or any(new_config[key] != old_config[key] for key in old_config if key != "schema"):
-      raise ValueError("Config upgrade changed non-policy artifact or qualification fields")
+    if type(old_config) is not dict or type(new_config) is not dict or new_config.get("schema") != "omarchy-t2-qualified-product-config-v2":
+      raise ValueError("Expected v1 to v2 or exact v2 runtime configuration upgrade")
+    runtime_only = old_config.get("schema") == "omarchy-t2-qualified-product-config-v2"
+    consumed = None
+    if runtime_only:
+      _approval_identity(approval_id)
+      if config != incoming_config:
+        raise ValueError("Runtime-only v2 upgrade must preserve exact configuration bytes")
+      consumed = "runtime-upgrade-approval-consumed-" + approval_id + ".json"
+    elif old_config.get("schema") == "omarchy-t2-qualified-product-config-v1" and approval_id is None:
+      if set(new_config) != set(old_config) | {"power_policy"} or any(new_config[key] != old_config[key] for key in old_config if key != "schema"):
+        raise ValueError("Config upgrade changed non-policy artifact or qualification fields")
+    else:
+      raise ValueError("Historical v1 upgrade cannot use runtime-only approval")
     if type(new_config["power_policy"]) is not dict or set(new_config["power_policy"]) != {"schema", "min_charge_percent"} or new_config["power_policy"]["schema"] != "omarchy-t2-attended-battery-policy-v1" or type(new_config["power_policy"]["min_charge_percent"]) is not int or not 30 <= new_config["power_policy"]["min_charge_percent"] <= 100:
       raise ValueError("Explicit bounded battery policy required")
     old_prefix, new_prefix = old_review["reviewed_commit"][:12], incoming["reviewed_commit"][:12]
@@ -357,20 +375,25 @@ def _upgrade_snapshot(source_directory, *, root, expected, guard, precheck, post
                 (BOOTSTRAP, "runtime-bootstrap-retained-" + old_prefix + "-before-" + new_prefix + ".py"),
                 (CONFIG, "config-retained-" + old_prefix + "-before-" + new_prefix + ".json"))
     completed = "runtime-upgrade-completed-" + new_prefix + ".json"
-    if any(os.path.lexists(state / name) for name in (UPGRADE_PENDING, COMPATIBLE_BARRIER, DEACTIVATION_PENDING, PENDING, completed,
-                                                       *(target for source, target in retained))):
+    if any(os.path.lexists(state / name) for name in (UPGRADE_PENDING, COMPATIBLE_BARRIER, DEACTIVATION_PENDING, MAINTENANCE_PENDING, PENDING, completed,
+                                                       *(target for source, target in retained), *((consumed,) if consumed else ()))):
       raise ValueError("Existing or partial runtime upgrade refuses automatic retry")
     guard()
     precheck()
-    intent = _encoded({"protocol": "omarchy-t2-runtime-upgrade-intent-v1", "transaction_id": str(uuid.uuid4()),
+    intent_record = {"protocol": "omarchy-t2-runtime-upgrade-intent-v2" if runtime_only else "omarchy-t2-runtime-upgrade-intent-v1", "transaction_id": str(uuid.uuid4()),
                        "old_review_sha256": expected["old_review"], "new_review_sha256": expected["new_review"],
-                       "old_config_sha256": expected["old_config"], "new_config_sha256": expected["new_config"]})
+                       "old_config_sha256": expected["old_config"], "new_config_sha256": expected["new_config"]}
+    if runtime_only: intent_record["approval_id"] = approval_id
+    intent = _encoded(intent_record)
     # Installed 608464dd sleep_entry and product both veto this existing name
     # by presence. The distinct payload must never be fed to boot-policy code.
     guard()
     _new_private(parent, COMPATIBLE_BARRIER, intent)
     guard()
     _new_private(parent, UPGRADE_PENDING, intent)
+    if consumed:
+      guard()
+      _new_private(parent, consumed, intent)
     for source, target in retained:
       guard()
       if os.path.lexists(state / target): raise ValueError("Retained target appeared")
@@ -392,7 +415,7 @@ def _upgrade_snapshot(source_directory, *, root, expected, guard, precheck, post
     guard()
     postcheck()
     guard()
-    completed_raw = _encoded({"protocol": "omarchy-t2-runtime-upgrade-completed-v1",
+    completed_raw = _encoded({"protocol": "omarchy-t2-runtime-upgrade-completed-v2" if runtime_only else "omarchy-t2-runtime-upgrade-completed-v1",
       "intent": json.loads(intent, object_pairs_hook=_pairs), "review_sha256": expected["new_review"],
       "config_sha256": expected["new_config"]})
     _new_private(parent, completed, completed_raw)
@@ -414,10 +437,10 @@ def _upgrade_snapshot(source_directory, *, root, expected, guard, precheck, post
     os.close(parent)
 
 
-def upgrade_snapshot(source_directory, *, root, expected, guard, precheck, postcheck):
+def upgrade_snapshot(source_directory, *, root, expected, guard, precheck, postcheck, approval_id=None):
   """Fixture-only transaction; live upgrade needs a separately reviewed adapter."""
   root = Path(root)
   if not root.is_absolute() or root.resolve() != root or not root.is_dir() or root == Path("/"):
     raise ValueError("Fixture-only runtime upgrade refuses live root and aliases")
   return _upgrade_snapshot(source_directory, root=root, expected=expected, guard=guard,
-                           precheck=precheck, postcheck=postcheck)
+                           precheck=precheck, postcheck=postcheck, approval_id=approval_id)

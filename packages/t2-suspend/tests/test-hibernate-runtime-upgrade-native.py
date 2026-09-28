@@ -2,6 +2,7 @@
 import hashlib
 import importlib.util
 import json
+import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,7 +20,8 @@ def digest(raw): return hashlib.sha256(raw).hexdigest()
 
 class NativeUpgrade(unittest.TestCase):
   def approval(self):
-    return {"protocol": "omarchy-t2-runtime-upgrade-approval-v1", "approved": True,
+    return {"protocol": "omarchy-t2-runtime-upgrade-approval-v2", "approved": True,
+            "approval_id": "306521e4-998e-4477-b603-31b93144d101",
             "current_boot_id": "0f909934-0ecf-4407-863d-6822c81cb2df",
             "source_directory": "/reviewed/source", "reviewed_commit": "a" * 40,
             "adapter_sha256": "b" * 64, "expected": {name: "c" * 64 for name in N.HASHES},
@@ -62,6 +64,47 @@ class NativeUpgrade(unittest.TestCase):
          patch.object(Path, "is_symlink", return_value=False), self.assertRaisesRegex(ValueError, "differs: qualification"):
       N._unchanged(approval)
 
+  def test_historical_approval_and_changed_config_pin_are_rejected(self):
+    approval = self.approval()
+    approval["adapter_sha256"] = digest(b"adapter")
+    approval["protocol"] = "omarchy-t2-runtime-upgrade-approval-v1"
+    with self.assertRaisesRegex(ValueError, "external runtime"):
+      N._parse_approval(json.dumps(approval).encode(), b"adapter")
+    approval["protocol"] = "omarchy-t2-runtime-upgrade-approval-v2"
+    approval["expected"]["new_config"] = "e" * 64
+    with self.assertRaisesRegex(ValueError, "configuration pin"):
+      N._parse_approval(json.dumps(approval).encode(), b"adapter")
+
+  def test_completed_v2_recovery_binds_approval_and_consumption_without_replay(self):
+    spec = importlib.util.spec_from_file_location("recovery_core", HERE / "hibernate/runtime_deployment.py")
+    core = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(core)
+    approval = self.approval()
+    expected = approval["expected"]
+    intent = {"protocol": "omarchy-t2-runtime-upgrade-intent-v2",
+      "transaction_id": "706521e4-998e-4477-b603-31b93144d102", "approval_id": approval["approval_id"],
+      "old_review_sha256": expected["old_review"], "new_review_sha256": expected["new_review"],
+      "old_config_sha256": expected["old_config"], "new_config_sha256": expected["new_config"]}
+    record = {"protocol": "omarchy-t2-runtime-upgrade-completed-v2", "intent": intent,
+      "review_sha256": expected["new_review"], "config_sha256": expected["new_config"]}
+    with tempfile.TemporaryDirectory() as directory:
+      state = Path(directory)
+      state.chmod(0o700)
+      for name, value in (("runtime-upgrade-completed-aaaaaaaaaaaa.json", core._encoded(record)),
+                          ("runtime-upgrade-approval-consumed-" + approval["approval_id"] + ".json", core._encoded(intent))):
+        (state / name).write_bytes(value)
+        (state / name).chmod(0o600)
+      with patch.object(N, "STATE", state):
+        N._restore_veto(core, approval)
+        self.assertEqual((state / core.COMPATIBLE_BARRIER).read_bytes(), core._encoded(intent))
+        N._restore_veto(core, approval)
+        foreign = {**approval, "approval_id": "306521e4-998e-4477-b603-31b93144d103"}
+        with self.assertRaisesRegex(ValueError, "invalid intent"):
+          N._restore_veto(core, foreign)
+        (state / core.COMPATIBLE_BARRIER).write_bytes(b"foreign veto")
+        with self.assertRaisesRegex(ValueError, "Foreign compatible"):
+          N._restore_veto(core, approval)
+        self.assertEqual((state / core.COMPATIBLE_BARRIER).read_bytes(), b"foreign veto")
   def test_review_requires_approved_exact_inventory_and_commit(self):
     raw = json.dumps({"protocol": "omarchy-t2-product-runtime-snapshot-v1", "approved": True,
                       "reviewed_commit": "a" * 40, "files": {N.RUNTIME_REL: {"size": 3, "sha256": digest(b"new")}}}).encode()
