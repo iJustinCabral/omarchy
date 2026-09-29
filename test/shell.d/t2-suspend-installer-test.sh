@@ -132,9 +132,47 @@ mkdir -p "$test_tmp/root/usr/lib/firmware/brcm"
 for suffix in .bin -SPPR-m.txt -SPPR-u.txt .clm_blob .txcap_blob; do
   echo fixture > "$test_tmp/root/usr/lib/firmware/brcm/brcmfmac4377b3-pcie.apple,formosa$suffix"
 done
-if bash -c 'source "$1"; _optmoduleroot=$2; KERNELVERSION=7.2.4-test-t2; add_file() { return 0; }; modinfo() { echo MODULE_LOOKUP >&2; return 1; }; build; echo UNSAFE_CONTINUATION' bash "$ROOT/packages/t2-suspend/installer/initcpio-install" "$test_tmp/root" > "$test_tmp/hook-output" 2>&1; then
+# mkinitcpio supplies error, warning, add_file and add_module; the fixture models them. The modinfo
+# stub resolves the t2bce_* family from a stock path (or a foreign one when BCE_FOREIGN names the
+# module) so the hook passes its BCE coherence loop, and fails every radio lookup with
+# MODULE_LOOKUP so module verification is reached.
+hook_harness='source "$1"; _optmoduleroot=$2; KERNELVERSION=7.2.4-test-t2
+error() { echo "error: $*" >&2; }
+warning() { echo "warning: $*" >&2; }
+add_file() { return 0; }
+modinfo() {
+  local name=${*: -1}
+  if [[ $name == t2bce_* ]]; then
+    [[ ${BCE_MISSING:-} == "$name" ]] && return 1
+    if [[ ${BCE_FOREIGN:-} == "$name" ]]; then echo "/lib/modules/$KERNELVERSION/updates/dkms/$name.ko.zst"
+    else echo "/lib/modules/$KERNELVERSION/kernel/drivers/staging/t2bce/$name/$name.ko.zst"; fi
+    return 0
+  fi
+  echo MODULE_LOOKUP >&2
+  return 1
+}
+build; echo UNSAFE_CONTINUATION'
+run_hook() { bash -c "$hook_harness" bash "$ROOT/packages/t2-suspend/installer/initcpio-install" "$test_tmp/root" > "$test_tmp/hook-output" 2>&1; }
+if run_hook; then
   fail "missing replacement must abort mkinitcpio"
 fi
 ! grep -q UNSAFE_CONTINUATION "$test_tmp/hook-output" || fail "hook continued after failure"
-grep -q MODULE_LOOKUP "$test_tmp/hook-output" || fail "test did not reach module verification"
+grep -q MODULE_LOOKUP "$test_tmp/hook-output" || fail "test did not reach module verification" "$(cat "$test_tmp/hook-output")"
+! grep -q 'BCE module' "$test_tmp/hook-output" || fail "stock BCE family must pass the coherence guard" "$(cat "$test_tmp/hook-output")"
 pass "boot-image guard stops generation before publishing incomplete images"
+
+# The BCE coherence guard refuses a t2bce_* module resolved from updates/dkms, before radio checks.
+if BCE_FOREIGN=t2bce_core run_hook; then
+  fail "foreign t2bce module must abort mkinitcpio"
+fi
+! grep -q UNSAFE_CONTINUATION "$test_tmp/hook-output" || fail "hook continued past foreign BCE module"
+grep -q 'Mixed or foreign T2 BCE module family: t2bce_core resolves to .*/updates/dkms/' "$test_tmp/hook-output" || fail "foreign BCE refusal names the module and path" "$(cat "$test_tmp/hook-output")"
+! grep -q MODULE_LOOKUP "$test_tmp/hook-output" || fail "radio verification ran after BCE refusal"
+if BCE_MISSING=t2bce_vhci run_hook; then
+  fail "missing t2bce module must abort mkinitcpio"
+fi
+grep -q 'Missing T2 BCE module: t2bce_vhci' "$test_tmp/hook-output" || fail "missing BCE module refusal" "$(cat "$test_tmp/hook-output")"
+BCE_MISSING=t2bce_ave run_hook || true
+! grep -q 'BCE module' "$test_tmp/hook-output" || fail "missing optional t2bce_ave must be tolerated" "$(cat "$test_tmp/hook-output")"
+grep -q MODULE_LOOKUP "$test_tmp/hook-output" || fail "absent t2bce_ave must still reach radio verification"
+pass "BCE coherence guard refuses foreign, updates/dkms and missing t2bce modules"
