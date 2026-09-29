@@ -460,11 +460,11 @@ def _maintenance_gate(engine, root, phase, pinned=None):
 
 
 def _driver_capture(root, release):
-  return _load_reviewed("native_reviewed_root_driver_inventory", RUNTIME_HIBERNATE / "root_driver_inventory.py").capture(root, release)
+  return _load_reviewed("native_reviewed_root_driver_inventory", RUNTIME_HIBERNATE / "root_driver_inventory.py").capture_baseline(root, release)
 
 
 def _control_capture(root):
-  return _load_reviewed("native_reviewed_root_control_inventory", RUNTIME_HIBERNATE / "root_control_inventory.py").capture(root)
+  return _load_reviewed("native_reviewed_root_control_inventory", RUNTIME_HIBERNATE / "root_control_inventory.py").capture(root, baseline=True)
 
 
 def _running_release(): return os.uname().release
@@ -511,10 +511,15 @@ def _item_module_stack(engine, root, state):
 
 
 def _item_driver(engine, root, state):
+  """(driver_modules, firmware) items; each part is an exception instance when only it failed to capture."""
   capture = _driver_capture(root, state["release"])
-  return ({"kernel_release": capture["kernel_release"], "capture_sha256": _digest(engine, capture["modules"]),
-           "modules": _node_digests(engine, capture["modules"])},
-          {"capture_sha256": _digest(engine, capture["firmware"]), "files": _node_digests(engine, capture["firmware"])})
+  errors = capture["errors"]
+  def part(key, build):
+    if capture[key] is None: return ValueError(errors.get(key, key + " capture unavailable"))
+    return build(capture[key])
+  return (part("modules", lambda modules: {"kernel_release": capture["kernel_release"], "capture_sha256": _digest(engine, modules),
+                                            "modules": _node_digests(engine, modules)}),
+          part("firmware", lambda firmware: {"capture_sha256": _digest(engine, firmware), "files": _node_digests(engine, firmware)}))
 
 
 def _item_control(engine, root, state):
@@ -567,9 +572,12 @@ def generation_items(engine, root=ROOT):
   def drivers():
     if not driver:
       try: driver["value"] = _item_driver(engine, root, {"release": need("release")})
-      except Exception as error: driver["error"] = error
-    if "error" in driver: raise driver["error"]
+      except Exception as error: driver["value"] = (error, error)
     return driver["value"]
+  def driver_part(index):
+    value = drivers()[index]
+    if isinstance(value, Exception): raise value
+    return value
   def run(name, thunk):
     try: items[name] = thunk()
     except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError) as error:
@@ -585,8 +593,8 @@ def generation_items(engine, root=ROOT):
   run("source_uki", uki("source"))
   run("restore_uki", uki("restore"))
   run("module_stack", lambda: _item_module_stack(engine, root, {"config": need("config"), "source_provenance": need("source_provenance")}))
-  run("driver_modules", lambda: drivers()[0])
-  run("firmware", lambda: drivers()[1])
+  run("driver_modules", lambda: driver_part(0))
+  run("firmware", lambda: driver_part(1))
   run("control_inventory", lambda: _item_control(engine, root, None))
   run("bootloader", lambda: _item_bootloader(engine, root, None))
   return {name: items[name] for name in engine.BASELINE_ITEMS}, errors
@@ -630,25 +638,26 @@ def assess(engine, root=ROOT):
     return {**report, "class": "unknown", "reason": reason, **extra}
   if engine._present(root / engine.DB_LOCK): return unknown("A package transaction holds db.lck", busy=True)
   owner = engine._owner(root)
+  # Probe only: a read-only, advisory evaluation needs no exclusion, and holding the
+  # lock through hashing would make a concurrent pacman guard refuse. Release now.
   try: fd, _ = engine.G._physical(root, owner)
   except ValueError as error: return unknown(str(error), busy="holds the physical lock" in str(error))
+  os.close(fd)
   try:
-    try:
-      evidence = engine.G._maintenance(root)
-      marker = engine._read(root, engine.MAINTENANCE)
-    except (OSError, ValueError, BlockingIOError) as error:
-      return unknown("Maintenance evidence not validated: " + type(error).__name__ + ": " + str(error)[:200])
-    report["transition_id"] = evidence["transition_id"]
-    report["maintenance_intent_sha256"] = evidence["maintenance_intent_sha256"]
-    try: baseline = engine.read_baseline(root, marker)
-    except FileNotFoundError: return unknown("Generation baseline is missing", baseline="missing")
-    except (OSError, ValueError) as error: return unknown("Generation baseline is invalid: " + str(error)[:200], baseline="invalid")
-    current, errors = generation_items(engine, root)
-    if engine._read(root, engine.MAINTENANCE) != marker: return unknown("Maintenance marker changed during assessment")
-    raw = engine._read(root, engine.P.LIMINE, private=False)
-    try: stock = engine.stock_identity(raw)
-    except ValueError as error: return unknown("Current Limine configuration is not stock: " + str(error)[:200])
-  finally: os.close(fd)
+    evidence = engine.G._maintenance(root)
+    marker = engine._read(root, engine.MAINTENANCE)
+  except (OSError, ValueError, BlockingIOError) as error:
+    return unknown("Maintenance evidence not validated: " + type(error).__name__ + ": " + str(error)[:200])
+  report["transition_id"] = evidence["transition_id"]
+  report["maintenance_intent_sha256"] = evidence["maintenance_intent_sha256"]
+  try: baseline = engine.read_baseline(root, marker)
+  except FileNotFoundError: return unknown("Generation baseline is missing", baseline="missing")
+  except (OSError, ValueError) as error: return unknown("Generation baseline is invalid: " + str(error)[:200], baseline="invalid")
+  current, errors = generation_items(engine, root)
+  if engine._read(root, engine.MAINTENANCE) != marker: return unknown("Maintenance marker changed during assessment")
+  raw = engine._read(root, engine.P.LIMINE, private=False)
+  try: stock = engine.stock_identity(raw)
+  except ValueError as error: return unknown("Current Limine configuration is not stock: " + str(error)[:200])
   items = {}
   for name in (*CRITICAL_ITEMS, *TOLERATED_ITEMS):
     if "unavailable" in baseline[name]: items[name] = {"state": "unknown", "reason": "baseline item unavailable: " + baseline[name]["unavailable"]}

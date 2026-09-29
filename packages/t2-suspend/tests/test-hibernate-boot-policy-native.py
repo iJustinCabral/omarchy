@@ -724,8 +724,8 @@ class Assess(unittest.TestCase):
     self.addCleanup(self.fx.doCleanups)
     self.root, self.f, self.T = self.fx.root, self.fx.f, F.T
     self.running = self.RELEASE
-    for target, replacement in (("_driver_capture", lambda root, release: DRIVER.capture(root, release, query=self.query)),
-                                ("_control_capture", CONTROL.capture), ("_running_release", lambda: self.running)):
+    for target, replacement in (("_driver_capture", lambda root, release: DRIVER.capture_baseline(root, release, query=self.query)),
+                                ("_control_capture", lambda root: CONTROL.capture(root, baseline=True)), ("_running_release", lambda: self.running)):
       patcher = patch.object(N, target, replacement)
       patcher.start()
       self.addCleanup(patcher.stop)
@@ -902,13 +902,14 @@ class Assess(unittest.TestCase):
     for name in list((other.root / "usr/lib/firmware/brcm").iterdir()): name.unlink()
     report = other.assess()
     self.assertEqual(report["class"], "unknown")
-    self.assertEqual(report["unknown_items"], ["driver_modules", "firmware"])
+    self.assertEqual(report["unknown_items"], ["firmware"])  # the module item survives a firmware failure
+    self.assertEqual(report["items"]["driver_modules"], {"state": "equal"})
     self.assertEqual(report["items"]["control_inventory"], {"state": "equal"})
     self.assertIn("firmware", report["items"]["firmware"]["reason"])
     # A definite change outranks an unreadable item.
     other.coherent_kernel_update()
     report = other.assess()
-    self.assertEqual((report["class"], report["changed_items"], report["unknown_items"]), ("requalification-required", ["production_uki"], ["driver_modules", "firmware"]))
+    self.assertEqual((report["class"], report["changed_items"], report["unknown_items"]), ("requalification-required", ["production_uki"], ["firmware"]))
     # A tolerated item that could not be captured at publication stays unknown, the core items still compare.
     third = Assess("test_unchanged_generation_reports_every_item_equal")
     third.setUp()
@@ -933,6 +934,40 @@ class Assess(unittest.TestCase):
         with self.assertRaises((ValueError, FileNotFoundError)): other.publish()
         self.assertEqual(other.fx.tree(), before)
         self.assertFalse(any(other.fx.pending_names()) or (other.root / self.T.MAINTENANCE).exists())
+
+  def test_assess_releases_the_physical_lock_before_any_hashing(self):
+    other = self.fresh()
+    events = []
+    real_physical, real_generation = other.T.G._physical, N.generation_items
+    def physical(root, owner):
+      fd, identity = real_physical(root, owner)
+      events.append("probe")
+      return fd, identity
+    def generation(engine, root):
+      probe = os.open(other.root / self.T.PHYSICAL_LOCK, os.O_RDONLY)
+      try: fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)  # a concurrent guard hook must be admitted while hashing
+      finally: os.close(probe)
+      events.append("hash")
+      return real_generation(engine, root)
+    with patch.object(other.T.G, "_physical", side_effect=physical), patch.object(N, "generation_items", side_effect=generation):
+      report = other.assess()
+    self.assertEqual(events, ["probe", "hash"])
+    self.assertEqual(report["class"], "unchanged")
+
+  def test_baseline_publication_and_assessment_accept_hardlinked_firmware_and_out_of_scope_control_links(self):
+    other = Assess("test_unchanged_generation_reports_every_item_equal")
+    other.setUp()
+    self.addCleanup(other.doCleanups)
+    brcm = other.root / "usr/lib/firmware/brcm"
+    for suffix in DRIVER.SUFFIXES:
+      os.link(brcm / (DRIVER.FORMOSA + suffix), brcm / ("brcmfmac4377b3-pcie.apple,fiji" + suffix))
+    hook = other.root / "etc/boot/hooks/pre.d"
+    hook.mkdir(parents=True)
+    (hook / "10-limine-reset-enroll").symlink_to("/usr/bin/limine-reset-enroll")
+    other.published()
+    baseline = other.T.read_baseline(other.root)
+    for name in ("driver_modules", "firmware", "control_inventory"): self.assertNotIn("unavailable", baseline[name], name)
+    self.assertEqual(other.assess()["class"], "unchanged")
 
   def test_assess_writes_nothing_leaves_no_lock_and_never_blocks(self):
     other = self.fresh()

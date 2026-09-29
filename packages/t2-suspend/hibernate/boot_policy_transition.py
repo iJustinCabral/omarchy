@@ -485,6 +485,8 @@ def _transition(root, action, *, precheck, guard, maintenance_continuation=None,
     if maintenance_gate is not None: maintenance_gate(root, "before")
     # Captured while the qualified generation is still active and before any write.
     baseline = None if maintenance_baseline is None else _baseline_value(maintenance_baseline())
+    # The stock projection is derived here too, so the only late step is a pure document build.
+    stock_limine = None if baseline is None else stock_identity(after)
     guard()
     transition_id = str(uuid.uuid4())
     intent = _encoded({"protocol": "omarchy-t2-source-default-transition-v1", "transition_id": transition_id,
@@ -564,7 +566,7 @@ def _transition(root, action, *, precheck, guard, maintenance_continuation=None,
         if _read(root, (archive / G.RESUME_NAME).relative_to(root)) != resume_raw:
           raise ValueError("Archived maintenance resume target readback differs")
       if baseline is not None:
-        baseline_raw = _baseline_document(transition_id, {**baseline, "limine": stock_identity(after)}, fields, maintenance_intent)
+        baseline_raw = _baseline_document(transition_id, {**baseline, "limine": stock_limine}, fields, maintenance_intent)
         guard()
         _new(archive / BASELINE_NAME, baseline_raw)
         if _read(root, (archive / BASELINE_NAME).relative_to(root)) != baseline_raw:

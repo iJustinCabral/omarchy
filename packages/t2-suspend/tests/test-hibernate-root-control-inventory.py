@@ -95,6 +95,37 @@ class RootControls(unittest.TestCase):
           with self.assertRaisesRegex(ValueError, "outside declared scope"): self.capture()
         link.unlink()
 
+  def test_baseline_records_out_of_scope_link_text_without_following_it(self):
+    for name, target in (("etc/boot/hooks/pre.d/10-limine-reset-enroll", "/usr/bin/limine-reset-enroll"),
+                         ("etc/boot/hooks/post.d/90-limine-enroll-config", "../../../../usr/bin/limine-enroll-config"),
+                         ("etc/crypttab", "/keys/unlock.key")):
+      with self.subTest(name=name):
+        link = self.link(name, target)
+        with self.assertRaisesRegex(ValueError, "outside declared scope"): self.capture()  # default unchanged
+        with patch.object(I.DRIVER.os, "open", side_effect=AssertionError("out-of-scope target must not be opened")):
+          first = I.capture(self.root, baseline=True)
+        self.assertEqual(first, I.capture(self.root, baseline=True))
+        node = first["files"][name] if name in I.FILES else first["directories"][name.rsplit("/", 1)[0]]["entries"][name.rsplit("/", 1)[1]]
+        self.assertEqual(node, {"kind": "symlink", "links": [{"path": "/" + name, "target": target}], "target": {"kind": "out-of-scope"}})
+        link.unlink()
+
+  def test_baseline_leaves_in_scope_links_and_default_output_unchanged(self):
+    self.write("usr/lib/systemd/system/bluetooth.service", b"unit")
+    self.link("etc/systemd/system/bluetooth.service", "/usr/lib/systemd/system/bluetooth.service")
+    self.write("etc/fstab", b"fstab")
+    default = self.capture()
+    self.assertEqual(default["files"]["etc/systemd/system/bluetooth.service"]["kind"], "symlink")
+    based = I.capture(self.root, baseline=True)
+    self.assertEqual(based["files"]["etc/systemd/system/bluetooth.service"]["links"], default["files"]["etc/systemd/system/bluetooth.service"]["links"])
+    self.assertEqual(based["files"]["etc/systemd/system/bluetooth.service"]["resolved"], "/usr/lib/systemd/system/bluetooth.service")
+    self.assertEqual(based["files"]["etc/fstab"], {**default["files"]["etc/fstab"], "nlink": 1})  # only addition: the link count
+
+  def test_hardlinked_control_file_refused_by_default_and_recorded_in_baseline(self):
+    path = self.write("etc/fstab", b"fstab")
+    os.link(path, self.root / "etc/fstab-alias")
+    with self.assertRaisesRegex(ValueError, "Bounded owned regular"): self.capture()
+    self.assertEqual(I.capture(self.root, baseline=True)["files"]["etc/fstab"]["nlink"], 2)
+
   def test_dangling_declared_link_is_explicit_and_link_loop_refuses(self):
     name = "etc/systemd/system/bluetooth.service"
     link = self.link(name, "/usr/lib/systemd/system/bluetooth.service")
@@ -155,8 +186,8 @@ class RootControls(unittest.TestCase):
   def test_changes_between_whole_inventory_reads_refuse(self):
     path = self.write("etc/fstab", b"before")
     original = I._scan
-    def changed(root, owner):
-      result = original(root, owner)
+    def changed(root, owner, *rest):
+      result = original(root, owner, *rest)
       path.write_bytes(b"after")
       return result
     with patch.object(I, "_scan", side_effect=changed), self.assertRaisesRegex(ValueError, "across capture"):

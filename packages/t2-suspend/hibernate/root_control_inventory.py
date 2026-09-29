@@ -70,7 +70,7 @@ def _allowed(relative):
   return relative in FILES or any(relative == tree or relative.startswith(tree + "/") for tree in TREES)
 
 
-def _target(root, path, owner):
+def _target(root, path, owner, baseline=False):
   links, current = [], path
   for _ in range(9):
     if not _parents(root, current, owner): return current, links, "absent"
@@ -84,12 +84,14 @@ def _target(root, path, owner):
     relative = posixpath.normpath(text.lstrip("/") if text.startswith("/") else current.parent.relative_to(root).as_posix() + "/" + text)
     if relative == "dev/null": return root / relative, links, "mask"
     if relative.startswith("../") or not _allowed(relative):
+      # Baseline mode records the out-of-scope link text only; it is never followed.
+      if baseline: return current, links, "out-of-scope"
       raise ValueError("Control link target outside declared scope")
     current = root / relative
   raise ValueError("Control link chain exceeds bound")
 
 
-def _node(root, path, owner, budget, *, tree=False, depth=0):
+def _node(root, path, owner, budget, *, tree=False, depth=0, baseline=False):
   budget[0] += 1
   if budget[0] > MAX_ENTRIES or depth > MAX_DEPTH: raise ValueError("Control inventory entry/depth bound exceeded")
   if not _parents(root, path, owner): return {"kind": "absent"}
@@ -102,15 +104,15 @@ def _node(root, path, owner, budget, *, tree=False, depth=0):
     for member in sorted(path.iterdir(), key=lambda item: item.name):
       if any(ord(char) < 32 or ord(char) == 127 for char in member.name): raise ValueError("Invalid control filename")
       member.name.encode("utf-8", "strict")
-      entries[member.name] = _node(root, member, owner, budget, tree=True, depth=depth + 1)
+      entries[member.name] = _node(root, member, owner, budget, tree=True, depth=depth + 1, baseline=baseline)
     if DRIVER._identity(path.lstat()) != DRIVER._identity(info): raise ValueError("Control directory changed during read")
     return {"kind": "directory", "mode": stat.S_IMODE(info.st_mode), "entries": entries}
   if tree and path.relative_to(root).as_posix() in TREES:
     raise ValueError("Control directory is not a real directory")
-  target, links, state = _target(root, path, owner)
+  target, links, state = _target(root, path, owner, baseline)
   if state == "present":
     named = target.lstat()
-    value = DRIVER._file(root, target, owner, allow_empty=True)
+    value = DRIVER._file(root, target, owner, allow_empty=True, allow_hardlinks=baseline)
     if DRIVER._identity(target.lstat()) != DRIVER._identity(named): raise ValueError("Control target changed during read")
     value["mode"] = stat.S_IMODE(named.st_mode)
     budget[1] += value["size"]
@@ -120,26 +122,35 @@ def _node(root, path, owner, budget, *, tree=False, depth=0):
   for link, identity, text in links:
     if DRIVER._identity(link.lstat()) != identity or os.readlink(link) != text:
       raise ValueError("Control link changed during read")
+  if state == "out-of-scope":
+    return {"kind": "symlink", "links": [{"path": "/" + link.relative_to(root).as_posix(), "target": text} for link, _, text in links],
+            "target": {"kind": "out-of-scope"}}
   if links:
     return {"kind": "symlink", "links": [{"path": "/" + link.relative_to(root).as_posix(), "target": text} for link, _, text in links],
             "resolved": "/" + target.relative_to(root).as_posix(), "target": value}
   return {"kind": "file", **value}
 
 
-def _scan(root, owner):
+def _scan(root, owner, baseline=False):
   budget = [0, 0]
-  return {"files": {name: _node(root, root / name, owner, budget) for name in FILES},
-          "directories": {name: _node(root, root / name, owner, budget, tree=True) for name in TREES}}
+  return {"files": {name: _node(root, root / name, owner, budget, baseline=baseline) for name in FILES},
+          "directories": {name: _node(root, root / name, owner, budget, tree=True, baseline=baseline) for name in TREES}}
 
 
-def capture(root):
-  """Return deterministic scoped control bytes/selection, never a safe boolean."""
+def capture(root, *, baseline=False):
+  """Return deterministic scoped control bytes/selection, never a safe boolean.
+
+  baseline=True (generation baseline only) records a symlink whose target lies
+  outside the declared scope as its link text plus an out-of-scope marker
+  instead of refusing, without following it, and accepts multi-link regular
+  files, recording their link count. The default refuses both.
+  """
   root = Path(root)
   if not root.is_absolute() or root.resolve() != root or not root.is_dir():
     raise ValueError("Canonical explicit control inventory root required")
   if root == Path("/") and (os.geteuid() != 0 or Path(__file__).absolute() != SOURCE):
     raise ValueError("Only reviewed installed live control inventory may run")
   owner = 0 if root == Path("/") else os.geteuid()
-  first = _scan(root, owner)
-  if _scan(root, owner) != first: raise ValueError("Control inventory changed across capture")
+  first = _scan(root, owner, baseline)
+  if _scan(root, owner, baseline) != first: raise ValueError("Control inventory changed across capture")
   return {"protocol": "omarchy-t2-root-control-inventory-v1", **first}

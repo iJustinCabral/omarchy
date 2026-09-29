@@ -45,11 +45,12 @@ def _identity(info):
           info.st_mode, info.st_uid, info.st_nlink)
 
 
-def _file(root, path, owner, *, allow_empty=False):
+def _file(root, path, owner, *, allow_empty=False, allow_hardlinks=False):
+  """Stable bounded digest; multi-link regular files are refused unless explicitly allowed (baseline capture)."""
   _ancestors(root, path, owner)
   named = path.lstat()
   if (not stat.S_ISREG(named.st_mode) or named.st_uid != owner or named.st_mode & 0o022 or
-      named.st_nlink != 1 or not (0 if allow_empty else 1) <= named.st_size <= MAX_FILE):
+      (named.st_nlink != 1 and not allow_hardlinks) or not (0 if allow_empty else 1) <= named.st_size <= MAX_FILE):
     raise ValueError("Bounded owned regular driver bytes required")
   fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
   try:
@@ -65,7 +66,9 @@ def _file(root, path, owner, *, allow_empty=False):
       digest.update(raw)
     if count != opened.st_size or _identity(os.fstat(fd)) != _identity(opened) or _identity(path.lstat()) != _identity(opened):
       raise ValueError("Short or changed driver read")
-    return {"size": count, "sha256": digest.hexdigest()}
+    value = {"size": count, "sha256": digest.hexdigest()}
+    if allow_hardlinks: value["nlink"] = opened.st_nlink
+    return value
   finally: os.close(fd)
 
 
@@ -117,9 +120,9 @@ def _firmware_target(root, path, owner):
   raise ValueError("Firmware link chain exceeds bound")
 
 
-def _firmware(root, path, owner):
+def _firmware(root, path, owner, allow_hardlinks=False):
   target, links = _firmware_target(root, path, owner)
-  value = _file(root, target, owner)
+  value = _file(root, target, owner, allow_hardlinks=allow_hardlinks)
   for link, identity, text in links:
     if _identity(link.lstat()) != identity or os.readlink(link) != text:
       raise ValueError("Firmware link changed during read")
@@ -129,8 +132,7 @@ def _firmware(root, path, owner):
           **value}
 
 
-def capture(root, kernel_release, query=None):
-  """Return deterministic partial bytes/selection inventory, never a safety verdict."""
+def _prepare(root, kernel_release, query):
   root = Path(root)
   if not root.is_absolute() or root.resolve() != root or not root.is_dir():
     raise ValueError("Canonical explicit inventory root required")
@@ -149,43 +151,102 @@ def capture(root, kernel_release, query=None):
     raise ValueError("Exact /lib to usr/lib alias required")
   for directory in (root / "usr/lib/modules" / kernel_release, root / "usr/lib/firmware/brcm"):
     _ancestors(root, directory / "member", owner)
-  query = _query if query is None else query
-  modules, total = {}, 0
+  return root, owner, alias, info, (_query if query is None else query)
+
+
+def _modules(root, kernel_release, owner, query, total, hardlinks):
+  modules = {}
   for name in MODULES:
     selected = query(("/usr/bin/modinfo", "-b", str(root), "-k", kernel_release, "-n", name))
     path = _selected(root, kernel_release, name, selected)
-    value = _file(root, path, owner)
+    value = _file(root, path, owner, allow_hardlinks=hardlinks)
     source = query(("/usr/bin/modinfo", "-F", "srcversion", str(path)))
     vermagic = query(("/usr/bin/modinfo", "-F", "vermagic", str(path)))
     if not re.fullmatch(r"[0-9A-Fa-f]{8,64}", source) or len(vermagic) > 4096 or "\n" in vermagic or not vermagic.split() or vermagic.split()[0] != kernel_release:
       raise ValueError("Selected module source/ABI differs")
     if (query(("/usr/bin/modinfo", "-b", str(root), "-k", kernel_release, "-n", name)) != selected or
-        _file(root, path, owner) != value):
+        _file(root, path, owner, allow_hardlinks=hardlinks) != value):
       raise ValueError("Selected module changed during metadata query")
     modules[name] = {"selected": "/" + path.relative_to(root).as_posix(), "srcversion": source,
                      "vermagic": vermagic, **value}
     total += value["size"]
     if total > MAX_TOTAL: raise ValueError("Root-side driver inventory exceeds total bound")
+  return modules, total
+
+
+def _firmware_set(root, owner, total, hardlinks):
   directory = root / "usr/lib/firmware/brcm"
   names = sorted(entry.name for entry in directory.iterdir() if entry.name.startswith("brcmfmac4377b3-"))
   if len(names) > MAX_FIRMWARE or not set(FORMOSA + suffix for suffix in SUFFIXES).issubset(names):
     raise ValueError("Complete required Formosa firmware set required")
   firmware = {}
   for name in names:
-    firmware[name] = _firmware(root, directory / name, owner)
+    firmware[name] = _firmware(root, directory / name, owner, hardlinks)
     total += firmware[name]["size"]
     if total > MAX_TOTAL: raise ValueError("Root-side driver inventory exceeds total bound")
   if sorted(entry.name for entry in directory.iterdir() if entry.name.startswith("brcmfmac4377b3-")) != names:
     raise ValueError("Firmware name set changed during capture")
+  return firmware, directory, total
+
+
+def _recheck_modules(root, kernel_release, owner, query, modules, hardlinks):
   for name, recorded in modules.items():
     selected = query(("/usr/bin/modinfo", "-b", str(root), "-k", kernel_release, "-n", name))
     path = _selected(root, kernel_release, name, selected)
-    if "/" + path.relative_to(root).as_posix() != recorded["selected"] or _file(root, path, owner) != {key: recorded[key] for key in ("size", "sha256")}:
+    keys = ("size", "sha256", "nlink") if hardlinks else ("size", "sha256")
+    if "/" + path.relative_to(root).as_posix() != recorded["selected"] or _file(root, path, owner, allow_hardlinks=hardlinks) != {key: recorded[key] for key in keys}:
       raise ValueError("Module selection or bytes changed across inventory")
+
+
+def _recheck_firmware(directory, owner, root, firmware, hardlinks):
   for name, recorded in firmware.items():
-    if _firmware(root, directory / name, owner) != recorded:
+    if _firmware(root, directory / name, owner, hardlinks) != recorded:
       raise ValueError("Firmware selection or bytes changed across inventory")
+
+
+def _alias_stable(alias, info):
   if os.readlink(alias) != "usr/lib" or alias.lstat().st_ino != info.st_ino:
     raise ValueError("/lib alias changed during capture")
+
+
+def capture(root, kernel_release, query=None):
+  """Return deterministic partial bytes/selection inventory, never a safety verdict."""
+  root, owner, alias, info, query = _prepare(root, kernel_release, query)
+  modules, total = _modules(root, kernel_release, owner, query, 0, False)
+  firmware, directory, total = _firmware_set(root, owner, total, False)
+  _recheck_modules(root, kernel_release, owner, query, modules, False)
+  _recheck_firmware(directory, owner, root, firmware, False)
+  _alias_stable(alias, info)
   return {"protocol": "omarchy-t2-root-driver-inventory-v1", "kernel_release": kernel_release,
           "lib_alias": "usr/lib", "modules": modules, "firmware": firmware}
+
+
+def capture_baseline(root, kernel_release, query=None):
+  """Baseline capture: modules and firmware fail independently and multi-link files are accepted.
+
+  Same ownership, mode, regular-file, size, O_NOFOLLOW and stable-read rules as
+  capture(), but a regular file may have several links (real Broadcom firmware
+  is hardlinked) and its link count is recorded. Returns
+  {"kernel_release", "modules", "firmware", "errors"}: a part that failed is
+  None with its reason in errors, so one never discards the other. Preconditions
+  (root, release, /lib alias) still raise.
+  """
+  root, owner, alias, info, query = _prepare(root, kernel_release, query)
+  result = {"kernel_release": kernel_release, "modules": None, "firmware": None, "errors": {}}
+  total = 0
+  try:
+    modules, total = _modules(root, kernel_release, owner, query, 0, True)
+    _recheck_modules(root, kernel_release, owner, query, modules, True)
+    _alias_stable(alias, info)
+    result["modules"] = modules
+  except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+    result["errors"]["modules"] = type(error).__name__ + ": " + str(error)[:200]
+    total = 0
+  try:
+    firmware, directory, _ = _firmware_set(root, owner, total, True)
+    _recheck_firmware(directory, owner, root, firmware, True)
+    _alias_stable(alias, info)
+    result["firmware"] = firmware
+  except (OSError, ValueError, KeyError) as error:
+    result["errors"]["firmware"] = type(error).__name__ + ": " + str(error)[:200]
+  return result

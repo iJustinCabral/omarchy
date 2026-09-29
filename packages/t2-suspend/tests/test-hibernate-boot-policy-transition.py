@@ -687,6 +687,29 @@ class NativeMaintenance(unittest.TestCase):
       (archive / T.BASELINE_NAME).unlink()
       self.assertEqual(T.G._maintenance(self.root)["resume"], RESUME)
 
+  def test_stock_identity_is_computed_before_the_first_write(self):
+    order = []
+    real_identity, original = T.stock_identity, T._new
+    def identity(raw):
+      order.append("stock_identity")
+      return real_identity(raw)
+    def record(path, raw, mode=0o600):
+      order.append(path.name)
+      return original(path, raw, mode)
+    with patch.object(T, "stock_identity", side_effect=identity), patch.object(T, "_new", side_effect=record):
+      T._transition(self.root, "maintenance", precheck=self.fixture.check, guard=lambda: None, maintenance_gate=self.gate,
+                    maintenance_resume=lambda: dict(RESUME), maintenance_baseline=self.baseline)
+    self.assertEqual(order.count("stock_identity"), 1)
+    self.assertEqual(order.index("stock_identity"), 0)  # ahead of the deactivation pending and every archive write
+
+  def test_unusable_stock_projection_fails_before_any_write(self):
+    before = self.tree()
+    with patch.object(T, "stock_identity", side_effect=ValueError("no stock projection")):
+      with self.assertRaisesRegex(ValueError, "no stock projection"):
+        T._transition(self.root, "maintenance", precheck=self.fixture.check, guard=lambda: None, maintenance_gate=self.gate,
+                      maintenance_resume=lambda: dict(RESUME), maintenance_baseline=self.baseline)
+    self.assertEqual(self.tree(), before)
+
   def test_baseline_write_crash_leaves_no_marker_and_keeps_the_old_pending_veto(self):
     original = T._new
     def fault(path, *args, **kwargs):

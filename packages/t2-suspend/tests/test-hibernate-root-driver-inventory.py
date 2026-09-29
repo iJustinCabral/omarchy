@@ -60,6 +60,44 @@ class RootDrivers(unittest.TestCase):
     self.assertEqual(first["modules"]["t2bce_core"]["srcversion"], second["modules"]["t2bce_core"]["srcversion"])
     self.assertNotEqual(first["modules"]["t2bce_core"]["sha256"], second["modules"]["t2bce_core"]["sha256"])
 
+  def hardlink_firmware(self):
+    for suffix in (".bin", "-SPPR-m.txt"):
+      os.link(self.firmware / (I.FORMOSA + suffix), self.firmware / ("brcmfmac4377b3-pcie.apple,fiji" + suffix))
+
+  def test_default_capture_still_refuses_multi_link_firmware_and_modules(self):
+    self.hardlink_firmware()
+    with self.assertRaisesRegex(ValueError, "Bounded owned regular"): self.capture()
+    os.link(self.modules / "brcmfmac.ko.zst", self.root / "usr/lib/brcmfmac-extra")
+    with self.assertRaisesRegex(ValueError, "Bounded owned regular"): self.capture()
+
+  def test_baseline_accepts_hardlinks_records_nlink_and_matches_default_bytes(self):
+    plain = self.capture()
+    result = I.capture_baseline(self.root, self.release, query=self.query)
+    self.assertEqual(result["errors"], {})
+    self.assertEqual({name: {k: v for k, v in node.items() if k != "nlink"} for name, node in result["firmware"].items()}, plain["firmware"])
+    self.assertEqual({node["nlink"] for node in result["firmware"].values()}, {1})
+    self.hardlink_firmware()
+    result = I.capture_baseline(self.root, self.release, query=self.query)
+    self.assertEqual(result["errors"], {})
+    self.assertEqual(result["firmware"][I.FORMOSA + ".bin"]["nlink"], 2)
+    self.assertEqual(result["firmware"]["brcmfmac4377b3-pcie.apple,fiji.bin"]["nlink"], 2)
+    self.assertEqual(result["firmware"][I.FORMOSA + ".clm_blob"]["nlink"], 1)
+    self.assertEqual(set(result["modules"]), set(I.MODULES))
+    self.assertEqual(result["firmware"], I.capture_baseline(self.root, self.release, query=self.query)["firmware"])
+
+  def test_baseline_still_refuses_unsafe_files_and_records_partial_failures(self):
+    (self.firmware / (I.FORMOSA + ".bin")).chmod(0o666)
+    result = I.capture_baseline(self.root, self.release, query=self.query)
+    self.assertIsNone(result["firmware"])
+    self.assertIn("Bounded owned regular", result["errors"]["firmware"])
+    self.assertEqual(set(result["modules"]), set(I.MODULES))  # a firmware failure never discards the modules
+    (self.firmware / (I.FORMOSA + ".bin")).chmod(0o644)
+    (self.modules / "t2bce_core.ko.zst").chmod(0o666)
+    result = I.capture_baseline(self.root, self.release, query=self.query)
+    self.assertIsNone(result["modules"])
+    self.assertIn("Bounded owned regular", result["errors"]["modules"])
+    self.assertEqual(len(result["firmware"]), 5)  # and vice versa
+
   def test_selector_path_change_and_wrong_abi(self):
     first = self.capture()
     alternate = self.root / "usr/lib/modules" / self.release / "extra/brcmfmac.ko.zst"
