@@ -25,9 +25,11 @@ Pacman already owns db.lck during a hook, so that lock is never required absent.
 Every unknown, partial, foreign or contended condition raises and blocks.
 
 Under the same lock the reviewed image_state.require_no_image proves that the
-qualified resume page holds no hibernation image; its resume target comes from
-the authenticated product config and derived artifact report (the same source the
-native publisher uses), never from arguments or the environment.
+pinned resume page holds no hibernation image. Its resume target is the exact
+tuple the native publisher archived in maintenance-resume.json, validated by the
+inactive validator; no qualified artifact derivation happens here, so an update
+that rewrites the kernel/UKI never blocks later transactions. A stale swap
+location fails closed via image_state's live /sys and btrfs topology checks.
 
 Installation prerequisite and scope: this guard is meaningful only in a runtime
 generation whose sleep_entry.py and product.py reject the maintenance marker.
@@ -66,6 +68,9 @@ RUNTIME = STATE / "runtime"
 REVIEW = STATE / "runtime-deployment-review.json"
 SCRIPT = Path("/") / RUNTIME / "packages/t2-suspend/hibernate/update_guard.py"
 MAX_REVIEW = 2 * 1024 * 1024
+RESUME_NAME = "maintenance-resume.json"
+RESUME_SCHEMA = "omarchy-t2-package-maintenance-resume-v1"
+PAGE = 4096
 
 
 def _stock(raw):
@@ -153,6 +158,31 @@ def check_inactive_maintenance(root):
   return _maintenance(root)
 
 
+def _resume_target(resume):
+  """Exact qualified resume shape, identical to image_state.require_no_image's."""
+  if (type(resume) is not dict or set(resume) != {"device", "devnum", "offset"} or resume["device"] != "/dev/mapper/root" or
+      type(resume["devnum"]) is not str or not re.fullmatch(r"[0-9]+:[0-9]+", resume["devnum"]) or
+      type(resume["offset"]) is not int or not 0 < resume["offset"] <= (2**63 - 1 - PAGE) // PAGE):
+    raise ValueError("Exact qualified resume target required")
+  return {"device": resume["device"], "devnum": resume["devnum"], "offset": resume["offset"]}
+
+
+def _resume_document(identifier, resume, intent):
+  """Canonical archived resume evidence, bound to the maintenance intent's pinned chain.
+
+  The audited resume tuple is pinned at publish time because the guard must not
+  re-derive qualified artifacts: an OS/kernel update rewrites the production UKI,
+  so derivation would block every later transaction. The live topology check in
+  image_state still fails closed if the swap location has since moved.
+  No pre-fix markers exist in the field (the installed runtime predates all of
+  this), so a marker lacking this document is simply refused; there is no migration.
+  """
+  document = {"protocol": RESUME_SCHEMA, "transition_id": identifier, "resume": _resume_target(resume)}
+  for name in ("old_policy_sha256", "staged_receipt_sha256", "deactivation_completion_sha256"):
+    document[name] = intent[name]
+  return json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+
+
 def _load(name, path, expected=None):
   """Execute exactly the bytes read (never a cached .pyc or a re-opened path).
 
@@ -206,7 +236,7 @@ def _maintenance(root, inventory=None):
         raise ValueError("Owned private maintenance evidence directories required")
   private_directories()
   paths = (transition.MAINTENANCE, archive / "maintenance-intent.json", archive / "policy.json",
-           archive / "intent.json", archive / "completion.json", policy.RECEIPT, policy.BACKUP)
+           archive / "intent.json", archive / "completion.json", policy.RECEIPT, policy.BACKUP, archive / RESUME_NAME)
   evidence = {path: transition._read(root, path) for path in paths}
   if evidence[transition.MAINTENANCE] != raw or evidence[archive / "maintenance-intent.json"] != raw:
     raise ValueError("Maintenance marker/archive bytes differ")
@@ -229,6 +259,11 @@ def _maintenance(root, inventory=None):
   if (completion != transition._encoded(expected_completion) or policy.digest(completion) != intent["deactivation_completion_sha256"] or
       intent["fallback_limine_sha256"] != old["before_limine_sha256"]):
     raise ValueError("Exact completed stock deactivation chain required")
+  resume_raw = evidence[archive / RESUME_NAME]
+  resume_doc = policy._json(resume_raw)
+  if type(resume_doc) is not dict or _resume_document(identifier, resume_doc.get("resume"), intent) != resume_raw:
+    raise ValueError("Exact archived resume target evidence required")
+  resume = _resume_target(resume_doc["resume"])
   opt_in = transition._read(root, archive / "opt-in", private=False)
   if opt_in != b"" or stat.S_IMODE((root / archive / "opt-in").lstat().st_mode) != 0o644:
     raise ValueError("Historical routine opt-in differs")
@@ -248,7 +283,7 @@ def _maintenance(root, inventory=None):
     if relative != transition.MAINTENANCE and transition._present(root / relative):
       raise ValueError("Source state appeared during maintenance verification")
   return {"classification": "fixture-inactive-maintenance-verified", "transition_id": identifier,
-    "maintenance_intent_sha256": policy.digest(raw), "fallback": fallback,
+    "maintenance_intent_sha256": policy.digest(raw), "fallback": fallback, "resume": resume,
     "qualification_issued": False, "reactivation_evaluated": False}
 
 
@@ -337,21 +372,22 @@ def _physical(root, owner):
     raise
 
 
-def _live_image(root, inventory):
-  """Prove the qualified resume page holds no image, from authenticated evidence only."""
+def _live_image(root, inventory, resume, **fixture):
+  """Prove the pinned resume page holds no image; no qualified artifact is consulted.
+
+  `resume` is the tuple `_maintenance` authenticated from the archived publish-time
+  evidence. `fixture` (query, fixture_identity) is honored only by image_state for
+  synthetic roots; `inventory` None means a synthetic fixture runtime.
+  """
   base = "packages/t2-suspend/hibernate/"
-  directory = root / RUNTIME / base
-  product = _load("guard_reviewed_product", directory / "product.py", inventory[base + "product.py"])
-  image_state = _load("guard_reviewed_image_state", directory / "image_state.py", inventory[base + "image_state.py"])
-  config = product.TRIAL._private_json(root / STATE / "config.json")
-  report = product.ARTIFACTS.derive_artifacts(config["source_directory"], config["restore_directory"], config["production_uki"])
-  return image_state.require_no_image(root, report["audited_details"]["restore_protocol"]["resume"])
+  image_state = _load("guard_reviewed_image_state", root / RUNTIME / base / "image_state.py", None if inventory is None else inventory[base + "image_state.py"])
+  return image_state.require_no_image(root, resume, **fixture)
 
 
 def _admit(root, owner, isolated, script, *, image=None):
   """Authenticate, hold the physical lock, validate the chain and image absence, admit.
 
-  Never mutates. `image` is a synthetic-root test seam, callable(root, inventory):
+  Never mutates. `image` is a synthetic-root test seam, callable(root, inventory, resume):
   forbidden for the live root, required for any other root.
   """
   root = Path(root)
@@ -363,7 +399,7 @@ def _admit(root, owner, isolated, script, *, image=None):
     fd, identity = _physical(root, owner)
     try:
       result = _maintenance(root, inventory if image is None else None)  # synthetic fixture runtimes carry no full inventory
-      checked = _live_image(root, inventory) if image is None else image(root, inventory)
+      checked = _live_image(root, inventory, result["resume"]) if image is None else image(root, None, result["resume"])
       if type(checked) is not dict or checked.get("classification") != "no-image-at-qualified-resume-page":
         raise ValueError("Verified absence of a saved hibernation image required")
       current = (root / PHYSICAL_LOCK).lstat()

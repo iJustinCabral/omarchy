@@ -266,7 +266,8 @@ def _exclusion(action, *, ongoing_power=False):
     os.close(fd)
 
 
-def _precheck(engine, action, phase):
+def _precheck(engine, action, phase, capture=None):
+  """`capture`, when given, records the audited resume tuple at "before" and requires the same at "after"."""
   product = engine.PRODUCT
   for directory in (STATE, STATE / "ledger", STATE / "archives"):
     info = directory.lstat()
@@ -277,9 +278,13 @@ def _precheck(engine, action, phase):
   report = product.ARTIFACTS.derive_artifacts(config["source_directory"], config["restore_directory"], config["production_uki"])
   ledger = product.TX.Ledger(STATE / "ledger")
   arguments = {"ledger": ledger, "archive_directory": STATE / "archives", "root": ROOT}
+  resume = report["audited_details"]["restore_protocol"]["resume"]
+  if capture is not None:
+    if phase == "before": capture["resume"] = json.loads(json.dumps(resume))
+    elif capture.get("resume") != resume: raise ValueError("Audited resume target changed during the transition")
   if phase == "before":
     result = product.check(config, qualification, report, **arguments)
-    engine.IMAGE_STATE.require_no_image(ROOT, report["audited_details"]["restore_protocol"]["resume"])
+    engine.IMAGE_STATE.require_no_image(ROOT, resume)
     return result
   # Only this internal postcheck crosses our own pending admission veto. The
   # exact approved byte transition is verified separately by the engine; reuse
@@ -290,7 +295,7 @@ def _precheck(engine, action, phase):
     raise ValueError("Post-transition policy state differs from action")
   product.TRIAL._verify_deployment(ROOT, config, report, source_default=source_default)
   result = product._admission_state(config, receipt, report, **arguments)
-  engine.IMAGE_STATE.require_no_image(ROOT, report["audited_details"]["restore_protocol"]["resume"])
+  engine.IMAGE_STATE.require_no_image(ROOT, resume)
   return result
 
 
@@ -412,8 +417,15 @@ def _maintenance_vetoes(engine):
     refuses(lambda: engine._transition(root, "activation", precheck=refuse, guard=lambda: None), "maintenance intent")
 
 
-def _maintenance_gate(engine, root, phase):
-  """Fixed read-only prerequisites, before any write and again before pending retirement."""
+def _maintenance_gate(engine, root, phase, pinned=None):
+  """Fixed read-only prerequisites, before any write and again before pending retirement.
+
+  "final" (publisher, marker just written) re-derives the audited resume tuple and
+  requires it to equal the `pinned` one just archived. "retained" (re-entry) reads
+  the archived tuple from authenticated evidence and NEVER derives artifacts: a
+  kernel/UKI update legitimately invalidates the qualified audit while the
+  inactive maintenance state stays valid.
+  """
   if root != ROOT or phase not in engine.GATE_PHASES: raise ValueError("Fixed live root and known gate phase required")
   _hibernate_route()
   _maintenance_vetoes(engine)
@@ -422,8 +434,12 @@ def _maintenance_gate(engine, root, phase):
     engine.verify_fallback(ROOT, engine._read(ROOT, engine.P.BACKUP))
   else:
     engine.verify_fallback(ROOT)
-  if phase in ("final", "retained"):
-    engine.IMAGE_STATE.require_no_image(ROOT, _resume(engine))
+  if phase == "final":
+    resume = _resume(engine)
+    if pinned is not None and resume != pinned.get("resume"): raise ValueError("Audited resume target differs from the archived evidence")
+    engine.IMAGE_STATE.require_no_image(ROOT, resume)
+  elif phase == "retained":
+    engine.IMAGE_STATE.require_no_image(ROOT, engine._pinned_resume(ROOT))
 
 
 def native(action):
@@ -437,13 +453,15 @@ def native(action):
     raise RuntimeError("Inhibitor exec unexpectedly returned")
   with _exclusion(action) as guard:
     if action == "maintenance":
-      gate = lambda root, phase: _maintenance_gate(engine, root, phase)
+      capture = {}
+      gate = lambda root, phase: _maintenance_gate(engine, root, phase, capture)
       if engine._present(ROOT / engine.MAINTENANCE):
         # Idempotent re-entry reuses the guard's exact inactive validator, never rewrites.
         result = engine._verify_existing_maintenance(ROOT, guard=guard, gate=gate, native=engine._NATIVE_MAINTENANCE)
       else:
-        result = engine._transition(ROOT, action, precheck=lambda root, requested, phase: _precheck(engine, requested, phase),
-                                    guard=guard, maintenance_gate=gate, native=engine._NATIVE_MAINTENANCE)
+        result = engine._transition(ROOT, action, precheck=lambda root, requested, phase: _precheck(engine, requested, phase, capture),
+                                    guard=guard, maintenance_gate=gate, native=engine._NATIVE_MAINTENANCE,
+                                    maintenance_resume=lambda: capture["resume"])
       return {**result, "live_execution": True, "power_operation": False}
     # The only live callback is this fixed adapter's own read-only verifier.
     result = engine._transition(ROOT, action, precheck=lambda root, requested, phase: _precheck(engine, requested, phase), guard=guard)

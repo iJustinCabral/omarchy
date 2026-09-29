@@ -321,6 +321,25 @@ class Native(unittest.TestCase):
       with self.assertRaises(ValueError): N._precheck(engine, "deactivation", "after")
       self.assertEqual(image_state.require_no_image.call_count, 2)
 
+  def test_precheck_captures_audited_resume_and_requires_it_unchanged(self):
+    resume = {"device": "/dev/mapper/root", "devnum": "253:0", "offset": 1923214}
+    def run(phase, capture, current=resume):
+      product = Mock()
+      product.TRIAL._private_json.side_effect = lambda path: {
+        "source_directory": "/source", "restore_directory": "/restore", "production_uki": "/production",
+        "staged_receipt_sha256": "a" * 64} if path.name == "config.json" else {"approved": True}
+      product.ARTIFACTS.derive_artifacts.return_value = {"audited_details": {"restore_protocol": {"resume": current}}}
+      product.BOOT_POLICY.verify.return_value = False
+      with patch.object(Path, "lstat", return_value=SimpleNamespace(st_mode=0o40700, st_uid=0)):
+        return N._precheck(SimpleNamespace(PRODUCT=product, IMAGE_STATE=Mock()), "deactivation", phase, capture)
+    capture = {}
+    run("before", capture)
+    self.assertEqual(capture["resume"], resume)
+    self.assertIsNot(capture["resume"], resume)  # a private copy
+    run("after", capture)
+    with self.assertRaisesRegex(ValueError, "resume target changed"): run("after", capture, {**resume, "offset": 5})
+    with self.assertRaisesRegex(ValueError, "resume target changed"): run("after", {})
+
   def test_no_image_required_after_admission_for_both_actions_and_phases(self):
     resume = {"device": "/dev/mapper/root", "devnum": "253:0", "offset": 1923214}
     report = {"audited_details": {"restore_protocol": {"resume": resume}}}
@@ -564,18 +583,24 @@ class Maintenance(unittest.TestCase):
     fixture.run_action()
     events = []
     resume = {"device": "/dev/mapper/root", "devnum": "253:0", "offset": 1}
+    pinned = {"device": "/dev/mapper/root", "devnum": "253:0", "offset": 2}  # archived evidence, deliberately not what a fresh audit yields
+    engine._pinned_resume = lambda root: pinned
     engine.IMAGE_STATE.require_no_image.side_effect = lambda root, value: events.append(("image", value))
     engine.verify_fallback = lambda root, raw=None: events.append(("fallback", raw is not None))
     with patch.object(N, "ROOT", fixture.root), patch.object(N, "_hibernate_route", side_effect=lambda: events.append("route")), \
-         patch.object(N, "_maintenance_vetoes", side_effect=lambda engine: events.append("vetoes")), patch.object(N, "_resume", return_value=resume):
+         patch.object(N, "_maintenance_vetoes", side_effect=lambda engine: events.append("vetoes")), patch.object(N, "_resume", side_effect=lambda engine: events.append("derive") or resume):
       expected = {"before": ["route", "vetoes", ("fallback", True)], "after": ["route", "vetoes", ("fallback", False)],
-                  "final": ["route", "vetoes", ("fallback", False), ("image", resume)],
-                  "retained": ["route", "vetoes", ("fallback", False), ("image", resume)]}
+                  "final": ["route", "vetoes", ("fallback", False), "derive", ("image", resume)],
+                  "retained": ["route", "vetoes", ("fallback", False), ("image", pinned)]}  # retained never derives artifacts
       for phase, sequence in expected.items():
         events.clear()
         with self.subTest(phase=phase):
           N._maintenance_gate(engine, fixture.root, phase)
           self.assertEqual(events, sequence)
+      events.clear()
+      N._maintenance_gate(engine, fixture.root, "final", {"resume": resume})  # publisher: fresh audit equals the archived tuple
+      with self.assertRaisesRegex(ValueError, "archived evidence"): N._maintenance_gate(engine, fixture.root, "final", {"resume": pinned})
+      with self.assertRaisesRegex(ValueError, "archived evidence"): N._maintenance_gate(engine, fixture.root, "final", {})
       with self.assertRaises(ValueError): N._maintenance_gate(engine, fixture.root, "unknown")
       with self.assertRaises(ValueError): N._maintenance_gate(engine, fixture.root.parent, "before")
       # Each prerequisite failure propagates; the image check cannot be skipped by a later phase.
@@ -598,7 +623,8 @@ class Maintenance(unittest.TestCase):
     engine._transition.return_value = {"qualification_issued": False, "live_execution": False}
     engine._verify_existing_maintenance.return_value = {"already_inactive": True, "qualification_issued": False}
     with patch.object(N, "_installed", return_value=engine), patch.object(Path, "readlink", return_value=Path("/usr/bin/systemd-inhibit")), \
-         patch.object(N, "_exclusion", side_effect=exclusion), patch.object(N, "_precheck") as precheck, patch.object(N, "_maintenance_gate") as gate:
+         patch.object(N, "_exclusion", side_effect=exclusion), patch.object(N, "_maintenance_gate") as gate:
+      precheck = None  # tests patch N._precheck themselves when they need it
       result = N.native("maintenance")
       callbacks(engine)
     return engine, precheck, gate, result
@@ -608,14 +634,21 @@ class Maintenance(unittest.TestCase):
       arguments = engine._transition.call_args
       arguments.kwargs["precheck"](Path("/"), "deactivation", "before")
       arguments.kwargs["maintenance_gate"](Path("/"), "final")
-    engine, precheck, gate, result = self.dispatch(False, callbacks)
+      self.captured = precheck_capture()
+      self.provider = arguments.kwargs["maintenance_resume"]
+    precheck_capture = lambda: precheck_mock.call_args.args[3]
+    def record(*args):  # stand in for _precheck: it stores the audited tuple in the shared capture
+      args[3]["resume"] = {"device": "/dev/mapper/root", "devnum": "253:0", "offset": 9}
+    with patch.object(N, "_precheck", side_effect=record) as precheck_mock:
+      engine, precheck, gate, result = self.dispatch(False, callbacks)
+    self.assertEqual(self.provider(), {"device": "/dev/mapper/root", "devnum": "253:0", "offset": 9})  # archived tuple = audited tuple
     arguments = engine._transition.call_args
     self.assertEqual(arguments.args, (Path("/"), "maintenance"))
     self.assertIs(arguments.kwargs["native"], engine._NATIVE_MAINTENANCE)
     self.assertNotIn("recover", arguments.kwargs)
     self.assertNotIn("maintenance_continuation", arguments.kwargs)
-    precheck.assert_called_once_with(engine, "deactivation", "before")
-    gate.assert_called_once_with(engine, Path("/"), "final")
+    precheck_mock.assert_called_once_with(engine, "deactivation", "before", self.captured)
+    gate.assert_called_once_with(engine, Path("/"), "final", self.captured)
     engine._verify_existing_maintenance.assert_not_called()
     self.assertTrue(result["live_execution"])
     self.assertFalse(result["power_operation"])
@@ -627,7 +660,8 @@ class Maintenance(unittest.TestCase):
     arguments = engine._verify_existing_maintenance.call_args
     self.assertEqual(arguments.args, (Path("/"),))
     self.assertIs(arguments.kwargs["native"], engine._NATIVE_MAINTENANCE)
-    gate.assert_called_once_with(engine, Path("/"), "retained")
+    self.assertEqual(gate.call_args.args[:3], (engine, Path("/"), "retained"))
+    gate.assert_called_once()
     self.assertTrue(result["already_inactive"])
     self.assertTrue(result["live_execution"])
 

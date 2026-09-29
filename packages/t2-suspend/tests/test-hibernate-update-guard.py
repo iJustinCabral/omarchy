@@ -1,9 +1,12 @@
 """Offline update admission fixtures; never run pacman, power or boot tools."""
 import configparser
+import contextlib
 import fcntl
 import importlib.util
 import importlib._bootstrap_external
 import shutil
+import stat
+import subprocess
 import sys
 import hashlib
 import json
@@ -325,7 +328,11 @@ class NativeAdmission(unittest.TestCase):
     original = self.T.D.inventory
     def inventory(source):
       # The reviewed runtime must carry the pinned stdlib verifier the guard loads first.
-      (Path(source) / self.T.D.TREES[0] / "runtime_deployment.py").write_bytes((HERE / "hibernate/runtime_deployment.py").read_bytes())
+      for name in ("runtime_deployment.py", "image_state.py"):  # the guard also loads the reviewed image_state
+        (Path(source) / self.T.D.TREES[0] / name).write_bytes((HERE / "hibernate" / name).read_bytes())
+      parser = Path(source) / self.T.D.TREES[1] / "audit-hibernation-swap-header.py"  # image_state's reviewed header parser
+      parser.parent.mkdir(parents=True, exist_ok=True)
+      parser.write_bytes((HERE / "experiments/audit-hibernation-swap-header.py").read_bytes())
       return original(source)
     self.fixture = self.fixture_module.Transitions("test_activation_then_exact_fallback_preserves_all_authority_and_evidence")
     with patch.object(self.T.D, "inventory", inventory): self.fixture.setUp()
@@ -345,7 +352,7 @@ class NativeAdmission(unittest.TestCase):
     self.f.write("sys/power/resume_offset", (str(self.offset) + "\n").encode())
     self.device = self.root / "dev/dm-0"
     self.set_page(self.clean_page())
-    self.calls = []
+    self.calls, self.resumes = [], []
 
   def clean_page(self):
     page = bytearray(4096)
@@ -363,14 +370,15 @@ class NativeAdmission(unittest.TestCase):
     if argv[0] == "/usr/bin/btrfs": return str(self.offset)
     return "/dev/mapper/root[/@swap] btrfs"
 
-  def image(self, root, inventory):
+  def image(self, root, inventory, resume):
     self.calls.append("image")
+    self.resumes.append(resume)
     held = os.open(root / self.T.PHYSICAL_LOCK, os.O_RDONLY)
     try:
       with self.assertRaises(BlockingIOError): fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)  # checked under our lock
     finally: os.close(held)
-    resume = {"device": "/dev/mapper/root", "devnum": self.devnum, "offset": self.offset}
-    return self.image_state.require_no_image(root, resume, query=self.query, fixture_identity=lambda fd: (254, 0))
+    # The real guard code path: reviewed image_state loaded from the runtime, pinned tuple from evidence.
+    return guard._live_image(root, inventory, resume, query=self.query, fixture_identity=lambda fd: (254, 0))
 
   def admit(self, **overrides):
     arguments = {"root": self.root, "owner": os.geteuid(), "isolated": True, "script": self.script, "image": self.image}
@@ -394,8 +402,8 @@ class NativeAdmission(unittest.TestCase):
     with self.assertRaises(OSError): self.admit()
 
   def test_image_check_failure_or_bad_result_blocks_and_synthetic_roots_need_a_check(self):
-    with self.assertRaises(ValueError): self.admit(image=lambda root, inventory: {"classification": "unknown"})
-    with self.assertRaises(ValueError): self.admit(image=lambda root, inventory: None)
+    with self.assertRaises(ValueError): self.admit(image=lambda root, inventory, resume: {"classification": "unknown"})
+    with self.assertRaises(ValueError): self.admit(image=lambda root, inventory, resume: None)
     with self.assertRaises(ValueError): guard._admit(self.root, os.geteuid(), True, self.script)  # no seam supplied
     with self.assertRaises(ValueError): guard._admit(Path("/"), 0, True, self.script, image=self.image)  # live root refuses seam
 
@@ -562,6 +570,133 @@ class NativeAdmission(unittest.TestCase):
       with patch.object(guard, "_marker_present", return_value=False), patch.object(guard, "native", side_effect=AssertionError("no native")), patch.object(guard, "check", return_value={}) as check:
         self.assertEqual(guard.main([]), 0)
         check.assert_called_once_with(Path("/"))
+
+  # ---- pinned resume evidence (the guard never derives qualified artifacts) ----
+  def resume_path(self): return self.root / self.T.HISTORY / self.intent["transition_id"] / guard.RESUME_NAME
+
+  def rewrite_resume(self, raw):
+    path = self.resume_path()
+    path.write_bytes(raw)
+    path.chmod(0o600)
+
+  def resume_bytes(self, resume, **overrides):
+    document = json.loads(self.resume_path().read_bytes())
+    document.update(resume=resume, **overrides)
+    return json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+
+  def booby_traps(self):
+    """Any qualified-artifact audit, tool run or product/artifacts load fails the test."""
+    def load(name, path, expected=None):
+      if Path(path).name not in ("package_maintenance.py", "image_state.py"): raise AssertionError("guard loaded unexpected module " + str(path))
+      return original(name, path, expected)
+    original = guard._load
+    trap = AssertionError("guard consulted qualified artifacts or ran a tool")
+    stack = contextlib.ExitStack()
+    stack.enter_context(patch.object(guard, "_load", load))
+    for name in ("run", "Popen", "check_output", "check_call"): stack.enter_context(patch.object(subprocess, name, side_effect=trap))
+    return stack
+
+  def test_publisher_archives_the_exact_resume_tuple_and_guard_admits_it(self):
+    expected = {"device": "/dev/mapper/root", "devnum": self.devnum, "offset": self.offset}
+    self.assertEqual(expected, self.fixture_module.RESUME)
+    raw = self.resume_path().read_bytes()
+    document = json.loads(raw)
+    self.assertEqual(document["resume"], expected)
+    self.assertEqual(raw, guard._resume_document(self.intent["transition_id"], expected, self.intent))
+    self.assertEqual(stat.S_IMODE(self.resume_path().stat().st_mode), 0o600)
+    result = self.admit()
+    self.assertEqual((result["resume"], self.resumes), (expected, [expected]))  # the seam saw the evidence tuple
+
+  def update_kernel(self, image):
+    """Coherent OS update: new production UKI bytes and the stock entry's hash."""
+    path = "boot/EFI/Linux/omarchy_linux-t2.efi"
+    old_hash = hashlib.blake2b((self.root / path).read_bytes()).hexdigest()
+    self.f.write(path, image)
+    config = (self.root / guard.LIMINE).read_bytes().replace(old_hash.encode(), hashlib.blake2b(image).hexdigest().encode())
+    self.f.write(guard.LIMINE, config)
+
+  def test_kernel_update_between_transactions_never_blocks_and_derives_nothing(self):
+    for generation in range(3):
+      image = ("updated synthetic production UKI %d" % generation).encode()
+      self.update_kernel(image)
+      with self.booby_traps():
+        result = self.admit()
+        self.assertEqual(result["classification"], "inactive-maintenance-update-admitted")
+        self.assertEqual(result["fallback"]["production"]["sha256"], hashlib.sha256(image).hexdigest())
+    self.assertEqual(self.marker.read_bytes(), self.raw)
+    self.assertEqual(self.calls, ["image"] * 3)
+
+  def test_missing_or_prefix_marker_without_resume_evidence_is_refused(self):
+    self.resume_path().unlink()  # what a pre-fix publisher produced (no deployed markers exist; no migration)
+    with self.assertRaises(FileNotFoundError): self.admit()
+    self.assertEqual(self.calls, [])
+
+  def test_malformed_resume_evidence_blocks_before_any_image_read(self):
+    good = {"device": "/dev/mapper/root", "devnum": self.devnum, "offset": self.offset}
+    document = json.loads(self.resume_path().read_bytes())
+    encoded = lambda value: json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    cases = [b"", b"{}", b"[]", b"malformed", json.dumps(document).encode(),  # noncanonical spacing
+             encoded({**document, "extra": 1}), encoded({key: value for key, value in document.items() if key != "resume"}),
+             encoded({**document, "transition_id": "00000000-0000-4000-8000-000000000000"}),
+             encoded({**document, "deactivation_completion_sha256": "0" * 64}),
+             encoded({**document, "old_policy_sha256": "0" * 64}), encoded({**document, "staged_receipt_sha256": "0" * 64}),
+             encoded({**document, "protocol": "other"})]
+    for resume in ({}, {"device": good["device"], "devnum": good["devnum"]}, {**good, "extra": 1}, {**good, "device": "/dev/sda1"},
+                   {**good, "devnum": 254}, {**good, "devnum": "254"}, {**good, "devnum": "254:0\n"}, {**good, "devnum": "a:b"},
+                   {**good, "offset": str(self.offset)}, {**good, "offset": True}, {**good, "offset": 0}, {**good, "offset": -7},
+                   {**good, "offset": self.offset + 0.5}, {**good, "offset": 2**63}, None, "254:0", [good]):
+      cases.append(encoded({**document, "resume": resume}))
+    for raw in cases:
+      with self.subTest(raw=raw[:100]):
+        self.rewrite_resume(raw)
+        with self.assertRaises((ValueError, KeyError, TypeError)): self.admit()
+    self.assertEqual(self.calls, [])
+    self.rewrite_resume(encoded(document))
+    self.assertEqual(self.admit()["image"], "no-image-at-qualified-resume-page")
+
+  def test_resume_evidence_metadata_and_symlink_are_private_and_exact(self):
+    path = self.resume_path()
+    path.chmod(0o644)
+    with self.assertRaises(ValueError): self.admit()
+    path.chmod(0o600)
+    saved = path.read_bytes()
+    path.unlink()
+    (path.parent / "elsewhere").write_bytes(saved)
+    path.symlink_to("elsewhere")
+    with self.assertRaises((ValueError, OSError)): self.admit()
+    path.unlink()
+    self.rewrite_resume(saved)
+    self.admit()
+
+  def test_stale_pinned_resume_fails_closed_against_live_topology(self):
+    other = self.resume_bytes({"device": "/dev/mapper/root", "devnum": self.devnum, "offset": self.offset + 1})
+    self.rewrite_resume(other)  # canonical and well-formed, but no longer the active swap location
+    with self.assertRaises(ValueError): self.admit()
+    self.rewrite_resume(self.resume_bytes({"device": "/dev/mapper/root", "devnum": "254:1", "offset": self.offset}))
+    with self.assertRaises(ValueError): self.admit()
+    self.rewrite_resume(self.resume_bytes({"device": "/dev/mapper/root", "devnum": self.devnum, "offset": self.offset}))
+    self.assertEqual(self.admit()["image"], "no-image-at-qualified-resume-page")
+
+  def test_saved_image_at_pinned_page_blocks_after_kernel_update(self):
+    self.update_kernel(b"kernel updated")
+    self.admit()
+    page = bytearray(self.clean_page())
+    page[-10:] = b"S1SUSPEND\0"
+    self.set_page(bytes(page))
+    with self.assertRaises(ValueError): self.admit()
+
+  def test_live_image_loads_only_reviewed_image_state_and_no_product(self):
+    source = (HERE / "hibernate/update_guard.py").read_text()
+    body = source[source.index("def _live_image"):source.index("def _admit")]
+    for forbidden in ("product.py", "derive_artifacts", "config.json", "production_uki", "source_directory"):
+      self.assertNotIn(forbidden, body)
+    seen = []
+    original = guard._load
+    def spy(name, path, expected=None):
+      seen.append(Path(path).name)
+      return original(name, path, expected)
+    with patch.object(guard, "_load", spy): self.admit()
+    self.assertEqual(sorted(set(seen)), ["image_state.py", "package_maintenance.py"])
 
 
 if __name__ == "__main__": unittest.main()

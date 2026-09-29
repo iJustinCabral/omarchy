@@ -285,7 +285,7 @@ def _replace(root, expected, replacement, transition_id, *, guard=lambda: None):
   if _read(root, P.LIMINE, private=False) != replacement: raise ValueError("Configuration replacement readback failed")
 
 
-def transition(root, action, *, precheck, maintenance_continuation=None, guard=None, recover=None):
+def transition(root, action, *, precheck, maintenance_continuation=None, guard=None, recover=None, maintenance_resume=None):
   root = Path(root)
   if not root.is_absolute() or root.resolve() != root or not root.is_dir() or root.resolve() == Path("/"):
     raise ValueError("Fixture-only transition refuses live root and aliases")
@@ -293,7 +293,8 @@ def transition(root, action, *, precheck, maintenance_continuation=None, guard=N
   if guard is not None and not callable(guard): raise ValueError("Explicit fixture exclusion guard required")
   if recover is not None and (action != "maintenance" or not callable(recover)):
     raise ValueError("Explicit fixture maintenance recovery required")
-  return _transition(root, action, precheck=precheck, guard=(lambda: None) if guard is None else guard, maintenance_continuation=maintenance_continuation, recover=recover)
+  return _transition(root, action, precheck=precheck, guard=(lambda: None) if guard is None else guard, maintenance_continuation=maintenance_continuation, recover=recover,
+                     maintenance_resume=maintenance_resume)
 
 
 def _runtime_pending(root, action):
@@ -311,20 +312,30 @@ def _live_maintenance(root, gate, native):
     raise ValueError("Live maintenance entry requires a separately reviewed native coordinator")
 
 
-def _transition(root, action, *, precheck, guard, maintenance_continuation=None, recover=None, maintenance_gate=None, native=None):
+def _transition(root, action, *, precheck, guard, maintenance_continuation=None, recover=None, maintenance_gate=None, native=None, maintenance_resume=None):
   """Internal core; maintenance is a durable veto, not update permission.
 
   maintenance_gate(root, phase) supplies additional read-only prerequisites at
   "before" (before any policy write), "after" (stock fallback restored) and
   "final" (marker durable, deactivation pending still retained). Any failure
   leaves the deactivation pending and, once published, the maintenance marker.
+
+  maintenance_resume() returns the audited qualified {device, devnum, offset}
+  resume target the publisher's no-image proofs used. It is archived (before the
+  archived intent and marker exist) in maintenance-resume.json so the update
+  guard can prove image absence later without re-deriving qualified artifacts,
+  which a kernel/UKI update legitimately invalidates. The live root requires it.
   """
   root = Path(root)
+  if maintenance_resume is not None and (action != "maintenance" or not callable(maintenance_resume)):
+    raise ValueError("Maintenance resume provider is only valid for the maintenance action")
   if maintenance_continuation is not None and (root.resolve() == Path("/") or action != "maintenance" or not callable(maintenance_continuation)):
     raise ValueError("Explicit fixture-only maintenance continuation required")
   if maintenance_gate is not None and (action != "maintenance" or not callable(maintenance_gate)):
     raise ValueError("Maintenance gate is only valid for the maintenance action")
   if action == "maintenance": _live_maintenance(root, maintenance_gate, native)
+  if action == "maintenance" and root.resolve() == Path("/") and maintenance_resume is None:
+    raise ValueError("Live maintenance requires the audited resume target for durable evidence")
   if recover is not None and (root.resolve() == Path("/") or action != "maintenance" or not callable(recover)):
     raise ValueError("Explicit fixture-only retained recovery required")
   if action not in (*PENDINGS, "maintenance"):
@@ -360,6 +371,8 @@ def _transition(root, action, *, precheck, guard, maintenance_continuation=None,
       P.validate(policy, before, actual, receipt_raw)
       after = before
     precheck(root, mechanics, "before")
+    # Validated before any write: a bad tuple must not strand a half-finished deactivation.
+    resume = None if maintenance_resume is None else G._resume_target(maintenance_resume())
     if maintenance_gate is not None: maintenance_gate(root, "before")
     guard()
     transition_id = str(uuid.uuid4())
@@ -428,10 +441,17 @@ def _transition(root, action, *, precheck, guard, maintenance_continuation=None,
     if action == "maintenance":
       if _read(root, (archive / "completion.json").relative_to(root)) != _encoded(completion):
         raise ValueError("Deactivation completion readback differs before maintenance handoff")
-      maintenance_intent = _encoded({"protocol": MAINTENANCE_SCHEMA, "transition_id": transition_id,
+      fields = {"protocol": MAINTENANCE_SCHEMA, "transition_id": transition_id,
         "old_policy_sha256": P.digest(policy_raw), "runtime_review_sha256": runtime_review,
         "staged_receipt_sha256": P.digest(receipt_raw), "fallback_limine_sha256": P.digest(after),
-        "deactivation_completion_sha256": P.digest(_encoded(completion))})
+        "deactivation_completion_sha256": P.digest(_encoded(completion))}
+      maintenance_intent = _encoded(fields)
+      if resume is not None:
+        resume_raw = G._resume_document(transition_id, resume, fields)
+        guard()
+        _new(archive / G.RESUME_NAME, resume_raw)
+        if _read(root, (archive / G.RESUME_NAME).relative_to(root)) != resume_raw:
+          raise ValueError("Archived maintenance resume target readback differs")
       guard()
       _new(archive / "maintenance-intent.json", maintenance_intent)
       if _read(root, (archive / "maintenance-intent.json").relative_to(root)) != maintenance_intent:
@@ -482,6 +502,11 @@ def _transition(root, action, *, precheck, guard, maintenance_continuation=None,
         except BaseException as error:
           raise RuntimeError("Maintenance veto durability unconfirmed") from error
     return result
+
+
+def _pinned_resume(root):
+  """The archived publish-time resume tuple, via the guard's exact validator."""
+  return G._maintenance(Path(root))["resume"]
 
 
 def _verify_existing_maintenance(root, *, guard, gate, native=None):

@@ -17,6 +17,7 @@ def load(name, filename):
   return module
 T = load("transition", HERE / "hibernate/boot_policy_transition.py")
 SLEEP = load("transition_sleep_entry", HERE / "hibernate/sleep_entry.py")
+RESUME = {"device": "/dev/mapper/root", "devnum": "254:0", "offset": 7}
 F = load("policy_fixture", Path(__file__).with_name("test-hibernate-boot-policy.py"))
 
 
@@ -65,7 +66,8 @@ class Transitions(unittest.TestCase):
     F.PRODUCT.TRIAL._verify_deployment(root, self.f.config, self.f.report, source_default=source_default)
 
   def run_action(self, action="activation", check=None):
-    return T.transition(self.root, action, precheck=self.check if check is None else check)
+    extra = {"maintenance_resume": lambda: dict(RESUME)} if action == "maintenance" else {}
+    return T.transition(self.root, action, precheck=self.check if check is None else check, **extra)
 
   def pending(self, action): return self.root / T.PENDINGS[action]
 
@@ -302,8 +304,40 @@ class Transitions(unittest.TestCase):
       self.run_action("maintenance")
     self.assertEqual(events, ["archived", "marker", "retired"])
 
+  def test_resume_tuple_is_archived_exactly_before_intent_and_marker_with_readback(self):
+    self.run_action()
+    order = []
+    original = T._new
+    def publish(path, raw, mode=0o600):
+      if path.name in ("maintenance-resume.json", "maintenance-intent.json", "package-maintenance.pending"): order.append(path.name)
+      return original(path, raw, mode)
+    with patch.object(T, "_new", side_effect=publish):
+      result = self.run_action("maintenance")
+    self.assertEqual(order, ["maintenance-resume.json", "maintenance-intent.json", "package-maintenance.pending"])
+    archive = self.root / T.HISTORY / result["transition_id"]
+    intent = json.loads((self.root / T.MAINTENANCE).read_bytes())
+    raw = (archive / "maintenance-resume.json").read_bytes()
+    self.assertEqual(stat.S_IMODE((archive / "maintenance-resume.json").stat().st_mode), 0o600)
+    self.assertEqual(raw, T.G._resume_document(result["transition_id"], RESUME, intent))
+    self.assertEqual(json.loads(raw)["resume"], RESUME)
+    self.assertEqual(T._pinned_resume(self.root), RESUME)
+    self.assertNotIn("resume", intent)  # the marker's field set is unchanged; the tuple is a separate bound object
+
+  def test_resume_provider_is_validated_and_a_bad_tuple_publishes_nothing(self):
+    self.run_action()
+    before = {str(path.relative_to(self.root)): path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+    for bad in ({}, None, {**RESUME, "offset": "7"}, {**RESUME, "device": "/dev/sda"}, {**RESUME, "extra": 1}):
+      with self.subTest(bad=bad), self.assertRaises(ValueError):
+        T.transition(self.root, "maintenance", precheck=self.check, maintenance_resume=lambda: bad)
+      self.assertEqual(before, {str(path.relative_to(self.root)): path.read_bytes() for path in self.root.rglob("*") if path.is_file()})
+    self.assertEqual(self.pending("deactivation").exists(), False)  # rejected before any pending or policy write
+    with self.assertRaisesRegex(ValueError, "only valid for the maintenance"):
+      T.transition(self.root, "activation", precheck=self.check, maintenance_resume=lambda: dict(RESUME))
+    with self.assertRaisesRegex(ValueError, "only valid for the maintenance"):
+      T.transition(self.root, "maintenance", precheck=self.check, maintenance_resume=RESUME)
+
   def test_maintenance_publication_faults_keep_old_pending_veto(self):
-    for failed_name in ("maintenance-intent.json", "package-maintenance.pending"):
+    for failed_name in ("maintenance-resume.json", "maintenance-intent.json", "package-maintenance.pending"):
       with self.subTest(failed_name=failed_name):
         fixture = Transitions("test_activation_then_exact_fallback_preserves_all_authority_and_evidence")
         fixture.setUp()
@@ -385,7 +419,8 @@ class NativeMaintenance(unittest.TestCase):
   def pending_names(self): return [self.fixture.pending(name).exists() for name in T.PENDINGS]
 
   def run_maintenance(self):
-    return T._transition(self.root, "maintenance", precheck=self.fixture.check, guard=lambda: None, maintenance_gate=self.gate)
+    return T._transition(self.root, "maintenance", precheck=self.fixture.check, guard=lambda: None, maintenance_gate=self.gate,
+                          maintenance_resume=lambda: dict(RESUME))
 
   def tree(self):
     return {str(path.relative_to(self.root)): path.read_bytes() for path in sorted(self.root.rglob("*"))
@@ -554,6 +589,7 @@ class NativeMaintenance(unittest.TestCase):
     updated = self.tree()
     self.assertTrue(self.reenter()["already_inactive"])
     self.assertEqual(self.tree(), updated)
+    self.assertEqual(T._pinned_resume(self.root), RESUME)  # re-entry after the update reads the archived tuple, never a fresh audit
     self.assertFalse((self.root / T.DB_LOCK).exists())
 
   @unittest.skipUnless(REAL, "requires the update guard's exact maintenance validator")
@@ -616,7 +652,8 @@ class NativeMaintenance(unittest.TestCase):
     # is stubbed to stop; nothing on the real host is opened or written.
     with patch.object(T, "_locks", side_effect=RuntimeError("stop at exclusion")), patch.object(T.G, "_ancestors", side_effect=RuntimeError("stop at ancestors")):
       with self.assertRaisesRegex(RuntimeError, "stop at"):
-        T._transition(Path("/"), "maintenance", precheck=lambda *a: None, guard=lambda: None, maintenance_gate=lambda *a: None, native=T._NATIVE_MAINTENANCE)
+        T._transition(Path("/"), "maintenance", precheck=lambda *a: None, guard=lambda: None, maintenance_gate=lambda *a: None, native=T._NATIVE_MAINTENANCE,
+                       maintenance_resume=lambda: dict(RESUME))
 
 
 if __name__ == "__main__": unittest.main()
