@@ -1,6 +1,6 @@
 # Resume here: permanent T2 hibernation
 
-Checkpoint date: September 29, 2026 (night). **Battery milestone COMPLETE. The full update-survival cycle is implemented, independently audited and VM-tested in source: runtime upgrade from installed `e489bab7`, inactive package maintenance with a generation baseline, a native pacman guard that survives kernel updates and limine-snapper-sync churn, read-only assessment, and reactivation of an unchanged generation. Deployment is a written, gated procedure awaiting operator approval.** The September 27 battery-only normal-logind S4 evidence is unchanged. Nothing from September 29 is deployed on the host. Older journal entries describe historical states, not instructions to replay them.
+Checkpoint date: September 29, 2026 (evening). **DEPLOYED: runtime `d64069bb` is installed and the machine is in inactive package maintenance (hibernation OFF by design, stock `Omarchy linux-t2` is the default entry, `omarchy update` is allowed).** Next: the owner reboots into the stock entry, runs the post-reboot checks and one ordinary sleep test ([DEPLOYMENT.md](DEPLOYMENT.md)), then updates. The September 27 battery-only normal-logind S4 evidence is unchanged. Older journal entries describe historical states, not instructions to replay them.
 
 ## Reconcile before doing anything
 
@@ -9,7 +9,7 @@ Checkpoint date: September 29, 2026 (night). **Battery milestone COMPLETE. The f
 3. Read `/home/jjc/.local/state/codex-mba-autonomous/handoff.json`, especially the latest checkpoint fields, then [the investigation status](HIBERNATION.md) and [production plan](HIBERNATION-PRODUCTION-PLAN.md).
 4. Compare installed runtime, pending markers and durable cycle evidence before any privileged action. Local handoff state is not in GitHub. A missing local file is not permission to reconstruct authority from these notes or rerun a consumed action.
 
-Last observed boot: `a45522fe-3787-4d06-a53e-2e6b896ea210` (September 29, hibernation source image `EFI\Linux\mba_t2_hibernation_source.efi`). Latest independently audited source checkpoint: `cf907542` (code), in `iJustinCabral/omarchy`, branch `fix-t2-vintage-mac-support`. This source checkpoint is **not installed**; the live runtime remains `e489bab7`.
+Last observed boot: `a45522fe-3787-4d06-a53e-2e6b896ea210` (September 29, hibernation source image; the next reboot selects the stock entry). Installed runtime: `d64069bb` (review `c31e1a43…`). Source branch `fix-t2-vintage-mac-support` in `iJustinCabral/omarchy`.
 
 ## What actually works, and what remains
 
@@ -52,9 +52,21 @@ Done in source (each independently audited):
 - **Reactivation** (`cf907542`): `boot_policy_native.py reactivate` returns inactive maintenance to ACTIVE source-default hibernation only when the assessment core reports the qualified generation unchanged and every qualified digest still agrees; it changes one `default_entry` line on the current Limine bytes, writes a durable reactivation pending first, and recovers by re-running (rollback before completion, never forward past the boot-config write). Any change requires requalification; anything unknown refuses. The same commit fixes deactivation on a snapshot-churned host (the intent records the approved `after` hash the guard chain pins).
 - **Operator documents:** [maintenance runbook](MAINTENANCE-RUNBOOK.md) for fail-closed stuck states, and the [deployment procedure](DEPLOYMENT.md) with operator gates H0-H4.
 
+## Deployment record (September 29, 2026)
+
+| Gate | Result |
+| --- | --- |
+| H0 | Pass. All old pins matched the prior approval; `/boot/limine.conf` equalled the boot policy's `after_limine_sha256`. |
+| H1/H2 (first) | Pass. Runtime `e489bab7` → `cf907542` (approval `43f9b849…`, review `83f8a1a8…`); tree verified. |
+| H3 (first) | Refused before any write: the generation baseline required root-owned ancestors, but the qualified source/restore artifacts are operator-owned under `~/.local/state`. Machine verified unchanged. Fixed in `d64069bb` (artifact-mode reader pinned to the manifest), audited. |
+| H1/H2 (second) | Pass. Runtime `cf907542` → `d64069bb` (approval `d0d4d176…`, review `c31e1a43…`); tree verified. |
+| H3 (retry) | Pass. Transition `f5be4683-011d-40ca-85b2-815508a9bdb1`; marker binds review `c31e1a43…`; policy, opt-in and pendings absent; `default_entry: 2`; archive includes `generation-baseline.json` and `maintenance-resume.json`; update guard exits 0; `assess` reports `unchanged` with no unknown items. |
+
+Evidence (local, not in git): `~/.local/state/codex-mba-autonomous/runtime-upgrade-cf907542/` and `runtime-upgrade-d64069bb/` (exports, staged files, approvals, `h2.log`, `h3.log`, `assess-after-h3.json`), and `claude_deployment` in the handoff.
+
 Next tasks, in order:
 
-1. **Deploy (operator-approved gates, see [DEPLOYMENT.md](DEPLOYMENT.md)):** H0 root read-only inspection (includes the staged Limine verify), H1 stage the six files, H2 runtime upgrade, H3 enter maintenance (hibernation unavailable; `/boot/limine.conf` returns to stock), H4 package updates, H5 optional reactivation after `assess` reports `unchanged`. Treat the first live `reactivate` as a supervised rehearsal: the real qualified-artifact checks run end to end there for the first time (any failure refuses or rolls back). No boot image, UKI, EFI, kernel or S4 change is involved. Do not run `omarchy update` or create snapshots before H3.
+1. **Reboot into stock, verify, then update:** the owner reboots (the stock entry is now the default), runs the "Reboot into the stock entry and verify" checks in [DEPLOYMENT.md](DEPLOYMENT.md) and one ordinary sleep test, then runs `omarchy update` (H4). Afterwards `assess` reports `unchanged` (userspace-only updates, H5 reactivation possible after an attended rehearsal) or `requalification-required` (kernel, modules, firmware, UKI or bootloader changed).
 2. **Requalification after kernel updates (hardware campaign):** when `assess` reports `requalification-required`, rebuild the candidate stack (patch set through 0015) and the source/restore UKI pair from the new production UKI, verify offline, then attended ordinary-boot, physical-input and real S4 qualification, issue a new qualification, and rebind the maintenance marker to the new generation (not implemented; design first). Until then hibernation stays off after kernel updates while updates keep working.
 3. **Deploy the S3 fix:** part of the next UKI pair rebuild (patch 0015); do not use S3 on the source image until then; the stock `Omarchy linux-t2` entry is S3-safe.
 4. **Unvetoed kernel routes:** suspend-then-hibernate, hybrid-sleep and direct `/sys/power/state` writes are outside the marker vetoes; the guard's image check is the backstop. Decide whether to veto them explicitly.

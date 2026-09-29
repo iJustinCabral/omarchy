@@ -239,7 +239,7 @@ First retain the previous upgrade's fixed-name files (only those that exist; the
 
 ```bash
 S=/var/lib/omarchy/t2-hibernate-product
-for name in runtime-upgrade-native.py runtime-upgrade-approval.json runtime-upgrade-review.json runtime-upgrade-config.json runtime-upgrade-bootstrap.py; do
+for name in runtime-upgrade-native.py runtime-upgrade-approval.json runtime-upgrade-review.json runtime-upgrade-config.json runtime-upgrade-bootstrap.py runtime-upgrade-image-state.py; do
   if sudo test -e "$S/$name"; then
     sudo test ! -e "$S/prior-e489bab7.$name" || { echo "retained name exists: $name"; false; }
     sudo cp -p -- "$S/$name" "$S/prior-e489bab7.$name"
