@@ -163,19 +163,20 @@ sudo test -f /var/lib/omarchy/t2-hibernate-trial/physical-cycle.lock && echo "lo
 Expected (all **unverified** until run):
 
 - `runtime-deployment-review.json` = `947f0ce9...2ee0d`, `runtime-deployment-bootstrap.py` = `85b33df9...23248`, `config.json` = `2f66daf8...16aa4f23`.
-- Present in `STATE`: the previous upgrade's fixed-name files (`runtime-upgrade-native.py` = adapter `460ac3da...482e`, `runtime-upgrade-approval.json`, `runtime-upgrade-review.json`, `runtime-upgrade-config.json`, `runtime-upgrade-bootstrap.py`), plus `runtime-upgrade-completed-e489bab70e13.json` and `runtime-upgrade-approval-consumed-4125726a-4847-4802-a821-953e6abe995a.json` (the consumed deployment). Whether the previous staged files were kept, and under what names, is **unverified**; the handoff says they were staged and the adapter run, not that they were retained.
+- Present in `STATE`: the previous upgrade's fixed-name files (`runtime-upgrade-native.py` = adapter `460ac3da...482e`, `runtime-upgrade-approval.json`, `runtime-upgrade-review.json`, `runtime-upgrade-config.json`, `runtime-upgrade-bootstrap.py`), plus `runtime-upgrade-completed-e489bab70e13.json`. There is no `runtime-upgrade-approval-consumed-*` file for that upgrade: the installed `e489bab7` core predates consumed-approval markers (its approval is protocol v1); replay of it is prevented by the completion record and the review mismatch. Observed at H0 on 2026-09-29. Whether the previous staged files were kept, and under what names, is **unverified**; the handoff says they were staged and the adapter run, not that they were retained.
 - Absent: `runtime-upgrade.pending`, `source-default-activation.pending`, `source-default-deactivation.pending`, `package-maintenance.pending`, `.runtime-pending`, and `/var/lib/pacman/db.lck`.
 - `qualification.json`, `boot-policy.json` and `/boot/limine.conf` hashes; record them. The prior approval pinned `ffa9bc82...fe64`, `a6e406ec...2177` and `aba687f2...65b7` for these; they may legitimately differ now if boot policy or `limine.conf` changed since. Whatever H0 prints becomes the approval's `unchanged` values; a difference from the prior values must be explained before proceeding.
 
 Stop if any pending marker exists, if `old_*` hashes differ from the pins above, or if `git` shows the consumed deployment `4125726a-4847-4802-a821-953e6abe995a` is not the last upgrade recorded in the handoff.
 
-Also confirm the boot configuration still matches the staged pair exactly, using the installed runtime's read-only stager verify (it loads the receipt and runs `verify_staged`; it writes nothing):
+Also confirm the boot configuration is still exactly the approved source-default bytes. While hibernation is active, `/boot/limine.conf` must equal the boot policy's recorded `after_limine_sha256`:
 
 ```bash
-sudo -n /usr/bin/python3 -I -B /var/lib/omarchy/t2-hibernate-product/runtime/packages/t2-suspend/experiments/stage-hibernation-uki-pair.py verify >/dev/null && echo "staged limine.conf verified"
+S=/var/lib/omarchy/t2-hibernate-product
+[[ $(sudo sha256sum /boot/limine.conf | cut -c1-64) == $(sudo jq -r .after_limine_sha256 "$S/boot-policy.json") ]] && echo "limine.conf is the approved source-default bytes"
 ```
 
-If it fails, stop: the snapshot region or another part of `/boot/limine.conf` changed while hibernation was active, and H3 would refuse. Do not edit the file by hand; this needs review. The stager is part of the installed runtime tree (`runtime_deployment.TREES` at `e489bab7` includes `packages/t2-suspend/experiments`).
+If it differs, stop: `limine-snapper-sync` or something else rewrote it while hibernation was active, and H3 would refuse. Do not edit the file by hand; this needs review. (Do not use the installed stager's `verify` action for this check: at `e489bab7` it verifies the stock layout with `default_entry: 2` and always refuses in source-default mode. Observed 2026-09-29: it printed "Staged pair Limine configuration changed" while the hash above matched exactly.)
 
 ## Create the approval JSON
 
