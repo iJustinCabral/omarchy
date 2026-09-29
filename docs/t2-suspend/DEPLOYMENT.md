@@ -1,6 +1,6 @@
-# Runtime deployment procedure: e489bab7 to 370c323c
+# Runtime deployment procedure: e489bab7 to 28774823
 
-Operator procedure for deploying the audited update-survival source (branch `fix-t2-vintage-mac-support`, reviewed commit `370c323c0476be2b56f2f66ef5c67b68cf9ddf4c`) to the live MacBookAir9,1, whose installed hibernation runtime is generation `e489bab70e13bfcbbfacc8811a6f6093e7973dd0`. Companion documents: [RESUME.md](RESUME.md) (state and task list), [MAINTENANCE-RUNBOOK.md](MAINTENANCE-RUNBOOK.md) (fail-closed stuck states after gate H3), [HIBERNATION.md](HIBERNATION.md) (evidence), [AGENTS.md](../../AGENTS.md) (hardware safety rules).
+Operator procedure for deploying the audited update-survival source (branch `fix-t2-vintage-mac-support`, reviewed commit `28774823666bd39a3bc5714e02f1cd07045becd5`) to the live MacBookAir9,1, whose installed hibernation runtime is generation `e489bab70e13bfcbbfacc8811a6f6093e7973dd0`. Companion documents: [RESUME.md](RESUME.md) (state and task list), [MAINTENANCE-RUNBOOK.md](MAINTENANCE-RUNBOOK.md) (fail-closed stuck states after gate H3), [HIBERNATION.md](HIBERNATION.md) (evidence), [AGENTS.md](../../AGENTS.md) (hardware safety rules).
 
 Status: **draft procedure, not approved for execution.** Nothing here has been run against the live machine. Every gate below (H0 to H4) needs its own explicit operator approval at the moment it is reached; a prior approval, an automatic goal continuation or a green fixture test is not approval. Facts that could not be confirmed from the repository or from user-readable files are marked **unverified**.
 
@@ -30,8 +30,8 @@ The adapter owns `db.lck` and the physical-cycle flock itself (`:426-540`) becau
 | Fixed staged names in `STATE` | `runtime-upgrade-native.py`, `runtime-upgrade-approval.json`, `runtime-upgrade-review.json`, `runtime-upgrade-config.json`, `runtime-upgrade-bootstrap.py`, `runtime-upgrade-image-state.py` | `:26-29`, `runtime_deployment.py:36-38` |
 | Adapter file modes | root:root, 0600, single link, no group/other write | `:65-75`, `:117-124` |
 | Consumed record | `runtime-upgrade-approval-consumed-<approval_id>.json`, created with `O_EXCL` | `runtime_deployment.py:364,394-396`, `_new_private:261` |
-| Completion record | `runtime-upgrade-completed-<first 12 hex of new commit>.json` = `runtime-upgrade-completed-370c323c0476.json` | `runtime_deployment.py:377`, `:421` |
-| Retained names | `runtime-retained-e489bab70e13-before-370c323c0476`, `runtime-review-retained-e489bab70e13-before-370c323c0476.json`, `runtime-bootstrap-retained-e489bab70e13-before-370c323c0476.py`, `config-retained-e489bab70e13-before-370c323c0476.json` | `runtime_deployment.py:372-376` |
+| Completion record | `runtime-upgrade-completed-<first 12 hex of new commit>.json` = `runtime-upgrade-completed-28774823666b.json` | `runtime_deployment.py:377`, `:421` |
+| Retained names | `runtime-retained-e489bab70e13-before-28774823666b`, `runtime-review-retained-e489bab70e13-before-28774823666b.json`, `runtime-bootstrap-retained-e489bab70e13-before-28774823666b.py`, `config-retained-e489bab70e13-before-28774823666b.json` | `runtime_deployment.py:372-376` |
 
 Pins expected from the prior deployment of `e489bab7` (mirrored from the user-readable copy `~/.local/state/codex-mba-autonomous/runtime-upgrade-review.zGJnAZ/`, whose sha256 I recomputed): the installed generation is `old_review 947f0ce95c9eb73da0f2316f0795d5c16c8b41dacffa7a3870db771602c2ee0d`, `old_bootstrap 85b33df9dead8a1621008074ab40bef3cffc9981529d4f1aa2d57381c8723248` (equals sha256 of `runtime_deployment.py` at `e489bab7`, verified with `git show`) and `old_config = new_config 2f66daf877d84a12c7fcb5df8de40a5722898f37be39a563c1609fbe16aa4f23` (equals the config file in that directory, verified). That the live `STATE` files still have exactly these bytes is **unverified** (root-only) and is re-checked at H0.
 
@@ -60,8 +60,8 @@ Run from the repository. Every command is read-only. Reconcile before proceeding
 
 ```bash
 cd /home/jjc/Projects/MBA_9_1
-git rev-parse HEAD                      # expect 370c323c0476be2b56f2f66ef5c67b68cf9ddf4c, or a descendant if only docs changed
-git merge-base --is-ancestor 370c323c0476be2b56f2f66ef5c67b68cf9ddf4c HEAD && echo "reviewed commit is in history"
+git rev-parse HEAD                      # expect 28774823666bd39a3bc5714e02f1cd07045becd5, or a descendant if only docs changed
+git merge-base --is-ancestor 28774823666bd39a3bc5714e02f1cd07045becd5 HEAD && echo "reviewed commit is in history"
 git status --short                      # informational; the export below does not use the working tree
 cat /proc/sys/kernel/random/boot_id     # record it; it goes into the approval. Last recorded in RESUME.md: a45522fe-3787-4d06-a53e-2e6b896ea210
 jq -r '.runtime_upgrade_execution' ~/.local/state/codex-mba-autonomous/handoff.json   # expect the e489bab7 record; do not dump the rest of the file
@@ -85,7 +85,7 @@ Root-only preconditions, checked at H0 and re-checked by the adapter itself: hib
 Never point the adapter at the development tree. The adapter reads the source as root, so it must be an immutable exact export owned by the operator, at a canonical path with no symlink components (`runtime_upgrade_native.py:104-106`).
 
 ```bash
-C=370c323c0476be2b56f2f66ef5c67b68cf9ddf4c
+C=28774823666bd39a3bc5714e02f1cd07045becd5
 D=/home/jjc/.local/state/codex-mba-autonomous/runtime-upgrade-${C:0:8}
 [[ ! -e $D ]] || echo "REFUSING: $D exists; stop here and do not run the next lines"
 install -d -m 0700 "$D" "$D/source"
@@ -151,8 +151,8 @@ sudo sha256sum "$S/runtime-deployment-review.json" "$S/runtime-deployment-bootst
 sudo jq -r '.reviewed_commit' "$S/runtime-deployment-review.json"        # expect e489bab70e13bfcbbfacc8811a6f6093e7973dd0
 sudo jq -r '.files["packages/t2-suspend/hibernate/00-omarchy-t2-hibernate-guard.hook"].sha256' "$S/runtime-deployment-review.json"   # expect 0491dcf7...
 # STATE is root-only (0700): globs must expand inside the root shell, not in yours.
-sudo bash -c 'cd /var/lib/omarchy/t2-hibernate-product && shopt -s nullglob && ls -la runtime-upgrade* source-default-*.pending package-maintenance.pending .runtime-pending *retained*370c323c* runtime-upgrade-completed-370c323c0476.json 2>&1'
-# expect: only the previous upgrade's retained/staged names described in H1 (if any); NO *.pending, NO .runtime-pending, NO *370c323c* names
+sudo bash -c 'cd /var/lib/omarchy/t2-hibernate-product && shopt -s nullglob && ls -la runtime-upgrade* source-default-*.pending package-maintenance.pending .runtime-pending *retained*28774823* runtime-upgrade-completed-28774823666b.json 2>&1'
+# expect: only the previous upgrade's retained/staged names described in H1 (if any); NO *.pending, NO .runtime-pending, NO *28774823* names
 sudo flock -n /var/lib/omarchy/t2-hibernate-trial/physical-cycle.lock true && echo "physical lock free"
 sudo test -f /var/lib/omarchy/t2-hibernate-trial/physical-cycle.lock && echo "lock file exists"
 ```
@@ -187,8 +187,8 @@ approval = {
   "approved": True,
   "approval_id": str(uuid.uuid4()),
   "current_boot_id": "<contents of /proc/sys/kernel/random/boot_id, from the same boot as H2>",
-  "source_directory": "/home/jjc/.local/state/codex-mba-autonomous/runtime-upgrade-370c323c/source",
-  "reviewed_commit": "370c323c0476be2b56f2f66ef5c67b68cf9ddf4c",
+  "source_directory": "/home/jjc/.local/state/codex-mba-autonomous/runtime-upgrade-28774823/source",
+  "reviewed_commit": "28774823666bd39a3bc5714e02f1cd07045becd5",
   "adapter_sha256": "<sha256 of runtime-upgrade-native.py>",
   "expected": {
     "old_review": "<H0: sha256 of installed runtime-deployment-review.json>",
@@ -216,13 +216,13 @@ The boot id in the approval must equal the boot id at H2; the adapter re-checks 
 
 An auditor other than the author (a separate Sol high agent or the owner) repeats the following from scratch and reports a match line by line. Only then may H1 begin. The auditor should work from a fresh export in a different directory, not from `$D`.
 
-1. Re-export `git archive 370c323c...` independently and compare it with `$D/source` (`diff -r`, expecting no difference apart from bytes not included in the export).
+1. Re-export `git archive 28774823...` independently and compare it with `$D/source` (`diff -r`, expecting no difference apart from bytes not included in the export).
 2. Recompute `inventory()` from the auditor's export and require `sha256` of the review file to match, byte for byte (`cmp`).
-3. Recompute `adapter_sha256`, `new_bootstrap`, `new_image_state` from `git show 370c323c:<path> | sha256sum` and require them to equal both the approval and the review's file entries.
+3. Recompute `adapter_sha256`, `new_bootstrap`, `new_image_state` from `git show 28774823:<path> | sha256sum` and require them to equal both the approval and the review's file entries.
 4. Confirm `old_config == new_config` and `new_config` equals the digest of the staged `runtime-upgrade-config.json`.
 5. Confirm the `unchanged` values against H0 output produced by the operator (not by the author).
 6. Confirm `approval_id` is a fresh UUID4, distinct from `4125726a-4847-4802-a821-953e6abe995a` and from any consumed id printed at H0, and that `current_boot_id` equals the live boot id.
-7. Read the diff `e489bab7..370c323c` for `packages/t2-suspend/hibernate` and `experiments` and confirm it matches the audited checkpoint in RESUME.md (this needs the auditor to re-run `git diff --stat`, not trust this document).
+7. Read the diff `e489bab7..28774823` for `packages/t2-suspend/hibernate` and `experiments` and confirm it matches the audited checkpoint in RESUME.md (this needs the auditor to re-run `git diff --stat`, not trust this document).
 8. Confirm the six files in `$D` are exactly the six that H1 will install and that no extra byte has been added (the staged file set is exactly the six names in the reference table).
 
 Record the auditor's result next to the approval. A mismatch anywhere blocks H1; regenerate everything rather than editing a file in place.
@@ -248,7 +248,7 @@ sudo sync
 Then install the six new files. Approval last, adapter before approval, so a half-staged state can never run:
 
 ```bash
-D=/home/jjc/.local/state/codex-mba-autonomous/runtime-upgrade-370c323c
+D=/home/jjc/.local/state/codex-mba-autonomous/runtime-upgrade-28774823
 for name in runtime-upgrade-review.json runtime-upgrade-config.json runtime-upgrade-bootstrap.py runtime-upgrade-image-state.py runtime-upgrade-native.py runtime-upgrade-approval.json; do
   sudo install -m 0600 -o root -g root -T -- "$D/$name" "$S/$name"
 done
@@ -271,7 +271,7 @@ sudo -n /usr/bin/python3 -I -B /var/lib/omarchy/t2-hibernate-product/runtime-upg
 
 Invocation facts: the adapter takes no arguments and refuses any (`runtime_upgrade_native.py:612-613`); it requires root, isolated Python and that `__file__` is exactly `STATE/runtime-upgrade-native.py` with private root-owned ancestry (`:114-125`). It re-executes itself under `/usr/bin/systemd-inhibit --what=sleep:shutdown --mode=block` (`:225-227`, `:565-568`) and verifies that inhibitor parent throughout (`:230-255`). The handoff records the previous run used the same form, `sudo -n python3 -I -B` (**unverified** exact text; the handoff summary does not include the full command line). `sudo -n` only works if `sudo` credentials are cached or passwordless; if not, prime the cache first with `sudo -v` in the same terminal rather than dropping `-n` in a script.
 
-What it does, in order: parses the approval and rechecks the unchanged pins and boot id (`:563-564`); verifies old and new reviews, bootstrap bytes and the old runtime tree (`:194-222`); acquires the DB lock and physical-cycle flock (`:572-573`); runs the fixed pre-barrier product check with the staged image-state helper (`:577-580`); then the core `_upgrade_snapshot` (`runtime_deployment.py:295-434`) writes the compatible admission barrier and `runtime-upgrade.pending`, writes the consumed record, renames the old runtime, review, bootstrap and config to their `*-retained-e489bab70e13-before-370c323c0476*` names, publishes the new review and bootstrap, deploys the new runtime, writes the config, runs the barrier-aware postcheck, writes the completion record, and retires `runtime-upgrade.pending` and then the barrier. The adapter then verifies the tree again, runs an ordinary product admission check with the new runtime, and releases `db.lck` (`:585-594`).
+What it does, in order: parses the approval and rechecks the unchanged pins and boot id (`:563-564`); verifies old and new reviews, bootstrap bytes and the old runtime tree (`:194-222`); acquires the DB lock and physical-cycle flock (`:572-573`); runs the fixed pre-barrier product check with the staged image-state helper (`:577-580`); then the core `_upgrade_snapshot` (`runtime_deployment.py:295-434`) writes the compatible admission barrier and `runtime-upgrade.pending`, writes the consumed record, renames the old runtime, review, bootstrap and config to their `*-retained-e489bab70e13-before-28774823666b*` names, publishes the new review and bootstrap, deploys the new runtime, writes the config, runs the barrier-aware postcheck, writes the completion record, and retires `runtime-upgrade.pending` and then the barrier. The adapter then verifies the tree again, runs an ordinary product admission check with the new runtime, and releases `db.lck` (`:585-594`).
 
 Success: exit status 0 and exactly one line of JSON on stdout (`:609`, `:614`):
 
@@ -292,10 +292,10 @@ S=/var/lib/omarchy/t2-hibernate-product
 sudo sha256sum "$S/runtime-deployment-review.json" "$S/runtime-deployment-bootstrap.py" "$S/config.json"
 # expect: new_review, new_bootstrap, and 2f66daf8...16aa4f23 (config unchanged)
 sudo ls "$S" | grep -E 'retained|completed|consumed|pending'
-# expect present: runtime-retained-e489bab70e13-before-370c323c0476, runtime-review-retained-...json, runtime-bootstrap-retained-...py, config-retained-...json,
-#   runtime-upgrade-completed-370c323c0476.json, runtime-upgrade-approval-consumed-<this approval_id>.json, and the earlier 4125726a consumed file
+# expect present: runtime-retained-e489bab70e13-before-28774823666b, runtime-review-retained-...json, runtime-bootstrap-retained-...py, config-retained-...json,
+#   runtime-upgrade-completed-28774823666b.json, runtime-upgrade-approval-consumed-<this approval_id>.json, and the earlier 4125726a consumed file
 # expect ABSENT: runtime-upgrade.pending, source-default-activation.pending, package-maintenance.pending, .runtime-pending
-sudo jq -r '.reviewed_commit' "$S/runtime-deployment-review.json"       # 370c323c0476be2b56f2f66ef5c67b68cf9ddf4c
+sudo jq -r '.reviewed_commit' "$S/runtime-deployment-review.json"       # 28774823666bd39a3bc5714e02f1cd07045becd5
 sudo jq -r '.reviewed_commit' "$S/runtime/snapshot.json"                # same
 sudo /usr/bin/python3 -I -B - <<'PY'
 import importlib.util, json
@@ -362,7 +362,7 @@ After the first updates, `assess` should report `unchanged` for userspace-only u
 
 ## Failure and rollback handling
 
-General rules: fail closed. There is no automatic retry, no replay and no rollback command. The retained `*-retained-e489bab70e13-before-370c323c0476*` files preserve the old runtime, review, bootstrap and config as evidence, but restoring them is a separately reviewed operation, not part of this procedure. Do not run the adapter or publisher a second time to "finish" a run. Never replay consumed deployment `4125726a-4847-4802-a821-953e6abe995a` or any approval whose consumed file exists: a replay is refused before any lock because the installed review no longer matches `old_review` (`runtime_upgrade_native.py:198`, in `_verified_engines` before `_locks`; the consumed-approval file is checked again at `runtime_deployment.py:378-380`), and even if it were not, replaying is forbidden.
+General rules: fail closed. There is no automatic retry, no replay and no rollback command. The retained `*-retained-e489bab70e13-before-28774823666b*` files preserve the old runtime, review, bootstrap and config as evidence, but restoring them is a separately reviewed operation, not part of this procedure. Do not run the adapter or publisher a second time to "finish" a run. Never replay consumed deployment `4125726a-4847-4802-a821-953e6abe995a` or any approval whose consumed file exists: a replay is refused before any lock because the installed review no longer matches `old_review` (`runtime_upgrade_native.py:198`, in `_verified_engines` before `_locks`; the consumed-approval file is checked again at `runtime_deployment.py:378-380`), and even if it were not, replaying is forbidden.
 
 | Where it failed | State | Action |
 | --- | --- | --- |

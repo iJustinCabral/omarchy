@@ -9,7 +9,7 @@ Checkpoint date: September 29, 2026 (evening). **Battery milestone COMPLETE. The
 3. Read `/home/jjc/.local/state/codex-mba-autonomous/handoff.json`, especially the latest checkpoint fields, then [the investigation status](HIBERNATION.md) and [production plan](HIBERNATION-PRODUCTION-PLAN.md).
 4. Compare installed runtime, pending markers and durable cycle evidence before any privileged action. Local handoff state is not in GitHub. A missing local file is not permission to reconstruct authority from these notes or rerun a consumed action.
 
-Last observed boot: `a45522fe-3787-4d06-a53e-2e6b896ea210` (September 29, hibernation source image `EFI\Linux\mba_t2_hibernation_source.efi`). Latest independently audited source checkpoint: `370c323c` (code), in `iJustinCabral/omarchy`, branch `fix-t2-vintage-mac-support`. This source checkpoint is **not installed**; the live runtime remains `e489bab7`.
+Last observed boot: `a45522fe-3787-4d06-a53e-2e6b896ea210` (September 29, hibernation source image `EFI\Linux\mba_t2_hibernation_source.efi`). Latest independently audited source checkpoint: `28774823` (code), in `iJustinCabral/omarchy`, branch `fix-t2-vintage-mac-support`. This source checkpoint is **not installed**; the live runtime remains `e489bab7`.
 
 ## What actually works, and what remains
 
