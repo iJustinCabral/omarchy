@@ -335,6 +335,18 @@ Failure: the publisher leaves the machine either unchanged or in the interrupted
 
 Hibernation remains OFF after H3. Reactivation is not implemented (RESUME.md task 4); do not try to re-enable it by hand (do not recreate the opt-in file, do not re-run `activation`).
 
+### After H3: record and check the generation baseline
+
+H3 also archives `generation-baseline.json` next to the maintenance intent (written before the intent and the marker, so a marker never exists without it). It records the qualified generation that was active when maintenance began: running kernel, production/source/restore UKI hashes, module stack, manifest, `config.json` and `qualification.json` digests, driver modules, firmware (hardlinked Apple firmware is accepted and its link count recorded), root control files (out-of-scope symlinks such as the limine enroll hooks recorded as link text only) and the ESP bootloaders `EFI/BOOT/BOOTX64.EFI` and `EFI/limine/limine_x64.efi`. The baseline cannot be amended later; only a new maintenance publication would replace it.
+
+Immediately after H3, run the read-only assessment and keep its output:
+
+```bash
+sudo -n /usr/bin/python3 -I -B /var/lib/omarchy/t2-hibernate-product/runtime/packages/t2-suspend/hibernate/boot_policy_native.py assess | tee ~/t2-assess-after-h3.json | jq '{class, busy}'
+```
+
+Expected: `class: "unchanged"`. It writes nothing and holds no lock while hashing. If any item reports `unknown` here (for example a root-only control path that still could not be read), record it: that item will stay `unknown` in later assessments, which only keeps reactivation conservative.
+
 ## Gate H4: first package update, then `omarchy update`
 
 Operator approval required for each update. The installed hook now runs the new native guard because the marker exists (`update_guard.main:434-440`, marker branch `:438`); with a valid marker it admits ordinary transactions under the physical lock after the exact inactive validator and a saved-image check.
@@ -345,6 +357,8 @@ Operator approval required for each update. The installed hook now runs the new 
 4. After each transaction re-run the guard (`exit=0`) and the runbook section 5 indicators.
 
 Do not change the boot image or run `limine-mkinitcpio` unless the runbook section 3 gate is followed; kernel updates under maintenance are the case the design tests, and a kernel transaction on this machine ordinarily rewrites boot artifacts, so the owner decides when to include one.
+
+After the first updates, `assess` should report `unchanged` for userspace-only updates, or `requalification-required` once the kernel, modules, firmware, UKIs or bootloader changed. Snapshot entries added to `/boot/limine.conf` by `limine-snapper-sync` do not count as a change. Reactivating hibernation is not part of this procedure (see [RESUME.md](RESUME.md)).
 
 ## Failure and rollback handling
 
