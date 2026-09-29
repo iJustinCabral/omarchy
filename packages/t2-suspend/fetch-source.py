@@ -19,7 +19,8 @@ def fetch(output, include_bce=True):
     LINUX_BASE + 'drivers/bluetooth/hci_bcm4377.c', manifest['bluetooth_base_sha256'])
   if include_bce:
     # The radio DKMS package never builds BCE; only the lab pipeline still needs it.
-    t2bce = manifest['t2bce_source']
+    pins = HERE / 't2bce-source.json'
+    t2bce = (json.loads(pins.read_text()) if pins.is_file() else manifest)['t2bce_source']
     files['t2bce/' + t2bce['path']] = (
       T2_PATCH_BASE + t2bce['commit'] + '/' + t2bce['path'], t2bce['sha256'])
   def one(item):

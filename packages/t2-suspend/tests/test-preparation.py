@@ -69,6 +69,28 @@ class Preparation(unittest.TestCase):
         self.assertFalse((self.out / 'drivers/staging').exists())
         self.assertNotIn('t2bce_source_commit', json.loads((self.out / 'provenance.json').read_text()))
 
+    def test_bce_pins_file_supersedes_manifest(self):
+        # BCE pins live beside the manifest so a BCE re-pin never touches radio provenance.
+        pins = {'t2bce_source': dict(self.manifest['t2bce_source']),
+                't2bce_patched': {'drivers/staging/t2bce/t2bce_core/core.c': sha(b'core\n')}}
+        pins['t2bce_source']['sha256'] = sha(b'stale pin')
+        del self.manifest['t2bce_source']
+        del self.manifest['t2bce_patched']
+        self.save()
+        (module.HERE / 't2bce-source.json').write_text(json.dumps(pins))
+        with self.assertRaises(ValueError): self.run_prepare()
+        pins['t2bce_source']['sha256'] = sha(self.bce_source.read_bytes())
+        (module.HERE / 't2bce-source.json').write_text(json.dumps(pins))
+        self.run_prepare()
+        provenance = json.loads((self.out / 'provenance.json').read_text())
+        self.assertEqual(provenance['t2bce_source_commit'], 'fixture')
+        self.assertEqual(provenance['manifest_sha256'], module.digest(module.HERE / 'manifest.json'))
+
+    def test_radio_only_ignores_bce_pins_file(self):
+        (module.HERE / 't2bce-source.json').write_text('not json')
+        module.prepare(self.wifi, self.bt, None, self.out, 's3', include_bce=False)
+        self.assertFalse((self.out / 'drivers/staging').exists())
+
     def test_existing_output_preserved(self):
         self.out.mkdir()
         (self.out / 'owned').write_text('keep')

@@ -1,0 +1,49 @@
+{
+  "t2bce_source": {
+    "commit": "6780d522fc19bde5230a1bdef94672d26f0cfc2d",
+    "path": "1001-Add-t2bce-driver-stack.patch",
+    "sha256": "41e01f7cc0a5cc6b067470b941c7bbe385f6594731e8f234089e4143cb71c50f",
+    "base": {
+      "drivers/staging/t2bce/t2bce_audio/Makefile": "94c0969fedaa2f63e0f51ea25c26d08bf447b2411c6081e1c036cada924ada9b",
+      "drivers/staging/t2bce/t2bce_audio/audio.c": "dab1f98d361d12d7f28ece619a8abdd386a84934d72558f9b754a4b375962351",
+      "drivers/staging/t2bce/t2bce_audio/audio.h": "90ee8bf44cfea3a421d77968a94276c26fd4fd37148e8fb53d180d88a0711e67",
+      "drivers/staging/t2bce/t2bce_audio/description.h": "2362145aeaa6390661e5744de0bbefd86133853ba34af08312a305465587f32e",
+      "drivers/staging/t2bce/t2bce_audio/pcm.c": "0252bdb004173b76f6b1bc87a138c6730621e3847bb1c9275ac690f159f86a00",
+      "drivers/staging/t2bce/t2bce_audio/pcm.h": "8a5fd8fa2ff111677e40951d47055dbeb2ba45ccc51f714f98816fe7d95c2467",
+      "drivers/staging/t2bce/t2bce_audio/protocol.c": "607bf4bed13305bc31d8516656d2dc50b391cde7055adc996a143386b12485fa",
+      "drivers/staging/t2bce/t2bce_audio/protocol.h": "605141e63a9acad6bc3bf09401f5a150d889f5c4fd43ca954154e1e64e65fc78",
+      "drivers/staging/t2bce/t2bce_audio/protocol_bce.c": "6f1b0b2407fe3dd510f50013f9b406471d29260d154351af100c28107d2a7e46",
+      "drivers/staging/t2bce/t2bce_audio/protocol_bce.h": "3d9c62ff84dd530d1f96bc48ee853d110a91651b33f0f76d367faecd36e557ab",
+      "drivers/staging/t2bce/t2bce_audio/timing.h": "e3acdc7e274f2c39f5ef3cec3c156406db8484332b794fb1274e8eb6cfa12e46",
+      "drivers/staging/t2bce/t2bce_core/Makefile": "760ec7df1cb4ca6132b1f2d0921e34e70b093f5f31659b6f0e0f211e1b666dec",
+      "drivers/staging/t2bce/t2bce_core/include/t2bce_core_transport.h": "812d8471935e4bd8170c4285568760401e4be5ceeb943020e82b748479e60732",
+      "drivers/staging/t2bce/t2bce_core/mailbox.c": "9b71af3117bf8a0319e9382a503e6f0c06d17b6a4c6a3c2a12d05fea6488bbe2",
+      "drivers/staging/t2bce/t2bce_core/mailbox.h": "98833c802002c5b1f8b17927a9f718b60f247b6c24a299600768b0563499ecdd",
+      "drivers/staging/t2bce/t2bce_core/t2bce.h": "27764dd7009fb1ca117741f38b305b0ead0d6bef26f84f21a7b228708cf5471e",
+      "drivers/staging/t2bce/t2bce_core/t2bce_main.c": "8e6eb4f7b519c8de729f68f6b6978642333d37c064208fe37dfe32b23de07613",
+      "drivers/staging/t2bce/t2bce_core/transport.c": "3e251f8360b1e4fdd6d75cea44b48bbbb07217b7a6fab00030d1b01dff9d4a95",
+      "drivers/staging/t2bce/t2bce_dma/include/t2bce_dma_queue.h": "74907d09572236cd8465fb935f288b4185dc3fe71acae077f202ba60d522cf4d"
+    }
+  },
+  "t2bce_patched": {
+    "drivers/staging/t2bce/t2bce_audio/Makefile": "94c0969fedaa2f63e0f51ea25c26d08bf447b2411c6081e1c036cada924ada9b",
+    "drivers/staging/t2bce/t2bce_audio/audio.c": "ef1664676d27ae3c39ca64fe239fa78c03c33a2684807140f82f43ea31a3e3a6",
+    "drivers/staging/t2bce/t2bce_audio/audio.h": "90ee8bf44cfea3a421d77968a94276c26fd4fd37148e8fb53d180d88a0711e67",
+    "drivers/staging/t2bce/t2bce_audio/description.h": "2362145aeaa6390661e5744de0bbefd86133853ba34af08312a305465587f32e",
+    "drivers/staging/t2bce/t2bce_audio/pcm.c": "0252bdb004173b76f6b1bc87a138c6730621e3847bb1c9275ac690f159f86a00",
+    "drivers/staging/t2bce/t2bce_audio/pcm.h": "8a5fd8fa2ff111677e40951d47055dbeb2ba45ccc51f714f98816fe7d95c2467",
+    "drivers/staging/t2bce/t2bce_audio/protocol.c": "607bf4bed13305bc31d8516656d2dc50b391cde7055adc996a143386b12485fa",
+    "drivers/staging/t2bce/t2bce_audio/protocol.h": "605141e63a9acad6bc3bf09401f5a150d889f5c4fd43ca954154e1e64e65fc78",
+    "drivers/staging/t2bce/t2bce_audio/protocol_bce.c": "6f1b0b2407fe3dd510f50013f9b406471d29260d154351af100c28107d2a7e46",
+    "drivers/staging/t2bce/t2bce_audio/protocol_bce.h": "3d9c62ff84dd530d1f96bc48ee853d110a91651b33f0f76d367faecd36e557ab",
+    "drivers/staging/t2bce/t2bce_audio/timing.h": "e3acdc7e274f2c39f5ef3cec3c156406db8484332b794fb1274e8eb6cfa12e46",
+    "drivers/staging/t2bce/t2bce_core/Makefile": "760ec7df1cb4ca6132b1f2d0921e34e70b093f5f31659b6f0e0f211e1b666dec",
+    "drivers/staging/t2bce/t2bce_core/include/t2bce_core_transport.h": "812d8471935e4bd8170c4285568760401e4be5ceeb943020e82b748479e60732",
+    "drivers/staging/t2bce/t2bce_core/mailbox.c": "9b71af3117bf8a0319e9382a503e6f0c06d17b6a4c6a3c2a12d05fea6488bbe2",
+    "drivers/staging/t2bce/t2bce_core/mailbox.h": "98833c802002c5b1f8b17927a9f718b60f247b6c24a299600768b0563499ecdd",
+    "drivers/staging/t2bce/t2bce_core/t2bce.h": "27764dd7009fb1ca117741f38b305b0ead0d6bef26f84f21a7b228708cf5471e",
+    "drivers/staging/t2bce/t2bce_core/t2bce_main.c": "73075209265e5a8d34655e3306c10c3268f4f3f5e0c05e8865a9c111ff03522a",
+    "drivers/staging/t2bce/t2bce_core/transport.c": "3e251f8360b1e4fdd6d75cea44b48bbbb07217b7a6fab00030d1b01dff9d4a95",
+    "drivers/staging/t2bce/t2bce_dma/include/t2bce_dma_queue.h": "74907d09572236cd8465fb935f288b4185dc3fe71acae077f202ba60d522cf4d"
+  }
+}
