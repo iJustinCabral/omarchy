@@ -108,12 +108,13 @@ def main():
   modes.add_argument("--maintenance-recovery", action="store_true", help="Join fixture maintenance coordinator, real user scopes and retained veto recovery under real logind exclusion; no package/native admission")
   modes.add_argument("--maintenance-owner", action="store_true", help="Prove actual owner-held logind FD and latched stop signals survive original inhibitor-parent death in the guest; no package/native admission")
   modes.add_argument("--maintenance-alpm", action="store_true", help="Test a real tiny disposable pacman transaction and fixture maintenance hook under an owner-held inhibitor; no host packages or native admission")
+  modes.add_argument("--maintenance-native", action="store_true", help="Run the REAL native update_guard.main and boot_policy_native maintenance re-entry from the deployed runtime with real pacman transactions (kernel-package update, negatives); publisher first-write uses a seam (see guest docstring); scratch virtio swap disk, no network")
   args = parser.parse_args()
   work = Path(tempfile.mkdtemp(prefix="mba-logind-vm-"))
   root = work / "root"
   root.mkdir()
   print(f"Disposable guest evidence: {work}", flush=True)
-  python_guest = args.native_inhibitor or args.maintenance_launcher or args.maintenance_handoff or args.maintenance_entry or args.maintenance_scope or args.maintenance_recovery or args.maintenance_owner or args.maintenance_alpm
+  python_guest = args.native_inhibitor or args.maintenance_launcher or args.maintenance_handoff or args.maintenance_entry or args.maintenance_scope or args.maintenance_recovery or args.maintenance_owner or args.maintenance_alpm or args.maintenance_native
   if not python_guest:
     source = work / "test.c"
     source.write_text(GUEST_TEST)
@@ -140,12 +141,12 @@ def main():
                  "/usr/bin/systemctl"):
     copy_binary(binary)
   if python_guest:
-    binaries = ("/usr/bin/python3", "/usr/bin/systemd-inhibit", "/usr/bin/busctl") if args.native_inhibitor or args.maintenance_entry or args.maintenance_scope or args.maintenance_recovery or args.maintenance_owner or args.maintenance_alpm else ("/usr/bin/python3",)
+    binaries = ("/usr/bin/python3", "/usr/bin/systemd-inhibit", "/usr/bin/busctl") if args.native_inhibitor or args.maintenance_entry or args.maintenance_scope or args.maintenance_recovery or args.maintenance_owner or args.maintenance_alpm or args.maintenance_native else ("/usr/bin/python3",)
     for binary in binaries:
       copy_binary(binary)
-    if args.maintenance_owner or args.maintenance_alpm:
+    if args.maintenance_owner or args.maintenance_alpm or args.maintenance_native:
       copy_binary("/usr/lib/libsystemd.so.0")
-    if args.maintenance_alpm:
+    if args.maintenance_alpm or args.maintenance_native:
       copy_binary("/usr/bin/pacman")
     # Only public installed stdlib source/data and extension modules. Never
     # traverse site packages, host configuration, home directories or caches.
@@ -224,6 +225,56 @@ def main():
     print("Exact owner guest SHA-256: " + hashlib.sha256(raw).hexdigest(), flush=True)
     marker = "MAINTENANCE_OWNER_VM"
     test_command = "/usr/bin/python3 -I -B /maintenance-owner-test.py"
+  elif args.maintenance_native:
+    tests = Path(__file__).resolve().parent
+    package = tests.parent
+    source_hashes = {}
+    source_root = "/opt/omarchy-src/packages/t2-suspend/"
+    # Exactly the files runtime_deployment.inventory() would accept: both fixed
+    # code trees, no __pycache__/.gitattributes. Bytes copied verbatim.
+    for tree in ("hibernate", "experiments"):
+      for directory, folders, names in os.walk(package / tree, followlinks=False):
+        folders[:] = sorted(name for name in folders if name != "__pycache__")
+        for name in sorted(names):
+          if name == ".gitattributes": continue
+          path = Path(directory) / name
+          if path.is_symlink() or not path.is_file(): raise ValueError("Regular public repository source required")
+          relative = path.relative_to(package).as_posix()
+          raw = path.read_bytes()
+          target = root / (source_root + relative).lstrip("/")
+          target.parent.mkdir(parents=True, exist_ok=True)
+          target.write_bytes(raw)
+          source_hashes[relative] = hashlib.sha256(raw).hexdigest()
+    for name in ("test-hibernate-boot-policy.py", "test-hibernate-boot-policy-transition.py"):
+      raw = (tests / name).read_bytes()
+      target = root / (source_root + "tests/" + name).lstrip("/")
+      target.parent.mkdir(parents=True, exist_ok=True)
+      target.write_bytes(raw)
+      source_hashes["tests/" + name] = hashlib.sha256(raw).hexdigest()
+    raw = (tests / "maintenance-native-guest.py").read_bytes()
+    write("/maintenance-native-test.py", raw.decode())
+    source_hashes["maintenance-native-guest.py"] = hashlib.sha256(raw).hexdigest()
+    # Reviewed hibernate drop-in installed at the exact fixed path (real systemd loads it).
+    dropin = root / "etc/systemd/system/systemd-hibernate.service.d/omarchy-t2.conf"
+    dropin.parent.mkdir(parents=True, exist_ok=True)
+    dropin.write_bytes((package / "hibernate/systemd-hibernate.conf").read_bytes())
+    dropin.chmod(0o644)
+    write("/usr/lib/systemd/system/systemd-hibernate.service", "[Unit]\nDescription=System Hibernate (vendor-shaped guest unit; never started)\nDocumentation=man:systemd-hibernate.service(8)\nDefaultDependencies=no\nRequires=sleep.target\nAfter=sleep.target\nConflicts=shutdown.target\n\n[Service]\nType=oneshot\nExecStart=/usr/lib/systemd/systemd-sleep hibernate\n")
+    # Guest-only stand-ins for the two host queries image_state runs (no btrfs/dm-crypt in the guest).
+    write("/etc/guest-sim/btrfs-swap-offset", "16\n")
+    write("/usr/bin/btrfs", '#!/bin/bash\nif [[ "$*" == "inspect-internal map-swapfile -r /swap/swapfile" ]]; then read -r value </etc/guest-sim/btrfs-swap-offset; echo "$value"; exit 0; fi\nexit 2\n', True)
+    write("/usr/bin/findmnt", '#!/bin/bash\nif [[ "$*" == "-n -o SOURCE,FSTYPE --target /swap/swapfile" ]]; then echo "/dev/mapper/root[/@swap] btrfs"; exit 0; fi\nexit 2\n', True)
+    commit = subprocess.run(["git", "-C", str(package), "rev-parse", "HEAD"], check=True, capture_output=True, text=True, timeout=20).stdout.strip()
+    write("/etc/guest-sim/reviewed-commit", commit + "\n")
+    write("/etc/pacman.conf", "[options]\nArchitecture = x86_64\nSigLevel = Never\nLocalFileSigLevel = Never\nCacheDir = /var/cache/pacman/pkg/\nLogFile = /var/log/pacman.log\n")
+    (root / "var/cache/pacman/pkg").mkdir(parents=True)
+    (root / "var/log").mkdir(parents=True, exist_ok=True)
+    manifest = "".join(value + "  " + name + "\n" for name, value in sorted(source_hashes.items()))
+    (work / "maintenance-native.sha256").write_text(manifest)
+    print("Exact public dependency manifest: " + str(work / "maintenance-native.sha256") + " (" + str(len(source_hashes)) + " entries, SHA-256 " + hashlib.sha256(manifest.encode()).hexdigest() + ")", flush=True)
+    print("Exact maintenance-native guest SHA-256: " + hashlib.sha256(raw).hexdigest() + "; repository HEAD " + commit, flush=True)
+    marker = "MAINTENANCE_NATIVE_VM"
+    test_command = "/usr/bin/python3 -I -B /maintenance-native-test.py"
   elif args.maintenance_recovery or args.maintenance_alpm:
     tests = Path(__file__).resolve().parent
     source_hashes = {}
@@ -359,6 +410,8 @@ def main():
     "hibernate.target": "[Unit]\nDefaultDependencies=no\nRequires=systemd-hibernate.service\nAfter=systemd-hibernate.service\nStopWhenUnneeded=yes\n",
     "sleep.target": "[Unit]\nDefaultDependencies=no\nRefuseManualStart=yes\nStopWhenUnneeded=yes\n",
   }
+  if args.maintenance_native:
+    del units["systemd-hibernate.service"]  # the vendor-shaped unit + reviewed drop-in are installed instead
   for name, content in units.items():
     if name.endswith(".service") and name != "test.service":
       content += "StandardOutput=tty\nStandardError=tty\nTTYPath=/dev/console\n"
@@ -372,13 +425,23 @@ def main():
     if listed.wait() or packed.returncode:
       raise RuntimeError(error.decode())
   kernel = Path("/usr/lib/modules") / os.uname().release / "vmlinuz"
+  extra = []
+  limit = "60s"
+  if args.maintenance_native:
+    # Disposable 2 MiB scratch image: the guest writes a synthetic swap header page there.
+    disk = work / "swap-scratch.img"
+    with disk.open("wb") as scratch: scratch.truncate(2 * 1024 * 1024)
+    extra = ["-drive", "file=" + str(disk) + ",if=none,id=swapscratch,format=raw", "-device", "virtio-blk-pci,drive=swapscratch"]
+    limit = "300s"
   with (work / "serial.log").open("wb") as log:
-    result = subprocess.run(["timeout", "--kill-after=5s", "60s", "qemu-system-x86_64", "-machine", "q35,accel=kvm", "-cpu", "host", "-smp", "2", "-m", "1024", "-nic", "none", "-display", "none", "-serial", "stdio", "-monitor", "none", "-no-reboot", "-kernel", str(kernel), "-initrd", str(initrd), "-append", "console=ttyS0 rdinit=/init loglevel=3 systemd.log_target=console"], stdout=log, stderr=subprocess.STDOUT)
+    result = subprocess.run(["timeout", "--kill-after=5s", limit, "qemu-system-x86_64", *extra, "-machine", "q35,accel=kvm", "-cpu", "host", "-smp", "2", "-m", "1024", "-nic", "none", "-display", "none", "-serial", "stdio", "-monitor", "none", "-no-reboot", "-kernel", str(kernel), "-initrd", str(initrd), "-append", "console=ttyS0 rdinit=/init loglevel=3 systemd.log_target=console"], stdout=log, stderr=subprocess.STDOUT)
   text = (work / "serial.log").read_text(errors="replace")
-  print(text[-18000:])
+  print(text[-(90000 if args.maintenance_native else 18000):])
   if result.returncode or marker + "_PASS" not in text or marker + "_EXIT=0" not in text:
     raise SystemExit("Disposable logind proof failed; retained " + str(work))
-  if args.maintenance_owner:
+  if args.maintenance_native:
+    print("PASS: real native update_guard.main hook admissions across a package/kernel update, real native maintenance re-entry, and fail-closed negatives in a disposable guest; first-write publisher seam and simulated layers documented in the guest docstring")
+  elif args.maintenance_owner:
     print("PASS: guest-only actual owner-held logind FD and latched stop requests retained across original parent death, with explicit simulated safe release; no package/native admission")
   elif args.maintenance_alpm:
     print("PASS: real disposable pacman hook/transaction fixture under retained owner-held inhibitor; no host packages, native admission or reactivation proof")
