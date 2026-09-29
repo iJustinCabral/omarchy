@@ -997,6 +997,49 @@ class Assess(AssessFixture):
     self.assertEqual(older.assess()["baseline"], "missing")
     self.assertEqual(older.assess()["class"], "unknown")
 
+  RUN_DROPIN = "run/systemd/system/bluetooth-after-wifi.service.d/10-source.conf"
+
+  def test_volatile_run_state_never_changes_the_class_in_either_direction(self):
+    absent = self.fresh()
+    self.assertEqual(absent.assess()["class"], "unchanged")
+    absent.write(self.RUN_DROPIN, b"[Unit]\nAfter=x\n")
+    self.assertEqual(absent.assess()["class"], "unchanged")
+    absent.write(self.RUN_DROPIN, b"different")
+    self.assertEqual(absent.assess()["class"], "unchanged")
+    self.assertNotIn("run/systemd/system/bluetooth-after-wifi.service.d", absent.T.read_baseline(absent.root, (absent.root / absent.T.MAINTENANCE).read_bytes())["control_inventory"]["directories"])
+    present = Assess("test_unchanged_generation_reports_every_item_equal")
+    present.setUp()
+    self.addCleanup(present.doCleanups)
+    present.write(self.RUN_DROPIN, b"[Unit]\nAfter=x\n")
+    present.published()
+    (present.root / self.RUN_DROPIN).unlink()
+    (present.root / self.RUN_DROPIN).parent.rmdir()
+    self.assertEqual(present.assess()["class"], "unchanged")
+
+  def test_old_format_baseline_with_run_entries_is_unchanged_after_reboot(self):
+    other = Assess("test_unchanged_generation_reports_every_item_equal")
+    other.setUp()
+    self.addCleanup(other.doCleanups)
+    other.write(self.RUN_DROPIN, b"[Unit]\nAfter=x\n")
+    def old_capture(root):  # what the published live baseline recorded: default-mode scan including /run
+      return CONTROL.capture(root, baseline=False)
+    with patch.object(N, "_control_capture", old_capture): other.published()
+    baseline = other.T.read_baseline(other.root, (other.root / other.T.MAINTENANCE).read_bytes())["control_inventory"]
+    self.assertIn("run/systemd/system/bluetooth-after-wifi.service.d", baseline["directories"])
+    (other.root / self.RUN_DROPIN).unlink()
+    (other.root / self.RUN_DROPIN).parent.rmdir()  # reboot: per-boot state gone
+    self.assertEqual(other.assess()["class"], "unchanged")
+    other.write("etc/systemd/system/bluetooth-after-wifi.service.d/x.conf", b"changed")
+    report = other.assess()
+    self.assertEqual((report["class"], report["changed_items"]), ("requalification-required", ["control_inventory"]))
+
+  def test_persistent_unit_changes_still_require_requalification(self):
+    for relative in ("etc/systemd/system/bluetooth-after-wifi.service.d/x.conf", "usr/lib/systemd/system/systemd-hibernate.service.d/x.conf"):
+      other = self.fresh()
+      other.write(relative, b"changed")
+      report = other.assess()
+      self.assertEqual((report["class"], report["changed_items"]), ("requalification-required", ["control_inventory"]), relative)
+
   def test_unreadable_items_are_unknown_and_never_unchanged(self):
     other = self.fresh()
     for name in list((other.root / "usr/lib/firmware/brcm").iterdir()): name.unlink()

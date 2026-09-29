@@ -43,6 +43,8 @@ TREES = tuple(sorted((
   "etc/cmdline.d", "etc/limine-entry-tool.d", "usr/share/limine-entry-tool.d",
   "etc/boot/hooks/pre.d", "etc/boot/hooks/post.d", "etc/dkms/framework.conf.d",
 )))
+# Volatile (tmpfs/per-boot) roots: never part of a generation baseline.
+VOLATILE = ("run", "var/run", "tmp", "var/tmp", "dev", "proc", "sys")
 MAX_ENTRIES = 4096
 MAX_DEPTH = 8
 MAX_TOTAL = 64 * 1024 * 1024
@@ -64,6 +66,10 @@ def _parents(root, path, owner):
     try: _owned_directory(current, owner)
     except FileNotFoundError: return False
   return True
+
+
+def volatile(relative):
+  return any(relative == root or relative.startswith(root + "/") for root in VOLATILE)
 
 
 def _allowed(relative):
@@ -133,8 +139,9 @@ def _node(root, path, owner, budget, *, tree=False, depth=0, baseline=False):
 
 def _scan(root, owner, baseline=False):
   budget = [0, 0]
-  return {"files": {name: _node(root, root / name, owner, budget, baseline=baseline) for name in FILES},
-          "directories": {name: _node(root, root / name, owner, budget, tree=True, baseline=baseline) for name in TREES}}
+  keep = lambda name: not (baseline and volatile(name))
+  return {"files": {name: _node(root, root / name, owner, budget, baseline=baseline) for name in FILES if keep(name)},
+          "directories": {name: _node(root, root / name, owner, budget, tree=True, baseline=baseline) for name in TREES if keep(name)}}
 
 
 def capture(root, *, baseline=False):
@@ -143,7 +150,8 @@ def capture(root, *, baseline=False):
   baseline=True (generation baseline only) records a symlink whose target lies
   outside the declared scope as its link text plus an out-of-scope marker
   instead of refusing, without following it, and accepts multi-link regular
-  files, recording their link count. The default refuses both.
+  files, recording their link count. The default refuses both. It also omits
+  volatile per-boot roots (/run, /tmp, ...), which are not generation state.
   """
   root = Path(root)
   if not root.is_absolute() or root.resolve() != root or not root.is_dir():

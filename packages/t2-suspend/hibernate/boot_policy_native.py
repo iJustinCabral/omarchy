@@ -549,6 +549,25 @@ def _item_control(engine, root, state):
           "files": _node_digests(engine, files), "directories": _node_digests(engine, capture["directories"])}
 
 
+def _control_volatile(key):
+  return any(key == root or key.startswith(root + "/") for root in ("run", "var/run", "tmp", "var/tmp", "dev", "proc", "sys"))
+
+
+def _comparable(name, item):
+  """Item in comparison form. control_inventory drops volatile-root keys and the aggregate digest.
+
+  Baselines published before volatile roots were excluded contain per-boot /run
+  entries and an aggregate over them; the per-item digest maps are compared with
+  every volatile key filtered on both sides instead. Everything else is exact.
+  """
+  if name != "control_inventory" or type(item) is not dict: return item
+  value = {key: part for key, part in item.items() if key != "capture_sha256"}
+  for section in ("files", "directories"):
+    if type(value.get(section)) is dict:
+      value[section] = {key: part for key, part in value[section].items() if not _control_volatile(key)}
+  return value
+
+
 def _item_bootloader(engine, root, state):
   files = {}
   for name in BOOTLOADERS:
@@ -705,8 +724,8 @@ def _assess_core(engine, root, evidence, marker, *, busy=lambda: False):
   for name in (*CRITICAL_ITEMS, *TOLERATED_ITEMS):
     if "unavailable" in baseline[name]: items[name] = {"state": "unknown", "reason": "baseline item unavailable: " + baseline[name]["unavailable"]}
     elif name in errors: items[name] = {"state": "unknown", "reason": errors[name]}
-    elif baseline[name] == current[name]: items[name] = {"state": "equal"}
-    else: items[name] = {"state": "changed", "paths": _differences(baseline[name], current[name])[:32]}
+    elif _comparable(name, baseline[name]) == _comparable(name, current[name]): items[name] = {"state": "equal"}
+    else: items[name] = {"state": "changed", "paths": _differences(_comparable(name, baseline[name]), _comparable(name, current[name]))[:32]}
   recorded = baseline["limine"]
   projection = recorded.get("projection_sha256") == stock["projection_sha256"]
   limine = {"exact_equal": recorded.get("exact_sha256") == stock["exact_sha256"], "stock_projection_equal": projection,
@@ -745,7 +764,7 @@ def _reactivation_postchecks(engine, root, baseline):
   product.TRIAL._verify_deployment(root, config, report, source_default=True)
   engine.IMAGE_STATE.require_no_image(root, resume)
   items, errors = generation_items(engine, root)
-  if errors or items != {name: baseline[name] for name in engine.BASELINE_ITEMS}:
+  if errors or any(_comparable(name, items[name]) != _comparable(name, baseline[name]) for name in engine.BASELINE_ITEMS):
     raise ValueError("Generation items differ from the baseline after reactivation")
 
 

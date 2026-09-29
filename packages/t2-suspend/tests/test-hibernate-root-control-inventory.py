@@ -207,6 +207,15 @@ class RootControls(unittest.TestCase):
     alias.symlink_to(self.root)
     with self.assertRaisesRegex(ValueError, "Canonical"): I.capture(alias)
 
+  def test_baseline_capture_omits_volatile_roots_and_default_keeps_them(self):
+    self.write("run/systemd/system/bluetooth-after-wifi.service.d/a.conf")
+    self.write("etc/systemd/system/bluetooth-after-wifi.service.d/a.conf")
+    default, baseline = I.capture(self.root), I.capture(self.root, baseline=True)
+    self.assertEqual(set(default["directories"]), set(I.TREES))
+    self.assertEqual(set(default["files"]), set(I.FILES))
+    self.assertEqual(set(baseline["directories"]), {name for name in I.TREES if not I.volatile(name)})
+    self.assertEqual(set(baseline["files"]), {name for name in I.FILES if not I.volatile(name)})
+
   def test_actual_selector_scope_and_no_commands(self):
     for name in ("usr/lib/systemd/systemd-sleep", "usr/lib/initcpio/functions", "etc/crypttab.initramfs", "etc/default/limine"):
       self.assertIn(name, I.FILES)
