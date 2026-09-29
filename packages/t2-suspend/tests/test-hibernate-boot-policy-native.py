@@ -954,6 +954,21 @@ class Assess(unittest.TestCase):
     self.assertEqual(events, ["probe", "hash"])
     self.assertEqual(report["class"], "unchanged")
 
+  def test_assess_reports_unknown_when_a_transaction_starts_while_hashing(self):
+    other = self.fresh()
+    real_generation = N.generation_items
+    lock = other.root / self.T.DB_LOCK
+    def generation(engine, root):
+      lock.write_bytes(b"pacman")  # pacman begins after the lock-free probe
+      return real_generation(engine, root)
+    with patch.object(N, "generation_items", side_effect=generation):
+      report = other.assess()
+    self.assertEqual(report["class"], "unknown")
+    self.assertTrue(report["busy"])
+    self.assertIn("started during assessment", report["reason"])
+    self.assertEqual(lock.read_bytes(), b"pacman")
+    lock.unlink()
+
   def test_baseline_publication_and_assessment_accept_hardlinked_firmware_and_out_of_scope_control_links(self):
     other = Assess("test_unchanged_generation_reports_every_item_equal")
     other.setUp()

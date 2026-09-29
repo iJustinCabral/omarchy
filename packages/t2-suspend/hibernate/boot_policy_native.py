@@ -655,6 +655,8 @@ def assess(engine, root=ROOT):
   except (OSError, ValueError) as error: return unknown("Generation baseline is invalid: " + str(error)[:200], baseline="invalid")
   current, errors = generation_items(engine, root)
   if engine._read(root, engine.MAINTENANCE) != marker: return unknown("Maintenance marker changed during assessment")
+  # No lock is held while hashing, so a transaction may have started meanwhile.
+  if engine._present(root / engine.DB_LOCK): return unknown("A package transaction started during assessment", busy=True)
   raw = engine._read(root, engine.P.LIMINE, private=False)
   try: stock = engine.stock_identity(raw)
   except ValueError as error: return unknown("Current Limine configuration is not stock: " + str(error)[:200])
