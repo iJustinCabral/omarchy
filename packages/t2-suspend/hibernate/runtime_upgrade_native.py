@@ -22,6 +22,7 @@ import os
 from pathlib import Path
 import re
 import select
+import signal
 import stat
 import sys
 import time
@@ -610,6 +611,16 @@ def _cleanup_release(release):
   if interrupt is not None: raise interrupt
 
 
+@contextmanager
+def _signals_raise():
+  """SIGHUP, SIGTERM and SIGINT become SystemExit so the lock and recovery `finally` clauses run (the veto is retained on the way out)."""
+  def raiser(number, _frame): raise SystemExit(128 + number)
+  previous = {number: signal.signal(number, raiser) for number in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)}
+  try: yield
+  finally:
+    for number, handler in previous.items(): signal.signal(number, handler)
+
+
 def native():
   approval = _installed_approval()
   _unchanged(approval)
@@ -620,7 +631,7 @@ def native():
   core, old_native, engine = _verified_engines(approval)
   fd, guard = _guard(old_native, approval)
   try:
-    with _locks(ROOT) as release_db:
+    with _signals_raise(), _locks(ROOT) as release_db:
       release_db.check_physical()
       try:
         guard()

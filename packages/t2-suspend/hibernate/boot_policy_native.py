@@ -38,6 +38,7 @@ docs/t2-suspend/REBIND-DESIGN.md). It issues no qualification and performs no po
 """
 import argparse
 from contextlib import contextmanager
+import signal
 import importlib.util
 import hashlib
 import json
@@ -820,6 +821,21 @@ def _refuse_reactivation_pending(engine):
     raise ValueError("A rebind is pending or interrupted; re-run `rebind` to recover it (it rolls back or finishes retirement) before any maintenance action")
 
 
+@contextmanager
+def _signals_raise():
+  """SIGHUP, SIGTERM and SIGINT become SystemExit, so the `finally` clauses release db.lck.
+
+  A dropped ssh session or a Ctrl-C must not leak the package lock. The write sequences are already recoverable by re-running
+  the same action (the pending veto stays until it proves rollback or completion), so raising at any point is safe. SIGKILL and
+  power loss cannot be caught; the runbook covers a leaked lock. Previous handlers are restored on exit.
+  """
+  def raiser(number, _frame): raise SystemExit(128 + number)
+  previous = {number: signal.signal(number, raiser) for number in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)}
+  try: yield
+  finally:
+    for number, handler in previous.items(): signal.signal(number, handler)
+
+
 def native(action):
   """Fixed host action; no roots, runners, prechecks, force or approval APIs."""
   if action not in (*ACTIONS, *READ_ONLY): raise ValueError("Explicit policy action required")
@@ -832,7 +848,7 @@ def native(action):
     command = _inhibit_command(action)
     os.execve(command[0], command, ENV)
     raise RuntimeError("Inhibitor exec unexpectedly returned")
-  with _exclusion(action) as guard:
+  with _signals_raise(), _exclusion(action) as guard:
     if action == "reactivate":
       capture = {}
       gate = lambda root, phase: _maintenance_gate(engine, root, phase, capture)

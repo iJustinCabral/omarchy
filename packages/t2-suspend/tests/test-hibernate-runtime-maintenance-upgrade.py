@@ -1,6 +1,7 @@
 """Runtime upgrade under package maintenance: tempdirs and mocks only; no lock, inhibitor, EFI or power operation."""
 import hashlib
 import importlib.util
+import signal
 import json
 import os
 from pathlib import Path
@@ -408,6 +409,14 @@ class Adapter(unittest.TestCase):
       N._postcheck(core, ordinary)
     check.assert_not_called()
     product_check.assert_called_once_with(product, barrier=True)
+
+  def test_signals_become_systemexit_and_previous_handlers_are_restored(self):
+    before = {number: signal.getsignal(number) for number in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)}
+    for number in before:
+      with self.subTest(signal=number), self.assertRaises(SystemExit) as caught:
+        with N._signals_raise(): os.kill(os.getpid(), number)
+      self.assertEqual(caught.exception.code, 128 + number)
+      self.assertEqual({n: signal.getsignal(n) for n in before}, before)
 
   def intent(self, approval, **changes):
     expected = approval["expected"]
