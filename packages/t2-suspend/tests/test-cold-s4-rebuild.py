@@ -33,7 +33,7 @@ restore_queue_dma = function(core, "bce_pm_restore_queue_dma", "void")
 block_queue_dma = function(core, "bce_pm_block_queue_dma")
 drop_graph = function(core, "bce_pm_drop_no_state_queue_graph", "void")
 rebuild_graph = function(core, "bce_pm_rebuild_no_state_queue_graph")
-suspend_no_state = function(core, "bce_pm_suspend_no_state")
+suspend_no_state = function(core, "bce_pm_suspend_no_state_fallback")
 suspend_common = function(core, "t2bce_suspend_common")
 resume_mode = function(core, "t2bce_resume_mode")
 resume_wrapper = function(core, "t2bce_resume_with_shared_dma")
@@ -48,11 +48,17 @@ assert ".thaw = t2audio_resume" in audio
 assert ".restore = t2audio_resume" in audio
 assert "t2bce_resume_mode(dev, true)" in restore
 assert "t2bce_resume(dev)" in resume_wrapper
+# Client teardown (HCD removal) needs a live transport and event queues: the fallback
+# reopens the transport before it, and only then quiesces for SLEEP_NO_STATE.
+assert suspend_no_state.index("bce_pm_suspend_abort") < suspend_no_state.index("pm_can_rebuild_no_state")
 assert suspend_no_state.index("pm_can_rebuild_no_state") < suspend_no_state.index("pm_prepare_no_state")
-assert suspend_no_state.index("pm_prepare_no_state") < suspend_no_state.index("bce_pm_suspend_fallback_no_state")
-assert suspend_common.index("pm_can_rebuild_no_state") < suspend_common.index("pm_prepare_no_state")
-assert suspend_common.index("pm_prepare_no_state") < suspend_common.index("pm_prepare(bce)")
-assert "bce_pm_suspend_no_state(bce, force_no_state)" in suspend_common
+assert suspend_no_state.index("pm_mark_no_state_resume") < suspend_no_state.index("pm_prepare_no_state")
+assert suspend_no_state.index("pm_prepare_no_state") < suspend_no_state.index("bce_pm_suspend_prepare")
+assert suspend_no_state.index("bce_pm_suspend_prepare") < suspend_no_state.index("bce_pm_suspend_fallback_no_state")
+assert suspend_common.index("pm_can_rebuild_no_state") < suspend_common.index("pm_prepare(bce)")
+assert "pm_prepare_no_state" not in suspend_common
+assert "force_no_state || !bce_stateful_supported(bce)" in suspend_common
+assert "bce_pm_suspend_no_state_fallback(bce)" in suspend_common
 assert suspend_no_state.index("bce_pm_suspend_fallback_no_state") < suspend_no_state.index("bce_pm_block_queue_dma")
 assert suspend_no_state.index("bce_pm_block_queue_dma") < suspend_no_state.index("bce_pm_drop_no_state_queue_graph")
 assert block_queue_dma.index("pci_clear_master") < block_queue_dma.rindex("pci_read_config_word")
@@ -65,6 +71,7 @@ assert "if (bce->no_state_early_wake_attempted)" in resume_mode
 assert resume_mode.index("no_state_early_wake_status") < resume_mode.index("bce_pm_resume_no_state(bce)")
 assert resume_mode.index("wake_status && !allow_cold_boot") < resume_mode.index("bce_xhci_pm_start")
 assert "!bce->no_state_rebuild_failed" in core
+assert "if (!bce->dma.cmd_cmdq)" in suspend_common
 
 for callback in ("pm_abort", "pm_drop_no_state_queues", "pm_rebuild_no_state_queues"):
   assert callback in transport_h
@@ -75,10 +82,12 @@ for callback in ("pm_abort", "pm_drop_no_state_queues", "pm_rebuild_no_state_que
 vhci_drop = function(vhci, "bce_vhci_pm_drop_no_state_queues", "void")
 vhci_rebuild = function(vhci, "bce_vhci_pm_rebuild_no_state_queues")
 vhci_prepare = function(vhci, "bce_vhci_pm_prepare")
-vhci_no_state = function(vhci, "bce_vhci_pm_prepare_no_state", "void")
+vhci_no_state = function(vhci, "bce_vhci_pm_prepare_no_state")
 vhci_system_event = function(vhci, "bce_vhci_handle_system_event", "void")
 assert "bce_vhci_pause_event_queues(vhci)" in vhci_prepare
 assert "bce_vhci_remove_hcd(vhci)" in vhci_no_state
+assert vhci_no_state.index("bce_vhci_resume_event_queues") < vhci_no_state.index("bce_vhci_remove_hcd")
+assert vhci_no_state.index("bce_vhci_remove_hcd") < vhci_no_state.index("bce_vhci_pause_event_queues")
 assert "bce_vhci_command_queue_deliver_completion" in vhci_system_event
 assert vhci_drop.index("cancel_work_sync") < vhci_drop.index("destroy_event_queues")
 assert vhci_drop.index("destroy_event_queues") < vhci_drop.index("destroy_message_queues")
@@ -113,14 +122,15 @@ harness = r'''
 typedef uint16_t u16;
 struct pci_dev { void *data; u16 command; int reads; bool fail_clear; };
 struct device { struct pci_dev *pdev; };
-struct t2bce_dma_engine { bool is_being_removed; };
+struct t2bce_dma_engine { bool is_being_removed; void *cmd_cmdq; };
 struct bce_xhci_pm { int unused; };
-struct mutex { int unused; };
+struct mutex { int held; };
 struct t2bce_device {
   struct pci_dev *pci, *pci0;
   struct t2bce_dma_engine dma;
   struct bce_xhci_pm xhci_pm;
   struct mutex pm_lock;
+  struct mutex dma_completion_lock;
   bool stateful_suspend_valid;
   bool no_state_fallback;
   bool no_state_resume;
@@ -138,12 +148,12 @@ enum event {
   EV_FREE_COMMANDS, EV_MARK_RESUME, EV_SUSPEND_ABORT, EV_CLIENT_ABORT,
   EV_RESTORE_NO_STATE, EV_RESUME_FINISH, EV_XHCI_INITIAL, EV_CHANNEL_RESUME,
   EV_HANDSHAKE, EV_CREATE_COMMANDS, EV_REBUILD_CLIENTS, EV_STATEFUL_SAVE,
-  EV_STATEFUL_RESTORE
+  EV_STATEFUL_RESTORE, EV_IRQ_ENABLE, EV_IRQ_DISABLE, EV_ENGINE_ENABLE
 };
 static enum event events[128];
 static int event_count;
 static bool can_rebuild = true, stateful_supported = true;
-static int prepare_status, suspend_prepare_status, sleep_status;
+static int prepare_status, suspend_prepare_status, sleep_status, prepare_no_state_status;
 static int stateful_save_status, stateful_restore_status, restore_no_state_status;
 static int handshake_status, create_commands_status, rebuild_clients_status;
 
@@ -165,7 +175,7 @@ static void reset_controls(void) {
   event_count = 0;
   can_rebuild = true;
   stateful_supported = true;
-  prepare_status = suspend_prepare_status = sleep_status = 0;
+  prepare_status = suspend_prepare_status = sleep_status = prepare_no_state_status = 0;
   stateful_save_status = stateful_restore_status = restore_no_state_status = 0;
   handshake_status = create_commands_status = rebuild_clients_status = 0;
 }
@@ -188,8 +198,8 @@ static int pci_irq_vector(struct pci_dev *pdev, unsigned int nr) {
   (void)pdev; assert(nr == 4); return 44;
 }
 static void synchronize_irq(unsigned int irq) { assert(irq == 44); record(EV_SYNC_IRQ); }
-static void mutex_lock(struct mutex *lock) { (void)lock; }
-static void mutex_unlock(struct mutex *lock) { (void)lock; }
+static void mutex_lock(struct mutex *lock) { assert(!lock->held); lock->held = 1; }
+static void mutex_unlock(struct mutex *lock) { assert(lock->held); lock->held = 0; }
 static void t2bce_core_clients_pm_reset(struct t2bce_device *bce) { (void)bce; record(EV_RESET); }
 static int t2bce_core_clients_pm_prepare(struct t2bce_device *bce) { (void)bce; record(EV_PREPARE); return prepare_status; }
 static void t2bce_core_clients_pm_abort(struct t2bce_device *bce) { (void)bce; record(EV_CLIENT_ABORT); }
@@ -203,19 +213,22 @@ static int bce_pm_suspend_try_state(struct t2bce_device *bce) {
   return stateful_save_status;
 }
 static bool t2bce_core_clients_pm_can_rebuild_no_state(struct t2bce_device *bce) { (void)bce; record(EV_CAN_REBUILD); return can_rebuild; }
-static void t2bce_core_clients_pm_prepare_no_state(struct t2bce_device *bce) { (void)bce; record(EV_PREPARE_NO_STATE); }
+static int t2bce_core_clients_pm_prepare_no_state(struct t2bce_device *bce) { (void)bce; record(EV_PREPARE_NO_STATE); return prepare_no_state_status; }
 static int bce_pm_suspend_fallback_no_state(struct t2bce_device *bce) { (void)bce; record(EV_SLEEP_NO_STATE); return sleep_status; }
 static void t2bce_core_clients_pm_drop_no_state_queues(struct t2bce_device *bce) { (void)bce; record(EV_DROP_CLIENTS); }
 static void bce_free_command_queues(struct t2bce_device *bce) { (void)bce; record(EV_FREE_COMMANDS); }
 static void t2bce_core_clients_pm_mark_no_state_resume(struct t2bce_device *bce) { (void)bce; record(EV_MARK_RESUME); }
-static int bce_fw_version_handshake(struct t2bce_device *bce) { (void)bce; record(EV_HANDSHAKE); return handshake_status; }
-static int bce_create_command_queues(struct t2bce_device *bce) { (void)bce; record(EV_CREATE_COMMANDS); return create_commands_status; }
-static int t2bce_core_clients_pm_rebuild_no_state_queues(struct t2bce_device *bce) { (void)bce; record(EV_REBUILD_CLIENTS); return rebuild_clients_status; }
+static int bce_fw_version_handshake(struct t2bce_device *bce) { assert(!bce->dma_completion_lock.held); record(EV_HANDSHAKE); return handshake_status; }
+static int bce_create_command_queues(struct t2bce_device *bce) { assert(!bce->dma_completion_lock.held); record(EV_CREATE_COMMANDS); return create_commands_status; }
+static int t2bce_core_clients_pm_rebuild_no_state_queues(struct t2bce_device *bce) { assert(!bce->dma_completion_lock.held); record(EV_REBUILD_CLIENTS); return rebuild_clients_status; }
 static int bce_pm_resume_stateful(struct t2bce_device *bce) { (void)bce; record(EV_STATEFUL_RESTORE); return stateful_restore_status; }
-static int bce_pm_resume_no_state(struct t2bce_device *bce) { (void)bce; record(EV_RESTORE_NO_STATE); return restore_no_state_status; }
-static void bce_pm_resume_finish(struct t2bce_device *bce) { (void)bce; record(EV_RESUME_FINISH); }
+static int bce_pm_resume_no_state(struct t2bce_device *bce) { assert(bce->dma_completion_lock.held); record(EV_RESTORE_NO_STATE); return restore_no_state_status; }
+static void bce_pm_resume_finish_locked(struct t2bce_device *bce) { assert(bce->dma_completion_lock.held); record(EV_RESUME_FINISH); }
+static void bce_dma_irq_enable(struct t2bce_device *bce) { (void)bce; record(EV_IRQ_ENABLE); }
+static void bce_dma_irq_disable(struct t2bce_device *bce) { (void)bce; record(EV_IRQ_DISABLE); }
+static void bce_dma_engine_enable(struct t2bce_device *bce) { assert(bce->dma_completion_lock.held); record(EV_ENGINE_ENABLE); }
 static void bce_xhci_pm_start(struct bce_xhci_pm *pm, bool initial) { (void)pm; assert(initial); record(EV_XHCI_INITIAL); }
-static void bce_pm_channel_resume(struct t2bce_device *bce) { (void)bce; record(EV_CHANNEL_RESUME); }
+static void bce_pm_channel_resume(struct t2bce_device *bce) { assert(bce->dma_completion_lock.held); record(EV_CHANNEL_RESUME); }
 '''
 harness += restore_queue_dma + block_queue_dma + drop_graph + rebuild_graph + suspend_no_state + suspend_common + resume_mode
 harness += r'''
@@ -225,6 +238,7 @@ static void init_device(struct t2bce_device *bce, struct pci_dev functions[2], s
   functions[1] = (struct pci_dev){.command = PCI_COMMAND_MASTER};
   bce->pci = &functions[0];
   bce->pci0 = &functions[1];
+  bce->dma.cmd_cmdq = &functions[0];
   functions[0].data = bce;
   dev->pdev = &functions[0];
 }
@@ -238,8 +252,11 @@ int main(void) {
   reset_controls(); init_device(&bce, functions, &dev);
   assert(t2bce_suspend_common(&dev, true) == 0);
   assert(bce.no_state_queues_dropped && bce.no_state_resume && bce.no_state_fallback);
-  assert(find_event(EV_PREPARE_NO_STATE) < find_event(EV_PREPARE));
+  assert(find_event(EV_PREPARE) < find_event(EV_SUSPEND_ABORT));
+  assert(find_event(EV_SUSPEND_ABORT) < find_event(EV_PREPARE_NO_STATE));
+  assert(find_event(EV_MARK_RESUME) < find_event(EV_PREPARE_NO_STATE));
   assert(find_event(EV_PREPARE_NO_STATE) < find_event(EV_SLEEP_NO_STATE));
+  assert(find_event(EV_IRQ_DISABLE) > find_event(EV_FREE_COMMANDS));
   assert(find_event(EV_SLEEP_NO_STATE) < find_event(EV_BLOCK_DMA));
   assert(find_event(EV_BLOCK_DMA) < find_event(EV_SYNC_IRQ));
   assert(find_event(EV_DROP_CLIENTS) < find_event(EV_FREE_COMMANDS));
@@ -286,6 +303,7 @@ int main(void) {
   assert(t2bce_resume_mode(&dev, false) == -ETIMEDOUT);
   assert(find_event(EV_RESTORE_NO_STATE) < 0);
   assert(find_event(EV_XHCI_INITIAL) < 0 && bce.no_state_rebuild_failed);
+  assert(find_event(EV_RESUME_FINISH) >= 0 && find_event(EV_HANDSHAKE) < 0);
 
   reset_controls(); init_device(&bce, functions, &dev);
   bce.no_state_queues_dropped = true; bce.no_state_resume = true;
@@ -294,12 +312,28 @@ int main(void) {
   assert(t2bce_resume_mode(&dev, true) == 0);
   assert(find_event(EV_RESTORE_NO_STATE) < 0);
   assert(find_event(EV_XHCI_INITIAL) < find_event(EV_CHANNEL_RESUME));
+  assert(find_event(EV_CHANNEL_RESUME) < find_event(EV_ENGINE_ENABLE));
+  assert(find_event(EV_ENGINE_ENABLE) < find_event(EV_HANDSHAKE));
 
   reset_controls(); init_device(&bce, functions, &dev); can_rebuild = false;
   assert(t2bce_suspend_common(&dev, true) == -EOPNOTSUPP);
   assert(find_event(EV_SLEEP_NO_STATE) < 0 && find_event(EV_DROP_CLIENTS) < 0);
   assert(find_event(EV_PREPARE_NO_STATE) < 0 && find_event(EV_PREPARE) < 0);
   assert(find_event(EV_SUSPEND_ABORT) < 0 && find_event(EV_CLIENT_ABORT) < 0);
+
+  /* A failed rebuild leaves no command queue; a later freeze must refuse
+   * rather than quiesce absent state.
+   */
+  reset_controls(); init_device(&bce, functions, &dev); bce.dma.cmd_cmdq = NULL;
+  assert(t2bce_suspend_common(&dev, true) == -ENODEV);
+  assert(find_event(EV_PREPARE) < 0 && find_event(EV_SUSPEND_PREPARE) < 0);
+  assert(find_event(EV_SLEEP_NO_STATE) < 0 && find_event(EV_IRQ_DISABLE) < 0);
+
+  reset_controls(); init_device(&bce, functions, &dev); prepare_no_state_status = -ETIMEDOUT;
+  assert(t2bce_suspend_common(&dev, true) == -ETIMEDOUT);
+  assert(find_event(EV_SLEEP_NO_STATE) < 0 && find_event(EV_DROP_CLIENTS) < 0);
+  assert(find_event(EV_BLOCK_DMA) < 0 && find_event(EV_IRQ_DISABLE) < 0);
+  assert(find_event(EV_CLIENT_ABORT) >= 0 && !bce.no_state_queues_dropped);
 
   reset_controls(); init_device(&bce, functions, &dev); sleep_status = -EIO;
   assert(t2bce_suspend_common(&dev, true) == -EIO);
