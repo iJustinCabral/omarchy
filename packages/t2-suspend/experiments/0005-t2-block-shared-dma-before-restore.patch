@@ -26,7 +26,111 @@ This is an unqualified diagnostic candidate.  It deliberately does not gate
 the Wi-Fi sibling, so the existing Wi-Fi-unbind isolation remains mandatory.
 It does not implement the separate cold-S4 BCE reconstruction path.
 
+Rebased for linux-t2 7.2.7 (t2bce 6780d522).  Upstream rewrote probe unwinding
+(no segment-list-pool label, fail_dev0 inside the NVMe-patch conditional), so
+the sibling references are now released at a fail_dev0 label outside that
+conditional.  The new MSI0 disable/enable pairing and the software DMA
+submission gate that upstream added are not bus-mastering gates and do not
+replace this PCI-level block; they are retained unchanged and this patch adds
+no code to them.
+
 ---
+diff --git a/drivers/bluetooth/hci_bcm4377.c b/drivers/bluetooth/hci_bcm4377.c
+--- a/drivers/bluetooth/hci_bcm4377.c
++++ b/drivers/bluetooth/hci_bcm4377.c
+@@ -567,6 +567,7 @@
+ 	bool transport_lost;
+ 	bool irq_blocked;
+ 	bool pm_blocked;
++	bool pm_was_busmaster;
+ 	bool setup_needed;
+ 	void *firmware_buffer;
+ 	dma_addr_t firmware_dma;
+@@ -2701,6 +2702,51 @@
+ 	return hci_resume_dev(bcm4377->hdev);
+ }
+ 
++static int bcm4377_suspend_noirq(struct device *dev)
++{
++	struct pci_dev *pdev = to_pci_dev(dev);
++	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
++	u16 command;
++
++	bcm4377->pm_was_busmaster = false;
++	if (pci_read_config_word(pdev, PCI_COMMAND, &command))
++		return -EIO;
++
++	bcm4377->pm_was_busmaster = command & PCI_COMMAND_MASTER;
++	pci_clear_master(pdev);
++	if (pci_read_config_word(pdev, PCI_COMMAND, &command) ||
++	    command & PCI_COMMAND_MASTER) {
++		if (bcm4377->pm_was_busmaster)
++			pci_set_master(pdev);
++		bcm4377->pm_was_busmaster = false;
++		return -EIO;
++	}
++
++	return 0;
++}
++
++static int bcm4377_restore_busmaster(struct pci_dev *pdev,
++				     struct bcm4377_data *bcm4377)
++{
++	u16 command;
++
++	if (!bcm4377->pm_was_busmaster ||
++	    READ_ONCE(bcm4377->transport_lost)) {
++		bcm4377->pm_was_busmaster = false;
++		return 0;
++	}
++
++	pci_set_master(pdev);
++	if (pci_read_config_word(pdev, PCI_COMMAND, &command) ||
++	    !(command & PCI_COMMAND_MASTER)) {
++		pci_clear_master(pdev);
++		return -EIO;
++	}
++
++	bcm4377->pm_was_busmaster = false;
++	return 0;
++}
++
+ /* PCI core has restored the standard header; restore vendor mappings
+  * before device interrupts and the normal unquiesce/HCI resume callback.
+  */
+@@ -2713,7 +2759,7 @@
+ 	int ret, i;
+ 
+ 	if (bcm4377->hw->id != 0x4377)
+-		return 0;
++		return bcm4377_restore_busmaster(pdev, bcm4377);
+ 
+ 	WRITE_ONCE(bcm4377->resume_config_failed, true);
+ 	for (i = 0; i < ARRAY_SIZE(offsets); i++) {
+@@ -2747,6 +2793,12 @@
+ 		}
+ 	}
+ 	WRITE_ONCE(bcm4377->resume_config_failed, false);
++	ret = bcm4377_restore_busmaster(pdev, bcm4377);
++	if (ret) {
++		WRITE_ONCE(bcm4377->resume_config_failed, true);
++		dev_err(dev, "PCI bus-master restore failed\n");
++		return ret;
++	}
+ 	dev_info(dev, "t2bt-resume: restored vendor windows (before %08x %08x %08x %08x %08x)\n",
+ 		 before[0], before[1], before[2], before[3], before[4]);
+ 	return 0;
+@@ -2774,6 +2826,10 @@
+ 
+ static const struct dev_pm_ops bcm4377_ops = {
+ 	SYSTEM_SLEEP_PM_OPS(bcm4377_suspend, bcm4377_resume)
++	.freeze_noirq = bcm4377_suspend_noirq,
++	.thaw_noirq = bcm4377_resume_noirq,
++	.poweroff_noirq = bcm4377_suspend_noirq,
++	.restore_noirq = bcm4377_resume_noirq,
+ 	.resume_noirq = bcm4377_resume_noirq,
+ 	.complete = bcm4377_complete,
+ };
 diff --git a/drivers/staging/t2bce/t2bce_core/t2bce.h b/drivers/staging/t2bce/t2bce_core/t2bce.h
 --- a/drivers/staging/t2bce/t2bce_core/t2bce.h
 +++ b/drivers/staging/t2bce/t2bce_core/t2bce.h
@@ -45,13 +149,13 @@ diff --git a/drivers/staging/t2bce/t2bce_core/t2bce.h b/drivers/staging/t2bce/t2
      bool mailbox_channel_active;
 +    bool pci_dma_restore_failed;
 +    unsigned long pci_master_mask;
+     bool dma_irq_disabled;
      struct mutex pm_lock;
-     struct mutex clients_lock;
-     struct list_head clients;
+     struct mutex dma_completion_lock;
 diff --git a/drivers/staging/t2bce/t2bce_core/t2bce_main.c b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
 --- a/drivers/staging/t2bce/t2bce_core/t2bce_main.c
 +++ b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
-@@ -166,6 +166,13 @@
+@@ -169,6 +169,13 @@
       * host state.
       */
      bce->pci0 = pci_get_slot(dev->bus, PCI_DEVFN(PCI_SLOT(dev->devfn), 0));
@@ -65,7 +169,7 @@ diff --git a/drivers/staging/t2bce/t2bce_core/t2bce_main.c b/drivers/staging/t2b
  #ifndef WITHOUT_NVME_PATCH
      if ((status = pci_enable_device_mem(bce->pci0))) {
          dev_warn(&dev->dev, "t2bce_core: failed to enable function 0\n");
-@@ -196,8 +203,10 @@
+@@ -199,8 +206,10 @@
      bce_xhci_pm_stop(&bce->xhci_pm);
  #ifndef WITHOUT_NVME_PATCH
      pci_disable_device(bce->pci0);
@@ -75,9 +179,9 @@ diff --git a/drivers/staging/t2bce/t2bce_core/t2bce_main.c b/drivers/staging/t2b
 +    pci_dev_put(bce->pci3);
 +    pci_dev_put(bce->pci2);
      pci_dev_put(bce->pci0);
- fail_segment_list_pool:
      t2bce_dma_destroy_segment_list_pool(&bce->dma);
-@@ -447,6 +456,8 @@
+ fail_interrupt:
+@@ -511,6 +520,8 @@
  #ifndef WITHOUT_NVME_PATCH
      pci_disable_device(bce->pci0);
  #endif
@@ -86,7 +190,7 @@ diff --git a/drivers/staging/t2bce/t2bce_core/t2bce_main.c b/drivers/staging/t2b
      pci_dev_put(bce->pci0);
      pci_free_irq(dev, 0, dev);
      pci_free_irq(dev, 4, dev);
-@@ -672,6 +683,151 @@
+@@ -830,6 +841,151 @@
      return status;
  }
  
@@ -238,7 +342,7 @@ diff --git a/drivers/staging/t2bce/t2bce_core/t2bce_main.c b/drivers/staging/t2b
  static int t2bce_prepare(struct device *dev)
  {
      /*
-@@ -708,10 +864,15 @@
+@@ -866,10 +1022,15 @@
  struct dev_pm_ops t2bce_pci_driver_pm = {
          .prepare = t2bce_prepare,
          .suspend = t2bce_suspend,
@@ -257,99 +361,3 @@ diff --git a/drivers/staging/t2bce/t2bce_core/t2bce_main.c b/drivers/staging/t2b
          .complete = t2bce_complete
  };
  struct pci_driver t2bce_pci_driver = {
-diff --git a/drivers/bluetooth/hci_bcm4377.c b/drivers/bluetooth/hci_bcm4377.c
---- a/drivers/bluetooth/hci_bcm4377.c
-+++ b/drivers/bluetooth/hci_bcm4377.c
-@@ -567,6 +567,7 @@
- 	bool transport_lost;
- 	bool irq_blocked;
- 	bool pm_blocked;
-+	bool pm_was_busmaster;
- 	bool setup_needed;
- 	void *firmware_buffer;
- 	dma_addr_t firmware_dma;
-@@ -2701,6 +2702,51 @@
- 	return hci_resume_dev(bcm4377->hdev);
- }
- 
-+static int bcm4377_suspend_noirq(struct device *dev)
-+{
-+	struct pci_dev *pdev = to_pci_dev(dev);
-+	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
-+	u16 command;
-+
-+	bcm4377->pm_was_busmaster = false;
-+	if (pci_read_config_word(pdev, PCI_COMMAND, &command))
-+		return -EIO;
-+
-+	bcm4377->pm_was_busmaster = command & PCI_COMMAND_MASTER;
-+	pci_clear_master(pdev);
-+	if (pci_read_config_word(pdev, PCI_COMMAND, &command) ||
-+	    command & PCI_COMMAND_MASTER) {
-+		if (bcm4377->pm_was_busmaster)
-+			pci_set_master(pdev);
-+		bcm4377->pm_was_busmaster = false;
-+		return -EIO;
-+	}
-+
-+	return 0;
-+}
-+
-+static int bcm4377_restore_busmaster(struct pci_dev *pdev,
-+				     struct bcm4377_data *bcm4377)
-+{
-+	u16 command;
-+
-+	if (!bcm4377->pm_was_busmaster ||
-+	    READ_ONCE(bcm4377->transport_lost)) {
-+		bcm4377->pm_was_busmaster = false;
-+		return 0;
-+	}
-+
-+	pci_set_master(pdev);
-+	if (pci_read_config_word(pdev, PCI_COMMAND, &command) ||
-+	    !(command & PCI_COMMAND_MASTER)) {
-+		pci_clear_master(pdev);
-+		return -EIO;
-+	}
-+
-+	bcm4377->pm_was_busmaster = false;
-+	return 0;
-+}
-+
- /* PCI core has restored the standard header; restore vendor mappings
-  * before device interrupts and the normal unquiesce/HCI resume callback.
-  */
-@@ -2713,7 +2759,7 @@
- 	int ret, i;
- 
- 	if (bcm4377->hw->id != 0x4377)
--		return 0;
-+		return bcm4377_restore_busmaster(pdev, bcm4377);
- 
- 	WRITE_ONCE(bcm4377->resume_config_failed, true);
- 	for (i = 0; i < ARRAY_SIZE(offsets); i++) {
-@@ -2747,6 +2793,12 @@
- 		}
- 	}
- 	WRITE_ONCE(bcm4377->resume_config_failed, false);
-+	ret = bcm4377_restore_busmaster(pdev, bcm4377);
-+	if (ret) {
-+		WRITE_ONCE(bcm4377->resume_config_failed, true);
-+		dev_err(dev, "PCI bus-master restore failed\n");
-+		return ret;
-+	}
- 	dev_info(dev, "t2bt-resume: restored vendor windows (before %08x %08x %08x %08x %08x)\n",
- 		 before[0], before[1], before[2], before[3], before[4]);
- 	return 0;
-@@ -2774,6 +2826,10 @@
- 
- static const struct dev_pm_ops bcm4377_ops = {
- 	SYSTEM_SLEEP_PM_OPS(bcm4377_suspend, bcm4377_resume)
-+	.freeze_noirq = bcm4377_suspend_noirq,
-+	.thaw_noirq = bcm4377_resume_noirq,
-+	.poweroff_noirq = bcm4377_suspend_noirq,
-+	.restore_noirq = bcm4377_resume_noirq,
- 	.resume_noirq = bcm4377_resume_noirq,
- 	.complete = bcm4377_complete,
- };

@@ -38,6 +38,10 @@ master check are removed from the S3 path.
 This is an unqualified source-only change; it has not been built, staged or
 tested on hardware.
 
+Rebased for linux-t2 7.2.7 (t2bce 6780d522).  Context and offsets only;
+the S3 wiring (.resume = t2bce_resume, no noirq gate) and the
+hibernation_transition flag are carried over unchanged.
+
 ---
 diff --git a/drivers/staging/t2bce/t2bce_core/t2bce.h b/drivers/staging/t2bce/t2bce_core/t2bce.h
 --- a/drivers/staging/t2bce/t2bce_core/t2bce.h
@@ -53,9 +57,9 @@ diff --git a/drivers/staging/t2bce/t2bce_core/t2bce.h b/drivers/staging/t2bce/t2
 diff --git a/drivers/staging/t2bce/t2bce_core/t2bce_main.c b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
 --- a/drivers/staging/t2bce/t2bce_core/t2bce_main.c
 +++ b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
-@@ -64,8 +64,12 @@
+@@ -65,8 +65,12 @@
      int status;
-
+ 
      (void)data;
 -    if (!bce || !bce->no_state_resume || !bce->no_state_queues_dropped ||
 -            bce->no_state_early_wake_attempted)
@@ -66,10 +70,10 @@ diff --git a/drivers/staging/t2bce/t2bce_core/t2bce_main.c b/drivers/staging/t2b
 +    if (!bce || !bce->hibernation_transition || !bce->no_state_resume ||
 +            !bce->no_state_queues_dropped || bce->no_state_early_wake_attempted)
          return;
-
+ 
      bce->no_state_early_wake_attempted = true;
-@@ -872,11 +876,17 @@
-
+@@ -1035,11 +1039,17 @@
+ 
  static int t2bce_suspend(struct device *dev)
  {
 +    struct t2bce_device *bce = pci_get_drvdata(to_pci_dev(dev));
@@ -77,7 +81,7 @@ diff --git a/drivers/staging/t2bce/t2bce_core/t2bce_main.c b/drivers/staging/t2b
 +    bce->hibernation_transition = false;
      return t2bce_suspend_common(dev, false);
  }
-
+ 
  static int t2bce_freeze(struct device *dev)
  {
 +    struct t2bce_device *bce = pci_get_drvdata(to_pci_dev(dev));
@@ -85,16 +89,16 @@ diff --git a/drivers/staging/t2bce/t2bce_core/t2bce_main.c b/drivers/staging/t2b
 +    bce->hibernation_transition = true;
      return t2bce_suspend_common(dev, true);
  }
-
-@@ -1124,6 +1134,7 @@
+ 
+@@ -1299,6 +1309,7 @@
      if (!bce->no_state_rebuild_failed)
          t2bce_core_notify_resume_complete(bce);
      bce->no_state_resume = false;
 +    bce->hibernation_transition = false;
      pr_debug("t2bce_core: complete: exit\n");
  }
-
-@@ -1137,9 +1148,10 @@
+ 
+@@ -1312,9 +1323,10 @@
  struct dev_pm_ops t2bce_pci_driver_pm = {
          .prepare = t2bce_prepare,
          .suspend = t2bce_suspend,

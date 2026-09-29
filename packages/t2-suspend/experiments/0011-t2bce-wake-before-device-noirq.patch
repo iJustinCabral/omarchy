@@ -17,21 +17,16 @@ rebuilds queues as before.  A failed early transaction remains eligible for
 the restore-only cold-epoch fallback; thaw and ordinary resume still fail
 closed.
 
-diff --git a/drivers/staging/t2bce/t2bce_core/mailbox.h b/drivers/staging/t2bce/t2bce_core/mailbox.h
-index 8a16bd36..c0ad48ad 100644
---- a/drivers/staging/t2bce/t2bce_core/mailbox.h
-+++ b/drivers/staging/t2bce/t2bce_core/mailbox.h
-@@ -43,6 +43,8 @@ int bce_mailbox_send_timeout(struct bce_mailbox *mb, u64 msg, u64 *recv, unsigne
- int bce_mailbox_send_no_reply(struct bce_mailbox *mb, u64 msg);
- int bce_mailbox_send_locked(struct bce_mailbox *mb, u64 msg, u64 *recv);
- int bce_mailbox_send_locked_timeout(struct bce_mailbox *mb, u64 msg, u64 *recv, unsigned int timeout_ms);
-+int bce_mailbox_send_locked_poll(struct bce_mailbox *mb, u64 msg, u64 *recv,
-+        unsigned int timeout_us);
- int bce_mailbox_send_no_reply_locked(struct bce_mailbox *mb, u64 msg);
- 
- int bce_mailbox_handle_interrupt(struct bce_mailbox *mb);
+Rebased for linux-t2 7.2.7 (t2bce 6780d522).  The syscore early wake is
+unchanged and still polls the mailbox with interrupts unavailable.  Upstream
+now enables the completion interrupt before issuing the wake command in the
+ordinary resume path; the early wake cannot do that (syscore runs with
+interrupts off before PCI config restore), so this ordering difference is
+deliberate and unproven on 7.2.7 hardware.  The resume-mode consumer of the
+saved result and the module init/exit hooks are otherwise carried over.
+
+---
 diff --git a/drivers/staging/t2bce/t2bce_core/mailbox.c b/drivers/staging/t2bce/t2bce_core/mailbox.c
-index 45aa999f..d58cc25a 100644
 --- a/drivers/staging/t2bce/t2bce_core/mailbox.c
 +++ b/drivers/staging/t2bce/t2bce_core/mailbox.c
 @@ -1,5 +1,6 @@
@@ -50,7 +45,7 @@ index 45aa999f..d58cc25a 100644
  void bce_mailbox_init(struct bce_mailbox *mb, void __iomem *reg_mb)
  {
      mb->reg_mb = reg_mb;
-@@ -86,6 +89,34 @@ int bce_mailbox_send_locked(struct bce_mailbox *mb, u64 msg, u64 *recv)
+@@ -86,6 +89,34 @@
      return bce_mailbox_send_locked_timeout(mb, msg, recv, BCE_MBOX_TIMEOUT_MS);
  }
  
@@ -85,11 +80,22 @@ index 45aa999f..d58cc25a 100644
  int bce_mailbox_send_no_reply_locked(struct bce_mailbox *mb, u64 msg)
  {
      u32 __iomem *regb;
+diff --git a/drivers/staging/t2bce/t2bce_core/mailbox.h b/drivers/staging/t2bce/t2bce_core/mailbox.h
+--- a/drivers/staging/t2bce/t2bce_core/mailbox.h
++++ b/drivers/staging/t2bce/t2bce_core/mailbox.h
+@@ -43,6 +43,8 @@
+ int bce_mailbox_send_no_reply(struct bce_mailbox *mb, u64 msg);
+ int bce_mailbox_send_locked(struct bce_mailbox *mb, u64 msg, u64 *recv);
+ int bce_mailbox_send_locked_timeout(struct bce_mailbox *mb, u64 msg, u64 *recv, unsigned int timeout_ms);
++int bce_mailbox_send_locked_poll(struct bce_mailbox *mb, u64 msg, u64 *recv,
++        unsigned int timeout_us);
+ int bce_mailbox_send_no_reply_locked(struct bce_mailbox *mb, u64 msg);
+ 
+ int bce_mailbox_handle_interrupt(struct bce_mailbox *mb);
 diff --git a/drivers/staging/t2bce/t2bce_core/t2bce.h b/drivers/staging/t2bce/t2bce_core/t2bce.h
-index 9a2c2041..39d2b60a 100644
 --- a/drivers/staging/t2bce/t2bce_core/t2bce.h
 +++ b/drivers/staging/t2bce/t2bce_core/t2bce.h
-@@ -31,6 +31,8 @@ struct t2bce_device {
+@@ -31,6 +31,8 @@
      bool no_state_resume;
      bool no_state_queues_dropped;
      bool no_state_rebuild_failed;
@@ -99,7 +105,6 @@ index 9a2c2041..39d2b60a 100644
      bool pci_dma_restore_failed;
      bool queue_dma_blocked;
 diff --git a/drivers/staging/t2bce/t2bce_core/t2bce_main.c b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
-index fb8eb8e5..caf8096f 100644
 --- a/drivers/staging/t2bce/t2bce_core/t2bce_main.c
 +++ b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
 @@ -3,6 +3,7 @@
@@ -110,7 +115,7 @@ index fb8eb8e5..caf8096f 100644
  #include <linux/version.h>
  
  /*
-@@ -31,6 +32,8 @@ static dev_t bce_chrdev;
+@@ -31,6 +32,8 @@
  static struct class *bce_class;
  static const bool bce_use_stateful_sleep = true;
  
@@ -119,9 +124,9 @@ index fb8eb8e5..caf8096f 100644
  struct t2bce_device *global_bce;
  
  static int bce_create_command_queues(struct t2bce_device *bce);
-@@ -51,6 +54,56 @@ static int bce_pm_suspend_prepare(struct t2bce_device *bce);
+@@ -52,6 +55,57 @@
  static void bce_pm_suspend_abort(struct t2bce_device *bce);
- static void bce_pm_resume_finish(struct t2bce_device *bce);
+ static void bce_pm_resume_finish_locked(struct t2bce_device *bce);
  
 +static void t2bce_syscore_resume(void *data)
 +{
@@ -173,20 +178,21 @@ index fb8eb8e5..caf8096f 100644
 +    .ops = &t2bce_syscore_ops,
 +};
 +
++
  static const struct t2bce_dma_engine_ops t2bce_dma_ops = {
      .register_queue = t2bce_dma_register_queue,
      .unregister_queue = t2bce_dma_unregister_queue,
-@@ -758,6 +793,8 @@ static int t2bce_suspend_common(struct device *dev, bool force_no_state)
+@@ -915,6 +969,8 @@
+     bce->no_state_fallback = false;
      bce->no_state_resume = false;
-     bce->no_state_queues_dropped = false;
      bce->no_state_rebuild_failed = false;
 +    bce->no_state_early_wake_attempted = false;
 +    bce->no_state_early_wake_status = 0;
      t2bce_core_clients_pm_reset(bce);
-     status = t2bce_core_clients_pm_prepare(bce);
-     if (status) {
-@@ -849,7 +886,10 @@ static int t2bce_resume_mode(struct device *dev, bool allow_cold_boot)
-         goto out_unlock;
+ 
+     if (!bce->dma.cmd_cmdq) {
+@@ -1018,7 +1074,10 @@
+         goto out_completion_unlock;
      }
  
 -    wake_status = bce_pm_resume_no_state(bce);
@@ -197,7 +203,7 @@ index fb8eb8e5..caf8096f 100644
      if (wake_status && !allow_cold_boot) {
          status = wake_status;
          bce->no_state_rebuild_failed = true;
-@@ -1113,6 +1153,8 @@ static int __init t2bce_module_init(void)
+@@ -1291,6 +1350,8 @@
      if (result)
          goto fail_drv;
  
@@ -206,7 +212,7 @@ index fb8eb8e5..caf8096f 100644
      pr_info("t2bce_core: module initialized\n");
      return 0;
  
-@@ -1129,6 +1171,7 @@ fail_chrdev:
+@@ -1307,6 +1368,7 @@
  }
  static void __exit t2bce_module_exit(void)
  {
