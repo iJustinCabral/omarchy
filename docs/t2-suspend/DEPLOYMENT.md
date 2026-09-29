@@ -50,7 +50,7 @@ Pin values are not listed here on purpose: they depend on the exact reviewed com
 | H5 (optional, later) | `reactivate`: re-applies the retained source default without requalification, only when `assess` reports `unchanged` | sudo, real inhibitor | operator |
 | H6a to H6i (after a kernel update, hardware campaign) | requalify and `rebind` a new generation: runtime upgrade under maintenance, retire, build, stage, attended vectors, issue authority, generation trial, `rebind`, one routine S4 | sudo, real inhibitor, attended hardware | operator, per sub-gate |
 
-Stop and ask for review if any check differs from its expected output. Unknown means stop. Never retry a failed gate by repeating it: recovery for H2 and H3 is read-only diagnosis first (see the failure section). Never reboot, power-cycle, suspend or hibernate the machine at any point of this procedure.
+Stop and ask for review if any check differs from its expected output. Unknown means stop. Never retry a failed gate by repeating it: recovery for H2 and H3 is read-only diagnosis first (see the failure section). Never reboot, power-cycle, suspend or hibernate the machine at any point of gates H0 to H5. Gate H6 is different: its attended hardware steps (H6e to H6g and H6i) reboot into the staged entries as described there, one at a time; every other H6 step (H6a, H6b, H6d, H6h) must not be interrupted by a reboot or power action.
 
 ### Do not create snapshots before H3
 
@@ -440,8 +440,8 @@ WORK=/home/jjc/.local/state/codex-mba-autonomous/gen-7.2.7                # new 
 | H6c | Build the new pair (sudo builders) and audit it |
 | H6d | Stage it |
 | H6e | Attended ordinary boots, `test_resume`, S4 vector |
-| H6f | Issue the qualification, config and boot policy review |
-| H6g | Generation trial (`trial.py --generation`) |
+| H6f | Boot the new source entry; generation trial (`trial.py --generation`) |
+| H6g | Issue the qualification (bound to the trial's record), config and boot policy review |
 | H6h | `rebind` |
 | H6i | One routine S4 |
 
@@ -525,20 +525,21 @@ sudo /usr/bin/python3 -I -B "$P" disarm-restore                                #
 
 Each `--execute` is a one-time hardware vector: a failed or ambiguous attempt is terminal, is preserved as evidence and is never repeated. Ordinary boot success does not establish S4 safety. Use the runners' own `--help` for the exact evidence arguments.
 
-### H6f: issue the qualification, config and boot policy review
+### H6f: boot the new source entry, then the generation trial
 
-Externally, from the archived evidence and after independent review: the qualification (`omarchy-t2-product-cycle-v1`, `qualified: true`, `manifest_sha256` of the new manifest, `evidence_sha256`), the v2 product config for the new pair (its `staged_receipt_sha256` is the live NEW receipt's hash, `marker_pin` is the v3 postwrite marker pin above, `power_policy` present), and the approved boot policy review for the new receipt (`boot_policy.prepare` output with `approved: true`). Stage them root-owned 0600, under distinct names:
+The generation trial is a one-use, unqualified hardware run whose durable terminal record is what the qualification must later point at. Its readiness check requires the current boot to be the staged source entry: `LoaderEntrySelected` must be `MBA-T2-hibernation-source-<first 16 hex of the source sha256>` (`trial.verify_readiness`), AC power online, the source marker module not loaded and no EFI stage or override variables. So first, attended, boot into the source entry (the one-shot armed by `arm-source` in H6e is consumed by that boot; re-arm it if this is a later session) and confirm:
 
 ```bash
-for f in rebind-config.json rebind-qualification.json rebind-boot-policy-review.json; do
-  sudo install -m 0600 -o root -g root -T -- "<reviewed dir>/$f" "$S/$f"
-done
-sudo sync
+sudo /usr/bin/python3 -I -B "$P" arm-source && systemctl reboot    # attended; select nothing manually: the one-shot picks the source entry
+sudo /usr/bin/python3 -I -B "$EXP/verify-hibernation-uki-pair-source.py" --source "$WORK/source" --restore "$WORK/restore" --role source
 ```
 
-### H6g: generation trial
+The trial's two inputs are written by the operator or orchestrator as root, never by this code, from audited evidence, root-owned 0600:
 
-Provision, as root, a fresh state root named by the first 12 hex digits of the new manifest's digest (`TX.digest(manifest)`), with real `0700` directories; the original trial root and its consumed guard are never reused:
+- `config.json` (schema `omarchy-t2-explicit-trial-config-v1`, exact keys `source_directory restore_directory production_uki source_tree marker_file marker_pin manifest audited_details_sha256 staged_receipt_sha256 retire_slots`). Provenance: the artifact paths are the private build outputs of H6c; `manifest` and `audited_details_sha256` are what the audit derives (`trial.py inspect` prints `manifest_sha256`; a mismatch refuses); `staged_receipt_sha256` is the live NEW receipt's hash; `marker_file`/`marker_pin` are the postwrite marker v3 built and pinned for this kernel in H6c. `retire_slots` MUST be `true`: only a retiring trial reaches the terminal `reconciled` cycle that H6g and `rebind` require.
+- `authorization.json` (protocol `omarchy-t2-product-one-use-trial-v1`, `qualified: false`). Provenance: written by the operator after reviewing the audit, with `manifest_sha256` and `audited_details_sha256` of this pair, `original_boot_id` equal to the CURRENT boot id (`/proc/sys/kernel/random/boot_id`), a fresh `authorization_id`, the same `marker_pin`, and `physical_acceptance` `{boot_id, authorization_id, accepted: true, method: "operator-attended-cold-power"}` recording the operator's explicit attended acceptance. It is permission for one run, not qualification.
+
+Provision the fresh root named by the first 12 hex digits of the manifest digest (`TX.digest(manifest)`) with real `0700` directories; the original trial root and its consumed guard are never reused:
 
 ```bash
 G=/var/lib/omarchy/t2-hibernate-trial/generations/<manifest12>
@@ -550,7 +551,24 @@ sudo /usr/bin/python3 -I -B "$T" --generation <manifest12> inspect
 sudo /usr/bin/python3 -I -B "$T" --generation <manifest12> execute            # one use; separate explicit approval
 ```
 
-It refuses if the audited manifest is not the directory's, if the manifest is the original trial's, or if this generation's guard is already consumed. `repair-constructor` never applies to a generation.
+It refuses if the audited manifest is not the directory's, if the manifest is the original trial's, or if this generation's guard is already consumed. `repair-constructor` never applies to a generation. After a successful run the durable terminal record is `$G/ledger/cycle-<cycle id>.json` in state `reconciled` (plus the consumed `$G/guards/trial-consumed.json` naming the same cycle and an unblocked `$G/ledger/state.json`). A failed or ambiguous trial is terminal for that generation: never repeat its vector.
+
+### H6g: issue the qualification, config and boot policy review
+
+Externally, after independent review of the trial record. The qualification is still written by the operator or orchestrator, but it can only point at a real successful trial: `rebind` requires `evidence_sha256` to equal the SHA-256 of the exact bytes of `$G/ledger/cycle-<cycle id>.json`:
+
+```bash
+sudo sha256sum "$G"/ledger/cycle-*.json          # the value for evidence_sha256
+```
+
+Qualification: `{"protocol": "omarchy-t2-product-cycle-v1", "manifest_sha256": <digest of the new manifest>, "evidence_sha256": <that sha256>, "qualified": true}`. Product config: schema v2 for the new pair (`staged_receipt_sha256` is the live NEW receipt's hash, the v3 `marker_pin`, `power_policy` present). Boot policy review: `boot_policy.prepare` output for the new receipt with `approved: true`. Stage all three root-owned 0600, under distinct names:
+
+```bash
+for f in rebind-config.json rebind-qualification.json rebind-boot-policy-review.json; do
+  sudo install -m 0600 -o root -g root -T -- "<reviewed dir>/$f" "$S/$f"
+done
+sudo sync
+```
 
 ### H6h: `rebind`
 
@@ -560,7 +578,7 @@ Read-only checks first (MAINTENANCE-RUNBOOK.md section 10), then:
 sudo /usr/bin/python3 -I -B "$NATIVE" rebind
 ```
 
-Do not reboot, power-cycle, suspend or hibernate while it runs. Success prints canonical JSON with `"rebound": true`, `"requalification_required": false`, `"live_execution": true`, `"power_operation": false`. Afterwards `config.json`, `qualification.json`, `boot-policy-review.json`, `limine.conf.before-source-default` and `boot-policy.json` are the new generation's, the opt-in exists, the marker and pending are gone and the old set is archived under `boot-policy-transitions/<id>`. Interrupted: re-run it.
+Do not reboot, power-cycle, suspend or hibernate while it runs. `rebind` reads and validates the generation trial record (private real directories, no symlinks, reconciled cycle for this manifest, consumed guard naming it, evidence digest) before any write. SIGHUP, SIGTERM and SIGINT (a dropped ssh session, Ctrl-C) are converted to an exit that releases `db.lck`; the pending veto stays and re-running recovers. SIGKILL or power loss can leak `db.lck`: confirm with `pgrep -ax pacman` that no pacman runs, then follow MAINTENANCE-RUNBOOK.md section 4 and re-run `rebind`. Success prints canonical JSON with `"rebound": true`, `"requalification_required": false`, `"live_execution": true`, `"power_operation": false`. Afterwards `config.json`, `qualification.json`, `boot-policy-review.json`, `limine.conf.before-source-default` and `boot-policy.json` are the new generation's, the opt-in exists, the marker and pending are gone and the old set is archived under `boot-policy-transitions/<id>`. Interrupted: re-run it. While the machine is ACTIVE after `rebind`, pacman is blocked by the guard (`boot-policy.json` and the opt-in exist) until the next `maintenance` publish, exactly as before H3; run `maintenance` before any package update.
 
 ### H6i: one routine S4
 

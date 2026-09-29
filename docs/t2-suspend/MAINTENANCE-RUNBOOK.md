@@ -361,7 +361,7 @@ Use this when `assess` reports `requalification-required` (a kernel update chang
 1. Runtime upgrade UNDER MAINTENANCE, first, while the old pair and its receipt are still intact (the installed guard reads the fixed receipt path). It deploys a runtime that contains the rebind engine, the receipt custody resolver and the volatile-state baseline fix. It uses the maintenance approval protocol (DEPLOYMENT.md, gate H6a).
 2. Retire the old pair with the stager `retire-after-production-change` mode (section 9). It deletes the old receipt, images and Limine entries and leaves `pair-retired-receipt.json` and `pair-retirement.json` in the product state directory. Updates stay allowed and `assess` keeps reporting `requalification-required`.
 3. Build and audit the new pair from the new production UKI (private candidate stack; never restage a replacement `.linux`), stage it, and run the attended ordinary boots, `test_resume` and S4 qualification. A one-use trial for the new manifest uses `trial.py --generation <manifest12>`; the original trial root and its consumed guard are never reused or reset.
-4. Externally issue the qualification, the product config (schema v2, battery policy) and the boot policy review for the new receipt. Stage them, root-owned mode 0600, as `rebind-qualification.json`, `rebind-config.json` and `rebind-boot-policy-review.json` in the product state directory.
+4. Run the one-use generation trial (`trial.py --generation <manifest12>`, with `retire_slots: true`), then externally issue the qualification, the product config (schema v2, battery policy) and the boot policy review for the new receipt. The qualification's `evidence_sha256` must be the SHA-256 of the trial's reconciled `generations/<manifest12>/ledger/cycle-<id>.json`. Stage them, root-owned mode 0600, as `rebind-qualification.json`, `rebind-config.json` and `rebind-boot-policy-review.json` in the product state directory.
 5. `sudo /usr/bin/python3 -I -B "$NATIVE" rebind`.
 6. One routine S4 with the product dispatcher, attended.
 
@@ -390,8 +390,12 @@ sudo jq -r .staged_receipt_sha256 "$S/rebind-config.json"                       
 | `Staged replacement authority required` / `does not bind the staged pair receipt` / `not bound to this product manifest` | A staged file is missing or does not bind the new pair and manifest. |
 | `Unrelated Limine drift: ... staged pair bytes` | `/boot/limine.conf` differs from the staged pair by more than the snapshot region (for example another update ran after staging); restage the pair. |
 | a product validation, resume, deployment or saved-image refusal | The staged generation is not qualified as staged. |
+| `Qualification evidence does not bind the generation trial's reconciled cycle`, `Generation trial state required`, `Consumed generation trial guard required`, `Generation trial cycle is not reconciled`, `Exactly one generation trial cycle required`, `Private real generation trial directory required` | The qualification does not point at a real, successful, consumed trial of this manifest under `/var/lib/omarchy/t2-hibernate-trial/generations/<manifest12>/`; a record of the original trial root never counts. |
+| `A retired ... image is still on the ESP` | The guard's retirement check: an ESP image still has a retired image's hash; re-run the stager retire. |
 
 ### Interrupted or failed `rebind`
+
+A dropped ssh session, Ctrl-C or SIGTERM is converted to an exit that releases `/var/lib/pacman/db.lck`, leaving the pending in place (sleep and updates stay vetoed): re-run `rebind`. SIGKILL or power loss cannot be caught and can leak `db.lck` (the next run then refuses with a `db.lck` error): confirm no pacman is running, remove it only after the section 4 checks, and re-run.
 
 `source-default-activation.pending` exists and `jq -r .protocol` prints `omarchy-t2-package-rebind-intent-v1` (anything else is the runtime upgrade barrier or a reactivation: do not run `rebind`; use section 6 or the DEPLOYMENT.md failure table). Sleep and updates are refused; `maintenance` and `reactivate` name `rebind`. Do not reboot while it exists: the boot line may already be changed.
 
