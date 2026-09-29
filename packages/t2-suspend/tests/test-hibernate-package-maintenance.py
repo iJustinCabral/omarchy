@@ -336,6 +336,23 @@ class Maintenance(unittest.TestCase):
     self.assertFalse((self.archive() / "package-maintenance-complete.json").exists())
     self.assertTrue((self.root / M.T.MAINTENANCE).exists())
 
+  def test_snapshot_churn_between_phases_never_blocks_the_pipeline(self):
+    numbers = [[1], [1, 2], [2], [2, 3], [3], [3, 4], [], [7], [7, 8], [8]]
+    def churn(name, session):
+      index = M.PHASES.index(name)
+      self.f.write(M.T.P.LIMINE, F.with_snapshots((self.root / M.T.P.LIMINE).read_bytes(), numbers[index]))
+      return self.phase(name, session)
+    result = self.coordinate(churn)
+    self.assertEqual(self.calls, list(M.PHASES))
+    self.assertEqual(result["maintenance"]["fallback"]["classification"], "fallback-bytes-verified")
+
+  def test_snapshot_promoted_to_default_fails_the_phase_fallback_check(self):
+    def promote(name, session):
+      config = F.with_snapshots((self.root / M.T.P.LIMINE).read_bytes(), [1]).replace(b"default_entry: 2", b"default_entry: 5")
+      self.f.write(M.T.P.LIMINE, config)
+      return self.phase(name, session)
+    with self.assertRaisesRegex(ValueError, "canonical stock default 2"): self.coordinate(promote)
+
   def test_wrong_or_replaced_fallback_bytes_fail_and_cannot_start_pipeline(self):
     (self.root / M.PRODUCTION).write_bytes(b"wrong hash")
     # Existing deactivation precheck itself refuses the broken production pin.

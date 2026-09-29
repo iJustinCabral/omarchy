@@ -693,6 +693,33 @@ class NativeAdmission(unittest.TestCase):
     self.assertEqual(self.marker.read_bytes(), self.raw)
     self.assertEqual(self.calls, ["image"] * 3)
 
+  def test_snapshot_churn_between_transactions_never_blocks_and_snapshot_default_does(self):
+    snapshots = self.fixture_module.with_snapshots
+    def rewrite(numbers, reverse=False, kernel=None):
+      config = snapshots((self.root / guard.LIMINE).read_bytes(), numbers, reverse)
+      if kernel is not None:
+        path = "boot/EFI/Linux/omarchy_linux-t2.efi"
+        config = config.replace(hashlib.blake2b((self.root / path).read_bytes()).hexdigest().encode(), hashlib.blake2b(kernel).hexdigest().encode())
+        self.f.write(path, kernel)
+      self.f.write(guard.LIMINE, config)
+    with self.booby_traps():
+      for label, change in (("first snapshot", lambda: rewrite([1])), ("second snapshot added", lambda: rewrite([1, 2])),
+                            ("old snapshot cleaned up", lambda: rewrite([2])), ("reordered block", lambda: rewrite([2, 3, 4], reverse=True)),
+                            ("kernel update plus churn", lambda: rewrite([5], kernel=b"kernel update with snapshot churn")), ("snapshots removed", lambda: rewrite([]))):
+        with self.subTest(label):
+          change()
+          self.assertEqual(self.admit()["classification"], "inactive-maintenance-update-admitted")
+      rewrite([1, 2])
+      good = (self.root / guard.LIMINE).read_bytes()
+      for label, text in (("snapshot promoted to default", good.replace(b"default_entry: 2", b"default_entry: 5")),
+                          ("default inside the region", good.replace(b"comment: 4.0.2-1", b"default_entry: 5", 1))):
+        with self.subTest(label):
+          self.f.write(guard.LIMINE, text)
+          with self.assertRaisesRegex(ValueError, "canonical stock default 2"): self.admit()
+      self.f.write(guard.LIMINE, good)
+      self.assertEqual(self.admit()["classification"], "inactive-maintenance-update-admitted")
+    self.assertEqual(self.marker.read_bytes(), self.raw)
+
   def test_missing_or_prefix_marker_without_resume_evidence_is_refused(self):
     self.resume_path().unlink()  # what a pre-fix publisher produced (no deployed markers exist; no migration)
     with self.assertRaises(FileNotFoundError): self.admit()
