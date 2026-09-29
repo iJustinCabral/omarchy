@@ -1,0 +1,101 @@
+#!/bin/bash
+
+# omarchy:summary=Inspect or drive the opt-in T2 hibernation boot policy (MacBookAir9,1)
+# omarchy:args=status|assess|maintenance|reactivate|activation|deactivation
+# omarchy:hidden=true
+# omarchy:requires-sudo=true
+
+# Thin wrapper over the root-owned, reviewed runtime snapshot. It never builds
+# or stages boot images, never touches the opt-in marker and never starts a
+# power transition; those steps stay with the reviewed deployment procedure in
+# docs/t2-suspend/DEPLOYMENT.md.
+
+set -euo pipefail
+
+MODEL="/sys/class/dmi/id/product_name"
+PYTHON="/usr/bin/python3"
+OPT_IN="/etc/omarchy/t2-hibernate-product.enabled"
+STATE="/var/lib/omarchy/t2-hibernate-product"
+DROPIN="/etc/systemd/system/systemd-hibernate.service.d/omarchy-t2.conf"
+GUARD_HOOK="/etc/pacman.d/hooks/00-omarchy-t2-hibernate-guard.hook"
+NATIVE="$STATE/runtime/packages/t2-suspend/hibernate/boot_policy_native.py"
+
+usage() {
+  cat <<'EOF'
+Usage: omarchy setup t2-hibernate status|assess|maintenance|reactivate|activation|deactivation
+
+  status        read-only summary of what is installed; needs no privilege
+  assess        classify the current boot generation against the qualified baseline (read-only)
+  maintenance   deactivate the source default and hold it inactive across a package update
+  reactivate    re-apply the source default after an update when assess reports "unchanged"
+  activation    apply the reviewed source-default boot policy
+  deactivation  restore the exact stock boot policy
+
+MacBookAir9,1 only. No boot image is built or staged and no power transition is started.
+EOF
+}
+
+state_of() {
+  if [[ -e $1 || -L $1 ]]; then
+    echo "present"
+  else
+    echo "absent"
+  fi
+}
+
+show_status() {
+  local runtime="not deployed"
+
+  if [[ -d $STATE ]]; then
+    if [[ ! -x $STATE ]]; then
+      runtime="root-private; run 'omarchy setup t2-hibernate assess' for details"
+    elif [[ -f $NATIVE ]]; then
+      runtime="deployed"
+    fi
+  fi
+
+  echo "Model:            $(< "$MODEL")"
+  echo "Kernel:           $(uname -r)"
+  echo "Opt-in marker:    $(state_of "$OPT_IN")"
+  echo "Runtime snapshot: $runtime"
+  echo "Sleep drop-in:    $(state_of "$DROPIN")"
+  echo "Update guard:     $(state_of "$GUARD_HOOK")"
+}
+
+run_privileged() {
+  if (( EUID == 0 )); then
+    "$@"
+  elif [[ -t 0 ]]; then
+    sudo "$@"
+  else
+    pkexec "$@"
+  fi
+}
+
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0 ;;
+  status|assess|maintenance|reactivate|activation|deactivation)
+    action=$1 ;;
+  *)
+    usage >&2
+    exit 2 ;;
+esac
+
+if (( $# != 1 )); then
+  usage >&2
+  exit 2
+fi
+
+if [[ ! -r $MODEL ]] || [[ $(< "$MODEL") != "MacBookAir9,1" ]]; then
+  echo "T2 hibernation is qualified only for MacBookAir9,1; refusing" >&2
+  exit 1
+fi
+
+if [[ $action == "status" ]]; then
+  show_status
+else
+  # Isolated Python: the runtime only accepts its fixed root-owned snapshot path.
+  run_privileged "$PYTHON" -I -B "$NATIVE" "$action"
+fi
