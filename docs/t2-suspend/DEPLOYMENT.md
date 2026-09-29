@@ -52,6 +52,8 @@ Stop and ask for review if any check differs from its expected output. Unknown m
 
 ### Do not create snapshots before H3
 
+This applies to the installed runtime (`e489bab7`) and to any deployed generation that predates the snapshot-blind Limine comparison; the reviewed source ignores the snapshot region while hibernation is active, but it is not installed until H2.
+
 Until H3 has completed, do not run `omarchy update`, `omarchy-snapshot` or `snapper create`, and do not delete snapshots. `omarchy update` creates a Snapper snapshot before pacman runs (and before the hibernation guard refuses the transaction), and the enabled `limine-snapper-sync` watcher then rewrites the snapshot region of `/boot/limine.conf`. While hibernation is active, the product and the H3 deactivation require `/boot/limine.conf` to equal the staged pair bytes exactly (`stage-hibernation-uki-pair.py` `verify_staged`, only `default_entry` may differ), so any such rewrite makes H3 refuse (fail closed, hibernation unavailable) until reviewed. After H3, snapshot churn is expected and admitted: the maintenance checks only read `default_entry` and the stock `//linux-t2` entry binding, never the snapshot region (verified with fixture and VM tests, `b2dbf51f`).
 
 ## Prerequisites (read-only, unprivileged)

@@ -194,17 +194,25 @@ def verify_staged(root, receipt, *, source_default=False):
   backup = rooted(root, BACKUP)
   if not backup.is_file() or digest(backup) != receipt["original_limine_sha256"]:
     raise ValueError("Pair Limine backup changed")
+  # Snapshot entries written by limine-snapper-sync are not part of the qualified
+  # boot policy (they never become default and boot an unrelated read-only
+  # snapshot). The recorded snapshot region, retained in the pair backup, is
+  # spliced into the current bytes so that everything else, including the pair
+  # block, the default entry and the //linux-t2 entry, stays byte-exact against
+  # staged_limine_sha256.
+  policy = import_path("pair_source_default_normalizer", HERE.parent / "hibernate/boot_policy.py")
+  with limine.open("rb") as stream: actual = stream.read(policy.MAX_BYTES + 1)
+  donor = backup.read_bytes()
   if source_default:
     # No CLI selects this mode. The routine product verifier first verifies
     # the fixed private external policy and retained configuration backup.
-    policy = import_path("pair_source_default_normalizer", HERE.parent / "hibernate/boot_policy.py")
-    with limine.open("rb") as stream: actual = stream.read(policy.MAX_BYTES + 1)
-    normalized = policy.normalize_source_default(actual, receipt)
-    text = normalized.decode()
+    normalized = policy.normalize_source_default(actual, receipt, donor=donor)
   else:
-    if digest(limine) != receipt["staged_limine_sha256"]:
+    if len(actual) > policy.MAX_BYTES: raise ValueError("Oversized Limine configuration")
+    normalized = policy.with_region(actual, donor)
+    if hashlib.sha256(normalized).hexdigest() != receipt["staged_limine_sha256"]:
       raise ValueError("Staged pair Limine configuration changed")
-    text = limine.read_text()
+  text = normalized.decode()
   production = rooted(root, Path("boot/EFI/Linux") / SINGLE.PRODUCTION_IMAGE)
   if digest(production) != receipt["production_uki_sha256"]:
     raise ValueError("Production UKI changed during pair staging")
