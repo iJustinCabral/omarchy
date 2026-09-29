@@ -321,6 +321,18 @@ It never continues forward past the boot-config write, so after a rollback (`"ro
 
 Section 5 indicators: after a rollback the marker exists, `boot-policy.json`, the opt-in and `source-default-*.pending` are absent and `default_entry: 2`. After a completed reactivation the marker and pending are gone and `boot-policy.json`, the opt-in and the source `default_entry` are present; the blanket guard then refuses updates until `maintenance` is run again.
 
+## 7. Unrecognized snapshot region in `/boot/limine.conf`
+
+While hibernation is active, and at H3, Limine checks ignore only the region that `limine-snapper-sync` writes (`boot_policy.limine_canonical`). The recognizer is strict: a line it does not recognize makes the check refuse, which keeps hibernation unavailable and, before H3, keeps updates blocked. The error names the file line, for example `Unexpected line inside snapshot region (line 42: '...')`.
+
+1. Read the named line with `sudo sed -n '<N>p' /boot/limine.conf` and compare it with a normal snapshot sub-entry (5-space indent; `comment:`, `///N │ date`, `////linux…`, `protocol: efi`, `path: boot():/<machine-id>/limine_history/…`, `cmdline:`).
+2. If a `limine-snapper-sync` update changed its output format, stop and report the line: the recognizer needs a reviewed update. Do not edit `/boot/limine.conf` by hand, and do not restore it from a backup; the retained backups pin the approved bytes and a hand edit can break both hibernation and the maintenance evidence.
+3. Snapshot sub-entries that reuse a top-level entry name, point outside `limine_history`, or set `default_entry` are refused on purpose.
+
+## 8. Stale snapshot entries after H3
+
+Entering maintenance writes back the retained stock bytes, whose snapshot list reflects the time hibernation was staged. Until `limine-snapper-sync` runs again (at the next snapshot, including the one `omarchy update` creates), the boot menu may list snapshots that were since deleted or miss newer ones. Selecting a missing snapshot entry fails to boot; it is never the default. To refresh immediately after H3, run `sudo limine-snapper-sync` (attended). This does not affect maintenance, which ignores the snapshot region.
+
 ## Summary of gaps
 
 - No code path re-publishes a new resume tuple, or retires maintenance, when the swapfile or cmdline changed; only restoring the original topology is supported today.
