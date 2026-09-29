@@ -2,6 +2,9 @@
 import configparser
 import fcntl
 import importlib.util
+import importlib._bootstrap_external
+import shutil
+import sys
 import hashlib
 import json
 import os
@@ -203,7 +206,7 @@ class MaintenanceEvidence(unittest.TestCase):
   def test_live_root_aliases_refuse_before_import_or_open(self):
     alias = self.root.parent / "live-alias"
     alias.symlink_to("/")
-    with patch.object(guard.importlib.util, "spec_from_file_location", side_effect=AssertionError("No live import")):
+    with patch.object(guard, "_load", side_effect=AssertionError("No live import")), patch.object(guard, "_execute", side_effect=AssertionError("No live import")):
       for root in ("/", "/tmp/..", alias, "relative", self.root / ".."):
         with self.assertRaises(ValueError): guard.check_inactive_maintenance(root)
 
@@ -276,22 +279,18 @@ class MaintenanceEvidence(unittest.TestCase):
     with self.assertRaises(FileNotFoundError): self.check()
 
   def during_fallback(self, mutation):
-    original_spec = guard.importlib.util.spec_from_file_location
-    def load(name, path):
-      spec = original_spec(name, path)
+    original = guard._load
+    def load(name, path, expected=None):
+      module = original(name, path, expected)
       if name == "guard_maintenance_evidence":
-        execute = spec.loader.exec_module
-        def loaded(module):
-          execute(module)
-          fallback = module._fallback
-          def changed(root):
-            result = fallback(root)
-            mutation()
-            return result
-          module._fallback = changed
-        spec.loader.exec_module = loaded
-      return spec
-    with patch.object(guard.importlib.util, "spec_from_file_location", side_effect=load):
+        fallback = module._fallback
+        def changed(root):
+          result = fallback(root)
+          mutation()
+          return result
+        module._fallback = changed
+      return module
+    with patch.object(guard, "_load", side_effect=load):
       with self.assertRaises(ValueError): self.check()
 
   def test_marker_drift_after_fallback_hashing_refuses(self):
@@ -338,10 +337,97 @@ class NativeAdmission(unittest.TestCase):
     self.raw = self.marker.read_bytes()
     self.script = self.root / guard.RUNTIME / "packages/t2-suspend/hibernate/update_guard.py"
     self.intent = json.loads(self.raw)
+    self.image_state = guard._load("test_image_state", HERE / "hibernate/image_state.py")
+    self.offset, self.devnum = 7, "254:0"
+    for directory in ("dev", "dev/mapper", "sys/power"): (self.root / directory).mkdir(parents=True, mode=0o700, exist_ok=True)
+    os.symlink("../dm-0", self.root / "dev/mapper/root")
+    self.f.write("sys/power/resume", (self.devnum + "\n").encode())
+    self.f.write("sys/power/resume_offset", (str(self.offset) + "\n").encode())
+    self.device = self.root / "dev/dm-0"
+    self.set_page(self.clean_page())
+    self.calls = []
+
+  def clean_page(self):
+    page = bytearray(4096)
+    page[1024:1028] = b"\x01\0\0\0"
+    page[-10:] = b"SWAPSPACE2"
+    return bytes(page)
+
+  def set_page(self, page):
+    data = bytearray((self.offset + 1) * 4096)
+    data[self.offset * 4096:] = page
+    self.device.write_bytes(bytes(data))
+    self.device.chmod(0o600)
+
+  def query(self, argv):
+    if argv[0] == "/usr/bin/btrfs": return str(self.offset)
+    return "/dev/mapper/root[/@swap] btrfs"
+
+  def image(self, root, inventory):
+    self.calls.append("image")
+    held = os.open(root / self.T.PHYSICAL_LOCK, os.O_RDONLY)
+    try:
+      with self.assertRaises(BlockingIOError): fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)  # checked under our lock
+    finally: os.close(held)
+    resume = {"device": "/dev/mapper/root", "devnum": self.devnum, "offset": self.offset}
+    return self.image_state.require_no_image(root, resume, query=self.query, fixture_identity=lambda fd: (254, 0))
 
   def admit(self, **overrides):
-    arguments = {"root": self.root, "owner": os.geteuid(), "isolated": True, "script": self.script}
+    arguments = {"root": self.root, "owner": os.geteuid(), "isolated": True, "script": self.script, "image": self.image}
     return guard._admit(**{**arguments, **overrides})
+
+  def test_saved_image_unknown_or_unreadable_header_blocks_under_lock(self):
+    self.assertEqual(self.admit()["image"], "no-image-at-qualified-resume-page")
+    self.assertEqual(self.calls, ["image"])
+    swsusp = bytearray(self.clean_page())
+    swsusp[-10:] = b"S1SUSPEND\0"
+    for page in (bytes(swsusp), bytes(4096), b"S" * 4096, self.clean_page()[:-10] + b"SWAP-SPACE"):
+      self.set_page(page)
+      with self.assertRaises(ValueError): self.admit()
+    self.device.write_bytes(b"short")  # truncated: header page unreadable
+    with self.assertRaises(ValueError): self.admit()
+    self.set_page(self.clean_page())
+    (self.root / "sys/power/resume_offset").write_text("8\n")  # kernel target differs
+    with self.assertRaises(ValueError): self.admit()
+    (self.root / "sys/power/resume_offset").write_text(str(self.offset) + "\n")
+    (self.root / "dev/mapper/root").unlink()
+    with self.assertRaises(OSError): self.admit()
+
+  def test_image_check_failure_or_bad_result_blocks_and_synthetic_roots_need_a_check(self):
+    with self.assertRaises(ValueError): self.admit(image=lambda root, inventory: {"classification": "unknown"})
+    with self.assertRaises(ValueError): self.admit(image=lambda root, inventory: None)
+    with self.assertRaises(ValueError): guard._admit(self.root, os.geteuid(), True, self.script)  # no seam supplied
+    with self.assertRaises(ValueError): guard._admit(Path("/"), 0, True, self.script, image=self.image)  # live root refuses seam
+
+  def test_planted_bytecode_and_reopened_paths_are_never_executed(self):
+    package = self.root.parent / "package-copy"
+    copy = package / "hibernate"
+    shutil.copytree(HERE / "hibernate", copy, ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copytree(HERE / "experiments", package / "experiments", ignore=shutil.ignore_patterns("__pycache__"))
+    target = copy / "package_maintenance.py"
+    evil = compile("raise RuntimeError('stale pyc executed')", str(target), "exec")
+    info = target.stat()
+    cache = Path(importlib.util.cache_from_source(str(target)))
+    cache.parent.mkdir(exist_ok=True)
+    cache.write_bytes(importlib._bootstrap_external._code_to_timestamp_pyc(evil, int(info.st_mtime), info.st_size))
+    spec = importlib.util.spec_from_file_location("guard_copy", copy / "update_guard.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    before = sys.dont_write_bytecode, sys.pycache_prefix
+    result = module._admit(self.root, os.geteuid(), True, self.script, image=self.image)
+    self.assertEqual(result["classification"], "inactive-maintenance-update-admitted")
+    self.assertEqual(before, (sys.dont_write_bytecode, sys.pycache_prefix))  # process settings restored
+    normal = importlib.util.spec_from_file_location("normal_import", target)
+    with self.assertRaises(RuntimeError):  # sanity: an ordinary import WOULD run the planted cache
+      normal.loader.exec_module(importlib.util.module_from_spec(normal))
+
+  def test_reviewed_bytes_pin_is_enforced_by_loader(self):
+    target = HERE / "hibernate/update_guard.py"
+    raw = target.read_bytes()
+    good = {"sha256": hashlib.sha256(raw).hexdigest(), "size": len(raw)}
+    self.assertTrue(hasattr(guard._load("pinned", target, good), "check"))
+    with self.assertRaises(ValueError): guard._load("pinned", target, {**good, "size": good["size"] + 1})
+    with self.assertRaises(ValueError): guard._load("pinned", target, {**good, "sha256": "0" * 64})
 
   def snapshot(self): return {str(path): path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
 
@@ -426,7 +512,7 @@ class NativeAdmission(unittest.TestCase):
                 {"owner": os.geteuid() + 1}, {"script": self.script.with_name("elsewhere.py")})
     for override in rejected:
       with self.subTest(override=override):
-        with patch.object(guard.importlib.util, "spec_from_file_location", side_effect=AssertionError("import before authentication")):
+        with patch.object(guard, "_load", side_effect=AssertionError("import before authentication")), patch.object(guard, "_execute", side_effect=AssertionError("import before authentication")):
           with self.assertRaises((ValueError, FileNotFoundError, OSError)): self.admit(**override)
 
   def test_unreviewed_or_unprivate_runtime_refuses_before_imports(self):
@@ -434,7 +520,7 @@ class NativeAdmission(unittest.TestCase):
     raw = target.read_bytes()
     review = self.root / guard.REVIEW
     review_raw = review.read_bytes()
-    with patch.object(guard.importlib.util, "spec_from_file_location", side_effect=AssertionError("import before authentication")):
+    with patch.object(guard, "_load", side_effect=AssertionError("import before authentication")), patch.object(guard, "_execute", side_effect=AssertionError("import before authentication")):
       target.write_bytes(raw + b"# tampered\n")
       with self.assertRaises(ValueError): self.admit()
       target.write_bytes(raw)

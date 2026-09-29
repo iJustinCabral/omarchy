@@ -23,6 +23,19 @@ validated. Success admits an ordinary transaction; the marker is retained (it is
 not a single-use grant), no qualification is issued and hibernation stays vetoed.
 Pacman already owns db.lck during a hook, so that lock is never required absent.
 Every unknown, partial, foreign or contended condition raises and blocks.
+
+Under the same lock the reviewed image_state.require_no_image proves that the
+qualified resume page holds no hibernation image; its resume target comes from
+the authenticated product config and derived artifact report (the same source the
+native publisher uses), never from arguments or the environment.
+
+Installation prerequisite and scope: this guard is meaningful only in a runtime
+generation whose sleep_entry.py and product.py reject the maintenance marker.
+Residual kernel-level routes the marker does not veto (suspend-then-hibernate,
+hybrid-sleep, direct /sys/power/state writes) are out of this module's scope; the
+saved-image check above is the backstop. Runtime modules are executed from the
+byte-pinned reads and bytecode caches are ignored; nested imports inside those
+modules rely on the whole-tree verification instead.
 """
 import hashlib
 import json
@@ -33,6 +46,7 @@ import re
 import stat
 import sys
 import fcntl
+import types
 
 
 STATE = Path("var/lib/omarchy/t2-hibernate-product")
@@ -139,12 +153,38 @@ def check_inactive_maintenance(root):
   return _maintenance(root)
 
 
-def _maintenance(root):
+def _load(name, path, expected=None):
+  """Execute exactly the bytes read (never a cached .pyc or a re-opened path).
+
+  `expected` is a reviewed inventory entry; when given, the bytes read must match
+  it. Fixture callers pass None. Sibling imports made by the loaded module itself
+  are covered by the whole-tree verification, not by this pin.
+  """
+  path = Path(path)
+  fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+  try:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= MAX_REVIEW: raise ValueError("Bounded regular runtime module required")
+    raw = os.read(fd, MAX_REVIEW + 1)
+  finally: os.close(fd)
+  if len(raw) != info.st_size: raise ValueError("Short runtime module read")
+  if expected is not None and expected != {"sha256": hashlib.sha256(raw).hexdigest(), "size": len(raw)}:
+    raise ValueError("Runtime module bytes differ from reviewed inventory")
+  return _execute(name, path, raw)
+
+
+def _execute(name, path, raw):
+  module = types.ModuleType(name)
+  module.__file__ = str(path)
+  exec(compile(raw, str(path), "exec", dont_inherit=True), module.__dict__)
+  return module
+
+
+def _maintenance(root, inventory=None):
   """Exact inactive-maintenance validation; callers authenticate and lock first."""
   # Lazy reuse avoids import-time cycles (the transition itself imports us).
-  spec = importlib.util.spec_from_file_location("guard_maintenance_evidence", Path(__file__).with_name("package_maintenance.py"))
-  maintenance = importlib.util.module_from_spec(spec)
-  spec.loader.exec_module(maintenance)
+  sibling = Path(__file__).with_name("package_maintenance.py")
+  maintenance = _load("guard_maintenance_evidence", sibling, None if inventory is None else inventory["packages/t2-suspend/hibernate/package_maintenance.py"])
   transition, policy = maintenance.T, maintenance.T.P
   for relative in ACTIVE:
     if relative == transition.MAINTENANCE: continue
@@ -268,14 +308,14 @@ def _authenticate(prefix, owner, isolated, script):
     raw = _private_bytes(path, owner)
     if review["files"].get(path.relative_to(runtime).as_posix()) != {"sha256": hashlib.sha256(raw).hexdigest(), "size": len(raw)}:
       raise ValueError("Installed guard bytes differ from reviewed inventory")
+    return raw
   bootstrap = script.with_name("runtime_deployment.py")
   pin(script)
-  pin(bootstrap)
-  spec = importlib.util.spec_from_file_location("guard_reviewed_bootstrap", bootstrap)
-  deployment = importlib.util.module_from_spec(spec)
-  spec.loader.exec_module(deployment)  # first sibling import: byte-pinned, stdlib-only
+  # First sibling code: the very bytes just pinned, stdlib-only, executed without re-opening.
+  deployment = _execute("guard_reviewed_bootstrap", bootstrap, pin(bootstrap))
   deployment._verify_tree(runtime, review["files"])
   pin(script)
+  return review["files"]
 
 
 def _physical(root, owner):
@@ -297,18 +337,41 @@ def _physical(root, owner):
     raise
 
 
-def _admit(root, owner, isolated, script):
-  """Authenticate, hold the physical lock, validate the exact chain, admit. Never mutates."""
+def _live_image(root, inventory):
+  """Prove the qualified resume page holds no image, from authenticated evidence only."""
+  base = "packages/t2-suspend/hibernate/"
+  directory = root / RUNTIME / base
+  product = _load("guard_reviewed_product", directory / "product.py", inventory[base + "product.py"])
+  image_state = _load("guard_reviewed_image_state", directory / "image_state.py", inventory[base + "image_state.py"])
+  config = product.TRIAL._private_json(root / STATE / "config.json")
+  report = product.ARTIFACTS.derive_artifacts(config["source_directory"], config["restore_directory"], config["production_uki"])
+  return image_state.require_no_image(root, report["audited_details"]["restore_protocol"]["resume"])
+
+
+def _admit(root, owner, isolated, script, *, image=None):
+  """Authenticate, hold the physical lock, validate the chain and image absence, admit.
+
+  Never mutates. `image` is a synthetic-root test seam, callable(root, inventory):
+  forbidden for the live root, required for any other root.
+  """
   root = Path(root)
-  _authenticate(root, owner, isolated, script)
-  fd, identity = _physical(root, owner)
+  if (root == Path("/")) != (image is None): raise ValueError("Live root uses the fixed image check; synthetic roots must supply one")
+  saved = sys.dont_write_bytecode, sys.pycache_prefix
+  sys.dont_write_bytecode, sys.pycache_prefix = True, "/nonexistent/omarchy-t2-guard-pycache"  # no stale .pyc for any import
   try:
-    result = _maintenance(root)
-    current = (root / PHYSICAL_LOCK).lstat()
-    if (current.st_dev, current.st_ino) != identity or not os.fstat(fd).st_nlink == 1:
-      raise ValueError("Physical cycle lock changed during admission")
-  finally: os.close(fd)  # closing releases the flock
-  return {**result, "classification": "inactive-maintenance-update-admitted"}
+    inventory = _authenticate(root, owner, isolated, script)
+    fd, identity = _physical(root, owner)
+    try:
+      result = _maintenance(root, inventory if image is None else None)  # synthetic fixture runtimes carry no full inventory
+      checked = _live_image(root, inventory) if image is None else image(root, inventory)
+      if type(checked) is not dict or checked.get("classification") != "no-image-at-qualified-resume-page":
+        raise ValueError("Verified absence of a saved hibernation image required")
+      current = (root / PHYSICAL_LOCK).lstat()
+      if (current.st_dev, current.st_ino) != identity or not os.fstat(fd).st_nlink == 1:
+        raise ValueError("Physical cycle lock changed during admission")
+    finally: os.close(fd)  # closing releases the flock
+  finally: sys.dont_write_bytecode, sys.pycache_prefix = saved
+  return {**result, "classification": "inactive-maintenance-update-admitted", "image": checked["classification"]}
 
 
 def native():
