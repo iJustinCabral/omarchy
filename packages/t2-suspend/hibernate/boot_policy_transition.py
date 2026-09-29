@@ -1198,6 +1198,18 @@ def _swap(root, relative, expected, replacement, tag, guard):
   if _read(root, relative) != replacement: raise ValueError("Authority replacement readback failed: " + relative.name)
 
 
+def _publish(path, raw, mode, tag):
+  """Torn-write-safe publication of a new name: a complete temporary is renamed into place, so the name never holds partial bytes.
+
+  The exclusions held by the caller cover cooperating writers; the existence check is the exclusive-create intent.
+  """
+  if _present(path): raise FileExistsError(str(path))
+  temporary = path.with_name(path.name + ".rebind-tmp-" + tag)
+  _new(temporary, raw, mode)
+  os.replace(temporary, path)
+  _sync(path.parent)
+
+
 def _rebind_refuse_assessment(assessment):
   if type(assessment) is not dict or assessment.get("class") not in ("unchanged", "requalification-required", "unknown"):
     raise ValueError("compatibility unknown: malformed assessment; nothing was changed")
@@ -1278,6 +1290,8 @@ def _rebind_forward(root, context, release_db):
   info = context["inspect"](evidence, {"config": new_config, "qualification": new_qualification})
   if type(info) is not dict or info.get("manifest") != new_config["manifest"]: raise ValueError("Derived manifest differs from the staged configuration")
   fresh = _baseline_value(info["baseline"])
+  for name in ("config", "qualification"):  # the fresh capture must have read exactly the bytes this run will install
+    if fresh[name].get("sha256") != P.digest(raws[name]): raise ValueError("Fresh generation capture read different " + name + " bytes than the staged file")
   old_raws = {"config": _read(root, CONFIG), "qualification": _read(root, QUALIFICATION), "review": _read(root, REVIEW), "backup": _read(root, P.BACKUP)}
   if P.digest(old_raws["review"]) != intent["old_policy_sha256"] or old_raws["review"] != _read(root, HISTORY / identifier / "policy.json"):
     raise ValueError("Reviewed policy differs from the archived old policy")
@@ -1312,8 +1326,14 @@ def _rebind_forward(root, context, release_db):
   comparison = _encoded({"protocol": REBIND_COMPARISON, "transition_id": transition_id, "intent_sha256": P.digest(pending_intent),
                          "assessment": assessment, "limine": limine})
   pending = root / PENDINGS["activation"]
+  # A torn W1 temporary from an earlier dead run holds no authority (it never became the pending): clear it, never adopt it.
+  for stray in sorted(pending.parent.glob(pending.name + ".rebind-tmp-*")):
+    if not stat.S_ISREG(stray.lstat().st_mode): raise ValueError("Stray staged pending is not a regular file")
+    guard()
+    stray.unlink()
+    _sync(stray.parent)
   guard()
-  _new(pending, pending_intent)  # W1: sleep and updates are vetoed from here on
+  _publish(pending, pending_intent, 0o600, transition_id)  # W1: sleep and updates are vetoed from here on
   archive = root / HISTORY / transition_id
   guard()
   archive.mkdir(mode=0o700)
@@ -1328,7 +1348,7 @@ def _rebind_forward(root, context, release_db):
     guard()
     _swap(root, relative, old_raws[name], new_raws[name], transition_id, guard)  # W3
   guard()
-  _new(root / P.POLICY, raws["review"])  # W4
+  _publish(root / P.POLICY, raws["review"], 0o600, transition_id)  # W4
   guard()
   _replace(root, current, replacement, transition_id, guard=guard)  # W5: point of no return; recovery only rolls back
   guard()
@@ -1416,8 +1436,9 @@ def _rebind_recover(root, context, release_db):
           raise ValueError("Archived " + side + " " + name + " is missing or differs from the rebind pending; nothing was touched")
     if not present["new-baseline.json"] or P.digest(_read(root, (archive / "new-baseline.json").relative_to(root))) != pending["new_baseline_sha256"]:
       raise ValueError("Archived fresh baseline differs from the rebind pending; nothing was touched")
-    if not present["new-receipt.json"] or P.digest(_read(root, (archive / "new-receipt.json").relative_to(root))) != pending["new_receipt_sha256"]:
-      raise ValueError("Archived new receipt differs from the rebind pending; nothing was touched")
+    for name, digest_ in (("new-receipt.json", pending["new_receipt_sha256"]), ("retirement.json", pending["retirement_sha256"]), ("retired-receipt.json", pending["retired_receipt_sha256"])):
+      if not _present(archive / name) or P.digest(_read(root, (archive / name).relative_to(root))) != digest_:
+        raise ValueError("Archived " + name + " differs from the rebind pending; nothing was touched")
   completion = _rebind_completion(identifier, raw, limine["to_canonical_sha256"])
   # A torn or foreign completion is never trusted: it cannot lead forward.
   complete = present["completion.json"] and _read(root, (archive / "completion.json").relative_to(root)) == completion
@@ -1448,6 +1469,7 @@ def _rebind_rollback(root, context, release_db, *, raw, pending, archive, rolled
   identifier = pending["transition_id"]
   strays = [(root / relative).with_name(relative.name + ".rebind-" + identifier + suffix) for _, relative in AUTHORITY for suffix in ("", "-rollback")]
   strays += [(root / P.LIMINE).with_name("limine.conf.source-default-" + identifier + suffix) for suffix in ("", "-rollback")]
+  strays += [(root / relative).with_name(relative.name + ".rebind-tmp-" + identifier) for relative in (P.POLICY, PENDINGS["activation"])]
   for stray in strays:
     if _present(stray):
       if not stat.S_ISREG(stray.lstat().st_mode): raise ValueError("Stray staged file is not a regular file")

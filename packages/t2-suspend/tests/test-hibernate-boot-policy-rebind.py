@@ -355,6 +355,16 @@ class Rebind(NT.AssessFixture):
     def malformed(evidence, staged): return {"manifest": staged["config"]["manifest"], "baseline": {"kernel": {}}}
     other.refuses("Exact generation baseline item set", inspect=malformed)
 
+  def test_the_fresh_capture_must_have_read_exactly_the_staged_bytes(self):
+    for name in ("config", "qualification"):
+      with self.subTest(name):
+        other = self.new()
+        def swapped(evidence, staged, other=other, name=name):
+          info = other.inspect(evidence, staged)
+          info["baseline"][name] = {**info["baseline"][name], "sha256": "1" * 64}
+          return info
+        other.refuses("read different " + name + " bytes", inspect=swapped)
+
   def test_review_policy_must_be_the_approved_proposal_for_the_new_pair(self):
     T = self.T
     cases = {"unapproved": {**self.new_policy, "approved": False}, "other receipt": {**self.new_policy, "staged_receipt_sha256": "1" * 64},
@@ -476,6 +486,37 @@ class Rebind(NT.AssessFixture):
     self.assertTrue(other.rebind()["rebound"])
     other.assert_active()
 
+  def test_a_torn_policy_write_never_leaves_partial_bytes_under_the_policy_name(self):
+    other = self.new()
+    real = other.T._new
+    def torn(path, raw, mode=0o600):
+      if path.name.startswith(other.T.P.POLICY.name + ".rebind-tmp-"):
+        path.write_bytes(raw[:len(raw) // 2])
+        raise Crash()
+      return real(path, raw, mode)
+    with patch.object(other.T, "_new", side_effect=torn), self.assertRaises(Crash): other.rebind()
+    self.assertFalse(other.path(other.T.P.POLICY).exists())  # only a stray temporary holds the torn bytes
+    self.assertTrue(other.pending().exists())
+    other.assert_vetoed()
+    self.assertTrue(other.rebind()["rolled_back"])  # recovery removes the stray and restores the exact prior state
+    other.assert_rolled_back()
+    self.assertTrue(other.rebind()["rebound"])
+    other.assert_active()
+
+  def test_a_torn_pending_write_leaves_no_pending_and_the_next_run_proceeds(self):
+    other = self.new()
+    real = other.T._new
+    def torn(path, raw, mode=0o600):
+      if path.name.startswith(other.T.PENDINGS["activation"].name + ".rebind-tmp-"):
+        path.write_bytes(raw[:len(raw) // 2])
+        raise Crash()
+      return real(path, raw, mode)
+    with patch.object(other.T, "_new", side_effect=torn), self.assertRaises(Crash): other.rebind()
+    self.assertFalse(other.pending().exists())  # nothing else was written yet, so the machine is still plain maintenance
+    other.T.G._maintenance(other.root)
+    self.assertTrue(other.rebind()["rebound"])
+    other.assert_active()
+
   def test_a_persistent_fault_keeps_the_veto_and_the_recorded_state(self):
     other = self.new(fault=ValueError("inside W7"))
     with self.assertRaises(ValueError): other.rebind()
@@ -502,7 +543,8 @@ class Rebind(NT.AssessFixture):
         self.assertTrue(other.pending().exists())
 
   def test_recovery_refuses_a_missing_or_altered_archive_while_state_is_changed(self):
-    for label, name in (("old config", "old-config.json"), ("new backup", "new-backup"), ("baseline", "new-baseline.json"), ("comparison", "comparison.json"), ("new receipt", "new-receipt.json")):
+    for label, name in (("old config", "old-config.json"), ("new backup", "new-backup"), ("baseline", "new-baseline.json"), ("comparison", "comparison.json"), ("new receipt", "new-receipt.json"),
+                        ("retirement record", "retirement.json"), ("retired receipt", "retired-receipt.json")):
       with self.subTest(label):
         other = self.new()
         other.crashed(other.guards().index("W3") + 1)
