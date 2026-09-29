@@ -416,7 +416,7 @@ def _retain_binding(archive, expected, approval_id, old_marker, old_baseline, ne
   for name, raw in ((old_marker_name, old_marker), (old_baseline_name, old_baseline), (record_name, record)):
     if os.path.lexists(archive / name):
       if _private_file(archive / name) != raw: raise ValueError("Retained runtime rebind evidence differs; preserved: " + name)
-    else: _write_private(archive / name, raw, replace=False)
+    else: _write_private(archive / name, raw, replace=True)  # temp plus rename: a crash never leaves a torn retained file under its name
 
 
 def _apply_maintenance_binding(state, plan, expected, approval_id):

@@ -236,10 +236,32 @@ class Core(Fixture):
         self.assertTrue((case.state / D.COMPATIBLE_BARRIER).exists() and (case.state / D.UPGRADE_PENDING).exists())  # sleep and updates stay vetoed
         self.assertEqual(case.review_digest(), case.expected["new_review"])  # the new runtime is what is installed
         record = case.record()
+        old_marker, old_baseline, _ = D._binding_names(case.expected["new_review"])
+        for name, expected in ((old_marker, case.marker), (old_baseline, case.baseline)):  # a retained copy is never torn under its name
+          if (case.archive / name).exists(): self.assertEqual((case.archive / name).read_bytes(), expected)
         self.assertEqual(D.settle_maintenance_binding(case.state, record, case.review_digest()), "new")
         self.assertEqual(case.triple(), case.new_triple())
         self.assertEqual(D.settle_maintenance_binding(case.state, record, case.review_digest()), "new")  # idempotent
         self.assertEqual(case.triple(), case.new_triple())
+
+  def test_a_storage_fault_while_writing_a_retained_copy_leaves_no_torn_file_under_its_name(self):
+    old_marker, old_baseline, record = D._binding_names(self.expected["new_review"])
+    real_fsync = D.os.fsync
+    state = {"armed": False}
+    def fsync(fd):
+      if state["armed"]: raise OSError("storage fault after the bytes were written")
+      return real_fsync(fd)
+    real = D._write_private
+    def arm(path, raw, *, replace):
+      state["armed"] = Path(path).name == old_baseline
+      try: return real(path, raw, replace=replace)
+      finally: state["armed"] = False
+    with patch.object(D, "_write_private", side_effect=arm), patch.object(D.os, "fsync", side_effect=fsync), self.assertRaisesRegex(OSError, "storage fault"): self.upgrade()
+    self.assertFalse((self.archive / old_baseline).exists())  # only a stray temporary may hold the bytes
+    self.assertEqual((self.archive / old_marker).read_bytes(), self.marker)
+    self.assertEqual(D.settle_maintenance_binding(self.state, self.record(), self.review_digest()), "new")
+    self.assertEqual(self.triple(), self.new_triple())
+    self.assertEqual((self.archive / old_baseline).read_bytes(), self.baseline)
 
   def test_settling_to_the_old_runtime_restores_the_exact_old_bytes_from_every_partial_state(self):
     original = D._write_private
