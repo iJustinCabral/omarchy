@@ -48,6 +48,7 @@ Pin values are not listed here on purpose: they depend on the exact reviewed com
 | H3 | maintenance publisher: deactivates hibernation, restores stock `limine.conf`, writes marker | sudo, real inhibitor | operator |
 | H4 | first package update through the native guard, then `omarchy update` | sudo / update flow | operator |
 | H5 (optional, later) | `reactivate`: re-applies the retained source default without requalification, only when `assess` reports `unchanged` | sudo, real inhibitor | operator |
+| H6a to H6f (after a kernel update, hardware campaign) | requalify and `rebind` a new generation: runtime upgrade under maintenance, retire the old pair, stage and qualify the new pair, `rebind`, one routine S4 | sudo, real inhibitor, attended hardware | operator, per sub-gate |
 
 Stop and ask for review if any check differs from its expected output. Unknown means stop. Never retry a failed gate by repeating it: recovery for H2 and H3 is read-only diagnosis first (see the failure section). Never reboot, power-cycle, suspend or hibernate the machine at any point of this procedure.
 
@@ -415,6 +416,23 @@ Interrupted or failed run: re-run `reactivate`. It authenticates its own pending
 
 Residual gap: userspace packages outside the UKI (systemd, logind and others) are not assessed items. Only the effective `systemd-hibernate.service` route is checked, so an update to them that the assessment does not see is not covered by `unchanged`.
 
+## Gate H6: requalify and rebind a new generation
+
+Operator approval required, separately for each sub-gate. Precondition: the machine is in inactive package maintenance and `assess` reports `requalification-required` after a kernel update (RESUME.md, 7.2.7 incident). Rationale and state machine: [REBIND-DESIGN.md](REBIND-DESIGN.md); stuck states: [MAINTENANCE-RUNBOOK.md section 10](MAINTENANCE-RUNBOOK.md). Nothing here is hardware evidence; H6c and H6f are attended hardware actions that this procedure only sequences and never performs on its own. Follow AGENTS.md hardware safety: never restage a replacement `.linux`, never reuse a consumed guard, never repeat a failed vector.
+
+The order matters. The runtime upgrade comes FIRST because the installed runtime's guard validates the maintenance chain from the receipt file at its fixed path, and retiring the old pair removes that file; the new runtime's guard resolves it from the stager's custody record instead.
+
+| Sub-gate | Action | Notes |
+| --- | --- | --- |
+| H6a | Runtime upgrade under maintenance | Same staging and adapter as H1/H2 with approval protocol `omarchy-t2-runtime-upgrade-maintenance-approval-v1`: the seven `expected` pins and a fresh UUID4 `approval_id` as for v2 (`old_config` equals `new_config`), but `unchanged` is exactly `{qualification, hook, marker}` (SHA-256 of `qualification.json`, the installed hook and the exact `package-maintenance.pending` bytes); Limine, boot policy and opt-in are not pinned. The new runtime must contain commit `1d1528fb` (volatile state out of the baseline), the rebind engine and the receipt custody resolver. The adapter rewrites the marker's runtime binding atomically; verify afterwards that the update guard exits 0, `assess` still reports `requalification-required`, and `runtime-rebind-<new12>.json` exists in the maintenance archive. |
+| H6b | Retire the old pair | The stager `retire` mode (attended) deletes the old receipt, images and Limine entries and leaves `pair-retirement.json` (protocol `omarchy-t2-pair-retirement-v1`, exactly `retired_receipt_sha256`, `source_sha256`, `restore_sha256`) and `pair-retired-receipt.json` in the product state directory. Verify the update guard still exits 0 and `assess` is unchanged in class. |
+| H6c | Build, audit, stage and qualify the new pair | Hardware campaign, owner attended: private candidate stack (patch set through 0015) and source/restore UKIs from the new production UKI (production `.linux` and `.cmdline` byte-for-byte), offline audit, staging, ordinary boots, physical input, real S4. A one-use trial for the new manifest uses `trial.py --generation <manifest12>` with a root-private provisioned state root under `/var/lib/omarchy/t2-hibernate-trial/generations/<manifest12>/`; the original root and its consumed guard are untouched. |
+| H6d | Issue and stage the authority | Externally issue the qualification (`omarchy-t2-product-cycle-v1`, `qualified: true`, `manifest_sha256` of the new manifest), the v2 config and the boot policy review (`approved: true`) for the new receipt. Stage them root-owned 0600 as `rebind-qualification.json`, `rebind-config.json`, `rebind-boot-policy-review.json` in the product state directory. Independent review before H6e. |
+| H6e | `rebind` | Read-only checks first (runbook section 10), then `sudo /usr/bin/python3 -I -B "$NATIVE" rebind`. Do not reboot, power-cycle, suspend or hibernate while it runs. Success prints canonical JSON with `"rebound": true`, `"requalification_required": false`, `"live_execution": true`, `"power_operation": false`. Afterwards `config.json`, `qualification.json`, `boot-policy-review.json`, `limine.conf.before-source-default` and `boot-policy.json` are the new generation's, the opt-in exists, the marker and pending are gone and the old set is archived under `boot-policy-transitions/<id>`. |
+| H6f | One routine S4 | Attended, separately approved: the first `omarchy-t2-hibernate-product hibernate` cycle under the new manifest (the product ledger chains it to the previous terminal cycle). Until it passes, treat the generation as bound but unproven. |
+
+Refusals and interruptions of H6e: [MAINTENANCE-RUNBOOK.md section 10](MAINTENANCE-RUNBOOK.md). H6e is the only sub-gate this repository's tests exercise end to end (synthetic roots), together with the H6a core and adapter.
+
 ## Failure and rollback handling
 
 General rules: fail closed. There is no automatic retry, no replay and no rollback command. The retained `*-retained-e489bab70e13-before-cf9075424e20*` files preserve the old runtime, review, bootstrap and config as evidence, but restoring them is a separately reviewed operation, not part of this procedure. Do not run the adapter or publisher a second time to "finish" a run. Never replay consumed deployment `4125726a-4847-4802-a821-953e6abe995a` or any approval whose consumed file exists: a replay is refused before any lock because the installed review no longer matches `old_review` (`runtime_upgrade_native.py:198`, in `_verified_engines` before `_locks`; the consumed-approval file is checked again at `runtime_deployment.py:378-380`), and even if it were not, replaying is forbidden.
@@ -430,6 +448,8 @@ General rules: fail closed. There is no automatic retry, no replay and no rollba
 | H3 | Marker written or not | MAINTENANCE-RUNBOOK.md sections 1 to 3 and 5 |
 | H4 | Update aborted by the guard before mutation | Read the guard message; runbook sections 2 and 3; never bypass the hook |
 | H5 | Refused with zero writes, or interrupted with an activation pending | Refusal: read the message above, nothing changed. Interrupted: do not reboot; re-run `reactivate` (MAINTENANCE-RUNBOOK.md section 6) |
+| H6a | Refused before the barrier, or barrier retained | As H2; the maintenance recovery also settles the marker binding (MAINTENANCE-RUNBOOK.md section 10) |
+| H6e | Refused with zero writes, or interrupted with a rebind pending | Refusal: read the message. Interrupted: do not reboot; re-run `rebind` (MAINTENANCE-RUNBOOK.md section 10) |
 
 If the machine loses power, hangs or reboots at any gate, do not assume state: on the next boot, reconcile with the handoff, `git`, and the read-only inventory in the runbook before any further action, and do not try to complete the gate.
 
