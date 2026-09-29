@@ -4,6 +4,14 @@ Install this file root-private outside the replaceable runtime. The only public
 entrypoint has no flags or alternate roots. It never changes EFI, modules,
 qualification, boot policy or power state. Interrupted publications are not
 replayed; the compatible pending marker vetoes routine hibernation.
+
+Maintenance mode (approval protocol omarchy-t2-runtime-upgrade-maintenance-approval-v1) is the only way to
+upgrade the runtime while package-maintenance.pending exists. It uses the same seven pins, adapter pin, boot
+pin and locks, but its unchanged-host pins are the qualification, the update-guard hook and the exact marker
+bytes (Limine legitimately churns; the boot policy and the opt-in must be ABSENT). Its checks are the update
+guard's: the old reviewed guard validates the maintenance chain and the pinned resume page before the barrier,
+the NEW reviewed guard validates it (barrier ignored) after the runtime and the marker's runtime binding were
+replaced, and again with the barrier retired. The ordinary v2 protocol still refuses under a marker.
 """
 import hashlib
 from contextlib import contextmanager
@@ -42,6 +50,17 @@ CORE_HASHES = {"old_review", "old_bootstrap", "old_config", "new_review", "new_b
 HASHES = CORE_HASHES | {"new_image_state"}
 DB_LOCK = Path("var/lib/pacman/db.lck")
 PHYSICAL_LOCK = Path("var/lib/omarchy/t2-hibernate-trial/physical-cycle.lock")
+MAINTENANCE_PROTOCOL = "omarchy-t2-runtime-upgrade-maintenance-approval-v1"
+ORDINARY_PROTOCOL = "omarchy-t2-runtime-upgrade-approval-v2"
+MARKER = STATE / "package-maintenance.pending"
+UNCHANGED_MAINTENANCE = {
+  "qualification": (STATE / "qualification.json", 0o600),
+  "hook": (Path("/etc/pacman.d/hooks/00-omarchy-t2-hibernate-guard.hook"), 0o644),
+  "marker": (MARKER, 0o600),
+}
+# Present only in ACTIVE source-default state; their presence during maintenance is not this upgrade's business.
+ABSENT_IN_MAINTENANCE = (STATE / "boot-policy.json", Path("/etc/omarchy/t2-hibernate-product.enabled"),
+                         STATE / "source-default-activation.pending", STATE / "source-default-deactivation.pending")
 UNCHANGED = {
   "qualification": (STATE / "qualification.json", 0o600),
   "boot_policy": (STATE / "boot-policy.json", 0o600),
@@ -85,8 +104,9 @@ def _parse_approval(raw, adapter_raw):
   approval = json.loads(raw, object_pairs_hook=_pairs)
   if (type(approval) is not dict or set(approval) != {"protocol", "approved", "current_boot_id", "source_directory",
       "reviewed_commit", "adapter_sha256", "expected", "unchanged", "approval_id"} or
-      approval["protocol"] != "omarchy-t2-runtime-upgrade-approval-v2" or approval["approved"] is not True):
+      approval["protocol"] not in (ORDINARY_PROTOCOL, MAINTENANCE_PROTOCOL) or approval["approved"] is not True):
     raise ValueError("Exact external runtime upgrade approval required")
+  maintenance = approval["protocol"] == MAINTENANCE_PROTOCOL
   identity = approval["approval_id"]
   if type(identity) is not str or not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", identity) or uuid.UUID(identity).version != 4:
     raise ValueError("Fresh canonical UUID4 runtime upgrade approval required")
@@ -95,7 +115,7 @@ def _parse_approval(raw, adapter_raw):
   for value in approval["expected"].values(): _pin(value)
   if approval["expected"]["old_config"] != approval["expected"]["new_config"]:
     raise ValueError("Runtime-only approval must preserve exact configuration pin")
-  if type(approval["unchanged"]) is not dict or set(approval["unchanged"]) != set(UNCHANGED):
+  if type(approval["unchanged"]) is not dict or set(approval["unchanged"]) != set(UNCHANGED_MAINTENANCE if maintenance else UNCHANGED):
     raise ValueError("Exact unchanged host pins required")
   for value in approval["unchanged"].values(): _pin(value)
   _pin(approval["adapter_sha256"])
@@ -108,7 +128,7 @@ def _parse_approval(raw, adapter_raw):
     raise ValueError("Exact reviewed source commit required")
   if type(approval["current_boot_id"]) is not str or not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", approval["current_boot_id"]):
     raise ValueError("Exact current boot required")
-  return approval
+  return {**approval, "maintenance": maintenance}
 
 
 def _installed_approval():
@@ -128,7 +148,11 @@ def _installed_approval():
 def _unchanged(approval):
   if _private_bytes(Path("/proc/sys/kernel/random/boot_id"), mode=None).decode().strip() != approval["current_boot_id"]:
     raise ValueError("Current boot changed during upgrade")
-  for name, (path, mode) in UNCHANGED.items():
+  maintenance = approval.get("maintenance", False)
+  if maintenance:
+    for path in ABSENT_IN_MAINTENANCE:
+      if os.path.lexists(path): raise ValueError("Active source-default state is present under a maintenance upgrade: " + path.name)
+  for name, (path, mode) in (UNCHANGED_MAINTENANCE if maintenance else UNCHANGED).items():
     for ancestor in path.parents:
       info = ancestor.lstat()
       if not stat.S_ISDIR(info.st_mode) or ancestor.is_symlink() or info.st_uid != 0 or info.st_mode & 0o022:
@@ -279,16 +303,39 @@ def _postcheck(core, approval):
   raw = _private_bytes(STATE / "runtime-deployment-review.json")
   review = _review(raw, approval["expected"]["new_review"], approval["reviewed_commit"])
   core._verify_tree(STATE / "runtime", review["files"])
+  if approval.get("maintenance", False): return _maintenance_check(_load_new_guard(), barrier=True)
   product = _load("reviewed_new_product", STATE / "runtime/packages/t2-suspend/hibernate/product.py")
   return _product_check(product, barrier=True)
+
+
+def _load_new_guard():
+  """The NEW reviewed update guard, from the tree the caller has just verified whole."""
+  return _load("reviewed_new_update_guard", STATE / "runtime/packages/t2-suspend/hibernate/update_guard.py")
+
+
+def _maintenance_check(guard, *, barrier, image_state=None):
+  """Inactive-maintenance admission by the update guard's own exact validator, then image absence at the archived resume tuple.
+
+  `barrier` ignores exactly this upgrade's two compatible veto files (never the marker). The resume tuple is the one the
+  publisher archived: no qualified artifact is derived, so a kernel/UKI update never blocks it. `image_state` is the
+  pinned staged helper before the barrier (the installed old runtime may lack the module); later callers use the installed one.
+  """
+  ignore = (guard.STATE / "source-default-activation.pending", guard.STATE / "runtime-upgrade.pending") if barrier else ()
+  evidence = guard._maintenance(ROOT, ignore=ignore)
+  if image_state is None: image_state = _load("reviewed_upgrade_image_state", STATE / "runtime/packages/t2-suspend/hibernate/image_state.py")
+  checked = image_state.require_no_image(ROOT, evidence["resume"])
+  if type(checked) is not dict or checked.get("classification") != "no-image-at-qualified-resume-page":
+    raise ValueError("Verified absence of a saved hibernation image required")
+  return evidence
 
 
 def _intent(core, approval, raw):
   record = json.loads(raw, object_pairs_hook=_pairs)
   expected = approval["expected"]
-  if (type(record) is not dict or set(record) != {"protocol", "transaction_id", "approval_id",
-      "old_review_sha256", "new_review_sha256", "old_config_sha256", "new_config_sha256"} or
-      record["protocol"] != "omarchy-t2-runtime-upgrade-intent-v2" or record["approval_id"] != approval["approval_id"] or
+  maintenance = approval.get("maintenance", False)
+  fields = {"protocol", "transaction_id", "approval_id", "old_review_sha256", "new_review_sha256", "old_config_sha256", "new_config_sha256"}
+  if (type(record) is not dict or set(record) != (fields | {"marker_sha256"} if maintenance else fields) or
+      record["protocol"] != (core.INTENT_MAINTENANCE if maintenance else "omarchy-t2-runtime-upgrade-intent-v2") or record["approval_id"] != approval["approval_id"] or
       any(record[field + "_sha256"] != expected[pin] for field, pin in
           (("old_review", "old_review"), ("new_review", "new_review"), ("old_config", "old_config"), ("new_config", "new_config")))):
     raise ValueError("Cannot restore veto from invalid intent")
@@ -337,7 +384,7 @@ def _restore_veto(core, approval):
     if completed in evidence:
       record = json.loads(evidence[completed], object_pairs_hook=_pairs)
       if (type(record) is not dict or set(record) != {"protocol", "intent", "review_sha256", "config_sha256"} or
-          record["protocol"] != "omarchy-t2-runtime-upgrade-completed-v2" or
+          record["protocol"] != (core.COMPLETED_MAINTENANCE if approval.get("maintenance", False) else "omarchy-t2-runtime-upgrade-completed-v2") or
           record["review_sha256"] != approval["expected"]["new_review"] or
           record["config_sha256"] != approval["expected"]["new_config"] or consumed not in evidence):
         raise ValueError("Cannot restore veto from foreign completion")
@@ -347,6 +394,10 @@ def _restore_veto(core, approval):
     if intents:
       if any(raw != intents[0] for raw in intents): raise ValueError("Recovery intents differ; foreign evidence preserved")
       _durable_veto(core, state_fd, intents[0])
+      if approval.get("maintenance", False):
+        # Marker, archived intent and baseline must agree with the runtime actually installed: forward when the new
+        # review is installed, back to the old bytes when it is not. Foreign bytes raise and stay preserved.
+        core.settle_maintenance_binding(STATE, json.loads(intents[0], object_pairs_hook=_pairs), _digest(_private_bytes(STATE / "runtime-deployment-review.json")))
     else:
       # No completion is not proof of safety. Require all old authority bytes
       # and the entire tree, with no partial staging or retained publication.
@@ -574,21 +625,26 @@ def native():
       try:
         guard()
         old_product = engine.PRODUCT
+        maintenance = approval.get("maintenance", False)
         def before():
           new_review = _review(_private_bytes(STATE / "runtime-upgrade-review.json"),
                                approval["expected"]["new_review"], approval["reviewed_commit"])
-          _product_check(old_product, barrier=False, image_state=_helper_image_state(approval, new_review))
+          if maintenance: _maintenance_check(engine.G, barrier=False, image_state=_helper_image_state(approval, new_review))
+          else: _product_check(old_product, barrier=False, image_state=_helper_image_state(approval, new_review))
         def after(): _postcheck(core, approval)
         result = core._upgrade_snapshot(approval["source_directory"], root=ROOT,
                                         expected={name: approval["expected"][name] for name in CORE_HASHES},
-                                        guard=guard, precheck=before, postcheck=after, approval_id=approval["approval_id"])
+                                        guard=guard, precheck=before, postcheck=after, approval_id=approval["approval_id"],
+                                        **({"maintenance": True} if maintenance else {}))
         guard()
         # After barrier retirement, ordinary admission and db release must
         # pass while the physical lock remains held. Failure rearms the veto.
         core._verify_tree(STATE / "runtime", _review(_private_bytes(STATE / "runtime-deployment-review.json"),
           approval["expected"]["new_review"], approval["reviewed_commit"])["files"])
-        new_product = _load("reviewed_final_product", STATE / "runtime/packages/t2-suspend/hibernate/product.py")
-        _product_check(new_product, barrier=False)
+        if maintenance: _maintenance_check(_load("reviewed_final_update_guard", STATE / "runtime/packages/t2-suspend/hibernate/update_guard.py"), barrier=False)
+        else:
+          new_product = _load("reviewed_final_product", STATE / "runtime/packages/t2-suspend/hibernate/product.py")
+          _product_check(new_product, barrier=False)
         guard()
         release_db(verify_only=True)
         release_db()

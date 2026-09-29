@@ -8,6 +8,12 @@ Fresh deployment refuses overwrite. A separate bounded fixture upgrade retains
 old runtime/authority/config and requires a compatible admission barrier.
 Live upgrades require a separately reviewed adapter; interrupted upgrades never
 replay automatically. Runtime-only v2 upgrades preserve exact config bytes.
+
+The ordinary upgrade refuses while package-maintenance.pending exists: the marker pins the runtime review it
+was published under. `maintenance=True` is the only path that may upgrade under a marker. It requires the
+runtime-only v2 pins, and rewrites the marker's runtime binding under the same barrier: the archived
+maintenance intent, generation baseline (which binds the intent digest) and the marker are replaced together,
+after the old bytes are retained beside them (see _maintenance_binding and settle_maintenance_binding).
 """
 
 import fcntl
@@ -39,6 +45,15 @@ CANDIDATE_BOOTSTRAP = "runtime-upgrade-bootstrap.py"
 HOOK = Path("etc/pacman.d/hooks/00-omarchy-t2-hibernate-guard.hook")
 DEACTIVATION_PENDING = "source-default-deactivation.pending"
 MAINTENANCE_PENDING = "package-maintenance.pending"
+HISTORY = "boot-policy-transitions"
+MAINTENANCE_SCHEMA = "omarchy-t2-package-maintenance-intent-v1"
+MAINTENANCE_FIELDS = {"protocol", "transition_id", "old_policy_sha256", "runtime_review_sha256", "staged_receipt_sha256",
+                      "fallback_limine_sha256", "deactivation_completion_sha256"}
+BASELINE_NAME = "generation-baseline.json"
+BASELINE_SCHEMA = "omarchy-t2-generation-baseline-v1"
+REBIND_RECORD_SCHEMA = "omarchy-t2-runtime-marker-rebind-v1"
+INTENT_MAINTENANCE = "omarchy-t2-runtime-upgrade-maintenance-intent-v1"
+COMPLETED_MAINTENANCE = "omarchy-t2-runtime-upgrade-maintenance-completed-v1"
 MAX_FILE = 2 * 1024 * 1024
 MAX_TOTAL = 16 * 1024 * 1024
 CHUNK = 1024 * 1024
@@ -292,7 +307,152 @@ def _approval_identity(value):
   return value
 
 
-def _upgrade_snapshot(source_directory, *, root, expected, guard, precheck, postcheck, approval_id=None):
+def _canonical_uuid(value):
+  if type(value) is not str or str(uuid.UUID(value)) != value: raise ValueError("Canonical UUID required")
+  return value
+
+
+def _sha(raw): return hashlib.sha256(raw).hexdigest()
+
+
+def _private_file(path):
+  """Bounded owner-private regular bytes at a named path (no symlink, single link)."""
+  fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+  try:
+    _private(fd)
+    raw = os.read(fd, MAX_FILE + 1)
+    if len(raw) > MAX_FILE: raise ValueError("Private maintenance evidence exceeds limit")
+    return raw
+  finally: os.close(fd)
+
+
+def _private_directory(path):
+  info = os.lstat(path)
+  if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+    raise ValueError("Owner-private maintenance evidence directory required")
+
+
+def _fsync_directory(path):
+  fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+  try: os.fsync(fd)
+  finally: os.close(fd)
+
+
+def _write_private(path, raw, *, replace):
+  """Durable owner-private file: exclusive create, or atomic replace of an existing one via a same-directory temporary."""
+  target = Path(path)
+  temporary = target.with_name(target.name + ".runtime-rebind-tmp") if replace else target
+  if replace and os.path.lexists(temporary):
+    if not stat.S_ISREG(os.lstat(temporary).st_mode): raise ValueError("Stray rebind temporary is not a regular file")
+    os.unlink(temporary)
+  fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+  with os.fdopen(fd, "wb") as stream:
+    stream.write(raw)
+    stream.flush()
+    os.fchmod(stream.fileno(), 0o600)
+    os.fsync(stream.fileno())
+  if replace: os.replace(temporary, target)
+  _fsync_directory(target.parent)
+
+
+def _maintenance_binding(old_marker, old_baseline, old_review, new_review):
+  """Pure: the marker and generation baseline bytes for a marker moved from one runtime review to another.
+
+  The marker's only runtime-dependent field is runtime_review_sha256. The archived baseline binds the marker's
+  digest, so it moves with it; nothing else in either document changes.
+  """
+  marker = json.loads(old_marker, object_pairs_hook=_pairs)
+  if type(marker) is not dict or set(marker) != MAINTENANCE_FIELDS or marker["protocol"] != MAINTENANCE_SCHEMA or _encoded(marker) != old_marker:
+    raise ValueError("Exact canonical maintenance intent required")
+  _canonical_uuid(marker["transition_id"])
+  if marker["runtime_review_sha256"] != old_review: raise ValueError("Maintenance marker is not bound to the old runtime review")
+  baseline = json.loads(old_baseline, object_pairs_hook=_pairs)
+  if (type(baseline) is not dict or baseline.get("protocol") != BASELINE_SCHEMA or baseline.get("transition_id") != marker["transition_id"] or
+      baseline.get("maintenance_intent_sha256") != _sha(old_marker) or _encoded(baseline) != old_baseline):
+    raise ValueError("Exact generation baseline bound to the maintenance intent required")
+  new_marker = _encoded({**marker, "runtime_review_sha256": new_review})
+  return new_marker, _encoded({**baseline, "maintenance_intent_sha256": _sha(new_marker)})
+
+
+def _binding_names(new_review):
+  tag = new_review[:12]
+  return ("maintenance-intent.before-runtime-" + tag + ".json", "generation-baseline.before-runtime-" + tag + ".json", "runtime-rebind-" + tag + ".json")
+
+
+def _maintenance_plan(state, parent, old_review, new_review):
+  """Read-only validation of the marker, its archive and baseline before any write; refuses any prior rebind evidence."""
+  try: marker = _private_read(parent, MAINTENANCE_PENDING)
+  except FileNotFoundError: raise ValueError("Maintenance runtime upgrade requires the package maintenance marker") from None
+  identifier = _canonical_uuid(json.loads(marker, object_pairs_hook=_pairs).get("transition_id"))
+  archive = state / HISTORY / identifier
+  for directory in (state / HISTORY, archive): _private_directory(directory)
+  if _private_file(archive / "maintenance-intent.json") != marker: raise ValueError("Maintenance marker differs from its archived intent")
+  baseline = _private_file(archive / BASELINE_NAME)
+  new_marker, new_baseline = _maintenance_binding(marker, baseline, old_review, new_review)
+  if any(os.path.lexists(archive / name) for name in _binding_names(new_review)) or os.path.lexists(state / (MAINTENANCE_PENDING + ".runtime-rebind-tmp")):
+    raise ValueError("Existing runtime marker rebind evidence refuses automatic retry")
+  return {"archive": archive, "marker": marker, "baseline": baseline, "new_marker": new_marker, "new_baseline": new_baseline}
+
+
+def _converge_binding(state, archive, forms, target):
+  """Bring baseline, archived intent and marker to exactly the old or the new form; any other bytes are foreign."""
+  documents = ((archive / BASELINE_NAME, forms["baseline"]), (archive / "maintenance-intent.json", forms["marker"]), (state / MAINTENANCE_PENDING, forms["marker"]))
+  current = [_private_file(path) for path, _ in documents]
+  # Every file is proven to be one of the two known forms before any is written: foreign bytes leave all three untouched.
+  for (path, (old, new)), raw in zip(documents, current):
+    if raw not in (old, new): raise ValueError("Maintenance evidence is neither the old nor the new bytes; preserved: " + path.name)
+  for (path, (old, new)), raw in zip(documents, current):
+    wanted = new if target == "new" else old
+    if raw != wanted: _write_private(path, wanted, replace=True)
+
+
+def _retain_binding(archive, expected, approval_id, old_marker, old_baseline, new_marker, new_baseline):
+  """Create-if-missing the retained old evidence and the rebind record; an existing file must already be exactly the expected bytes."""
+  old_marker_name, old_baseline_name, record_name = _binding_names(expected["new_review"])
+  record = _encoded({"protocol": REBIND_RECORD_SCHEMA, "approval_id": approval_id,
+    "old_review_sha256": expected["old_review"], "new_review_sha256": expected["new_review"],
+    "old_marker_sha256": _sha(old_marker), "new_marker_sha256": _sha(new_marker),
+    "old_baseline_sha256": _sha(old_baseline), "new_baseline_sha256": _sha(new_baseline)})
+  for name, raw in ((old_marker_name, old_marker), (old_baseline_name, old_baseline), (record_name, record)):
+    if os.path.lexists(archive / name):
+      if _private_file(archive / name) != raw: raise ValueError("Retained runtime rebind evidence differs; preserved: " + name)
+    else: _write_private(archive / name, raw, replace=False)
+
+
+def _apply_maintenance_binding(state, plan, expected, approval_id):
+  """Retain the old evidence, record the rebind, then move baseline, archived intent and marker to the new runtime binding."""
+  _retain_binding(plan["archive"], expected, approval_id, plan["marker"], plan["baseline"], plan["new_marker"], plan["new_baseline"])
+  _converge_binding(state, plan["archive"], {"marker": (plan["marker"], plan["new_marker"]), "baseline": (plan["baseline"], plan["new_baseline"])}, "new")
+
+
+def settle_maintenance_binding(state, record, installed_review):
+  """Idempotent recovery: make marker, archived intent and baseline agree with the runtime review actually installed.
+
+  `record` is the upgrade's maintenance intent (review digests, approval and the old marker digest); `installed_review`
+  is the SHA-256 of the installed runtime-deployment-review.json. The old bytes come from the retained copies or, when a
+  crash preceded them, from the still-old current files (which are then retained first). Anything foreign, or a new
+  binding whose old evidence was never retained, raises and is preserved untouched.
+  """
+  state = Path(state)
+  old_review, new_review = record["old_review_sha256"], record["new_review_sha256"]
+  if installed_review == new_review: target = "new"
+  elif installed_review == old_review: target = "old"
+  else: raise ValueError("Installed runtime review is neither the old nor the new one; marker binding preserved")
+  marker = _private_file(state / MAINTENANCE_PENDING)
+  identifier = _canonical_uuid(json.loads(marker, object_pairs_hook=_pairs).get("transition_id"))
+  archive = state / HISTORY / identifier
+  old_marker_name, old_baseline_name, _ = _binding_names(new_review)
+  # The retained copies are written before any replacement, so a missing copy means that document is still the old one.
+  old_marker = _private_file(archive / old_marker_name) if os.path.lexists(archive / old_marker_name) else marker
+  old_baseline = _private_file(archive / old_baseline_name) if os.path.lexists(archive / old_baseline_name) else _private_file(archive / BASELINE_NAME)
+  if _sha(old_marker) != record["marker_sha256"]: raise ValueError("Old maintenance marker is not the one the upgrade pinned; preserved")
+  new_marker, new_baseline = _maintenance_binding(old_marker, old_baseline, old_review, new_review)
+  _retain_binding(archive, {"old_review": old_review, "new_review": new_review}, record["approval_id"], old_marker, old_baseline, new_marker, new_baseline)
+  _converge_binding(state, archive, {"marker": (old_marker, new_marker), "baseline": (old_baseline, new_baseline)}, target)
+  return target
+
+
+def _upgrade_snapshot(source_directory, *, root, expected, guard, precheck, postcheck, approval_id=None, maintenance=False):
   """Internal core; live caller must be a separately reviewed fixed native adapter.
 
   The adapter must own a real sleep:shutdown block inhibitor, pacman db.lck and
@@ -300,6 +460,8 @@ def _upgrade_snapshot(source_directory, *, root, expected, guard, precheck, post
   pin all expected old/new hashes, and supply fixed old admission precheck().
   postcheck() must verify the *new* installed runtime/config under the still-
   present compatibility barrier, not call product.check() which vetoes it.
+  `maintenance=True` upgrades under package-maintenance.pending and additionally rewrites the marker's
+  runtime binding (see the module docstring); the ordinary call refuses when the marker exists.
   Callbacks are fixture injections only in the public API below. No live CLI.
   Incomplete publication retains the compatible admission veto and available
   evidence; no automatic retry API exists.
@@ -313,6 +475,9 @@ def _upgrade_snapshot(source_directory, *, root, expected, guard, precheck, post
     raise ValueError("Invalid exact upgrade pin")
   if any(not callable(callback) for callback in (guard, precheck, postcheck)):
     raise ValueError("Fixed guard, precheck and barrier-aware postcheck required")
+  if type(maintenance) is not bool: raise ValueError("Explicit boolean maintenance mode required")
+  # The ordinary path treats the marker as a blocker; only the maintenance path may run under it.
+  blockers = (UPGRADE_PENDING, COMPATIBLE_BARRIER, DEACTIVATION_PENDING, PENDING) + (() if maintenance else (MAINTENANCE_PENDING,))
   state = root / STATE.relative_to("/")
   parent = _open_directory(state)
   lock = None
@@ -322,7 +487,7 @@ def _upgrade_snapshot(source_directory, *, root, expected, guard, precheck, post
     _private(lock)
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     guard()
-    if any(os.path.lexists(state / name) for name in (UPGRADE_PENDING, COMPATIBLE_BARRIER, DEACTIVATION_PENDING, MAINTENANCE_PENDING, PENDING)):
+    if any(os.path.lexists(state / name) for name in blockers):
       raise ValueError("Existing or partial runtime upgrade refuses automatic retry")
     old_raw = _private_read(parent, REVIEW.name)
     bootstrap = _private_read(parent, BOOTSTRAP)
@@ -369,21 +534,24 @@ def _upgrade_snapshot(source_directory, *, root, expected, guard, precheck, post
       raise ValueError("Historical v1 upgrade cannot use runtime-only approval")
     if type(new_config["power_policy"]) is not dict or set(new_config["power_policy"]) != {"schema", "min_charge_percent"} or new_config["power_policy"]["schema"] != "omarchy-t2-attended-battery-policy-v1" or type(new_config["power_policy"]["min_charge_percent"]) is not int or not 30 <= new_config["power_policy"]["min_charge_percent"] <= 100:
       raise ValueError("Explicit bounded battery policy required")
+    if maintenance and not runtime_only: raise ValueError("Maintenance runtime upgrade requires the exact runtime-only v2 configuration")
+    plan = _maintenance_plan(state, parent, expected["old_review"], expected["new_review"]) if maintenance else None
     old_prefix, new_prefix = old_review["reviewed_commit"][:12], incoming["reviewed_commit"][:12]
     retained = (("runtime", "runtime-retained-" + old_prefix + "-before-" + new_prefix),
                 (REVIEW.name, "runtime-review-retained-" + old_prefix + "-before-" + new_prefix + ".json"),
                 (BOOTSTRAP, "runtime-bootstrap-retained-" + old_prefix + "-before-" + new_prefix + ".py"),
                 (CONFIG, "config-retained-" + old_prefix + "-before-" + new_prefix + ".json"))
     completed = "runtime-upgrade-completed-" + new_prefix + ".json"
-    if any(os.path.lexists(state / name) for name in (UPGRADE_PENDING, COMPATIBLE_BARRIER, DEACTIVATION_PENDING, MAINTENANCE_PENDING, PENDING, completed,
+    if any(os.path.lexists(state / name) for name in (*blockers, completed,
                                                        *(target for source, target in retained), *((consumed,) if consumed else ()))):
       raise ValueError("Existing or partial runtime upgrade refuses automatic retry")
     guard()
     precheck()
-    intent_record = {"protocol": "omarchy-t2-runtime-upgrade-intent-v2" if runtime_only else "omarchy-t2-runtime-upgrade-intent-v1", "transaction_id": str(uuid.uuid4()),
+    intent_record = {"protocol": INTENT_MAINTENANCE if maintenance else ("omarchy-t2-runtime-upgrade-intent-v2" if runtime_only else "omarchy-t2-runtime-upgrade-intent-v1"), "transaction_id": str(uuid.uuid4()),
                        "old_review_sha256": expected["old_review"], "new_review_sha256": expected["new_review"],
                        "old_config_sha256": expected["old_config"], "new_config_sha256": expected["new_config"]}
     if runtime_only: intent_record["approval_id"] = approval_id
+    if maintenance: intent_record["marker_sha256"] = _sha(plan["marker"])
     intent = _encoded(intent_record)
     # Installed 608464dd sleep_entry and product both veto this existing name
     # by presence. The distinct payload must never be fed to boot-policy code.
@@ -412,10 +580,13 @@ def _upgrade_snapshot(source_directory, *, root, expected, guard, precheck, post
     _verify_tree(state / "runtime", incoming["files"])
     if completion["review_sha256"] != expected["new_review"]:
       raise ValueError("Published runtime receipt differs")
+    if maintenance:
+      guard()
+      _apply_maintenance_binding(state, plan, expected, approval_id)
     guard()
     postcheck()
     guard()
-    completed_raw = _encoded({"protocol": "omarchy-t2-runtime-upgrade-completed-v2" if runtime_only else "omarchy-t2-runtime-upgrade-completed-v1",
+    completed_raw = _encoded({"protocol": COMPLETED_MAINTENANCE if maintenance else ("omarchy-t2-runtime-upgrade-completed-v2" if runtime_only else "omarchy-t2-runtime-upgrade-completed-v1"),
       "intent": json.loads(intent, object_pairs_hook=_pairs), "review_sha256": expected["new_review"],
       "config_sha256": expected["new_config"]})
     _new_private(parent, completed, completed_raw)
@@ -437,10 +608,10 @@ def _upgrade_snapshot(source_directory, *, root, expected, guard, precheck, post
     os.close(parent)
 
 
-def upgrade_snapshot(source_directory, *, root, expected, guard, precheck, postcheck, approval_id=None):
+def upgrade_snapshot(source_directory, *, root, expected, guard, precheck, postcheck, approval_id=None, maintenance=False):
   """Fixture-only transaction; live upgrade needs a separately reviewed adapter."""
   root = Path(root)
   if not root.is_absolute() or root.resolve() != root or not root.is_dir() or root == Path("/"):
     raise ValueError("Fixture-only runtime upgrade refuses live root and aliases")
   return _upgrade_snapshot(source_directory, root=root, expected=expected, guard=guard,
-                           precheck=precheck, postcheck=postcheck, approval_id=approval_id)
+                           precheck=precheck, postcheck=postcheck, approval_id=approval_id, maintenance=maintenance)
