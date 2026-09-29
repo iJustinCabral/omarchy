@@ -1,6 +1,6 @@
 # Resume here: permanent T2 hibernation
 
-Checkpoint date: September 29, 2026 (evening). **DEPLOYED: runtime `d64069bb` is installed and the machine is in inactive package maintenance (hibernation OFF by design, stock `Omarchy linux-t2` is the default entry, `omarchy update` is allowed).** Next: the owner reboots into the stock entry, runs the post-reboot checks and one ordinary sleep test ([DEPLOYMENT.md](DEPLOYMENT.md)), then updates. The September 27 battery-only normal-logind S4 evidence is unchanged. Older journal entries describe historical states, not instructions to replay them.
+Checkpoint date: September 29, 2026 (night). **Runtime `d64069bb` deployed; the machine is in inactive package maintenance on linux-t2 7.2.7 with radio package 1.6 (radio-only). Ordinary S3 passes on the stock entry. Hibernation stays OFF until a requalification on 7.2.7.** The first `omarchy update` (7.2.6 → 7.2.7) exposed and fixed a driver-package defect; see the incident record below. Older journal entries describe historical states, not instructions to replay them.
 
 ## Reconcile before doing anything
 
@@ -64,9 +64,17 @@ Done in source (each independently audited):
 
 Evidence (local, not in git): `~/.local/state/codex-mba-autonomous/runtime-upgrade-cf907542/` and `runtime-upgrade-d64069bb/` (exports, staged files, approvals, `h2.log`, `h3.log`, `assess-after-h3.json`), and `claude_deployment` in the handoff.
 
+## Incident and recovery (September 29, 2026)
+
+The first `omarchy update` after H3 upgraded linux-t2 7.2.6.arch2-2 → 7.2.7.arch1-2. The update guard admitted it as designed. DKMS then rebuilt radio package 1.5, which replaced only `t2bce_core` and `t2bce_audio` with hibernation-era builds from pinned 7.2.4-era source, while `t2bce_dma`/`t2bce_vhci` came from 7.2.7 (all four stock srcversions changed in 7.2.7). The split family broke the internal keyboard and trackpad (`t2bce_dma: CQ registration failed (2)`, `t2bce_vhci: module init failed -22`). Nothing on the stock boot or hibernation path needed the DKMS BCE copies: the hibernation images carry their own private BCE stack.
+
+Fix (audited): radio package 1.6 (`c0bb551d`, `bb43fefe`, `45c7684e`) is radio-only, refuses any boot image with a non-stock or mixed BCE family, and only builds for kernels whose stock radio srcversions match a qualified row (7.2.6 and 7.2.7 are identical). The qualification gate reads DKMS's archive of moved stock modules after install; the first live install attempt refused and rolled back cleanly because of that gap, which `45c7684e` fixed. Also `1d1528fb` keeps volatile `/run` state out of the generation baseline (source only until the next runtime deployment).
+
+Recovery, run from Snapper snapshot 4 through a chroot of `@`: installer rollback of 1.5 and transactional install of 1.6 for 7.2.7, rebuilt production UKI (`omarchy_linux-t2.efi`, Limine binds its BLAKE2b), hibernation images byte-identical, maintenance marker intact. After reboot: stock BCE family loaded with no errors, radio from 1.6 (Wi-Fi `1D85357E…`, Bluetooth `4DF58889…`), update guard exits 0, `assess` reports `requalification-required` (kernel, production UKI and control inventory changed; driver items unknown under the installed runtime's older inventory), and a real ACPI S3 lid-close cycle passed (16:44:55 → 16:45:07). Evidence: `~/.local/state/codex-mba-autonomous/recovery-7.2.7-*/`.
+
 Next tasks, in order:
 
-1. **Reboot into stock, verify, then update:** the owner reboots (the stock entry is now the default), runs the "Reboot into the stock entry and verify" checks in [DEPLOYMENT.md](DEPLOYMENT.md) and one ordinary sleep test, then runs `omarchy update` (H4). Afterwards `assess` reports `unchanged` (userspace-only updates, H5 reactivation possible after an attended rehearsal) or `requalification-required` (kernel, modules, firmware, UKI or bootloader changed).
+1. **Requalification on 7.2.7 (hardware campaign, owner-attended):** rebuild the private candidate stack (patch set through 0015, which also fixes S3 on the source image) and the source/restore UKI pair from the 7.2.7 production UKI, verify offline, then ordinary-boot, physical-input and real S4 qualification, issue a new qualification, deploy a runtime containing `1d1528fb` and a reviewed marker rebind (runtime upgrade is refused while the maintenance marker exists; design needed). Until then hibernation stays off and updates keep working.
 2. **Requalification after kernel updates (hardware campaign):** when `assess` reports `requalification-required`, rebuild the candidate stack (patch set through 0015) and the source/restore UKI pair from the new production UKI, verify offline, then attended ordinary-boot, physical-input and real S4 qualification, issue a new qualification, and rebind the maintenance marker to the new generation (not implemented; design first). Until then hibernation stays off after kernel updates while updates keep working.
 3. **Deploy the S3 fix:** part of the next UKI pair rebuild (patch 0015); do not use S3 on the source image until then; the stock `Omarchy linux-t2` entry is S3-safe.
 4. **Unvetoed kernel routes:** suspend-then-hibernate, hybrid-sleep and direct `/sys/power/state` writes are outside the marker vetoes; the guard's image check is the backstop. Decide whether to veto them explicitly.
