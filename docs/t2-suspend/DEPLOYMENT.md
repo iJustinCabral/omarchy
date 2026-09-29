@@ -50,6 +50,10 @@ Pin values are not listed here on purpose: they depend on the exact reviewed com
 
 Stop and ask for review if any check differs from its expected output. Unknown means stop. Never retry a failed gate by repeating it: recovery for H2 and H3 is read-only diagnosis first (see the failure section). Never reboot, power-cycle, suspend or hibernate the machine at any point of this procedure.
 
+### Do not create snapshots before H3
+
+Until H3 has completed, do not run `omarchy update`, `omarchy-snapshot` or `snapper create`, and do not delete snapshots. `omarchy update` creates a Snapper snapshot before pacman runs (and before the hibernation guard refuses the transaction), and the enabled `limine-snapper-sync` watcher then rewrites the snapshot region of `/boot/limine.conf`. While hibernation is active, the product and the H3 deactivation require `/boot/limine.conf` to equal the staged pair bytes exactly (`stage-hibernation-uki-pair.py` `verify_staged`, only `default_entry` may differ), so any such rewrite makes H3 refuse (fail closed, hibernation unavailable) until reviewed. After H3, snapshot churn is expected and admitted: the maintenance checks only read `default_entry` and the stock `//linux-t2` entry binding, never the snapshot region (verified with fixture and VM tests, `b2dbf51f`).
+
 ## Prerequisites (read-only, unprivileged)
 
 Run from the repository. Every command is read-only. Reconcile before proceeding, as AGENTS.md "T2 Hibernation Hardware Safety" requires.
@@ -161,6 +165,14 @@ Expected (all **unverified** until run):
 - `qualification.json`, `boot-policy.json` and `/boot/limine.conf` hashes; record them. The prior approval pinned `ffa9bc82...fe64`, `a6e406ec...2177` and `aba687f2...65b7` for these; they may legitimately differ now if boot policy or `limine.conf` changed since. Whatever H0 prints becomes the approval's `unchanged` values; a difference from the prior values must be explained before proceeding.
 
 Stop if any pending marker exists, if `old_*` hashes differ from the pins above, or if `git` shows the consumed deployment `4125726a-4847-4802-a821-953e6abe995a` is not the last upgrade recorded in the handoff.
+
+Also confirm the boot configuration still matches the staged pair exactly, using the installed runtime's read-only stager verify (it loads the receipt and runs `verify_staged`; it writes nothing):
+
+```bash
+sudo -n /usr/bin/python3 -I -B /var/lib/omarchy/t2-hibernate-product/runtime/packages/t2-suspend/experiments/stage-hibernation-uki-pair.py verify >/dev/null && echo "staged limine.conf verified"
+```
+
+If it fails, stop: the snapshot region or another part of `/boot/limine.conf` changed while hibernation was active, and H3 would refuse. Do not edit the file by hand; this needs review. The stager is part of the installed runtime tree (`runtime_deployment.TREES` at `e489bab7` includes `packages/t2-suspend/experiments`).
 
 ## Create the approval JSON
 
