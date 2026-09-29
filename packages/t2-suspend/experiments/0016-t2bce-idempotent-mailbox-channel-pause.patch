@@ -1,0 +1,134 @@
+Subject: [PATCH] t2bce: make mailbox channel pause idempotent and refuse suspend after a skipped resume
+
+The mailbox channel lock is held from a successful freeze until the matching
+resume.  Two paths could pair it wrongly:
+
+1. t2bce_resume_with_shared_dma() and t2bce_restore() return -EIO when the
+   noirq step latched pci_dma_restore_failed, before t2bce_resume_mode() runs.
+   The channel lock and the disabled completion interrupt taken by the freeze
+   are then never released.  The .poweroff callback (t2bce_freeze) that
+   follows a failed .thaw would call bce_pm_channel_pause() and take the
+   non-recursive channel_lock again.  In the current tree the absent command
+   queue (dropped by the freeze) makes t2bce_suspend_common() return -ENODEV
+   before that point, but that is an accident of ordering, not a guard.
+
+2. bce_pm_suspend_abort() calls bce_pm_channel_resume() unconditionally.  The
+   no-state fallback runs it once to restore the transport and again on later
+   failures (client prepare, bce_pm_suspend_prepare(), the SLEEP_NO_STATE send)
+   when the channel is not paused, which unlocks an unlocked mutex.
+
+mailbox_channel_active already records the state exactly: it is cleared only
+after a successful pause and set on resume.  bce_pm_channel_pause() now
+returns success without locking when the flag shows the channel is already
+held, and bce_pm_channel_resume() returns without unlocking when the flag
+shows it is not.  The pair can no longer deadlock or double-unlock.
+
+The two early -EIO returns set a new resume_skipped flag, cleared when
+t2bce_resume_mode() starts.  t2bce_suspend_common() refuses with -EBUSY while
+it is set: after a thaw that never ran the device is still frozen with its
+queue graph dropped, so it is already quiescent and must not be quiesced
+again.  This does not change the return code the PM core sees on the shipped
+tree in practice (the poweroff failed before with -ENODEV), but the refusal no
+longer depends on the command queue being absent.  t2bce_shutdown() already
+skips the pause when mailbox_channel_active is false.
+
+The completion interrupt disable is idempotent through dma_irq_disabled and
+remains disabled until a real t2bce_resume_mode() runs.  S3 never sets
+resume_skipped (.resume is t2bce_resume, not the wrapper) and its pause/resume
+pairing is unchanged.
+
+This is an unqualified source-only change; it has not been loaded or run on
+hardware.
+
+---
+diff --git a/drivers/staging/t2bce/t2bce_core/t2bce.h b/drivers/staging/t2bce/t2bce_core/t2bce.h
+--- a/drivers/staging/t2bce/t2bce_core/t2bce.h
++++ b/drivers/staging/t2bce/t2bce_core/t2bce.h
+@@ -36,6 +36,7 @@
+     int no_state_early_wake_status;
+     bool mailbox_channel_active;
+     bool pci_dma_restore_failed;
++    bool resume_skipped;
+     bool queue_dma_blocked;
+     bool queue_dma_was_master;
+     unsigned long pci_master_mask;
+diff --git a/drivers/staging/t2bce/t2bce_core/t2bce_main.c b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
+--- a/drivers/staging/t2bce/t2bce_core/t2bce_main.c
++++ b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
+@@ -510,6 +510,14 @@
+ {
+     int status;
+ 
++    /*
++     * mailbox_channel_active is false exactly while this driver holds the
++     * channel lock.  A freeze that follows a thaw which never resumed the
++     * device must not take the non-recursive mutex a second time.
++     */
++    if (!bce->mailbox_channel_active)
++        return 0;
++
+     status = bce_mailbox_channel_pause(&bce->mbox);
+     if (status)
+         return status;
+@@ -528,6 +536,10 @@
+ 
+ static void bce_pm_channel_resume(struct t2bce_device *bce)
+ {
++    /* Nothing to release unless this driver paused the channel: no double unlock. */
++    if (bce->mailbox_channel_active)
++        return;
++
+     /* Reopen mailbox traffic after bridgeOS completed the wake handshake. */
+     bce->mailbox_channel_active = true;
+     bce_mailbox_channel_resume(&bce->mbox);
+@@ -969,6 +981,18 @@
+             force_no_state ? "hibernate-no-state" : "stateful-first");
+     mutex_lock(&bce->pm_lock);
+ 
++    if (bce->resume_skipped) {
++        /*
++         * The previous thaw or restore was refused before t2bce_resume_mode()
++         * ran, so the mailbox channel and completion interrupt taken by the
++         * last freeze are still held and the queue graph is still dropped.
++         * The device is already quiescent; do not quiesce it a second time.
++         */
++        pr_err("t2bce_core: suspend refused: the previous resume never ran\n");
++        status = -EBUSY;
++        goto out_unlock;
++    }
++
+     bce->stateful_suspend_valid = false;
+     bce->no_state_fallback = false;
+     bce->no_state_resume = false;
+@@ -1062,6 +1086,7 @@
+ 
+     pr_info("t2bce_core: resume: entry\n");
+     mutex_lock(&bce->pm_lock);
++    bce->resume_skipped = false;
+     /* Serialize MSI0 delivery across RESTORE, engine enable and the CQ0 poll. */
+     mutex_lock(&bce->dma_completion_lock);
+ 
+@@ -1251,8 +1276,10 @@
+     struct t2bce_device *bce = pci_get_drvdata(to_pci_dev(dev));
+     int status;
+ 
+-    if (bce->pci_dma_restore_failed)
++    if (bce->pci_dma_restore_failed) {
++        bce->resume_skipped = true;
+         return -EIO;
++    }
+ 
+     status = t2bce_resume(dev);
+     if (status) {
+@@ -1268,8 +1295,10 @@
+     struct t2bce_device *bce = pci_get_drvdata(to_pci_dev(dev));
+     int status;
+ 
+-    if (bce->pci_dma_restore_failed)
++    if (bce->pci_dma_restore_failed) {
++        bce->resume_skipped = true;
+         return -EIO;
++    }
+ 
+     status = t2bce_resume_mode(dev, true);
+     if (status) {

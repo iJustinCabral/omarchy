@@ -1,0 +1,31 @@
+Subject: [PATCH] t2bce: refuse hibernation before touching queues without rebuild support
+
+A hibernation whose registered clients cannot drop and rebuild their queues is
+refused up front instead of after client teardown has begun.
+
+Rebased for linux-t2 7.2.7 (t2bce 6780d522).  The original change ran HCD
+removal before the client PM prepare so that command replies could still use
+the system event queue.  Upstream's VHCI pm_prepare_no_state now resumes the
+event queues before removing the HCD, and the reworked no-state fallback
+reopens the transport first, so that ordering is provided upstream and is not
+duplicated.  What remains here is the fail-early refusal: a hibernation whose
+clients lack queue-rebuild callbacks is refused before any client or transport
+state has been touched.
+
+---
+diff --git a/drivers/staging/t2bce/t2bce_core/t2bce_main.c b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
+--- a/drivers/staging/t2bce/t2bce_core/t2bce_main.c
++++ b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
+@@ -980,6 +980,12 @@
+         goto out_unlock;
+     }
+     bce->no_state_queues_dropped = false;
++    if (force_no_state && !t2bce_core_clients_pm_can_rebuild_no_state(bce)) {
++        /* Refuse before any client or transport state has been touched. */
++        pr_err("t2bce_core: hibernation refused: a client cannot rebuild queues\n");
++        status = -EOPNOTSUPP;
++        goto out_unlock;
++    }
+ 
+     status = t2bce_core_clients_pm_prepare(bce);
+     if (status) {

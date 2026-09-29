@@ -1,0 +1,134 @@
+Subject: [PATCH] t2bce: block DMA before dropping the queue graph
+
+Clear PCI bus mastering on the BCE function after the no-state sleep request
+and before the host queue graph is freed, so that bridgeOS cannot write into
+released rings, and restore it when the device resumes.  The block is folded
+into the shared-link mask by the noirq callback.
+
+Rebased for linux-t2 7.2.7 (t2bce 6780d522).  The DMA block is now issued
+after upstream's SLEEP_NO_STATE send inside the reworked no-state fallback and
+still precedes the local queue-graph drop.  Upstream's software submission
+gate stops host submissions only; clearing PCI bus mastering on the BCE
+function is what stops the device writing into freed rings, so both are
+needed.  The resume-side restore stays ahead of pci_set_master() and now runs
+under dma_completion_lock.
+
+---
+diff --git a/drivers/staging/t2bce/t2bce_core/t2bce.h b/drivers/staging/t2bce/t2bce_core/t2bce.h
+--- a/drivers/staging/t2bce/t2bce_core/t2bce.h
++++ b/drivers/staging/t2bce/t2bce_core/t2bce.h
+@@ -33,6 +33,8 @@
+     bool no_state_rebuild_failed;
+     bool mailbox_channel_active;
+     bool pci_dma_restore_failed;
++    bool queue_dma_blocked;
++    bool queue_dma_was_master;
+     unsigned long pci_master_mask;
+     unsigned long pci_async_suspend_mask;
+     bool dma_irq_disabled;
+diff --git a/drivers/staging/t2bce/t2bce_core/t2bce_main.c b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
+--- a/drivers/staging/t2bce/t2bce_core/t2bce_main.c
++++ b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
+@@ -626,12 +626,51 @@
+     return 0;
+ }
+ 
++static void bce_pm_restore_queue_dma(struct t2bce_device *bce)
++{
++    if (!bce->queue_dma_blocked)
++        return;
++
++    if (bce->queue_dma_was_master)
++        pci_set_master(bce->pci);
++    bce->queue_dma_blocked = false;
++    bce->queue_dma_was_master = false;
++}
++
++static int bce_pm_block_queue_dma(struct t2bce_device *bce)
++{
++    u16 command;
++
++    if (bce->queue_dma_blocked) {
++        bce_pm_restore_queue_dma(bce);
++        return -EBUSY;
++    }
++    bce->queue_dma_was_master = false;
++    if (pci_read_config_word(bce->pci, PCI_COMMAND, &command))
++        return -EIO;
++
++    bce->queue_dma_was_master = command & PCI_COMMAND_MASTER;
++    pci_clear_master(bce->pci);
++    if (pci_read_config_word(bce->pci, PCI_COMMAND, &command) ||
++            command & PCI_COMMAND_MASTER) {
++        if (bce->queue_dma_was_master)
++            pci_set_master(bce->pci);
++        bce->queue_dma_was_master = false;
++        pr_err("t2bce_core: failed to block BCE queue DMA before teardown\n");
++        return -EIO;
++    }
++
++    bce->queue_dma_blocked = true;
++    pr_info("t2bce_core: blocked BCE queue DMA before teardown\n");
++    return 0;
++}
++
+ static void bce_pm_drop_no_state_queue_graph(struct t2bce_device *bce)
+ {
+     /*
+-     * SLEEP_NO_STATE has stopped the remote producer.  Drain any handler that
+-     * entered before the sleep request, then free host objects without asking
+-     * the now-stateless firmware to unregister them.
++     * Bus mastering is already disabled.  Drain any handler that entered
++     * before the gate, then free host objects without asking the now-stateless
++     * firmware to unregister them.
+      */
+     synchronize_irq(pci_irq_vector(bce->pci, 4));
+     bce->dma.is_being_removed = true;
+@@ -709,6 +748,12 @@
+         return status;
+     }
+ 
++    status = bce_pm_block_queue_dma(bce);
++    if (status) {
++        bce_pm_suspend_abort(bce);
++        return status;
++    }
++
+     /* Capture the image with the transport absent: no host queue survives. */
+     bce_pm_drop_no_state_queue_graph(bce);
+     return 0;
+@@ -948,6 +993,7 @@
+     /* Serialize MSI0 delivery across RESTORE, engine enable and the CQ0 poll. */
+     mutex_lock(&bce->dma_completion_lock);
+ 
++    bce_pm_restore_queue_dma(bce);
+     pci_set_master(bce->pci);
+     pci_set_master(bce->pci0);
+     /* Tahoe enables MSI0 before issuing the RESTORE/WAKE mailbox command. */
+@@ -1046,6 +1092,8 @@
+ 
+     bce->pci_dma_restore_failed = false;
+     bce->pci_master_mask = 0;
++    if (bce->queue_dma_blocked && bce->queue_dma_was_master)
++        master_mask |= BIT(1);
+     for (i = 0; i < ARRAY_SIZE(functions); i++) {
+         if (pci_read_config_word(functions[i], PCI_COMMAND, &command))
+             goto restore;
+@@ -1060,6 +1108,8 @@
+     if (t2bce_save_shared_pci_state(bce))
+         goto restore;
+ 
++    bce->queue_dma_blocked = false;
++    bce->queue_dma_was_master = false;
+     bce->pci_master_mask = master_mask;
+     pr_info("t2bce_core: noirq: blocked shared-link DMA and saved disabled state mask=%#lx\n",
+             master_mask);
+@@ -1070,6 +1120,8 @@
+         if (master_mask & BIT(i))
+             pci_set_master(functions[i]);
+     t2bce_save_shared_pci_state(bce);
++    bce->queue_dma_blocked = false;
++    bce->queue_dma_was_master = false;
+     bce->pci_master_mask = 0;
+     pr_err("t2bce_core: noirq: failed to block shared-link DMA\n");
+     return -EIO;

@@ -1,0 +1,83 @@
+diff --git a/drivers/staging/t2bce/t2bce_vhci/queue.h b/drivers/staging/t2bce/t2bce_vhci/queue.h
+--- a/drivers/staging/t2bce/t2bce_vhci/queue.h
++++ b/drivers/staging/t2bce/t2bce_vhci/queue.h
+@@ -52,6 +52,7 @@ struct bce_vhci_command_queue {
+     struct bce_vhci_command_queue_completion completion;
+     struct spinlock completion_lock;
+     struct mutex mutex;
++    bool quarantined;
+ };
+ 
+ int bce_vhci_message_queue_create(struct bce_vhci *vhci, struct bce_vhci_message_queue *ret, const char *name);
+diff --git a/drivers/staging/t2bce/t2bce_vhci/queue.c b/drivers/staging/t2bce/t2bce_vhci/queue.c
+--- a/drivers/staging/t2bce/t2bce_vhci/queue.c
++++ b/drivers/staging/t2bce/t2bce_vhci/queue.c
+@@ -192,6 +192,7 @@ void bce_vhci_command_queue_create(struct bce_vhci_command_queue *ret, struct bce_vhci_message_queue *mq)
+ {
+     ret->mq = mq;
+     ret->completion.result = NULL;
++    ret->quarantined = false;
+     init_completion(&ret->completion.completion);
+     spin_lock_init(&ret->completion_lock);
+     mutex_init(&ret->mutex);
+@@ -225,6 +226,15 @@ void bce_vhci_command_queue_deliver_completion(struct bce_vhci_command_queue *cq, struct bce_vhci_message *msg)
+     spin_unlock(&cq->completion_lock);
+ }
+ 
++static void bce_vhci_command_queue_quarantine(struct bce_vhci_command_queue *cq)
++{
++    /* The reply may still arrive, so discard its pointer to the caller's stack. */
++    spin_lock(&cq->completion_lock);
++    cq->completion.result = NULL;
++    spin_unlock(&cq->completion_lock);
++    cq->quarantined = true;
++}
++
+ static int __bce_vhci_command_queue_execute(struct bce_vhci_command_queue *cq, struct bce_vhci_message *req,
+         struct bce_vhci_message *res, unsigned long timeout)
+ {
+@@ -246,8 +256,11 @@ static int __bce_vhci_command_queue_execute(struct bce_vhci_command_queue *cq, struct bce_vhci_message *req,
+     if (!wait_for_completion_timeout(&c->completion, timeout)) {
+         /* Ask bridgeOS to cancel the command before reporting timeout. */
+         pr_debug("t2bce_vhci: command timed out req=%x\n", req->cmd);
+-        if ((status = t2bce_core_reserve_submission(cq->mq->sq, &timeout)))
++        if ((status = t2bce_core_reserve_submission(cq->mq->sq, &timeout))) {
++            pr_err("t2bce_vhci: cannot reserve cancellation; quarantining command queue\n");
++            bce_vhci_command_queue_quarantine(cq);
+             return status;
++        }
+ 
+         creq = *req;
+         creq.cmd |= 0x4000;
+@@ -255,10 +268,7 @@ static int __bce_vhci_command_queue_execute(struct bce_vhci_command_queue *cq, struct bce_vhci_message *req,
+ 
+         if (!wait_for_completion_timeout(&c->completion, 1000)) {
+             pr_err("t2bce_vhci: Possible desync, cmd cancel timed out\n");
+-
+-            spin_lock(&cq->completion_lock);
+-            c->result = NULL;
+-            spin_unlock(&cq->completion_lock);
++            bce_vhci_command_queue_quarantine(cq);
+             return -ETIMEDOUT;
+         }
+         if ((res->cmd & ~0x8000) == creq.cmd)
+@@ -269,4 +279,5 @@ static int __bce_vhci_command_queue_execute(struct bce_vhci_command_queue *cq, struct bce_vhci_message *req,
+     if ((res->cmd & ~0x8000) != req->cmd) {
+         pr_err("t2bce_vhci: Possible desync, cmd reply mismatch req=%x, res=%x\n", req->cmd, res->cmd);
++        bce_vhci_command_queue_quarantine(cq);
+         return -EIO;
+     }
+@@ -279,8 +290,12 @@ int bce_vhci_command_queue_execute(struct bce_vhci_command_queue *cq, struct bce_vhci_message *req,
+                                    struct bce_vhci_message *res, unsigned long timeout)
+ {
+     int status;
+     mutex_lock(&cq->mutex);
+-    status = __bce_vhci_command_queue_execute(cq, req, res, timeout);
++    if (cq->quarantined) {
++        status = -EIO;
++    } else {
++        status = __bce_vhci_command_queue_execute(cq, req, res, timeout);
++    }
+     mutex_unlock(&cq->mutex);
+     return status;
+ }

@@ -1,0 +1,26 @@
+Subject: [PATCH] staging: t2bce: run the stateful handshake for hibernation images
+
+The BCE core PM table only exposes suspend and resume. During hibernation the
+USB core therefore freezes and restores the VHCI child without invoking the
+parent BCE SAVE_STATE_AND_SLEEP and RESTORE_STATE_AND_WAKE handshake. After a
+test_resume memory rewind, Linux restores queue indices that no longer match
+bridgeOS. Every VHCI queue command times out and usb_dev_restore loses the
+internal keyboard and trackpad.
+
+Pair freeze with the existing stateful suspend path and both thaw and restore
+with its matching resume path. This makes the in-place test_resume lifecycle
+coherent without changing ordinary S3 behavior. It does not implement the
+separate no-state reconstruction required after a cold S4 boot.
+
+--- a/drivers/staging/t2bce/t2bce_core/t2bce_main.c
++++ b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
+@@ -709,6 +709,9 @@ struct dev_pm_ops t2bce_pci_driver_pm = {
+         .prepare = t2bce_prepare,
+         .suspend = t2bce_suspend,
+         .resume = t2bce_resume,
++        .freeze = t2bce_suspend,
++        .thaw = t2bce_resume,
++        .restore = t2bce_resume,
+         .complete = t2bce_complete
+ };
+ struct pci_driver t2bce_pci_driver = {

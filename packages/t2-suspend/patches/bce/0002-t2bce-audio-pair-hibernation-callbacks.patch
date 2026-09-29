@@ -1,0 +1,27 @@
+Subject: [PATCH] staging: t2bce_audio: pair hibernation image callbacks
+
+The audio function owns coherent DMA buffers and BCE command queues, but its PM
+table only exposes suspend and resume.  Hibernation therefore invokes the BCE
+client prepare hook to revoke bridgeOS remote access without disabling the
+audio PCI function, and it never invokes the matching audio resume callback on
+thaw or image restore.
+
+Use the existing stateful suspend and resume paths for the in-place freeze,
+thaw, and restore lifecycle.  The BCE device link orders the audio consumer
+around its core supplier, while the existing deferred-resume callback waits for
+VHCI reconstruction before granting bridgeOS remote access again.  Leave
+poweroff unset because cold S4 still needs a separate no-state policy.
+
+--- a/drivers/staging/t2bce/t2bce_audio/audio.c
++++ b/drivers/staging/t2bce/t2bce_audio/audio.c
+@@ -919,6 +919,9 @@ MODULE_DEVICE_TABLE(pci, t2audio_ids);
+ struct dev_pm_ops t2audio_pci_driver_pm = {
+         .suspend = t2audio_suspend,
+-        .resume = t2audio_resume
++        .resume = t2audio_resume,
++        .freeze = t2audio_suspend,
++        .thaw = t2audio_resume,
++        .restore = t2audio_resume
+ };
+ struct pci_driver t2audio_pci_driver = {
+         .name = "t2bce_audio",

@@ -1,0 +1,114 @@
+Subject: [PATCH] t2bce: limit the shared-link DMA gate to hibernation
+
+Patch 0005 registered t2bce_suspend_noirq()/t2bce_resume_noirq() as the
+ordinary .suspend_noirq/.resume_noirq callbacks and routed .resume through
+t2bce_resume_with_shared_dma().  The verify step in t2bce_resume_noirq()
+(fail with -EIO and latch pci_dma_restore_failed when any of the four 74:00.x
+functions has PCI_COMMAND bus-master set) only makes sense for hibernation,
+where DMA must stay blocked until the restored kernel rebuilds its state.
+After a real ACPI S3 wake firmware leaves bus-master set on the sibling
+functions (function 2 is the unbound SEP function), so every S3 resume failed:
+
+  t2bce_core: noirq: blocked shared-link DMA and saved disabled state mask=0x6
+  t2bce_core: noirq: shared-link DMA became enabled during restore
+  t2bce_core 0000:74:00.1: PM: failed to resume noirq: error -5
+
+Remove .suspend_noirq/.resume_noirq and use the plain t2bce_resume() for
+.resume so ordinary S3 no longer runs the noirq DMA gate, consults the latch,
+or clears bus-master after a failed resume.  The hibernation mappings
+(.freeze_noirq, .thaw_noirq, .poweroff_noirq, .restore_noirq, .thaw,
+.restore) are unchanged, and .freeze_noirq still resets the latch and saved
+mask at the start of every hibernation transition.  .resume is never invoked
+by the hibernation phases, so the latch is unreachable on S3.
+
+The syscore early wake added by 0011 has the same defect: t2bce_syscore_resume
+runs before dpm_resume_noirq and rejects any bus-master sibling, which also
+hits an ordinary S3 whose suspend took the no-state fallback.  Add an explicit
+hibernation_transition flag, set in t2bce_freeze() (.freeze and .poweroff),
+cleared in the ordinary S3 t2bce_suspend() and in t2bce_complete(), and make
+the syscore hook return early unless it is set.  On S3 the wake is then left
+to t2bce_resume_mode(), as before 0011.  Hibernation behaviour is unchanged.
+
+S3 is not otherwise identical to the pre-0005 stack: 0006 changes the
+no-state suspend/resume internals, 0007 disables asynchronous system suspend
+for the four shared functions (ordering only) and 0011 adds the hibernation
+syscore wake.  Only the 0005 DMA gate, its latch and the 0011 early-wake
+master check are removed from the S3 path.
+
+This is an unqualified source-only change; it has not been built, staged or
+tested on hardware.
+
+Rebased for linux-t2 7.2.7 (t2bce 6780d522).  Context and offsets only;
+the S3 wiring (.resume = t2bce_resume, no noirq gate) and the
+hibernation_transition flag are carried over unchanged.
+
+---
+diff --git a/drivers/staging/t2bce/t2bce_core/t2bce.h b/drivers/staging/t2bce/t2bce_core/t2bce.h
+--- a/drivers/staging/t2bce/t2bce_core/t2bce.h
++++ b/drivers/staging/t2bce/t2bce_core/t2bce.h
+@@ -32,6 +32,7 @@
+     bool no_state_queues_dropped;
+     bool no_state_rebuild_failed;
+     bool no_state_early_wake_attempted;
++    bool hibernation_transition;
+     int no_state_early_wake_status;
+     bool mailbox_channel_active;
+     bool pci_dma_restore_failed;
+diff --git a/drivers/staging/t2bce/t2bce_core/t2bce_main.c b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
+--- a/drivers/staging/t2bce/t2bce_core/t2bce_main.c
++++ b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
+@@ -65,8 +65,12 @@
+     int status;
+ 
+     (void)data;
+-    if (!bce || !bce->no_state_resume || !bce->no_state_queues_dropped ||
+-            bce->no_state_early_wake_attempted)
++    /* The early wake and its bus-master check are hibernation-only.  After a
++     * real S3 wake firmware leaves the sibling functions bus-master, so ordinary
++     * S3 (including its no-state fallback) leaves the wake to t2bce_resume_mode().
++     */
++    if (!bce || !bce->hibernation_transition || !bce->no_state_resume ||
++            !bce->no_state_queues_dropped || bce->no_state_early_wake_attempted)
+         return;
+ 
+     bce->no_state_early_wake_attempted = true;
+@@ -1035,11 +1039,17 @@
+ 
+ static int t2bce_suspend(struct device *dev)
+ {
++    struct t2bce_device *bce = pci_get_drvdata(to_pci_dev(dev));
++
++    bce->hibernation_transition = false;
+     return t2bce_suspend_common(dev, false);
+ }
+ 
+ static int t2bce_freeze(struct device *dev)
+ {
++    struct t2bce_device *bce = pci_get_drvdata(to_pci_dev(dev));
++
++    bce->hibernation_transition = true;
+     return t2bce_suspend_common(dev, true);
+ }
+ 
+@@ -1299,6 +1309,7 @@
+     if (!bce->no_state_rebuild_failed)
+         t2bce_core_notify_resume_complete(bce);
+     bce->no_state_resume = false;
++    bce->hibernation_transition = false;
+     pr_debug("t2bce_core: complete: exit\n");
+ }
+ 
+@@ -1312,9 +1323,10 @@
+ struct dev_pm_ops t2bce_pci_driver_pm = {
+         .prepare = t2bce_prepare,
+         .suspend = t2bce_suspend,
+-        .resume = t2bce_resume_with_shared_dma,
+-        .suspend_noirq = t2bce_suspend_noirq,
+-        .resume_noirq = t2bce_resume_noirq,
++        /* Ordinary S3 uses the plain BCE resume and no noirq DMA gate; the
++         * shared-link block is hibernation-only (freeze/poweroff/thaw/restore).
++         */
++        .resume = t2bce_resume,
+         .freeze = t2bce_freeze,
+         .thaw = t2bce_resume_with_shared_dma,
+         .poweroff = t2bce_freeze,

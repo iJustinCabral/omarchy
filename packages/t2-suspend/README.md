@@ -39,6 +39,12 @@ python3 packages/t2-suspend/prepare-source.py \
 `--profile s3` reproduces the Wi-Fi protocol/diagnostic and Bluetooth recovery
 source used for the repeated S3 passes. `--profile wifi-reenable` additionally
 includes both Wi-Fi re-enable patches, matching the latest test image's source.
+`--profile hibernation` is used only by the opt-in hibernation candidate build
+(`experiments/verify-hibernation-candidate.py`): it adds Wi-Fi patch 0006, the
+`patches/bce/` series and the pinned BCE source (`--t2bce-source-patch`, fetched
+with `fetch-source.py --include-bce`), all defined in `manifest-hibernation.json` and `t2bce-source.json`.
+The two radio profiles never read that file, so radio source is unaffected. See
+[hibernation](../../docs/t2-suspend/HIBERNATION.md).
 Select a new output directory for each profile. Existing output, changed input,
 changed patches, or output that differs from tested source is rejected.
 

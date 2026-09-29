@@ -1,0 +1,23 @@
+Subject: [PATCH] wifi: brcmfmac: complete PCIe hibernation PM callbacks
+
+The PCIe driver puts the firmware and software bus into D3 from its freeze
+callback, but does not provide the matching thaw callback. The PCI PM core
+does not fall back to the driver's resume callback when a driver PM table is
+present and thaw is unset. A test_resume cycle therefore leaves the bus down
+after creating the image and fails the second freeze with -EIO.
+
+Use the existing D0 transition for thaw, and pair it with the existing D3
+transition for the post-image poweroff phase. This completes the hibernation
+callback sequence without changing ordinary suspend/resume behavior.
+
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c
+@@ -2872,7 +2872,9 @@ static const struct dev_pm_ops brcmf_pciedrvr_pm = {
+ 	.suspend = brcmf_pcie_pm_enter_D3,
+ 	.resume = brcmf_pcie_pm_leave_D3,
+ 	.freeze = brcmf_pcie_pm_enter_D3,
++	.thaw = brcmf_pcie_pm_leave_D3,
++	.poweroff = brcmf_pcie_pm_enter_D3,
+ 	.restore = brcmf_pcie_pm_leave_D3,
+ };
+ 

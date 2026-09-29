@@ -1,0 +1,115 @@
+Subject: [PATCH] t2bce: bound the command-queue idle wait on the suspend path
+
+Upstream 6780d522 closes the DMA submission gate at suspend and then calls
+t2bce_dma_wait_command_queue_idle(), which used an untimed wait_event().  A
+completion that never arrives (firmware fault, lost MSI) leaves freeze,
+poweroff and ordinary S3 suspend blocked uninterruptibly under pm_lock, with
+no way for the fallback or abort logic to run.
+
+t2bce_dma_wait_command_queue_idle() now uses wait_event_timeout() with
+T2BCE_DMA_IDLE_TIMEOUT_MS (5000 ms) and returns -ETIMEDOUT.  It has a single
+caller, bce_dma_engine_disable(), which now returns int and propagates the
+result.  bce_dma_engine_disable() has a single caller,
+bce_pm_suspend_prepare(), which on failure reopens the submission gate
+(nothing else has been quiesced at that point: the mailbox channel is not
+paused and the XHCI PM doorbell is untouched), reaps completions that became
+visible, and returns the error.  Both users of bce_pm_suspend_prepare() unwind
+on that error: t2bce_suspend_common() aborts the client prepare and returns
+without disabling the interrupt, and bce_pm_suspend_no_state_fallback() runs
+bce_pm_suspend_abort().  For S3 this means a timeout fails the suspend with
+-ETIMEDOUT and the system stays running instead of hanging; for hibernation
+the freeze/poweroff callback fails and the hibernation attempt is aborted.
+
+The fallback's bce_pm_suspend_abort() reopens the mailbox channel even though
+bce_pm_suspend_prepare() failed before pausing it; that unwind depends on the
+idempotent channel pause/resume pair from 0016, which must precede this patch.
+
+This is an unqualified source-only change; it has not been loaded or run on
+hardware.
+
+---
+diff --git a/drivers/staging/t2bce/t2bce_core/t2bce_main.c b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
+--- a/drivers/staging/t2bce/t2bce_core/t2bce_main.c
++++ b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
+@@ -428,7 +428,7 @@
+     return IRQ_HANDLED;
+ }
+ 
+-static void bce_dma_engine_disable(struct t2bce_device *bce)
++static int bce_dma_engine_disable(struct t2bce_device *bce)
+ {
+     /*
+      * Tahoe closes the submission gate and sleeps until its command queue's
+@@ -440,7 +440,8 @@
+     bce_process_dma_completions_locked(bce);
+     mutex_unlock(&bce->dma_completion_lock);
+     if (bce->dma.cmd_cmdq)
+-        t2bce_dma_wait_command_queue_idle(&bce->dma);
++        return t2bce_dma_wait_command_queue_idle(&bce->dma);
++    return 0;
+ }
+ 
+ static void bce_dma_engine_enable(struct t2bce_device *bce)
+@@ -549,7 +550,18 @@
+ {
+     int status;
+ 
+-    bce_dma_engine_disable(bce);
++    status = bce_dma_engine_disable(bce);
++    if (status) {
++        /*
++         * The command queue never drained (lost completion).  Reopen the gate
++         * and reap whatever is visible so the caller can unwind; nothing else
++         * has been quiesced yet.
++         */
++        pr_err("t2bce_core: suspend: command queue idle wait failed: %d\n", status);
++        bce_dma_engine_enable(bce);
++        bce_process_dma_completions(bce);
++        return status;
++    }
+     status = bce_pm_channel_pause(bce);
+     if (status) {
+         bce_dma_engine_enable(bce);
+diff --git a/drivers/staging/t2bce/t2bce_dma/include/t2bce_dma_queue.h b/drivers/staging/t2bce/t2bce_dma/include/t2bce_dma_queue.h
+--- a/drivers/staging/t2bce/t2bce_dma/include/t2bce_dma_queue.h
++++ b/drivers/staging/t2bce/t2bce_dma/include/t2bce_dma_queue.h
+@@ -168,7 +168,9 @@
+ void t2bce_dma_notify_submission_complete(struct bce_queue_sq *sq);
+ void t2bce_dma_disable(struct t2bce_dma_engine *dma);
+ void t2bce_dma_enable(struct t2bce_dma_engine *dma);
+-void t2bce_dma_wait_command_queue_idle(struct t2bce_dma_engine *dma);
++/* Upper bound for the command queue to drain once the submission gate is closed. */
++#define T2BCE_DMA_IDLE_TIMEOUT_MS 5000
++int t2bce_dma_wait_command_queue_idle(struct t2bce_dma_engine *dma);
+ 
+ void t2bce_dma_set_next_submission_single(struct bce_queue_sq *sq, dma_addr_t addr, size_t size);
+ int t2bce_dma_init_segment_list_pool(struct t2bce_dma_engine *dma);
+diff --git a/drivers/staging/t2bce/t2bce_dma/queue.c b/drivers/staging/t2bce/t2bce_dma/queue.c
+--- a/drivers/staging/t2bce/t2bce_dma/queue.c
++++ b/drivers/staging/t2bce/t2bce_dma/queue.c
+@@ -302,12 +302,22 @@
+ }
+ EXPORT_SYMBOL_GPL(t2bce_dma_enable);
+ 
+-void t2bce_dma_wait_command_queue_idle(struct t2bce_dma_engine *dma)
++int t2bce_dma_wait_command_queue_idle(struct t2bce_dma_engine *dma)
+ {
+     struct bce_queue_sq *sq = dma->cmd_cmdq->sq;
+ 
+-    wait_event(sq->idle_wait,
+-            atomic_read(&sq->available_commands) == sq->el_count - 1);
++    /*
++     * A lost completion must not hang freeze or poweroff uninterruptibly:
++     * bound the wait and let the caller unwind.
++     */
++    if (!wait_event_timeout(sq->idle_wait,
++            atomic_read(&sq->available_commands) == sq->el_count - 1,
++            msecs_to_jiffies(T2BCE_DMA_IDLE_TIMEOUT_MS))) {
++        pr_err("t2bce_dma: command queue did not drain within %d ms\n",
++                T2BCE_DMA_IDLE_TIMEOUT_MS);
++        return -ETIMEDOUT;
++    }
++    return 0;
+ }
+ EXPORT_SYMBOL_GPL(t2bce_dma_wait_command_queue_idle);
+ 
