@@ -351,6 +351,22 @@ sudo -n /usr/bin/python3 -I -B /var/lib/omarchy/t2-hibernate-product/runtime/pac
 
 Expected: `class: "unchanged"`. It writes nothing and holds no lock while hashing. If any item reports `unknown` here (for example a root-only control path that still could not be read), record it: that item will stay `unknown` in later assessments, which only keeps reactivation conservative.
 
+## Reboot into the stock entry and verify (between H3 and H4)
+
+H3 makes the stock `Omarchy linux-t2` entry the default again but does not change the running system. Before any package update, the owner reboots once so updates run on the standard boot image with the installed DKMS drivers, not under the hibernation source image's private experimental drivers. An assistant never initiates this reboot.
+
+After the reboot, read-only:
+
+```bash
+f=$(ls /sys/firmware/efi/efivars/LoaderImageIdentifier-*); tail -c +5 "$f" | tr -d '\0'; echo   # expect EFI\Linux\omarchy_linux-t2.efi, not mba_t2_hibernation_source.efi
+for m in hci_bcm4377 brcmfmac t2bce_core t2bce_vhci t2bce_audio; do echo "$m $(cat /sys/module/$m/srcversion) $(modinfo -F srcversion $m)"; done   # each pair must match (disk drivers loaded)
+journalctl -b -u bluetooth-after-wifi --no-pager | grep bt-order   # the stock gate, not the hibernation candidate loader
+sudo /usr/bin/python3 -I -B /var/lib/omarchy/t2-hibernate-product/runtime/packages/t2-suspend/hibernate/update_guard.py; echo "exit=$?"   # expect 0
+sudo /usr/bin/python3 -I -B /var/lib/omarchy/t2-hibernate-product/runtime/packages/t2-suspend/hibernate/boot_policy_native.py assess | jq '{class, busy}'   # expect unchanged
+```
+
+Then test ordinary sleep once on the stock entry (lid close, wait a minute, open). The earlier S3 freezes were specific to the hibernation source image's private drivers; on stock, sleep should resume with keyboard, trackpad, audio, Wi-Fi and Bluetooth working. If it does not, stop and report before updating.
+
 ## Gate H4: first package update, then `omarchy update`
 
 Operator approval required for each update. The installed hook now runs the new native guard because the marker exists (`update_guard.main:434-440`, marker branch `:438`); with a valid marker it admits ordinary transactions under the physical lock after the exact inactive validator and a saved-image check.
