@@ -263,16 +263,17 @@ class NativeUpgrade(unittest.TestCase):
     def release_db(*, verify_only=False):
       nonlocal release_failed
       events.append("db_verify" if verify_only else "db_release")
-      if fail == "release" and not verify_only and not release_failed:
+      if fail in ("release", "preserved") and not verify_only and not release_failed:
         release_failed = True
-        raise ValueError("db release failed")
+        raise (N._Preserved if fail == "preserved" else ValueError)("db release failed")
     release_db.check_physical = lambda: events.append("physical_check")
+    release_db.abandon = lambda: events.append("abandon")
     @contextmanager
     def locks(root):
       events.append("locks_enter")
       try: yield release_db
       finally: events.append("locks_exit")
-    engine = SimpleNamespace(_locks=locks, PRODUCT=product, DB_LOCK=Path("fixture-db.lck"))
+    engine = SimpleNamespace(_locks=Mock(side_effect=AssertionError("Old engine lock API must not run")), PRODUCT=product)
     def product_check(*args, barrier):
       events.append("old_admission" if args[0] is product else "final_admission")
       if fail == "final" and args[0] is not product: raise ValueError("final admission failed")
@@ -282,6 +283,7 @@ class NativeUpgrade(unittest.TestCase):
     with patch.object(N, "_installed_approval", return_value=approval), patch.object(N, "_unchanged"), \
          patch.object(Path, "readlink", return_value=Path("/usr/bin/systemd-inhibit")), \
          patch.object(N, "_verified_engines", return_value=(core, object(), engine)), \
+         patch.object(N, "_locks", side_effect=locks), \
          patch.object(N, "_guard", return_value=(9, lambda: events.append("guard"))), \
          patch.object(N, "_product_check", side_effect=product_check), \
          patch.object(N, "_postcheck", return_value={}), patch.object(N, "_review", return_value={"files": {}}), \
@@ -324,11 +326,12 @@ class NativeUpgrade(unittest.TestCase):
           expected, _ = case.runtime_only_fixture()
           case.runtime_only_upgrade(expected)
           approval = {**self.approval(), "expected": expected, "reviewed_commit": "b" * 40, "approval_id": case.approval_id}
-          db = case.root / "var/lib/pacman/db.lck"
+          db = case.root / N.DB_LOCK
           db.parent.mkdir(parents=True)
-          db.write_bytes(b"")
-          physical = case.root / "physical.lock"
+          physical = case.root / N.PHYSICAL_LOCK
+          physical.parent.mkdir(parents=True)
           physical.write_bytes(b"")
+          physical.chmod(0o600)
           events, failures = [], 0
           directory_synced = False
           core = fixture.D
@@ -349,31 +352,18 @@ class NativeUpgrade(unittest.TestCase):
             path = Path(os.readlink("/proc/self/fd/" + str(fd)))
             if ((fault == "file-sync" and path == case.state / core.COMPATIBLE_BARRIER) or
                 (fault == "directory-sync" and path == case.state) or
-                (fault == "db-sync" and path == db.parent)): inject()
+                (fault == "db-sync" and path == db.parent and not db.exists())): inject()
             original_sync(fd)
             if path == case.state: directory_synced = True
+          adapter_locks = N._locks
           @contextmanager
           def locks(root):
-            held = os.open(physical, os.O_RDONLY)
-            fcntl.flock(held, fcntl.LOCK_EX)
-            released = False
-            def release(*, verify_only=False):
-              nonlocal released
-              self.assertTrue(db.exists())
-              if verify_only: return
-              db.unlink()
-              released = True
-              directory = os.open(db.parent, os.O_RDONLY | os.O_DIRECTORY)
-              try: os.fsync(directory)
-              finally: os.close(directory)
-            release.check_physical = lambda: self.assertEqual(os.fstat(held).st_ino, physical.stat().st_ino)
-            try: yield release
+            try:
+              with adapter_locks(root) as release: yield release
             finally:
-              self.assertTrue(released)
               events.append("physical_release")
-              os.close(held)
           original_error = ValueError("original upgrade fault")
-          engine = SimpleNamespace(_locks=locks, PRODUCT=object(), DB_LOCK=db.relative_to(case.root))
+          engine = SimpleNamespace(PRODUCT=object())
           def pause(seconds):
             self.assertEqual(seconds, 1)
             self.assertNotIn("physical_release", events)
@@ -387,6 +377,7 @@ class NativeUpgrade(unittest.TestCase):
                patch.object(N, "_installed_approval", return_value=approval), patch.object(N, "_unchanged"), \
                patch.object(Path, "readlink", return_value=Path("/usr/bin/systemd-inhibit")), \
                patch.object(N, "_verified_engines", return_value=(core, object(), engine)), \
+               patch.object(N, "_locks", side_effect=locks), \
                patch.object(N, "_guard", return_value=(guard_fd, lambda: None)), \
                patch.object(core, "_upgrade_snapshot", side_effect=original_error) as upgrade, \
                patch.object(core, "_new_private", side_effect=write), patch.object(core, "_private_read", side_effect=read), \
@@ -434,28 +425,465 @@ class NativeUpgrade(unittest.TestCase):
     self.assertEqual(pause.call_count, 3)
 
   def test_lock_entry_failure_does_not_run_repair_without_exclusion(self):
-    engine = SimpleNamespace(_locks=Mock(side_effect=ValueError("lock entry failed")))
+    engine = SimpleNamespace()
     with patch.object(N, "_installed_approval", return_value=self.approval()), patch.object(N, "_unchanged"), \
          patch.object(Path, "readlink", return_value=Path("/usr/bin/systemd-inhibit")), \
          patch.object(N, "_verified_engines", return_value=(object(), object(), engine)), \
+         patch.object(N, "_locks", side_effect=ValueError("lock entry failed")), \
          patch.object(N, "_guard", return_value=(9, lambda: None)), patch.object(N.os, "close"), \
          patch.object(N, "_restore_veto") as repair, self.assertRaisesRegex(ValueError, "lock entry"):
       N.native()
     repair.assert_not_called()
 
-  def test_old_engine_missing_physical_check_refuses_before_core_and_recovery(self):
-    @contextmanager
-    def locks(root): yield lambda **kwargs: None
-    engine = SimpleNamespace(_locks=locks)
-    core = SimpleNamespace(_upgrade_snapshot=Mock())
-    with patch.object(N, "_installed_approval", return_value=self.approval()), patch.object(N, "_unchanged"), \
-         patch.object(Path, "readlink", return_value=Path("/usr/bin/systemd-inhibit")), \
-         patch.object(N, "_verified_engines", return_value=(core, object(), engine)), \
-         patch.object(N, "_guard", return_value=(9, lambda: None)), patch.object(N.os, "close"), \
-         patch.object(N, "_restore_veto") as repair, self.assertRaisesRegex(ValueError, "lacks required"):
-      N.native()
-    core._upgrade_snapshot.assert_not_called()
-    repair.assert_not_called()
+  def test_old_engine_lock_api_is_not_required_or_called(self):
+    self._orchestration()
+
+  @contextmanager
+  def lock_fixture(self):
+    with tempfile.TemporaryDirectory() as directory:
+      root = Path(directory)
+      db, physical = root / N.DB_LOCK, root / N.PHYSICAL_LOCK
+      db.parent.mkdir(parents=True)
+      physical.parent.mkdir(parents=True)
+      physical.write_bytes(b"")
+      physical.chmod(0o600)
+      yield root, db, physical
+
+  def assert_physical_held(self, physical):
+    competitor = os.open(physical, os.O_RDONLY)
+    try:
+      with self.assertRaises(BlockingIOError): fcntl.flock(competitor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally: os.close(competitor)
+
+  def test_adapter_live_lock_gate_refuses_before_opening_lock_paths(self):
+    with patch.object(N, "_lock_parent") as parent, self.assertRaisesRegex(ValueError, "fixed installed"):
+      with N._locks(Path("/")): self.fail("Live source lock must refuse")
+    parent.assert_not_called()
+
+  def test_adapter_locks_are_exclusive_private_and_release_is_idempotent(self):
+    with self.lock_fixture() as (root, db, physical):
+      with N._locks(root) as release:
+        self.assertEqual(db.stat().st_mode & 0o777, 0o600)
+        self.assert_physical_held(physical)
+        with self.assertRaises(FileExistsError):
+          with N._locks(root): self.fail("Second DB acquisition must refuse")
+        release(verify_only=True)
+        release()
+        release()
+        self.assertFalse(db.exists())
+        self.assert_physical_held(physical)
+        release.check_physical()
+      with self.assertRaisesRegex(ValueError, "scope ended"): release()
+      with self.assertRaisesRegex(ValueError, "scope ended"): release.check_physical()
+
+  def test_adapter_preserves_foreign_db_before_and_after_own_unlink(self):
+    with self.lock_fixture() as (root, db, physical):
+      with N._locks(root) as release:
+        retained = db.with_name("owned-retained")
+        db.rename(retained)
+        db.write_bytes(b"foreign before unlink")
+        db.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "Foreign pacman"): release()
+        self.assertEqual(db.read_bytes(), b"foreign before unlink")
+        db.rename(db.with_name("foreign-before-retained"))
+        retained.rename(db)
+        release()
+        db.write_bytes(b"foreign after unlink")
+        db.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "Foreign pacman"): release()
+        self.assertEqual(db.read_bytes(), b"foreign after unlink")
+        db.rename(db.with_name("foreign-after-retained"))
+        release()
+      self.assertEqual(db.with_name("foreign-before-retained").read_bytes(), b"foreign before unlink")
+      self.assertEqual(db.with_name("foreign-after-retained").read_bytes(), b"foreign after unlink")
+
+  def test_adapter_physical_replacement_symlink_permissions_and_ancestry_refuse(self):
+    with self.lock_fixture() as (root, db, physical):
+      with N._locks(root) as release:
+        retained = physical.with_name("physical-retained")
+        physical.rename(retained)
+        physical.write_bytes(b"foreign physical")
+        physical.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "inode changed"): release.check_physical()
+        physical.rename(physical.with_name("foreign-physical-retained"))
+        retained.rename(physical)
+        release()
+      physical.chmod(0o644)
+      with self.assertRaisesRegex(ValueError, "Private regular"):
+        with N._locks(root): self.fail("Loose physical mode must refuse")
+      self.assertFalse(db.exists())
+      physical.chmod(0o600)
+      retained = physical.with_name("physical-real")
+      physical.rename(retained)
+      physical.symlink_to(retained)
+      with self.assertRaises(OSError):
+        with N._locks(root): self.fail("Symlink physical lock must refuse")
+      self.assertFalse(db.exists())
+      db.parent.chmod(0o777)
+      with self.assertRaisesRegex(ValueError, "lock ancestry"):
+        with N._locks(root): self.fail("Writable ancestry must refuse")
+      self.assertFalse(db.exists())
+
+  def test_adapter_context_cleanup_sync_fault_keeps_physical_until_settled(self):
+    with self.lock_fixture() as (root, db, physical):
+      original_sync, failures = os.fsync, 0
+      original_error = ValueError("body failure")
+      def sync(fd):
+        nonlocal failures
+        path = Path(os.readlink("/proc/self/fd/" + str(fd)))
+        if path == db.parent and not db.exists() and failures < 2:
+          failures += 1
+          raise OSError("cleanup directory fsync fault")
+        original_sync(fd)
+      def pause(seconds):
+        self.assertEqual(seconds, 1)
+        self.assert_physical_held(physical)
+      with patch.object(os, "fsync", side_effect=sync), patch.object(N.time, "sleep", side_effect=pause) as sleep:
+        with self.assertRaises(ValueError) as caught:
+          with N._locks(root): raise original_error
+      self.assertIs(caught.exception, original_error)
+      self.assertEqual(failures, 2)
+      self.assertEqual(sleep.call_count, 2)
+      self.assertFalse(db.exists())
+
+
+  def test_preserved_foreign_lock_in_recovery_fails_closed_without_spinning(self):
+    with patch.object(N.time, "sleep", side_effect=AssertionError("must not retry a preserved foreign lock")):
+      events = self._orchestration(fail="preserved")
+    self.assertIn("restore_veto", events)
+    self.assertLess(events.index("restore_veto"), events.index("locks_exit"))
+    operation = Mock(side_effect=N._Preserved("foreign"))
+    with patch.object(N.time, "sleep", side_effect=AssertionError("no retry")), self.assertRaises(N._Preserved):
+      N._retain_recovery(operation)
+    operation.assert_called_once()
+
+  def test_pacman_recreating_lock_after_our_unlink_settles_without_recovery(self):
+    with self.lock_fixture() as (root, db, physical):
+      original_sync = os.fsync
+      def sync(fd):
+        original_sync(fd)
+        if Path(os.readlink("/proc/self/fd/" + str(fd))) == db.parent and not db.exists():
+          db.write_bytes(b"real pacman")
+          db.chmod(0o644)
+      with patch.object(os, "fsync", side_effect=sync), \
+           patch.object(N.time, "sleep", side_effect=AssertionError("must not retry")):
+        with N._locks(root) as release:
+          release()
+          self.assertEqual(db.read_bytes(), b"real pacman")
+          self.assert_physical_held(physical)
+        self.assertEqual(db.read_bytes(), b"real pacman")
+        self.assertEqual(db.stat().st_mode & 0o777, 0o644)
+      # mid-settlement retry (fsync fault, then pacman appears) also settles
+      db.unlink()
+      failures = 0
+      def flaky(fd):
+        nonlocal failures
+        if Path(os.readlink("/proc/self/fd/" + str(fd))) == db.parent and not db.exists() and not failures:
+          failures += 1
+          db.write_bytes(b"real pacman 2")
+          raise OSError("fsync fault")
+        original_sync(fd)
+      with patch.object(os, "fsync", side_effect=flaky), patch.object(N.time, "sleep", side_effect=lambda seconds: None):
+        with N._locks(root) as release:
+          with self.assertRaises(OSError): release()
+          release()
+        self.assertEqual(db.read_bytes(), b"real pacman 2")
+        self.assertEqual(failures, 1)
+
+  def test_signal_between_unlink_and_released_flag_settles_on_retry(self):
+    with self.lock_fixture() as (root, db, physical):
+      real_unlink = os.unlink
+      def unlink(*args, **kwargs):
+        real_unlink(*args, **kwargs)
+        raise KeyboardInterrupt()
+      with N._locks(root) as release:
+        with patch.object(os, "unlink", side_effect=unlink), self.assertRaises(KeyboardInterrupt): release()
+        self.assertFalse(db.exists())
+        release()
+        release()
+      self.assertFalse(db.exists())
+
+  def test_physical_lock_contention_leaves_no_db_lock_and_keeps_original_error(self):
+    with self.lock_fixture() as (root, db, physical):
+      holder = os.open(physical, os.O_RDONLY)
+      try:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        with self.assertRaises(BlockingIOError):
+          with N._locks(root): self.fail("Contended physical lock must refuse")
+        self.assertFalse(db.exists())
+        original_sync, failures = os.fsync, 0
+        def sync(fd):
+          nonlocal failures
+          if Path(os.readlink("/proc/self/fd/" + str(fd))) == db.parent and not db.exists() and failures < 2:
+            failures += 1
+            raise OSError("cleanup fsync fault")
+          original_sync(fd)
+        with patch.object(os, "fsync", side_effect=sync), self.assertRaises(BlockingIOError):
+          with N._locks(root): self.fail("Contended physical lock must refuse")
+        self.assertEqual(failures, 2)
+        self.assertFalse(db.exists())
+        # exhausted cleanup never masks the original error, and is recorded
+        failures = -100
+        with patch.object(os, "fsync", side_effect=sync), self.assertRaises(BlockingIOError) as caught:
+          with N._locks(root): self.fail("Contended physical lock must refuse")
+        self.assertTrue(any("lock cleanup failed" in note for note in caught.exception.__notes__))
+        self.assertFalse(db.exists())
+      finally: os.close(holder)
+
+  def test_every_descriptor_is_closed_even_when_one_close_fails(self):
+    for primary in (False, True):
+      with self.subTest(primary=primary), self.lock_fixture() as (root, db, physical):
+        real_close, closed = os.close, []
+        def close(fd):
+          try: target = Path(os.readlink("/proc/self/fd/" + str(fd)))
+          except OSError: target = None
+          real_close(fd)
+          closed.append(target)
+          if target == physical: raise OSError("close fault")
+        original = ValueError("body failure")
+        with patch.object(os, "close", side_effect=close):
+          try:
+            with N._locks(root):
+              if primary: raise original
+          except (OSError, ValueError) as error: caught = error
+        for target in (physical.parent, db.parent):
+          self.assertIn(target, closed)
+        self.assertNotIn(physical, [Path(os.readlink("/proc/self/fd/" + name)) for name in os.listdir("/proc/self/fd") if os.path.islink("/proc/self/fd/" + name)])
+        if primary:
+          self.assertIs(caught, original)
+          self.assertTrue(any("close fault" in note for note in caught.__notes__))
+        else: self.assertRegex(str(caught), "close fault")
+        self.assertFalse(db.exists())
+        competitor = os.open(physical, os.O_RDONLY)
+        try: fcntl.flock(competitor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally: os.close(competitor)
+
+  def test_db_lock_hardlink_wrong_mode_or_owner_refuse_without_deleting(self):
+    with self.lock_fixture() as (root, db, physical):
+      with N._locks(root) as release:
+        link = db.with_name("db-link")
+        os.link(db, link)
+        with self.assertRaisesRegex(ValueError, "single-link"): release()
+        self.assertTrue(db.exists())
+        link.unlink()
+        db.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "single-link"): release()
+        self.assertTrue(db.exists())
+        db.chmod(0o600)
+        release()
+    # ownership: chown is impossible unprivileged, so exercise the real check
+    fake = SimpleNamespace(st_mode=0o100600, st_uid=os.geteuid() + 1, st_nlink=1, st_dev=1, st_ino=1, st_gid=0)
+    with self.assertRaisesRegex(ValueError, "single-link"): N._lock_identity(fake)
+
+  def test_physical_lock_hardlink_fifo_or_directory_refuse_without_db_lock(self):
+    with self.lock_fixture() as (root, db, physical):
+      link = physical.with_name("physical-link")
+      os.link(physical, link)
+      with self.assertRaisesRegex(ValueError, "single-link"):
+        with N._locks(root): self.fail("Hardlinked physical lock must refuse")
+      self.assertFalse(db.exists())
+      link.unlink()
+      physical.unlink()
+      os.mkfifo(physical, 0o600)
+      with self.assertRaisesRegex(ValueError, "Private regular"):
+        with N._locks(root): self.fail("FIFO physical lock must refuse")
+      self.assertFalse(db.exists())
+      physical.unlink()
+      physical.mkdir(mode=0o700)
+      with self.assertRaisesRegex(ValueError, "Private regular"):
+        with N._locks(root): self.fail("Directory physical lock must refuse")
+      self.assertFalse(db.exists())
+
+
+  @contextmanager
+  def real_native(self, root, physical, *, upgrade, restore):
+    """native() with the REAL adapter _locks on a temp root; everything else is stubbed."""
+    core = SimpleNamespace(_upgrade_snapshot=Mock(side_effect=upgrade), _verify_tree=Mock())
+    guard_fd = os.open(physical, os.O_RDONLY)  # native() closes it
+    with patch.object(N, "ROOT", root), patch.object(N, "_installed_approval", return_value=self.approval()), \
+         patch.object(N, "_unchanged"), patch.object(Path, "readlink", return_value=Path("/usr/bin/systemd-inhibit")), \
+         patch.object(N, "_verified_engines", return_value=(core, object(), SimpleNamespace(PRODUCT=object()))), \
+         patch.object(N, "_guard", return_value=(guard_fd, lambda: None)), patch.object(N, "_product_check"), \
+         patch.object(N, "_postcheck", return_value={}), patch.object(N, "_review", return_value={"files": {}}), \
+         patch.object(N, "_private_bytes", return_value=b"review"), patch.object(N, "_load", return_value=object()), \
+         patch.object(N, "_restore_veto", side_effect=restore) as veto:
+      yield veto
+
+  def fake_clock(self):
+    clock = [0.0]
+    def sleep(seconds): clock[0] += seconds
+    return clock, patch.object(N.time, "sleep", side_effect=sleep), patch.object(N.time, "monotonic", side_effect=lambda: clock[0])
+
+  def test_native_pacman_recreating_lock_after_unlink_completes_without_recovery(self):
+    with self.lock_fixture() as (root, db, physical):
+      original_sync = os.fsync
+      def sync(fd):
+        original_sync(fd)
+        if Path(os.readlink("/proc/self/fd/" + str(fd))) == db.parent and not db.exists():
+          db.write_bytes(b"real pacman")
+          db.chmod(0o644)
+      upgrade = lambda *args, **kwargs: {"review_sha256": "x" * 64}
+      with self.real_native(root, physical, upgrade=upgrade, restore=lambda *args: None) as veto, \
+           patch.object(os, "fsync", side_effect=sync), \
+           patch.object(N.time, "sleep", side_effect=AssertionError("no retry")):
+        self.assertEqual(N.native(), {"review_sha256": "x" * 64, "live_execution": True, "power_operation": False})
+      veto.assert_not_called()
+      self.assertEqual(db.read_bytes(), b"real pacman")
+      self.assertEqual(db.stat().st_mode & 0o777, 0o644)
+
+  def test_foreign_or_altered_db_lock_before_our_unlink_is_preserved_in_recovery(self):
+    for variant in ("replaced", "chmod", "hardlink"):
+      with self.subTest(variant=variant), self.lock_fixture() as (root, db, physical):
+        def restore(*args):
+          if variant == "replaced":
+            db.rename(db.with_name("ours-retained"))
+            db.write_bytes(b"real pacman")
+            db.chmod(0o644)
+          elif variant == "chmod": db.chmod(0o644)
+          else: os.link(db, db.with_name("extra-link"))
+        original = ValueError("upgrade fault")
+        with self.real_native(root, physical, upgrade=original, restore=restore) as veto, \
+             patch.object(N.time, "sleep", side_effect=AssertionError("must not spin")):
+          with self.assertRaises(ValueError) as caught: N.native()
+        self.assertIs(caught.exception, original)
+        self.assertIsInstance(caught.exception.__cause__, N._Preserved)
+        veto.assert_called_once()
+        self.assertTrue(db.exists())
+        if variant == "replaced": self.assertEqual(db.read_bytes(), b"real pacman")
+        elif variant == "chmod": self.assertEqual(db.stat().st_mode & 0o777, 0o644)
+        else: self.assertEqual(db.stat().st_nlink, 2)
+        self.assertTrue(any("may remain and block pacman" in note for note in caught.exception.__notes__))
+
+  def test_deterministic_fault_after_durable_veto_is_bounded_and_fails_closed(self):
+    with self.lock_fixture() as (root, db, physical):
+      calls = []
+      def restore(*args):
+        calls.append(1)
+        db.parent.chmod(0o777)  # veto established, then a fault retries can never clear
+      original = ValueError("upgrade fault")
+      clock, sleep, mono = self.fake_clock()
+      with self.real_native(root, physical, upgrade=original, restore=restore), sleep as pause, mono:
+        with self.assertRaises(ValueError) as caught: N.native()
+      self.assertIs(caught.exception, original)
+      self.assertIsInstance(caught.exception.__cause__, ValueError)
+      self.assertIn(pause.call_count, range(int(N.RECOVERY_BOUND) - 1, int(N.RECOVERY_BOUND) + 3))
+      self.assertGreaterEqual(len(calls), int(N.RECOVERY_BOUND) - 1)
+      self.assertTrue(any("lock cleanup failed for " + str(db) in note and "may remain and block pacman" in note
+                          for note in caught.exception.__notes__))
+      self.assertTrue(db.exists())
+
+  def test_same_fault_before_veto_is_durable_keeps_retrying_past_the_bound(self):
+    with self.lock_fixture() as (root, db, physical):
+      failures = int(N.RECOVERY_BOUND) + 100
+      calls = []
+      def restore(*args):
+        calls.append(1)
+        if len(calls) <= failures: raise OSError("veto not yet durable")
+      original = ValueError("upgrade fault")
+      clock, sleep, mono = self.fake_clock()
+      with self.real_native(root, physical, upgrade=original, restore=restore), sleep, mono:
+        with self.assertRaises(ValueError) as caught: N.native()
+      self.assertIs(caught.exception, original)
+      self.assertEqual(len(calls), failures + 1)
+      self.assertFalse(db.exists())
+
+  def test_pre_acquisition_cleanup_is_paced_and_interrupt_is_reraised_after_release(self):
+    with self.lock_fixture() as (root, db, physical):
+      holder = os.open(physical, os.O_RDONLY)
+      original_sync, faults = os.fsync, [OSError("a"), OSError("b")]
+      def sync(fd):
+        if Path(os.readlink("/proc/self/fd/" + str(fd))) == db.parent and not db.exists() and faults: raise faults.pop(0)
+        original_sync(fd)
+      try:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        with patch.object(os, "fsync", side_effect=sync), patch.object(N.time, "sleep") as pause, self.assertRaises(BlockingIOError):
+          with N._locks(root): self.fail("Contended physical lock must refuse")
+        self.assertEqual([call.args for call in pause.call_args_list], [(0.2,), (0.2,)])
+        self.assertFalse(db.exists())
+        faults[:] = [KeyboardInterrupt()]
+        with patch.object(os, "fsync", side_effect=sync), self.assertRaises(KeyboardInterrupt):
+          with N._locks(root): self.fail("Contended physical lock must refuse")
+        self.assertFalse(db.exists())
+      finally: os.close(holder)
+
+
+  def test_scope_exit_cleanup_with_permanent_fault_is_bounded_and_keeps_original_error(self):
+    with self.lock_fixture() as (root, db, physical):
+      original = ValueError("body failure")
+      clock, sleep, mono = self.fake_clock()
+      with sleep as pause, mono, self.assertRaises(ValueError) as caught:
+        with N._locks(root):
+          db.parent.chmod(0o777)
+          raise original
+      self.assertIs(caught.exception, original)
+      self.assertGreaterEqual(pause.call_count, int(N.RECOVERY_BOUND) - 1)
+      self.assertTrue(any("may remain and block pacman" in note for note in original.__notes__))
+
+
+  def test_durability_is_per_attempt_so_a_later_failed_veto_is_never_bounded(self):
+    with self.lock_fixture() as (root, db, physical):
+      mode = db.parent.stat().st_mode & 0o777
+      failures, calls = int(N.RECOVERY_BOUND) + 50, []
+      def restore(*args):
+        calls.append(1)
+        if len(calls) == 1: db.parent.chmod(0o777)  # veto verified, but release then fails deterministically
+        elif len(calls) <= failures + 1: raise ValueError("Foreign compatible veto must remain untouched")
+        else: db.parent.chmod(mode)  # a veto is re-verified and the fault clears
+      original = ValueError("upgrade fault")
+      clock, sleep, mono = self.fake_clock()
+      with self.real_native(root, physical, upgrade=original, restore=restore), sleep, mono:
+        with self.assertRaises(ValueError) as caught: N.native()
+      self.assertIs(caught.exception, original)
+      self.assertEqual(len(calls), failures + 2)
+      self.assertFalse(db.exists())
+
+  def test_real_durable_veto_faults_keep_recovery_unbounded_until_it_succeeds(self):
+    spec = importlib.util.spec_from_file_location("durable_core", HERE / "hibernate/runtime_deployment.py")
+    core = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(core)
+    approval = self.approval()
+    expected = approval["expected"]
+    intent = {"protocol": "omarchy-t2-runtime-upgrade-intent-v2",
+      "transaction_id": "706521e4-998e-4477-b603-31b93144d102", "approval_id": approval["approval_id"],
+      "old_review_sha256": expected["old_review"], "new_review_sha256": expected["new_review"],
+      "old_config_sha256": expected["old_config"], "new_config_sha256": expected["new_config"]}
+    record = {"protocol": "omarchy-t2-runtime-upgrade-completed-v2", "intent": intent,
+      "review_sha256": expected["new_review"], "config_sha256": expected["new_config"]}
+    real_restore = N._restore_veto
+    for fault in ("directory-fsync", "file-fsync", "readback"):
+      with self.subTest(fault=fault), self.lock_fixture() as (root, db, physical), tempfile.TemporaryDirectory() as directory:
+        state = Path(directory)
+        state.chmod(0o700)
+        for name, value in (("runtime-upgrade-completed-aaaaaaaaaaaa.json", core._encoded(record)),
+                            ("runtime-upgrade-approval-consumed-" + approval["approval_id"] + ".json", core._encoded(intent))):
+          (state / name).write_bytes(value)
+          (state / name).chmod(0o600)
+        barrier = state / core.COMPATIBLE_BARRIER
+        failures, attempts = int(N.RECOVERY_BOUND) + 50, []
+        original_sync, original_read = os.fsync, core._private_read
+        def sync(fd):
+          target = Path(os.readlink("/proc/self/fd/" + str(fd)))
+          if ((fault == "directory-fsync" and target == state) or (fault == "file-fsync" and target == barrier)) and len(attempts) <= failures:
+            raise OSError("durability fault")
+          original_sync(fd)
+        def read(parent, name):
+          raw = original_read(parent, name)
+          if fault == "readback" and name == core.COMPATIBLE_BARRIER and len(attempts) <= failures: return raw + b" "
+          return raw
+        def restore(*args):
+          attempts.append(1)
+          return real_restore(core, approval)
+        original = ValueError("upgrade fault")
+        clock, sleep, mono = self.fake_clock()
+        with patch.object(N, "STATE", state), patch.object(os, "fsync", side_effect=sync), \
+             patch.object(core, "_private_read", side_effect=read), \
+             self.real_native(root, physical, upgrade=original, restore=restore), sleep, mono:
+          with self.assertRaises(ValueError) as caught: N.native()
+        self.assertIs(caught.exception, original)
+        self.assertGreater(len(attempts), failures)
+        self.assertGreater(clock[0], N.RECOVERY_BOUND)
+        self.assertEqual(barrier.read_bytes(), core._encoded(intent))
+        self.assertFalse(db.exists())
 
 
 if __name__ == "__main__": unittest.main()

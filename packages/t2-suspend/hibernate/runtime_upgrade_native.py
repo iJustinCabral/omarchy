@@ -6,6 +6,8 @@ qualification, boot policy or power state. Interrupted publications are not
 replayed; the compatible pending marker vetoes routine hibernation.
 """
 import hashlib
+from contextlib import contextmanager
+import fcntl
 import importlib.util
 import json
 import os
@@ -28,6 +30,8 @@ WHY = "reviewed-v2-runtime-upgrade"
 ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"}
 RUNTIME_REL = "packages/t2-suspend/hibernate/runtime_deployment.py"
 HASHES = {"old_review", "old_bootstrap", "old_config", "new_review", "new_bootstrap", "new_config"}
+DB_LOCK = Path("var/lib/pacman/db.lck")
+PHYSICAL_LOCK = Path("var/lib/omarchy/t2-hibernate-trial/physical-cycle.lock")
 UNCHANGED = {
   "qualification": (STATE / "qualification.json", 0o600),
   "boot_policy": (STATE / "boot-policy.json", 0o600),
@@ -315,22 +319,202 @@ def _restore_veto(core, approval):
   finally: os.close(state_fd)
 
 
-def _retain_recovery(operation):
+class _Preserved(ValueError):
+  """A foreign pacman lock is preserved; no retry can ever change that."""
+
+
+RECOVERY_BOUND = 300.0  # seconds of paced retries allowed once the veto is durable
+
+
+def _retain_recovery(operation, durable=lambda: False):
   """Keep the entered physical scope on repair faults, with paced retries.
 
-  This does not own the parent inhibitor or survive SIGTERM/SIGKILL, parent
-  loss, or context-manager exit failures. Those remain deployment limitations.
+  Recovery policy. Until `durable()` reports the veto (or proven old state)
+  established, every fault retries without bound: giving up earlier could leave
+  a published upgrade unvetoed. Afterwards, deterministic faults (a renamed or
+  group-writable lock parent, a replaced physical lock) can never clear, so
+  retries are bounded to RECOVERY_BOUND seconds and then the last error
+  propagates: the process exits non-zero with the veto retained (fail closed,
+  not hung; the flock is released only by that exit). A _Preserved refusal
+  cannot change at all and propagates immediately, foreign file untouched.
+  This does not own the parent inhibitor or survive SIGTERM/SIGKILL or parent
+  loss. Those remain deployment limitations.
   """
+  start = None
   while True:
     try:
       operation()
       return
+    except _Preserved: raise
     except BaseException:
+      if not durable(): start = None  # the bound only runs while the veto is verified in the current attempt
+      elif start is None: start = time.monotonic()
+      elif time.monotonic() - start >= RECOVERY_BOUND: raise
       while True:
         try:
           time.sleep(1)
           break
         except BaseException: pass
+
+
+def _lock_parent(root, relative):
+  """Owned nonsymlink ancestry, rooted in the fixed host or disposable fixture."""
+  fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+  try:
+    for part in (None, *relative.parent.parts):
+      if part is not None:
+        child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+        os.close(fd)
+        fd = child
+      info = os.fstat(fd)
+      if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+        raise ValueError("Owned nonsymlink lock ancestry required")
+    return fd
+  except BaseException:
+    os.close(fd)
+    raise
+
+
+def _lock_identity(info):
+  if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1:
+    raise ValueError("Private regular single-link lock required")
+  return info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid, info.st_nlink
+
+
+@contextmanager
+def _locks(root):
+  """Adapter-owned fixed locks; reviewed old engines need no lock API.
+
+  Acquisition failures precede publication. After physical acquisition, DB
+  cleanup retries under the flock; before it, cleanup is retried a bounded
+  number of times. Cleanup and close errors never mask a primary exception.
+  Remaining limits: parent-inhibitor death, default SIGKILL and power-loss
+  durability; no process-lifetime claim follows here. Unlinking by name cannot
+  itself be identity-checked, so a replacement between check and unlink stays
+  a residual race.
+  """
+  root = Path(root)
+  if root == Path("/") and (os.geteuid() != 0 or not sys.flags.isolated or Path(__file__).absolute() != SCRIPT):
+    raise ValueError("Only fixed installed isolated adapter may acquire live locks")
+  if not root.is_absolute() or root.resolve() != root or not root.is_dir():
+    raise ValueError("Canonical explicit lock root required")
+  db_parent = physical_parent = db_fd = physical_fd = None
+  acquired = released = settled = False
+  active = True
+  abandoned = []
+  primary = None
+  try:
+    db_parent = _lock_parent(root, DB_LOCK)
+    db_fd = os.open(DB_LOCK.name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=db_parent)
+    def parent_check(parent, relative):
+      current = _lock_parent(root, relative)
+      try:
+        if (os.fstat(current).st_dev, os.fstat(current).st_ino) != (os.fstat(parent).st_dev, os.fstat(parent).st_ino):
+          raise ValueError("Lock parent directory changed")
+      finally: os.close(current)
+    def release_db(*, verify_only=False):
+      nonlocal released, settled
+      if not active: raise ValueError("Adapter lock scope ended")
+      parent_check(db_parent, DB_LOCK)
+      was_settled = settled
+      if released:
+        try: os.stat(DB_LOCK.name, dir_fd=db_parent, follow_symlinks=False)
+        except FileNotFoundError: pass
+        else:
+          # Mid-settlement retry: our unlink is proven done, so a present name
+          # is a legitimate foreign owner. Only later calls or verification
+          # treat it as a refusal.
+          if was_settled or verify_only: raise _Preserved("Foreign pacman lock replacement must remain preserved")
+      else:
+        try: current = os.stat(DB_LOCK.name, dir_fd=db_parent, follow_symlinks=False)
+        except FileNotFoundError: released = True  # our unlink landed before the flag; absence cannot be foreign
+        else:
+          # Before our unlink, anything on the name that is not exactly our
+          # held inode in exact form is foreign or altered: preserve it, never
+          # unlink or modify it. Only the held fd check is strict (plain error).
+          ours = os.fstat(db_fd)
+          if (current.st_dev, current.st_ino) != (ours.st_dev, ours.st_ino):
+            raise _Preserved("Foreign pacman lock replacement must remain preserved")
+          try: named = _lock_identity(current)
+          except ValueError as error: raise _Preserved("Altered pacman lock must remain preserved: " + str(error)) from error
+          if named != _lock_identity(ours):
+            raise _Preserved("Foreign pacman lock replacement must remain preserved")
+      if verify_only: return
+      settled = False
+      if not released:
+        os.unlink(DB_LOCK.name, dir_fd=db_parent)
+        released = True  # an ensuing fsync failure must retry absence, not unlink
+      os.fsync(db_parent)
+      try: os.stat(DB_LOCK.name, dir_fd=db_parent, follow_symlinks=False)
+      except FileNotFoundError: pass
+      # Decision: once our identity-verified unlink is durable, a name that
+      # reappears (real pacman) is a foreign owner. Release is settled, never
+      # deleted or modified, and a completed upgrade is not turned into a
+      # veto-restoring recovery by it. Physical exclusion still ends with the
+      # scope; the foreign lock protects the database from then on.
+      settled = True
+    def check_physical():
+      if not active or not acquired: raise ValueError("Physical exclusion scope ended")
+      parent_check(physical_parent, PHYSICAL_LOCK)
+      named = os.stat(PHYSICAL_LOCK.name, dir_fd=physical_parent, follow_symlinks=False)
+      if _lock_identity(named) != _lock_identity(os.fstat(physical_fd)):
+        raise ValueError("Physical exclusion inode changed")
+    release_db.check_physical = check_physical
+    release_db.abandon = lambda: abandoned.append(True)
+    os.fchmod(db_fd, 0o600)
+    _lock_identity(os.fstat(db_fd))
+    release_db(verify_only=True)
+    os.fsync(db_fd)
+    os.fsync(db_parent)
+    physical_parent = _lock_parent(root, PHYSICAL_LOCK)
+    physical_fd = os.open(PHYSICAL_LOCK.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=physical_parent)
+    _lock_identity(os.fstat(physical_fd))
+    fcntl.flock(physical_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    acquired = True
+    check_physical()
+    yield release_db
+  except BaseException as error:
+    primary = error
+    raise
+  finally:
+    problem = None
+    try:
+      if db_fd is not None and not settled:
+        if abandoned:
+          try: release_db()  # recovery gave up: one best-effort attempt, no retention
+          except Exception as error: problem = error
+        elif acquired: _retain_recovery(release_db, lambda: True)
+        else: _cleanup_release(release_db)
+    except BaseException as error: problem = error
+    active = False
+    for descriptor in (physical_fd, physical_parent, db_fd, db_parent):
+      if descriptor is None: continue
+      try: os.close(descriptor)
+      except BaseException as error:
+        if problem is None: problem = error
+    if problem is not None:
+      if primary is not None:
+        primary.add_note("lock cleanup failed for " + str(root / DB_LOCK) + " (our db.lck may remain and block pacman; remove it only after confirming no pacman process is running, e.g. `pgrep -x pacman` shows none): " + repr(problem))
+      if primary is None or not isinstance(problem, Exception): raise problem
+
+
+def _cleanup_release(release):
+  """Bounded pre-acquisition release: 3 paced attempts; an interrupt still gets one more attempt, then re-raises."""
+  interrupt, attempts = None, 0
+  while True:
+    try:
+      release()
+      break
+    except _Preserved: raise
+    except Exception:
+      attempts += 1
+      if attempts >= 3: raise
+      try: time.sleep(0.2)
+      except BaseException as error: interrupt = interrupt or error
+    except BaseException as error:
+      if interrupt is not None: raise
+      interrupt = error
+  if interrupt is not None: raise interrupt
 
 
 def native():
@@ -343,13 +527,8 @@ def native():
   core, old_native, engine = _verified_engines(approval)
   fd, guard = _guard(old_native, approval)
   try:
-    with engine._locks(ROOT) as release_db:
-      # Reject unsupported reviewed engines before entering the publication
-      # body; recovery must never wait for an API absent from loaded code.
-      if not callable(getattr(release_db, "check_physical", None)):
-        raise ValueError("Reviewed lock engine lacks required physical exclusion check")
+    with _locks(ROOT) as release_db:
       release_db.check_physical()
-      release_attempted = False
       try:
         guard()
         old_product = engine.PRODUCT
@@ -366,26 +545,19 @@ def native():
         _product_check(new_product, barrier=False)
         guard()
         release_db(verify_only=True)
-        release_attempted = True
         release_db()
-      except BaseException:
+      except BaseException as error:
+        veto = []
         def recover():
+          veto.clear()  # durability is per attempt: never inherited from an earlier one
           _restore_veto(core, approval)
+          veto.append(True)  # durable veto (or proven old state) established in this attempt
           release_db.check_physical()
-          # A db-directory fsync can fail after the adapter's release unlinks
-          # its lock. Sync absence without touching any foreign replacement.
-          nonlocal release_attempted
-          if release_attempted and not os.path.lexists(ROOT / engine.DB_LOCK):
-            directory = core._open_directory((ROOT / engine.DB_LOCK).parent)
-            try:
-              os.fsync(directory)
-              if os.path.lexists(ROOT / engine.DB_LOCK): raise ValueError("Pacman lock appeared during release settlement")
-            finally: os.close(directory)
-          else:
-            release_db(verify_only=True)
-            release_attempted = True
-            release_db()
-        _retain_recovery(recover)
+          release_db()
+        try: _retain_recovery(recover, lambda: bool(veto))
+        except BaseException as stopped:
+          release_db.abandon()
+          raise error from stopped
         raise
   finally: os.close(fd)
   return {"review_sha256": result["review_sha256"], "live_execution": True, "power_operation": False}
