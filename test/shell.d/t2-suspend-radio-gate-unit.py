@@ -392,6 +392,66 @@ class DkmsArchive(unittest.TestCase):
       m.check_selection([RELEASE], self.runner, self.root, [])
 
 
+class Upgrade(base.Installer):
+  """Upgrade from an installed 1.0 (older receipt, no qualified_kernels) by rollback then install."""
+  OLD = '1.0'
+
+  def install_old(self):
+    self.install()
+    (self.root / m.SOURCE).rename(self.root / m.source_name(self.OLD))
+    receipt = m.load(self.root)
+    receipt['version'] = self.OLD
+    del receipt['qualified_kernels']
+    m.save(self.root, receipt)
+    build = self.root / f'var/lib/dkms/{m.NAME}/{self.OLD}/{RELEASE}/x86_64/module'
+    build.mkdir(parents=True)
+    (build / 'brcmfmac.ko').write_text('old')
+    self.calls.clear()
+
+  def test_upgrade_1_0_is_transactional(self):
+    original = (self.root / 'etc/bluetooth/main.conf').read_bytes()
+    self.install_old()
+    self.install()
+    order = [c[:2] for c in self.calls if c[0] in ('dkms', 'limine-mkinitcpio')]
+    self.assertEqual(order, [['dkms', 'remove'], ['limine-mkinitcpio', 'linux-t2'], ['dkms', 'add'],
+                             ['dkms', 'build'], ['dkms', 'install'], ['limine-mkinitcpio', 'linux-t2']])
+    self.assertIn(['dkms', 'remove', '-m', m.NAME, '-v', self.OLD, '--all'], self.calls)
+    self.assertIn(['dkms', 'build', '-m', m.NAME, '-v', m.VERSION, '-k', RELEASE], self.calls)
+    self.assertFalse((self.root / m.source_name(self.OLD)).exists())
+    receipt = m.load(self.root)
+    self.assertEqual((receipt['version'], receipt['state']), (m.VERSION, 'installed'))
+    m.rollback(self.root, self.runner)
+    self.assertEqual((self.root / 'etc/bluetooth/main.conf').read_bytes(), original)
+    self.assertFalse((self.root / m.SOURCE).exists())
+
+  def test_upgrade_failure_leaves_stock_and_rolled_back_receipt(self):
+    original = (self.root / 'etc/bluetooth/main.conf').read_bytes()
+    self.install_old()
+    self.fail = ['dkms', 'build']
+    with self.assertRaises(subprocess.CalledProcessError): self.install()
+    self.assertEqual(m.load(self.root)['state'], 'rolled-back')
+    self.assertEqual((self.root / 'etc/bluetooth/main.conf').read_bytes(), original)
+    self.assertIsNone(m.bt.read(self.root, 'etc/modprobe.d/omarchy-t2-suspend.conf'))
+    # The stock-driver image published by the old package's rollback survives the failed retry.
+    self.assertEqual((self.root / 'boot/EFI/Linux/test-linux-t2.efi').read_bytes(), b'generated image')
+    self.assertFalse((self.root / m.SOURCE).exists())
+    self.assertFalse((self.root / m.source_name(self.OLD)).exists())
+
+  def test_rollback_from_1_0_receipt_cleans_up_1_0(self):
+    self.install_old()
+    m.rollback(self.root, self.runner)
+    self.assertIn(['dkms', 'remove', '-m', m.NAME, '-v', self.OLD, '--all'], self.calls)
+    self.assertFalse((self.root / m.source_name(self.OLD)).exists())
+    self.assertEqual(m.load(self.root)['state'], 'rolled-back')
+    self.assertIsNone(m.bt.read(self.root, 'etc/modprobe.d/omarchy-t2-suspend.conf'))
+
+  def test_verify_reports_version_mismatch_clearly(self):
+    self.install_old()
+    with self.assertRaisesRegex(ValueError, 'version 1.0, not ' + re.escape(m.VERSION) + '; run omarchy setup t2-suspend to upgrade'):
+      m.verify(self.root, self.runner, lambda *_: None)
+    self.assertEqual(self.calls, [])
+
+
 class Qualification(base.Installer):
   """Install-time qualification decisions."""
   def add_kernel(self, release):
