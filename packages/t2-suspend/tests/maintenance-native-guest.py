@@ -49,6 +49,13 @@ SIMULATED (each is a seam, not evidence of the host):
      has no kmod). The baseline itself is captured by the REAL provider
      (boot_policy_native._baseline: real root_driver_inventory/root_control_inventory
      against guest '/') and `assess` runs through the REAL CLI.
+  S9 `reactivate` is exercised through the real engine core (_reactivate) with the REAL assess core
+     (N._assess_core), REAL retained gate, REAL locks/limine writes/guard/pacman, and an owner-held real
+     logind block for the guard; only product-side seams are simulated: `inspect` returns the guest's
+     config (with the real receipt digest; derive_artifacts needs the real qualified pair) and the W6
+     postchecks reuse the fixture's `_verify_deployment` plus the real no-image and generation checks.
+     The interrupted-run recovery, the kernel-update refusal and the class (c) refusal go through the
+     REAL CLI (real inhibitor re-exec), because none of them reach derive_artifacts.
 Kernel update is a test package plus the S4 hook; no real kernel/initramfs,
 DKMS, EFI, PM or power operation exists. Not a host, hibernation or hardware claim.
 """
@@ -83,6 +90,7 @@ UKI = Path("/boot/EFI/Linux/omarchy_linux-t2.efi")
 LIMINE = Path("/boot/limine.conf")
 OFFSET = 16
 PAGE = 4096
+MACHINE = "0123456789abcdef0123456789abcdef"
 ENV = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
 HOOKS = Path("/etc/pacman.d/hooks")
 KERNEL_FILE = Path("/usr/lib/modules/t2fixture/version")
@@ -160,7 +168,7 @@ def snapsync():
   for number in numbers:
     lines += ["     ///%d \u2502 2026-09-%02d 17:35:47" % (number, number), "     comment: 4.0.2-1", "     ////linux-t2",
               "     comment: kernel-id=linux-t2", "     protocol: efi",
-              "     path: boot():/MACHINE/limine_history/omarchy_linux-t2.efi_sha256_%s#%s" % (("%02x" % number) * 32, ("%02x" % number) * 64),
+              "     path: boot():/" + MACHINE + "/limine_history/omarchy_linux-t2.efi_sha256_%s#%s" % (("%02x" % number) * 32, ("%02x" % number) * 64),
               "     cmdline: root=/dev/mapper/root rootflags=subvol=/@/.snapshots/%d/snapshot rw" % number]
   base = SNAPSHOT_RE.sub("", text)
   marker = "# BEGIN omarchy T2 hibernation pair"
@@ -258,6 +266,12 @@ def run_hook():
 
 def native_cli():
   process = subprocess.run(["/usr/bin/python3", "-I", "-B", str(NATIVE), "maintenance"], env=ENV, capture_output=True, text=True, timeout=90)
+  return process.returncode, process.stdout.strip(), process.stderr.strip()
+
+
+def reactivate_cli():
+  """The real CLI (real systemd-inhibit re-exec, real logind, real locks): (returncode, stdout, stderr)."""
+  process = subprocess.run(["/usr/bin/python3", "-I", "-B", str(NATIVE), "reactivate"], env=ENV, capture_output=True, text=True, timeout=120)
   return process.returncode, process.stdout.strip(), process.stderr.strip()
 
 
@@ -402,6 +416,13 @@ def owner():
   engine = N._installed()  # authenticates the ENTIRE installed tree (real code)
   I = load("owner_inhibitor", INHIBITOR)
   N.WHO, N.WHY = I.WHO, I.WHY
+
+  def release(handle):
+    handle.close()
+    deadline = time.monotonic() + 3
+    while N._bus("call", N.LOGIN, "ListInhibitors") != ["a(ssssuu)", "0"]:
+      require(time.monotonic() < deadline, "Owner inhibitor remained after safe close")
+      time.sleep(.02)
   require(N._bus("call", N.LOGIN, "ListInhibitors") == ["a(ssssuu)", "0"], "Guest must start with no inhibitors")
   block = I.acquire(N)
   T = engine
@@ -433,15 +454,11 @@ def owner():
   block.check()
   marker = (STATE / "package-maintenance.pending")
   require(marker.exists() and not (STATE / "source-default-deactivation.pending").exists() and not (STATE / "boot-policy.json").exists(), "Maintenance publication state wrong")
-  block.close()
-  deadline = time.monotonic() + 3
-  while N._bus("call", N.LOGIN, "ListInhibitors") != ["a(ssssuu)", "0"]:
-    require(time.monotonic() < deadline, "Owner inhibitor remained after safe close")
-    time.sleep(.02)
+  release(block)
   step("publish-marker", "S5 seam; real _maintenance_gate (drop-in/ExecStart/vetoes/fallback/no-image) passed; intent_sha256=" + result["maintenance_intent_sha256"])
   del block
 
-  baseline_file = next((STATE / "boot-policy-transitions").iterdir()) / "generation-baseline.json"
+  baseline_file = STATE / "boot-policy-transitions" / result["transition_id"] / "generation-baseline.json"
   require(baseline_file.is_file() and stat.S_IMODE(baseline_file.stat().st_mode) == 0o600, "Baseline sidecar was not archived")
   document = json.loads(baseline_file.read_bytes())
   require(document["protocol"] == "omarchy-t2-generation-baseline-v1" and document["transition_id"] == result["transition_id"] and
@@ -451,6 +468,102 @@ def owner():
   report = assessed("unchanged", changed=[], limine_exact=True)
   require(all(item == {"state": "equal"} for item in report["items"].values()), "Fresh baseline items differ")
   step("assess-0-published", "class=unchanged, every item equal, read-only (evidence bytes/mtimes and locks unchanged)")
+
+  # --- reactivation (S9): assess -> failed run -> real-CLI rollback -> reactivate -> ACTIVE -> guard blocks -> churn -> back to maintenance ---
+  sleep_entry = N._load_reviewed("guest_reviewed_sleep_entry", N.SLEEP_ENTRY)
+  receipt_digest = hashlib.sha256(Path("/var/lib/omarchy-t2-hibernation-pair/receipt.json").read_bytes()).hexdigest()
+  qualified = json.loads((STATE / "config.json").read_bytes())
+
+  def veto_holds():
+    with_pending = (STATE / "source-default-activation.pending")
+    require(with_pending.exists(), "Reactivation pending missing while a veto is expected")
+    try: sleep_entry.reject_pending(Path("/"))
+    except ValueError: pass
+    else: raise RuntimeError("Reviewed sleep entry admitted sleep with a reactivation pending")
+    code, text = run_hook()
+    require(code == 1 and ("prevents maintenance evidence" in text or "remains active/incomplete" in text), "Update guard admitted an interrupted reactivation: " + text)
+    blocked(app("0.9-1"), "T2 hibernation update guard")
+
+  def reactivate(handle, failure=None):
+    capture = {}
+    def postchecks(root, baseline):
+      if failure: raise ValueError(failure)
+      F.F.PRODUCT.TRIAL._verify_deployment(root, fixture.f.config, fixture.f.report, source_default=True)
+      engine.IMAGE_STATE.require_no_image(root, resume)
+      items, errors = N.generation_items(engine, root)
+      require(not errors and items == {name: baseline[name] for name in engine.BASELINE_ITEMS}, "Generation differs from the baseline after reactivation")
+    return engine._reactivate(N.ROOT, guard=handle.check, gate=lambda root, phase: N._maintenance_gate(engine, root, phase, capture), native=engine._NATIVE_MAINTENANCE,
+                              pinned=capture, assess=lambda evidence, raw: N._assess_core(engine, N.ROOT, evidence, raw),
+                              inspect=lambda evidence: {"config": {**qualified, "staged_receipt_sha256": receipt_digest}, "manifest": qualified["manifest"]},
+                              postchecks=postchecks)
+
+  snapsync()  # one snapshot sync before anything: the region now exists in the inactive stock bytes
+  assessed("unchanged", changed=[], limine_exact=False)
+  stock_with_region = LIMINE.read_bytes()
+  step("reactivate-0-assess-unchanged", "class=unchanged with a snapshot region present (exact_equal=False, stock projection equal)")
+
+  before = evidence_tree()
+  code, out, err = reactivate_cli()
+  require(code != 0 and evidence_tree() == before and not Path("/var/lib/pacman/db.lck").exists(), "Real CLI reactivate must refuse without writing when derivation is unavailable: " + out + err)
+  step("reactivate-1-cli-refuses-without-derivation", "real CLI passed the assessment then refused at derivation with zero writes: " + (err.splitlines()[-1] if err else out)[:160])
+
+  handle = I.acquire(N)
+  try: reactivate(handle, failure="injected W6 failure")
+  except ValueError as error: require("injected W6 failure" in str(error), "Wrong failure: " + str(error))
+  else: raise RuntimeError("Injected postcheck failure did not surface")
+  handle.check()
+  release(handle)
+  require((STATE / "boot-policy.json").exists() and (Path("/etc/omarchy/t2-hibernate-product.enabled")).exists() and (STATE / "package-maintenance.pending").exists(), "Failed run must stop after W5 with the marker kept")
+  require(b"default_entry: MBA-T2-hibernation-source-" in LIMINE.read_bytes(), "Boot-config line was not switched before the injected failure")
+  veto_holds()
+  code, out, err = native_cli()
+  require(code != 0 and "reactivate" in err, "maintenance did not refuse naming reactivate: " + out + err)
+  step("reactivate-2-injected-failure-vetoed", "W6 failure left pending+marker+policy+opt-in+switched line; reviewed sleep entry, update guard, real pacman and `maintenance` all refuse")
+
+  code, out, err = reactivate_cli()  # recovery is a re-run of the real CLI: it rolls back, never forward
+  require(code == 0, "Real CLI recovery failed: " + out + err)
+  rolled = json.loads(out.splitlines()[-1])
+  require(rolled["rolled_back"] is True and rolled["reactivated"] is False and rolled["live_execution"] is True and rolled["power_operation"] is False, "Recovery result differs: " + out)
+  require(LIMINE.read_bytes() == stock_with_region and not (STATE / "boot-policy.json").exists() and not Path("/etc/omarchy/t2-hibernate-product.enabled").exists()
+          and not (STATE / "source-default-activation.pending").exists() and marker.exists() and not Path("/var/lib/pacman/db.lck").exists(), "Rollback did not restore inactive maintenance")
+  code, text = run_hook()
+  require(code == 0, "Guard refused after rollback: " + text)
+  assessed("unchanged", changed=[], limine_exact=False)
+  step("reactivate-3-rollback-by-rerun", "real CLI rolled back: limine bytes restored exactly (snapshot region intact), marker kept, guard admits, assess unchanged; " + out[:120])
+
+  handle = I.acquire(N)
+  reply = reactivate(handle)
+  handle.check()
+  release(handle)
+  require(reply["reactivated"] is True and reply["requalification_required"] is False, "Reactivation result differs: " + json.dumps(reply, sort_keys=True))
+  activated = LIMINE.read_bytes()
+  require(activated == stock_with_region.replace(b"default_entry: 2\n", b"default_entry: " + json.loads((STATE / "boot-policy.json").read_bytes())["source_entry_id"].encode() + b"\n", 1)
+          and b"limine-snapper-sync" in activated, "Reactivated bytes are not exactly the one-line change of the current bytes")
+  require(not marker.exists() and not (STATE / "source-default-activation.pending").exists() and (STATE / "boot-policy.json").exists()
+          and Path("/etc/omarchy/t2-hibernate-product.enabled").exists() and not Path("/var/lib/pacman/db.lck").exists(), "ACTIVE state wrong after reactivation")
+  sleep_entry.reject_pending(Path("/"))  # no pending or marker remains: the reviewed sleep entry's veto no longer applies
+  code, text = run_hook()
+  require(code == 1 and "remains active/incomplete" in text, "Blanket guard did not refuse the ACTIVE state: " + text)
+  blocked(app("0.9-1"), "remains active/incomplete")
+  step("reactivate-4-active-and-guard-blocks", "reactivated=True; exactly one default_entry line changed; hook exit 1 and real pacman aborted; " + json.dumps({key: reply[key] for key in ("transition_id", "requalification_required")}))
+
+  snapsync()  # one more snapshot sync while ACTIVE
+  require(engine.P.verify(Path("/"), receipt_digest) is True, "BOOT_POLICY.verify failed after further snapshot churn")
+  F.F.PRODUCT.TRIAL._verify_deployment(Path("/"), fixture.f.config, fixture.f.report, source_default=True)
+  step("reactivate-5-verify-survives-snapsync", "BOOT_POLICY.verify and the source-default deployment check pass after another snapshot sync: " + json.dumps(re.findall(r"^     ///(\d+) ", LIMINE.read_text(), re.M)))
+
+  handle = I.acquire(N)
+  capture = {"resume": dict(resume)}
+  result = engine._transition(N.ROOT, "maintenance", precheck=precheck, guard=handle.check, maintenance_gate=lambda root, phase: N._maintenance_gate(engine, root, phase, capture),
+                              native=engine._NATIVE_MAINTENANCE, maintenance_resume=lambda: capture["resume"], maintenance_baseline=lambda: N._baseline(engine, N.ROOT))
+  handle.check()
+  release(handle)
+  baseline_file = STATE / "boot-policy-transitions" / result["transition_id"] / "generation-baseline.json"
+  require(marker.exists() and not (STATE / "boot-policy.json").exists(), "Second maintenance publication state wrong")
+  code, text = run_hook()
+  require(code == 0, "Guard refused the republished maintenance: " + text)
+  assessed("unchanged", changed=[], limine_exact=True)
+  step("reactivate-6-back-to-maintenance", "deactivation after churn published a marker the real guard validates (from_sha256 = approved active hash); assess unchanged; intent_sha256=" + result["maintenance_intent_sha256"])
 
   # --- (b) real native CLI re-entry ---
   code, out, err = native_cli()
@@ -482,6 +595,13 @@ def owner():
   require(uki2 != uki1 and installed("t2fixture-kernel") == "2.0-1" and blake2(uki2) in LIMINE.read_text(), "Kernel update did not coherently rewrite UKI + limine")
   report = assessed("requalification-required", changed=["production_uki"], limine_exact=False)
   step("assess-2-after-kernel-update", "class=requalification-required changed=" + json.dumps(report["changed_items"]) + " paths=" + json.dumps(report["items"]["production_uki"]["paths"]))
+  before = evidence_tree()
+  code, out, err = reactivate_cli()
+  require(code != 0 and "requalification required: production_uki" in err and evidence_tree() == before and not Path("/var/lib/pacman/db.lck").exists(),
+          "Kernel-update variant was not refused with zero writes: " + out + err)
+  code, text = run_hook()
+  require(code == 0, "Refused reactivation must leave updates allowed: " + text)
+  step("reactivate-7-kernel-update-refused", "real CLI: requalification required: production_uki, zero writes, marker kept, guard still admits")
   step("txn-2-3-kernel-update-admitted", "kernel 1.0-1 then 2.0-1 admitted; uki blake2b " + blake2(original_uki)[:16] + " -> " + blake2(uki1)[:16] + " -> " + blake2(uki2)[:16])
 
   # --- (e) transaction after the kernel update still admitted, with the NEW stock bytes ---
@@ -538,7 +658,7 @@ def owner():
   admitted(app("3.0-1"))
   step("neg-incoherent-kernel-update", "UKI changed without limine hash: pacman + native CLI refuse; repaired coherent bytes admit again")
 
-  archive = next((STATE / "boot-policy-transitions").iterdir())
+  archive = STATE / "boot-policy-transitions" / result["transition_id"]
   resume_file = archive / "maintenance-resume.json"
   saved = resume_file.read_bytes()
   resume_file.unlink()
@@ -555,6 +675,9 @@ def owner():
   write_file(baseline_file, saved_baseline.replace(b'"transition_id":"', b'"transition_id":"0', 1), 0o600)
   report = assessed("unknown")
   require(report["baseline"] == "invalid", "Forged baseline binding must be refused")
+  before = evidence_tree()
+  code, out, err = reactivate_cli()
+  require(code != 0 and "compatibility unknown: Generation baseline is invalid" in err and evidence_tree() == before, "Class (c) was not refused with zero writes: " + out + err)
   write_file(baseline_file, saved_baseline, 0o600)
   assessed("requalification-required", changed=["production_uki"])
   step("neg-baseline-missing-and-forged", "removed and mis-bound baseline sidecars are unknown (compatibility unknown); exact restore assesses again")

@@ -482,10 +482,12 @@ class Maintenance(unittest.TestCase):
     with patch.object(N, "native", return_value={"ok": True}) as native, patch("builtins.print"):
       self.assertEqual(N.main(["maintenance"]), 0)
       self.assertEqual(N.main(["assess"]), 0)
-      for args in (["assess", "--root", "/tmp"], ["assess", "--force"], ["reactivate"], ["assess", "maintenance"]):
+      self.assertEqual(N.main(["reactivate"]), 0)
+      for args in (["assess", "--root", "/tmp"], ["assess", "--force"], ["reactivate", "--root", "/tmp"], ["reactivate", "--force"], ["reactivate", "--approve"], ["assess", "maintenance"]):
         with self.assertRaises(SystemExit): N.main(args)
-    self.assertEqual([call.args for call in native.call_args_list], [("maintenance",), ("assess",)])
+    self.assertEqual([call.args for call in native.call_args_list], [("maintenance",), ("assess",), ("reactivate",)])
     self.assertEqual(N._inhibit_command("maintenance")[-1], "maintenance")
+    self.assertEqual(N._inhibit_command("reactivate")[-1], "reactivate")
 
   def test_matching_reviewed_drop_in_and_effective_exec_start_pass(self):
     self.route()
@@ -627,6 +629,7 @@ class Maintenance(unittest.TestCase):
     engine.MAINTENANCE = Path("var/lib/omarchy/t2-hibernate-product/package-maintenance.pending")
     engine.PENDINGS = {"deactivation": Path("var/lib/omarchy/t2-hibernate-product/source-default-deactivation.pending")}
     engine._present.side_effect = lambda path: marker_present if path.name == "package-maintenance.pending" else pending_present
+    engine.reactivation_pending.return_value = False
     engine._complete_interrupted_maintenance.return_value = {"completed_interrupted_maintenance": True, "qualification_issued": False}
     engine._transition.return_value = {"qualification_issued": False, "live_execution": False}
     engine._verify_existing_maintenance.return_value = {"already_inactive": True, "qualification_issued": False}
@@ -702,7 +705,7 @@ STATE_DIR = "var/lib/omarchy/t2-hibernate-product"
 ARTIFACTS = "/" + STATE_DIR + "/artifacts"
 
 
-class Assess(unittest.TestCase):
+class AssessFixture(unittest.TestCase):
   """Baseline sidecar and read-only assessment against a disposable root; nothing touches the host."""
   RELEASE = "7.2.6-fixture-t2"
 
@@ -778,6 +781,34 @@ class Assess(unittest.TestCase):
     (self.root / self.T.PRODUCTION).write_bytes(image)
     self.f.write(self.T.P.LIMINE, limine.replace(hashlib.blake2b(old).hexdigest().encode(), hashlib.blake2b(image).hexdigest().encode()))
 
+  def mutation_cases(self):
+    """Every single-item change the assessment must classify as requalification-required: label -> (mutate(other), changed items or None)."""
+    def limine_cmdline(other):
+      raw = (other.root / other.T.P.LIMINE).read_bytes()
+      other.f.write(other.T.P.LIMINE, raw.replace(b"protocol: efi\n", b"protocol: efi\ncmdline: root=/dev/other\n", 1))
+    def config_changes(other): other.write_config(audited_details_sha256="d" * 64)
+    def manifest_changes(other): other.write_config(manifest={**other.config["manifest"], "source_sha256": "e" * 64})
+    def write(relative, raw=b"changed"): return lambda other: other.write(relative, raw)
+    state, module = STATE_DIR + "/artifacts/", "usr/lib/modules/" + self.RELEASE + "/updates/dkms/t2bce_core.ko.zst"
+    cases = {
+      "kernel": (lambda other: (other.root / "usr/lib/modules/7.3.0-new").mkdir(), ["kernel"]),
+      "production_uki": (lambda other: other.coherent_kernel_update(), ["production_uki"]),
+      "source_uki": (write(state + "source/mba-t2-hibernation-candidate.efi"), ["source_uki"]),
+      "restore_uki": (write(state + "restore/mba-t2-hibernation-candidate.efi"), ["restore_uki"]),
+      "module_stack initrd": (write(state + "restore/mba-t2-hibernation-candidate.initrd"), ["module_stack"]),
+      "module_stack provenance": (write(state + "source/provenance.json", json.dumps({"kernel_release": self.RELEASE, "modules": {"t2bce_core": {"sha256": "new"}}}).encode()), ["module_stack"]),
+      "config": (config_changes, ["config"]), "manifest": (manifest_changes, None),
+      "qualification": (write(STATE_DIR + "/qualification.json", b'{"approved":true,"new":1}'), ["qualification"]),
+      "driver_modules": (write(module), ["driver_modules"]),
+      "firmware": (write("usr/lib/firmware/brcm/" + DRIVER.FORMOSA + ".bin"), ["firmware"]),
+      "control_inventory": (write("etc/modprobe.d/t2.conf"), ["control_inventory"]),
+      "bootloader": (write("boot/EFI/BOOT/BOOTX64.EFI"), ["bootloader"]),
+      "limine stock projection": (limine_cmdline, ["limine"])}
+    return cases
+
+
+
+class Assess(AssessFixture):
   def test_unchanged_generation_reports_every_item_equal(self):
     self.published()
     report = self.assess()
@@ -803,27 +834,7 @@ class Assess(unittest.TestCase):
     self.assertEqual(baseline["limine"], self.T.stock_identity(self.f.before))
 
   def test_each_changed_item_requires_requalification(self):
-    def limine_cmdline(other):
-      raw = (other.root / other.T.P.LIMINE).read_bytes()
-      other.f.write(other.T.P.LIMINE, raw.replace(b"protocol: efi\n", b"protocol: efi\ncmdline: root=/dev/other\n", 1))
-    def config_changes(other): other.write_config(audited_details_sha256="d" * 64)
-    def manifest_changes(other): other.write_config(manifest={**other.config["manifest"], "source_sha256": "e" * 64})
-    def write(relative, raw=b"changed"): return lambda other: other.write(relative, raw)
-    state, module = STATE_DIR + "/artifacts/", "usr/lib/modules/" + self.RELEASE + "/updates/dkms/t2bce_core.ko.zst"
-    cases = {
-      "kernel": (lambda other: (other.root / "usr/lib/modules/7.3.0-new").mkdir(), ["kernel"]),
-      "production_uki": (lambda other: other.coherent_kernel_update(), ["production_uki"]),
-      "source_uki": (write(state + "source/mba-t2-hibernation-candidate.efi"), ["source_uki"]),
-      "restore_uki": (write(state + "restore/mba-t2-hibernation-candidate.efi"), ["restore_uki"]),
-      "module_stack initrd": (write(state + "restore/mba-t2-hibernation-candidate.initrd"), ["module_stack"]),
-      "module_stack provenance": (write(state + "source/provenance.json", json.dumps({"kernel_release": self.RELEASE, "modules": {"t2bce_core": {"sha256": "new"}}}).encode()), ["module_stack"]),
-      "config": (config_changes, ["config"]), "manifest": (manifest_changes, None),
-      "qualification": (write(STATE_DIR + "/qualification.json", b'{"approved":true,"new":1}'), ["qualification"]),
-      "driver_modules": (write(module), ["driver_modules"]),
-      "firmware": (write("usr/lib/firmware/brcm/" + DRIVER.FORMOSA + ".bin"), ["firmware"]),
-      "control_inventory": (write("etc/modprobe.d/t2.conf"), ["control_inventory"]),
-      "bootloader": (write("boot/EFI/BOOT/BOOTX64.EFI"), ["bootloader"]),
-      "limine stock projection": (limine_cmdline, ["limine"])}
+    cases = self.mutation_cases()
     for label, (mutate, expected) in cases.items():
       with self.subTest(label):
         other = self.fresh()
@@ -1054,6 +1065,630 @@ class Assess(unittest.TestCase):
     engine._transition.assert_not_called()
     with patch.object(N.os, "execve", side_effect=AssertionError("no inhibitor")), patch.object(N, "_command", side_effect=AssertionError("no host queries")):
       with self.assertRaises(ValueError): N.native("assess")  # workspace/nonroot invocation refuses before anything runs
+
+
+class Crash(BaseException):
+  """A simulated process death: not an Exception, so no recovery code in the engine may swallow it."""
+
+
+class Reactivation(AssessFixture):
+  """`reactivate` on a disposable root: the real engine and the real lock-free assess core, fixture product/gate seams."""
+  STAGES = ("none", "pre", "W3", "W4", "W5", "W7", "W8", "done")
+  unavailable_control = False
+  trace = None
+
+  def setUp(self):
+    super().setUp()
+    if self.unavailable_control:
+      with patch.object(N, "_control_capture", side_effect=ValueError("control unreadable at publication")): self.published()
+    else: self.published()
+    self.pinned, self.derived_manifest, self.inspect_config, self.fault = {}, None, {}, None
+    self.review = (self.root / self.T.REVIEW).read_bytes()
+    self.entry = json.loads(self.review)["source_entry_id"]
+    self.f.write(self.T.P.LIMINE, F.with_snapshots((self.root / self.T.P.LIMINE).read_bytes(), [1, 2]))
+    self.original = (self.root / self.T.P.LIMINE).read_bytes()
+
+  # --- seams -----------------------------------------------------------------------------------
+  def assess_core(self, evidence, marker): return N._assess_core(self.T, self.root, evidence, marker)
+
+  def inspect(self, evidence):
+    config = {**json.loads((self.root / STATE_DIR / "config.json").read_bytes()), **self.inspect_config}
+    return {"config": config, "manifest": config["manifest"] if self.derived_manifest is None else self.derived_manifest}
+
+  def postchecks(self, root, baseline):
+    if self.fault is not None: raise self.fault
+    F.F.PRODUCT.TRIAL._verify_deployment(root, self.f.config, self.f.report, source_default=True)
+    items, errors = N.generation_items(self.T, root)
+    if errors or items != {name: baseline[name] for name in self.T.BASELINE_ITEMS}: raise ValueError("generation differs from the baseline")
+
+  def reactivate(self, **changes):
+    arguments = {"guard": lambda: None, "gate": self.fx.gate, "assess": self.assess_core, "inspect": self.inspect, "postchecks": self.postchecks, "pinned": self.pinned}
+    return self.T._reactivate(self.root, **{**arguments, **changes})
+
+  def new(self, **attributes):
+    other = Reactivation("runTest")
+    for name, value in attributes.items(): setattr(other, name, value)
+    other.setUp()
+    self.addCleanup(other.doCleanups)
+    return other
+
+  def guards(self):
+    """Stage seen by every guard() of one complete run (cached: the sequence is deterministic)."""
+    if Reactivation.trace is None:
+      probe = self.new()
+      guard, calls = probe.guard_at(None)
+      probe.reactivate(guard=guard)
+      Reactivation.trace = calls
+    return Reactivation.trace
+
+  def to_stage(self, name):
+    other = self.new()
+    other.crashed(self.guards().index(name) + 1)
+    self.assertEqual(other.stage(), name)
+    return other
+
+  def own_archive(self):
+    return next(item for item in (self.root / self.T.HISTORY).iterdir() if (item / "intent.json").exists() and json.loads((item / "intent.json").read_bytes()).get("action") == "reactivation")
+
+  # --- observation -----------------------------------------------------------------------------
+  def path(self, relative): return self.root / relative
+
+  def pending(self): return self.path(self.T.PENDINGS["activation"])
+
+  def limine(self): return self.path(self.T.P.LIMINE).read_bytes()
+
+  def flags(self):
+    archives = [item for item in (self.root / self.T.HISTORY).iterdir() if (item / "intent.json").exists() and json.loads((item / "intent.json").read_bytes()).get("action") == "reactivation"]
+    completion = any((item / "completion.json").exists() for item in archives)
+    return {"pending": self.pending().exists(), "marker": self.path(self.T.MAINTENANCE).exists(), "policy": self.path(self.T.P.POLICY).exists(),
+            "switched": (b"default_entry: " + self.entry.encode() + b"\n") in self.limine(), "optin": self.path(self.T.OPT_IN).exists(), "completion": completion}
+
+  def stage(self):
+    f = self.flags()
+    if not f["pending"]: return "none" if f["marker"] else "done"
+    if f["completion"]: return "W7" if f["marker"] else "W8"
+    if f["optin"]: return "W5"
+    if f["switched"]: return "W4"
+    return "W3" if f["policy"] else "pre"
+
+  def tree(self):
+    state = {}
+    for path in sorted(self.root.rglob("*")):
+      if path == self.root / self.T.DB_LOCK: continue
+      info = path.lstat()
+      state[str(path.relative_to(self.root))] = (stat.S_IMODE(info.st_mode), stat.S_ISDIR(info.st_mode),
+        os.readlink(path) if stat.S_ISLNK(info.st_mode) else (path.read_bytes() if stat.S_ISREG(info.st_mode) else None))
+    return state
+
+  def refuses(self, pattern, *, exception=ValueError, **changes):
+    before = self.tree()
+    with self.assertRaisesRegex(exception, pattern): self.reactivate(**changes)
+    self.assertEqual(self.tree(), before)
+    self.assertFalse(self.pending().exists())
+    self.assertTrue(self.path(self.T.MAINTENANCE).exists())
+
+  def assert_vetoed(self):
+    """Every route that could sleep or update is refused while an activation pending exists."""
+    with self.assertRaises(ValueError): F.SLEEP.reject_pending(self.root)
+    with self.assertRaises(ValueError): F.F.PRODUCT.verify_deployment(self.root, self.f.config, self.f.report)
+    with self.assertRaises(ValueError): self.T.G.check(self.root)
+    if self.path(self.T.MAINTENANCE).exists():
+      with self.assertRaises(ValueError): self.T.G._maintenance(self.root)  # the native guard route: marker present, so the pending vetoes it
+
+  def assert_active(self):
+    f = self.flags()
+    self.assertEqual((f["pending"], f["marker"], f["policy"], f["switched"], f["optin"]), (False, False, True, True, True))
+    self.assertEqual(self.path(self.T.P.POLICY).read_bytes(), self.review)
+    self.assertEqual(self.path(self.T.OPT_IN).read_bytes(), b"")
+    self.assertEqual(stat.S_IMODE(self.path(self.T.OPT_IN).stat().st_mode), 0o644)
+    self.assertTrue(self.T.P.verify(self.root, self.T.P.digest((self.root / self.T.P.RECEIPT).read_bytes())))
+    self.assertFalse((self.root / self.T.DB_LOCK).exists())
+    with self.assertRaises(ValueError): self.T.G.check(self.root)  # blanket guard: boot-policy.json and the opt-in
+
+  def assert_rolled_back(self, original):
+    f = self.flags()
+    self.assertEqual((f["pending"], f["marker"], f["policy"], f["switched"], f["optin"]), (False, True, False, False, False))
+    self.assertEqual(self.limine(), original)
+    self.assertEqual(list(self.path("boot").glob("limine.conf.source-default-*")), [])
+    self.T.G._maintenance(self.root)  # inactive maintenance is valid again: updates are allowed
+    self.assertFalse((self.root / self.T.DB_LOCK).exists())
+
+  def expected(self, current, entry=None):
+    return current.replace(b"default_entry: 2\n", b"default_entry: " + (entry or self.entry).encode() + b"\n", 1)
+
+  # --- happy path and bytes --------------------------------------------------------------------
+  def test_happy_path_applies_exactly_one_line_to_current_bytes_and_becomes_active(self):
+    marker = (self.root / self.T.MAINTENANCE).read_bytes()
+    with patch.object(self.T, "_transition", side_effect=AssertionError("no _transition")), \
+         patch.object(self.T, "_verify_existing_maintenance", side_effect=AssertionError("no re-entry")), \
+         patch.object(self.T.PRODUCT, "check", side_effect=AssertionError("no product.check")), \
+         patch.object(self.T.PRODUCT, "verify_deployment", side_effect=AssertionError("no verify_deployment")), \
+         patch.object(self.T.PRODUCT, "_admission_state", side_effect=AssertionError("no admission")), \
+         patch.object(N, "_precheck", side_effect=AssertionError("no precheck")), patch.object(N, "assess", side_effect=AssertionError("no assess wrapper")), \
+         patch.object(N, "check_maintenance", create=True, side_effect=AssertionError("no check_maintenance")):
+      result = self.reactivate()
+    self.assertTrue(result["reactivated"] and result["requalification_required"] is False)
+    self.assertFalse(result["live_execution"] or result["qualification_issued"])
+    self.assertEqual(result["maintenance_transition_id"], self.result["transition_id"])
+    self.assertEqual(self.limine(), self.expected(self.original))
+    self.assertIn(b"limine-snapper-sync", self.limine())  # the snapshot region survived the swap
+    self.assert_active()
+    self.assertEqual((self.root / self.T.P.BACKUP).read_bytes(), self.f.before)
+    archive = self.root / self.T.HISTORY / result["transition_id"]
+    self.assertEqual(sorted(item.name for item in archive.iterdir()), ["comparison.json", "completion.json", "intent.json", "opt-in", "policy.json"])
+    self.assertEqual((archive / "policy.json").read_bytes(), self.review)
+    self.assertEqual(json.loads((archive / "comparison.json").read_bytes())["assessment"]["class"], "unchanged")
+    self.assertEqual(json.loads((archive / "completion.json").read_bytes())["configuration_canonical_sha256"], self.T.P.digest(self.T.P.limine_canonical(self.expected(self.original))))
+    self.assertEqual(marker, (self.root / self.T.HISTORY / self.result["transition_id"] / "maintenance-intent.json").read_bytes())  # old evidence untouched
+    self.assertEqual(json.loads(json.dumps(result, sort_keys=True)), result)
+    self.assertFalse((self.root / self.T.PENDINGS["deactivation"]).exists())
+
+  def test_snapshot_order_and_count_vary_and_only_default_entry_changes(self):
+    for numbers, reverse in (([], False), ([1], False), ([1, 2], False), ([2, 3, 4], True), ([7, 8, 9, 10, 11], False)):
+      with self.subTest(numbers=numbers, reverse=reverse):
+        other = self.new()
+        other.f.write(other.T.P.LIMINE, F.with_snapshots(other.original, numbers, reverse))
+        current = other.limine()
+        result = other.reactivate()
+        self.assertTrue(result["reactivated"])
+        self.assertEqual(other.limine(), other.expected(current))
+        proposal = other.T.P.prepare(other.f.before, other.f.raw)["after"]
+        self.assertEqual(other.T.P.limine_canonical(other.limine()), other.T.P.limine_canonical(proposal))
+        other.assert_active()
+
+  def test_active_state_tolerates_further_snapshot_churn_and_deactivates_again(self):
+    self.reactivate()
+    self.f.write(self.T.P.LIMINE, F.with_snapshots(self.limine(), [3, 4, 5], True))  # one more snapper sync
+    self.assertTrue(self.T.P.verify(self.root, self.T.P.digest((self.root / self.T.P.RECEIPT).read_bytes())))
+    result = self.publish()  # active again means the ordinary deactivation/maintenance round trip works
+    self.assertTrue((self.root / self.T.MAINTENANCE).exists())
+    self.assertNotEqual(result["transition_id"], self.result["transition_id"])
+    self.assertEqual(self.assess()["class"], "unchanged")
+    self.assertTrue(self.reactivate()["reactivated"])  # and the reactivation is repeatable
+
+  def test_unrelated_limine_drift_and_non_stock_bytes_refuse_with_zero_writes(self):
+    cases = {"extra global option": (lambda raw: b"timeout: 9\n" + raw, "Unrelated Limine drift"),
+             "remembered selection": (lambda raw: raw.replace(b"default_entry: 2\n", b"default_entry: 2\nremember_last_entry: yes\n", 1), "Remembered"),
+             "altered pair block": (lambda raw: raw.replace(b"# END", b"# tampered\n# END", 1), "Unrelated Limine drift"),
+             "second default": (lambda raw: raw + b"default_entry: 3\n", "canonical stock default"),
+             "snapshot promoted to default": (lambda raw: raw.replace(b"default_entry: 2\n", b"default_entry: 5\n", 1), "canonical stock default")}
+    for label, (mutate, pattern) in cases.items():
+      with self.subTest(label):
+        other = self.new()
+        other.f.write(other.T.P.LIMINE, mutate(other.limine()))
+        other.refuses(pattern)
+
+  # --- refusals with zero writes -----------------------------------------------------------------
+  def test_class_b_refuses_per_item_with_zero_writes_and_keeps_the_marker(self):
+    for label, (mutate, expected) in self.mutation_cases().items():
+      with self.subTest(label):
+        other = self.new()
+        mutate(other)
+        before = other.tree()
+        with self.assertRaises(ValueError) as caught: other.reactivate()
+        self.assertRegex(str(caught.exception), "requalification required: ")
+        if expected is not None: self.assertIn(", ".join(expected), str(caught.exception))
+        else: self.assertIn(label, str(caught.exception))
+        self.assertEqual(other.tree(), before)
+        self.assertTrue(other.path(other.T.MAINTENANCE).exists())
+        self.assertFalse(other.pending().exists())
+
+  def test_the_running_kernel_alone_refuses_as_requalification(self):
+    other = self.new()
+    other.running = "7.3.0-new"
+    other.refuses("requalification required: kernel")
+
+  def test_class_c_unknown_refuses_with_zero_writes(self):
+    other = self.new()
+    path = other.archive() / self.T.BASELINE_NAME
+    good = path.read_bytes()
+    document = json.loads(good)
+    path.unlink()
+    other.refuses("compatibility unknown: Generation baseline is missing")
+    forged = {"garbage": b"{", "not canonical": good + b"\n", "other transition": self.T._encoded({**document, "transition_id": str(uuid.uuid4())}),
+              "unbound": self.T._encoded({**document, "old_policy_sha256": "1" * 64}), "extra item": self.T._encoded({**document, "items": {**document["items"], "extra": {}}})}
+    for label, raw in forged.items():
+      with self.subTest(label):
+        path.write_bytes(raw)
+        path.chmod(0o600)
+        other.refuses("compatibility unknown: Generation baseline is invalid")
+    path.write_bytes(good)
+    for item in list((other.root / "usr/lib/firmware/brcm").iterdir()): item.unlink()
+    other.refuses("compatibility unknown: .*firmware|compatibility unknown: unknown items: firmware")
+
+  def test_unavailable_baseline_item_refuses_as_unknown(self):
+    other = self.new(unavailable_control=True)
+    other.refuses("compatibility unknown: unknown items: control_inventory")
+
+  def test_busy_locks_refuse_and_are_preserved(self):
+    before = self.tree()
+    db = self.root / self.T.DB_LOCK
+    db.write_bytes(b"existing transaction")
+    with self.assertRaises(FileExistsError): self.reactivate()
+    self.assertEqual(db.read_bytes(), b"existing transaction")
+    db.unlink()
+    held = os.open(self.root / self.T.PHYSICAL_LOCK, os.O_RDONLY)
+    try:
+      fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+      with self.assertRaises(BlockingIOError): self.reactivate()
+    finally: os.close(held)
+    self.assertFalse(db.exists())
+    self.assertEqual(self.tree(), before)
+
+  def test_existing_policy_optin_pending_and_runtime_or_deactivation_state_refuse_with_zero_writes(self):
+    T = self.T
+    def foreign(relative, raw=b"foreign"):
+      return lambda other: other.f.write(relative, raw)
+    barrier = self.T._encoded({"protocol": "omarchy-t2-runtime-upgrade-intent-v2", "transaction_id": str(uuid.uuid4()), "approval_id": str(uuid.uuid4())})
+    cases = {"policy": (foreign(T.P.POLICY), "Existing source-default"), "opt-in": (lambda other: other.f.write(T.OPT_IN, b"").chmod(0o644), "Existing source-default"),
+             "runtime upgrade pending": (foreign(T.P.STATE / T.D.UPGRADE_PENDING), "Runtime deployment/upgrade pending"),
+             "runtime pending": (foreign(T.P.STATE / T.D.PENDING), "Runtime deployment/upgrade pending"),
+             "deactivation pending": (foreign(T.PENDINGS["deactivation"]), "re-enter `maintenance`"),
+             "runtime barrier under the shared filename": (foreign(T.PENDINGS["activation"], barrier), "not a reactivation intent")}
+    for label, (mutate, pattern) in cases.items():
+      with self.subTest(label):
+        other = self.new()
+        mutate(other)
+        before = other.tree()
+        with self.assertRaisesRegex(ValueError, pattern): other.reactivate()
+        self.assertEqual(other.tree(), before)
+        self.assertTrue(other.path(T.MAINTENANCE).exists())
+        self.assertFalse(other.T.reactivation_pending(other.root))  # the barrier is never mistaken for ours
+    other = self.new()
+    other.f.write(other.T.MAINTENANCE, b"junk")
+    with self.assertRaises(ValueError): other.reactivate()
+    other = self.new()
+    other.path(other.T.MAINTENANCE).unlink()
+    with self.assertRaisesRegex(ValueError, "marker required"): other.reactivate()
+
+  def test_efi_override_saved_image_and_runtime_drift_refuse_with_zero_writes(self):
+    other = self.new()
+    other.f.write(other.T.G.EFI / other.T.PRODUCT.HOST.CT.SOURCE_VARIABLE, b"stage")
+    other.refuses("EFI overrides")
+    other = self.new()
+    other.f.write(other.T.G.EFI / ("LoaderEntryOneShot-" + other.T.G.LOADER_GUID), b"one shot")
+    other.refuses("EFI overrides|Active or incomplete source state")
+    other = self.new()
+    other.fx.image = True
+    other.refuses("saved image present")
+    other = self.new()
+    next((other.root / other.T.P.STATE / "runtime").rglob("fixture.py")).write_bytes(b"drifted reviewed code\n")
+    other.refuses("")
+    other = self.new()
+    other.fx.fail["retained"] = True
+    other.refuses("injected retained")
+
+  def test_qualified_configuration_and_evidence_mismatches_refuse_with_zero_writes(self):
+    other = self.new()
+    other.derived_manifest = {**other.config["manifest"], "source_sha256": "f" * 64}
+    other.refuses("manifest differs")
+    other = self.new()
+    other.inspect_config = {"staged_receipt_sha256": "e" * 64}
+    other.refuses("receipt digests differ")
+    other = self.new()
+    def differs(evidence): raise ValueError("Derived resume target differs")
+    other.refuses("resume", inspect=differs)
+    other = self.new()
+    other.f.write(other.T.REVIEW, json.dumps(json.loads(other.review), indent=2).encode())  # same policy, different bytes
+    other.refuses("Reviewed policy differs")
+    other = self.new()
+    (other.archive() / "policy.json").write_bytes(b"{}")
+    other.refuses("policy")
+    other = self.new()
+    other.f.write(other.T.P.BACKUP, other.f.before + b"# tampered\n")
+    other.refuses("Before bytes differ")
+
+  # --- crash injection ---------------------------------------------------------------------------
+  def guard_at(self, limit):
+    calls = []
+    def guard():
+      calls.append(self.stage() if self.pending().exists() or self.path(self.T.P.POLICY).exists() else "none")
+      if limit is not None and len(calls) == limit: raise Crash()
+    return guard, calls
+
+  def crashed(self, limit):
+    guard, calls = self.guard_at(limit)
+    try: self.reactivate(guard=guard)
+    except Crash: pass
+    else: self.fail("no crash at guard " + str(limit))
+    return calls
+
+  def test_a_crash_before_every_write_keeps_sleep_and_updates_vetoed_and_recovery_finishes_correctly(self):
+    total = len(self.guards())
+    self.assertGreaterEqual(total, 14)
+    seen, outcomes = set(), {}
+    for limit in range(1, total + 1):
+      with self.subTest(guard=limit):
+        other = self.new()
+        other.crashed(limit)
+        stage = other.stage()
+        seen.add(stage)
+        self.assertFalse((other.root / other.T.DB_LOCK).exists())
+        if stage == "done":
+          other.assert_active()
+        elif stage == "none":
+          self.assertFalse(other.pending().exists())
+          self.assertEqual(other.limine(), other.original)
+          self.assertTrue(other.reactivate()["reactivated"])
+          other.assert_active()
+        else:
+          other.assert_vetoed()
+          self.assertTrue(other.T.reactivation_pending(other.root))
+          result = other.reactivate()
+          if stage in ("pre", "W3", "W4", "W5"):
+            self.assertEqual((result.get("rolled_back"), result["reactivated"]), (True, False))
+            other.assert_rolled_back(other.original)
+            self.assertTrue((other.root / other.T.HISTORY / result["transition_id"] / other.T.ROLLBACK_NAME).exists())
+            self.assertTrue(other.reactivate()["reactivated"])  # a fresh attempt is then allowed
+          else: self.assertEqual(result["recovered"], "finished-retirement" if stage == "W7" else "retired-pending")
+          other.assert_active()
+        outcomes[limit] = stage
+    # A process death between the pending unlink and the lock release cannot be simulated in-process: the engine
+    # reinstates the pending on any BaseException there, so that instant shows up as W8 again.
+    self.assertEqual(seen, set(self.STAGES) - {"done"})
+    order = [self.STAGES.index(outcomes[limit]) for limit in range(1, total + 1)]
+    self.assertEqual(order, sorted(order))  # the writes advance monotonically through W1..W9
+
+  def test_a_crash_between_stage_and_swap_leaves_a_stray_temporary_that_recovery_removes(self):
+    calls = self.guards()
+    inner = next(index + 2 for index, name in enumerate(calls) if name == "W3" and calls[index + 1] == "W3")  # the guard inside _replace, after the temporary exists
+    other = self.new()
+    other.crashed(inner)
+    self.assertTrue(list(other.path("boot").glob("limine.conf.source-default-*")))
+    self.assertEqual(other.stage(), "W3")
+    self.assertEqual(other.limine(), other.original)
+    self.assertTrue(other.reactivate()["rolled_back"])
+    other.assert_rolled_back(other.original)
+
+  def test_fault_after_the_boot_write_and_inside_postchecks_roll_back_on_rerun(self):
+    original_new = self.T._new
+    def fail_optin(path, *args, **kwargs):
+      if path.name == "t2-hibernate-product.enabled": raise OSError("opt-in publication fault")
+      return original_new(path, *args, **kwargs)
+    other = self.new()
+    with patch.object(other.T, "_new", side_effect=fail_optin):
+      with self.assertRaises(OSError): other.reactivate()
+    self.assertEqual(other.stage(), "W4")
+    other.assert_vetoed()
+    self.assertTrue(other.reactivate()["rolled_back"])
+    other.assert_rolled_back(other.original)
+    other = self.new()
+    other.fault = ValueError("postcheck failure inside W6")
+    with self.assertRaisesRegex(ValueError, "inside W6"): other.reactivate()
+    self.assertEqual(other.stage(), "W5")
+    other.assert_vetoed()
+    other.fault = None
+    result = other.reactivate()
+    self.assertEqual((result["rolled_back"], result["reactivated"]), (True, False))  # never retried forward past the boot write
+    other.assert_rolled_back(other.original)
+
+  def test_a_snapshot_sync_during_the_swap_aborts_and_rolls_back_without_dropping_snapshots(self):
+    other = self.new()
+    original_replace = other.T._replace
+    def racing(root, expected, replacement, identifier, *, guard=lambda: None):
+      other.f.write(other.T.P.LIMINE, F.with_snapshots(other.limine(), [8, 9]))  # snapper-sync rewrote the region before the swap
+      return original_replace(root, expected, replacement, identifier, guard=guard)
+    with patch.object(other.T, "_replace", side_effect=racing):
+      with self.assertRaisesRegex(ValueError, "Configuration changed before replacement"): other.reactivate()
+    churned = other.limine()
+    self.assertEqual(other.stage(), "W3")
+    result = other.reactivate()
+    self.assertTrue(result["rolled_back"])
+    other.assert_rolled_back(churned)  # the new snapshots are still there
+    self.assertIn(b"///9 ", other.limine())
+    self.assertTrue(other.reactivate()["reactivated"])
+    self.assertIn(b"///9 ", other.limine())
+
+  def test_snapshot_churn_after_the_boot_write_is_tolerated_by_recovery_and_rollback(self):
+    other = self.to_stage("W4")
+    other.f.write(other.T.P.LIMINE, F.with_snapshots(other.limine(), [5, 6], True))
+    churned = other.limine()
+    self.assertTrue(other.reactivate()["rolled_back"])
+    self.assertEqual(other.limine(), churned.replace(b"default_entry: " + other.entry.encode() + b"\n", b"default_entry: 2\n", 1))
+    self.assertIn(b"///6 ", other.limine())  # the new snapshots were never dropped
+    self.assertFalse(other.flags()["switched"])
+    other.T.G._maintenance(other.root)
+
+  def test_rollback_is_resumable_after_a_crash_at_every_step(self):
+    for name in ("W4", "W5"):
+      probe = self.to_stage(name)
+      guard, calls = probe.guard_at(None)
+      probe.reactivate(guard=guard)
+      steps = len(calls)
+      self.assertGreaterEqual(steps, 8)
+      for limit in range(1, steps + 1):
+        with self.subTest(stage=name, guard=limit):
+          other = self.to_stage(name)
+          guard, _ = other.guard_at(limit)
+          try: other.reactivate(guard=guard)
+          except Crash: pass
+          if other.pending().exists():
+            other.assert_vetoed()
+            self.assertTrue(other.reactivate()["rolled_back"])
+          other.assert_rolled_back(other.original)
+
+  def test_post_completion_recovery_re_checks_and_rolls_back_when_the_checks_fail(self):
+    other = self.to_stage("W7")
+    other.fault = ValueError("state no longer verifies")
+    result = other.reactivate()
+    self.assertEqual((result["rolled_back"], result["reactivated"]), (True, False))
+    other.fault = None
+    other.assert_rolled_back(other.original)
+    # a torn (non-matching) completion is never trusted either
+    other = self.to_stage("W7")
+    (other.own_archive() / "completion.json").write_bytes(b'{"torn":')
+    self.assertTrue(other.reactivate()["rolled_back"])
+    other.assert_rolled_back(other.original)
+
+  def test_recovery_refuses_a_forged_or_mismatched_pending_without_touching_anything(self):
+    def rewrite(other, **changes):
+      other.pending().write_bytes(other.T._encoded({**json.loads(other.pending().read_bytes()), **changes}))
+    cases = {"other marker": lambda other: rewrite(other, marker_sha256="0" * 64), "other baseline": lambda other: rewrite(other, baseline_sha256="0" * 64),
+             "other policy": lambda other: rewrite(other, policy_sha256="0" * 64), "other action": lambda other: rewrite(other, action="activation"),
+             "other maintenance": lambda other: rewrite(other, maintenance_transition_id=str(uuid.uuid4())),
+             "other limine": lambda other: rewrite(other, limine={**json.loads(other.pending().read_bytes())["limine"], "to_canonical_sha256": "1" * 64}),
+             "not canonical": lambda other: other.pending().write_bytes(other.pending().read_bytes() + b"\n"),
+             "torn": lambda other: other.pending().write_bytes(other.pending().read_bytes()[:20]),
+             "runtime barrier": lambda other: other.pending().write_bytes(other.T._encoded({"protocol": "omarchy-t2-runtime-upgrade-intent-v2", "transaction_id": str(uuid.uuid4())})),
+             "archive differs": lambda other: (other.own_archive() / "intent.json").write_bytes(b"{}"),
+             "comparison differs": lambda other: (other.own_archive() / "comparison.json").write_bytes(b"{}")}
+    for label, mutate in cases.items():
+      with self.subTest(label):
+        other = self.to_stage("W5")
+        mutate(other)
+        before = other.tree()
+        with self.assertRaises(ValueError): other.reactivate()
+        self.assertEqual(other.tree(), before)
+    other = self.to_stage("W5")
+    other.f.write(other.T.P.LIMINE, other.limine() + b"# unrelated drift\n")
+    before = other.tree()
+    with self.assertRaisesRegex(ValueError, "Unrelated Limine drift"): other.reactivate()
+    self.assertEqual(other.tree(), before)
+
+  # --- mutual exclusion --------------------------------------------------------------------------
+  def test_the_two_commands_exclude_each_other_and_the_runtime_upgrade_barrier(self):
+    other = self.to_stage("W4")
+    self.assertTrue(other.T.reactivation_pending(other.root))
+    gate = other.fx.gate
+    with self.assertRaises((ValueError, OSError)):
+      other.T._transition(other.root, "maintenance", precheck=other.fx.fixture.check, guard=lambda: None, maintenance_gate=gate, maintenance_resume=lambda: dict(F.RESUME))
+    with self.assertRaises((ValueError, OSError)): other.T._verify_existing_maintenance(other.root, guard=lambda: None, gate=gate)
+    with self.assertRaises((ValueError, OSError)): other.T._complete_interrupted_maintenance(other.root, guard=lambda: None, gate=gate)
+    with self.assertRaises((ValueError, OSError)): other.T._transition(other.root, "activation", precheck=other.fx.fixture.check, guard=lambda: None)
+    # and the deactivation pending the maintenance publisher leaves is never adopted by reactivate
+    third = self.new()
+    third.f.write(third.T.PENDINGS["deactivation"], b"interrupted maintenance publication")
+    third.refuses("re-enter `maintenance`")
+    self.assertEqual((third.root / third.T.PENDINGS["deactivation"]).read_bytes(), b"interrupted maintenance publication")
+
+  def test_neither_side_can_adopt_the_others_pending_under_the_shared_filename(self):
+    RU = load("upgrade_native_for_exclusion", HERE / "hibernate/runtime_upgrade_native.py")
+    crashed = self.to_stage("W4")
+    ours = crashed.pending().read_bytes()
+    self.assertEqual(json.loads(ours)["protocol"], self.T.REACTIVATION_SCHEMA)
+    self.assertNotEqual(self.T.REACTIVATION_SCHEMA, "omarchy-t2-runtime-upgrade-intent-v2")
+    self.assertNotEqual(self.T.REACTIVATION_SCHEMA, "omarchy-t2-runtime-upgrade-intent-v1")
+    approval = {"approval_id": str(uuid.uuid4()), "expected": {name: "0" * 64 for name in ("old_review", "new_review", "old_config", "new_config")}}
+    with self.assertRaisesRegex(ValueError, "invalid intent"): RU._intent(self.T.D, approval, ours)  # the upgrade's recovery compares protocol and exact fields
+    document = json.loads(ours)
+    self.assertNotEqual(set(document), {"protocol", "transaction_id", "approval_id", "old_review_sha256", "new_review_sha256", "old_config_sha256", "new_config_sha256"})
+    # the upgrade start refuses while our pending holds the barrier name, without altering it
+    expected = {name: "0" * 64 for name in ("old_review", "old_bootstrap", "old_config", "new_review", "new_bootstrap", "new_config")}
+    with self.assertRaisesRegex(ValueError, "Existing or partial runtime upgrade"):
+      self.T.D.upgrade_snapshot(crashed.root, root=crashed.root, expected=expected, guard=lambda: None, precheck=lambda: None, postcheck=lambda: None)
+    self.assertEqual(crashed.pending().read_bytes(), ours)
+    # conversely a runtime-upgrade barrier is never taken for a reactivation intent
+    other = self.new()
+    barrier = self.T._encoded({"protocol": "omarchy-t2-runtime-upgrade-intent-v2", "transaction_id": str(uuid.uuid4())})
+    other.f.write(other.T.PENDINGS["activation"], barrier)
+    self.assertFalse(other.T.reactivation_pending(other.root))
+    with self.assertRaisesRegex(ValueError, "not a reactivation intent"): other.reactivate()
+    self.assertEqual(other.pending().read_bytes(), barrier)
+
+  def test_assess_core_never_probes_locks_while_the_wrapper_reports_unknown_under_them(self):
+    with self.T._locks(self.root):
+      self.assertEqual(self.assess()["class"], "unknown")  # the wrapper sees our own db.lck
+      evidence = self.T.G._maintenance(self.root)
+      marker = (self.root / self.T.MAINTENANCE).read_bytes()
+      with patch.object(self.T.G, "_physical", side_effect=AssertionError("no physical probe")):
+        self.assertEqual(N._assess_core(self.T, self.root, evidence, marker)["class"], "unchanged")
+
+
+class ReactivationNative(unittest.TestCase):
+  """The native adapter wiring for `reactivate`; every host query and reviewed byte source is mocked."""
+
+  def dispatch(self, pending=False):
+    from contextlib import contextmanager
+    seen = {}
+    @contextmanager
+    def exclusion(action):
+      seen["action"] = action
+      yield lambda: None
+    engine = Mock()
+    engine.reactivation_pending.return_value = pending
+    engine._reactivate.return_value = {"reactivated": True, "requalification_required": False, "qualification_issued": False}
+    with patch.object(N, "_installed", return_value=engine), patch.object(Path, "readlink", return_value=Path("/usr/bin/systemd-inhibit")), \
+         patch.object(N, "_exclusion", side_effect=exclusion):
+      return engine, seen, N.native("reactivate")
+
+  def test_dispatch_supplies_only_fixed_root_capability_and_callbacks(self):
+    engine, seen, result = self.dispatch()
+    self.assertEqual(seen["action"], "reactivate")
+    arguments = engine._reactivate.call_args
+    self.assertEqual(arguments.args, (Path("/"),))
+    self.assertIs(arguments.kwargs["native"], engine._NATIVE_MAINTENANCE)
+    self.assertEqual(set(arguments.kwargs), {"guard", "gate", "native", "pinned", "assess", "inspect", "postchecks"})
+    self.assertTrue(result["live_execution"] and result["power_operation"] is False and result["reactivated"] and result["requalification_required"] is False)
+    engine._transition.assert_not_called()
+    with patch.object(N, "_maintenance_gate") as gate:
+      arguments.kwargs["gate"](Path("/"), "retained")
+    gate.assert_called_once_with(engine, Path("/"), "retained", arguments.kwargs["pinned"])
+    with patch.object(N, "_assess_core", return_value={"class": "unchanged"}) as core:
+      self.assertEqual(arguments.kwargs["assess"]({"evidence": 1}, b"marker"), {"class": "unchanged"})
+    core.assert_called_once_with(engine, Path("/"), {"evidence": 1}, b"marker")
+    with patch.object(N, "_reactivation_inspect", return_value={"config": {}}) as inspect:
+      arguments.kwargs["inspect"]({"evidence": 1})
+    inspect.assert_called_once_with(engine, {"evidence": 1})
+    with patch.object(N, "_reactivation_postchecks") as postchecks:
+      arguments.kwargs["postchecks"](Path("/"), {"kernel": {}})
+    postchecks.assert_called_once_with(engine, Path("/"), {"kernel": {}})
+
+  def test_the_inhibitor_command_and_parent_identity_use_the_reactivate_action(self):
+    self.assertEqual(N._inhibit_command("reactivate")[-1], "reactivate")
+    with patch.object(N.os, "execve", side_effect=AssertionError("exec")), patch.object(N, "_command", side_effect=AssertionError("no host queries")):
+      with self.assertRaises(ValueError): N.native("reactivate")  # workspace/nonroot invocation refuses first
+
+  def test_maintenance_refuses_naming_reactivate_while_a_reactivation_is_pending(self):
+    from contextlib import contextmanager
+    @contextmanager
+    def exclusion(action):
+      yield lambda: None
+    engine = Mock()
+    engine.reactivation_pending.return_value = True
+    with patch.object(N, "_installed", return_value=engine), patch.object(Path, "readlink", return_value=Path("/usr/bin/systemd-inhibit")), patch.object(N, "_exclusion", side_effect=exclusion):
+      with self.assertRaisesRegex(ValueError, "reactivate"): N.native("maintenance")
+    engine._transition.assert_not_called()
+    engine._verify_existing_maintenance.assert_not_called()
+    engine._complete_interrupted_maintenance.assert_not_called()
+
+  def test_inspect_requires_the_pinned_resume_and_product_validation(self):
+    engine = Mock()
+    report = {"manifest": {"m": 1}, "audited_details": {"restore_protocol": {"resume": {"offset": 1}}}}
+    engine.PRODUCT.TRIAL._private_json.side_effect = [{"source_directory": "s", "restore_directory": "r", "production_uki": "p"}, {"q": 1}]
+    engine.PRODUCT.ARTIFACTS.derive_artifacts.return_value = report
+    info = N._reactivation_inspect(engine, {"resume": {"offset": 1}})
+    self.assertEqual(info["manifest"], {"m": 1})
+    engine.PRODUCT.validate.assert_called_once()
+    engine.PRODUCT.TRIAL._private_json.side_effect = [{"source_directory": "s", "restore_directory": "r", "production_uki": "p"}, {"q": 1}]
+    with self.assertRaisesRegex(ValueError, "resume"): N._reactivation_inspect(engine, {"resume": {"offset": 2}})
+
+  def test_postchecks_verify_source_default_deployment_no_image_and_generation_equality(self):
+    engine = Mock()
+    engine.BASELINE_ITEMS = ("kernel", "config")
+    report = {"manifest": {}, "audited_details": {"restore_protocol": {"resume": {"offset": 1}}}}
+    engine.PRODUCT.TRIAL._private_json.side_effect = lambda path: {"source_directory": "s", "restore_directory": "r", "production_uki": "p"}
+    engine.PRODUCT.ARTIFACTS.derive_artifacts.return_value = report
+    with patch.object(N, "generation_items", return_value=({"kernel": {"a": 1}, "config": {"b": 2}}, {})):
+      N._reactivation_postchecks(engine, Path("/"), {"kernel": {"a": 1}, "config": {"b": 2}, "limine": {}})
+    engine.PRODUCT.TRIAL._verify_deployment.assert_called_once()
+    self.assertIs(engine.PRODUCT.TRIAL._verify_deployment.call_args.kwargs["source_default"], True)
+    engine.IMAGE_STATE.require_no_image.assert_called_once_with(Path("/"), {"offset": 1})
+    for items, errors in (({"kernel": {"a": 2}, "config": {"b": 2}}, {}), ({"kernel": {"a": 1}, "config": {"b": 2}}, {"config": "unreadable"})):
+      with patch.object(N, "generation_items", return_value=(items, errors)), self.assertRaisesRegex(ValueError, "differ from the baseline"):
+        N._reactivation_postchecks(engine, Path("/"), {"kernel": {"a": 1}, "config": {"b": 2}, "limine": {}})
+
+  def test_retained_gate_uses_the_pinned_resume_without_the_guards_derivation(self):
+    engine = Mock()
+    engine.GATE_PHASES = ("before", "after", "final", "retained")
+    with patch.object(N, "_hibernate_route"), patch.object(N, "_maintenance_vetoes"):
+      N._maintenance_gate(engine, Path("/"), "retained", {"resume": {"offset": 5}})
+    engine.IMAGE_STATE.require_no_image.assert_called_once_with(Path("/"), {"offset": 5})
+    engine._pinned_resume.assert_not_called()
+    engine.IMAGE_STATE.require_no_image.reset_mock()
+    engine._pinned_resume.return_value = {"offset": 6}
+    with patch.object(N, "_hibernate_route"), patch.object(N, "_maintenance_vetoes"):
+      N._maintenance_gate(engine, Path("/"), "retained", {})
+    engine.IMAGE_STATE.require_no_image.assert_called_once_with(Path("/"), {"offset": 6})
 
 
 if __name__ == "__main__": unittest.main()

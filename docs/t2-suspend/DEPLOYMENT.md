@@ -8,7 +8,7 @@ Status: **draft procedure, not approved for execution.** Nothing here has been r
 
 This procedure replaces the root-private runtime snapshot at `/var/lib/omarchy/t2-hibernate-product/runtime` (plus its review and bootstrap authority) with the reviewed source, then moves the machine into inactive package maintenance so that ordinary `pacman`/`omarchy update` transactions can run. It deploys runtime code only.
 
-It does NOT: build, stage, install or boot any UKI, `.linux`, `.cmdline`, EFI variable, kernel or module; change `qualification.json`, `config.json` or the source and restore images; run any S3, S4 or other power transition; reactivate hibernation (RESUME.md task 4 is not implemented); or deploy the S3 fix (RESUME.md task 6). Gate H3 does rewrite `/boot/limine.conf` back to the retained stock configuration and removes the routine opt-in and active policy; that is a boot-configuration change (not a boot-image change) and is called out at that gate. Hibernation stays OFF after H3 by design. That is the intended fail-safe.
+It does NOT: build, stage, install or boot any UKI, `.linux`, `.cmdline`, EFI variable, kernel or module; change `qualification.json`, `config.json` or the source and restore images; run any S3, S4 or other power transition; reactivate hibernation (gate H5 is a separate, later, optional approval and needs a runtime generation that contains `reactivate`); or deploy the S3 fix (RESUME.md task 6). Gate H3 does rewrite `/boot/limine.conf` back to the retained stock configuration and removes the routine opt-in and active policy; that is a boot-configuration change (not a boot-image change) and is called out at that gate. Hibernation stays OFF after H3 by design. That is the intended fail-safe.
 
 The adapter changes runtime authority under a fixed protocol: source `runtime_upgrade_native.py` (adapter), `runtime_deployment.py` (core, `_upgrade_snapshot` at line 295) and `image_state.py`. Facts cited below use `file:line` at the reviewed commit.
 
@@ -47,6 +47,7 @@ Pin values are not listed here on purpose: they depend on the exact reviewed com
 | H2 | runs the adapter: replaces runtime, review, bootstrap; consumes approval | sudo, real inhibitor | operator |
 | H3 | maintenance publisher: deactivates hibernation, restores stock `limine.conf`, writes marker | sudo, real inhibitor | operator |
 | H4 | first package update through the native guard, then `omarchy update` | sudo / update flow | operator |
+| H5 (optional, later) | `reactivate`: re-applies the retained source default without requalification, only when `assess` reports `unchanged` | sudo, real inhibitor | operator |
 
 Stop and ask for review if any check differs from its expected output. Unknown means stop. Never retry a failed gate by repeating it: recovery for H2 and H3 is read-only diagnosis first (see the failure section). Never reboot, power-cycle, suspend or hibernate the machine at any point of this procedure.
 
@@ -335,7 +336,7 @@ sudo /usr/bin/python3 -I -B "$S/runtime/packages/t2-suspend/hibernate/update_gua
 
 Failure: the publisher leaves the machine either unchanged or in the interrupted state that [MAINTENANCE-RUNBOOK.md](MAINTENANCE-RUNBOOK.md) section 1 describes (marker plus stale deactivation pending). Re-running the same maintenance command completes that state safely (`completed_interrupted_maintenance: true`); if it refuses, stop for review. Never remove files by hand.
 
-Hibernation remains OFF after H3. Reactivation is not implemented (RESUME.md task 4); do not try to re-enable it by hand (do not recreate the opt-in file, do not re-run `activation`).
+Hibernation remains OFF after H3. The only sanctioned way back is the optional, separately approved gate H5 below, and only from a runtime generation that contains `reactivate`; do not try to re-enable it by hand (do not recreate the opt-in file, do not re-run `activation`).
 
 ### After H3: record and check the generation baseline
 
@@ -362,6 +363,41 @@ Do not change the boot image or run `limine-mkinitcpio` unless the runbook secti
 
 After the first updates, `assess` should report `unchanged` for userspace-only updates, or `requalification-required` once the kernel, modules, firmware, UKIs or bootloader changed. Snapshot entries added to `/boot/limine.conf` by `limine-snapper-sync` do not count as a change. Reactivating hibernation is not part of this procedure (see [RESUME.md](RESUME.md)).
 
+## Gate H5 (optional, later): reactivation
+
+Operator approval required, separately from H0 to H4. Precondition: a runtime generation that contains `reactivate` is installed (the `28774823` generation this procedure deploys predates it; a later reviewed runtime upgrade is needed first), the maintenance marker exists, and the read-only assessment reports `class: "unchanged"`:
+
+```bash
+NATIVE=/var/lib/omarchy/t2-hibernate-product/runtime/packages/t2-suspend/hibernate/boot_policy_native.py
+sudo -n /usr/bin/python3 -I -B "$NATIVE" assess | tee ~/t2-assess-before-h5.json | jq '{class, changed_items, unknown_items, limine}'
+```
+
+`reactivate` is not hibernation permission and not requalification. It only re-applies the source default that the H3 deactivation removed, when nothing that the qualification depends on has changed. It re-evaluates the same assessment itself under its own locks, so the output above is a preview, not an authorization.
+
+```bash
+sudo /usr/bin/python3 -I -B "$NATIVE" reactivate
+```
+
+Do NOT reboot, power-cycle, suspend or hibernate while it runs, and do not interrupt it. Sleep and package updates are vetoed for the whole run (the activation pending, and the maintenance marker until it is retired), but a reboot is not vetoed once the boot configuration line is written.
+
+What it does, in order (every write is preceded by the real logind exclusion check): it refuses unless the preconditions hold; writes `source-default-activation.pending` (protocol `omarchy-t2-package-reactivation-intent-v1`, the runtime upgrade's barrier filename with a different protocol), an archive directory `boot-policy-transitions/<new id>` (intent, policy, comparison, opt-in evidence), `boot-policy.json`; then changes exactly ONE line of `/boot/limine.conf`, `default_entry: 2` to the source entry, on the current bytes (the snapshot region is never rewritten or dropped); creates the routine opt-in; re-verifies the active state; writes `completion.json`; removes the maintenance marker and finally the pending. Success prints canonical JSON with `"reactivated": true`, `"requalification_required": false`, `"live_execution": true`, `"power_operation": false`. Afterwards updates are refused by the blanket guard again (`boot-policy.json` and the opt-in exist), exactly as before H3; deactivate again with `maintenance` before any update.
+
+Refusals (all with zero writes; the marker stays and updates stay allowed):
+
+| Message | Meaning |
+| --- | --- |
+| `requalification required: <items>` | Something the qualification depends on changed (kernel, UKIs, module stack, manifest, config, qualification, driver modules, firmware, control files, bootloader, or the stock Limine projection). Reactivation is not possible; the generation must be requalified. |
+| `compatibility unknown: <reason>` | The baseline is missing, invalid or an item could not be read. Nothing is assumed; reactivation is refused. |
+| `Unrelated Limine drift` | `/boot/limine.conf` differs from the retained backup by more than the snapshot region. |
+| `Interrupted deactivation/maintenance publication preserved` | A deactivation pending exists: finish the interrupted maintenance publication first. |
+| `Runtime deployment/upgrade pending` | A runtime upgrade is pending or interrupted; it and reactivation exclude each other. |
+| `Existing source-default policy, opt-in or pending` | Source-default state already exists (or the shared pending name holds something that is not a reactivation intent, which is never adopted). |
+| a busy lock, EFI override, saved hibernation image or reviewed-runtime mismatch | The same fail-closed checks as maintenance; nothing is written. |
+
+Interrupted or failed run: re-run `reactivate`. It authenticates its own pending and then rolls the boot configuration line, the opt-in and the policy back (never forward past the boot-config write) and re-verifies the inactive maintenance state; if the completion was already written it re-checks and only finishes retiring the marker and pending. See [MAINTENANCE-RUNBOOK.md section 6](MAINTENANCE-RUNBOOK.md). After a rollback a fresh attempt is allowed. Never delete the pending or any archive file by hand.
+
+Residual gap: userspace packages outside the UKI (systemd, logind and others) are not assessed items. Only the effective `systemd-hibernate.service` route is checked, so an update to them that the assessment does not see is not covered by `unchanged`.
+
 ## Failure and rollback handling
 
 General rules: fail closed. There is no automatic retry, no replay and no rollback command. The retained `*-retained-e489bab70e13-before-28774823666b*` files preserve the old runtime, review, bootstrap and config as evidence, but restoring them is a separately reviewed operation, not part of this procedure. Do not run the adapter or publisher a second time to "finish" a run. Never replay consumed deployment `4125726a-4847-4802-a821-953e6abe995a` or any approval whose consumed file exists: a replay is refused before any lock because the installed review no longer matches `old_review` (`runtime_upgrade_native.py:198`, in `_verified_engines` before `_locks`; the consumed-approval file is checked again at `runtime_deployment.py:378-380`), and even if it were not, replaying is forbidden.
@@ -376,6 +412,7 @@ General rules: fail closed. There is no automatic retry, no replay and no rollba
 | H2, `db.lck` left over | Our lock may remain | MAINTENANCE-RUNBOOK.md section 4: remove only after the listed checks pass |
 | H3 | Marker written or not | MAINTENANCE-RUNBOOK.md sections 1 to 3 and 5 |
 | H4 | Update aborted by the guard before mutation | Read the guard message; runbook sections 2 and 3; never bypass the hook |
+| H5 | Refused with zero writes, or interrupted with an activation pending | Refusal: read the message above, nothing changed. Interrupted: do not reboot; re-run `reactivate` (MAINTENANCE-RUNBOOK.md section 6) |
 
 If the machine loses power, hangs or reboots at any gate, do not assume state: on the next boot, reconcile with the handoff, `git`, and the read-only inventory in the runbook before any further action, and do not try to complete the gate.
 
@@ -389,7 +426,7 @@ From AGENTS.md "T2 Hibernation Hardware Safety", RESUME.md and the runbook:
 - Do not run privileged Python from the writable workspace or from `$D`. Only the root-private staged files under `STATE` run as root; `$D/source` is read as inventory and copy input only.
 - Do not delete, edit, "tidy" or hand-create anything under `STATE`, and do not edit `maintenance-resume.json`, the marker or any archive file.
 - Do not disable, remove or bypass the pacman guard hook, or use `--noscriptlet` or `--hookdir` tricks.
-- Do not reactivate hibernation by hand after H3.
+- Do not reactivate hibernation by hand after H3; the only sanctioned path is gate H5 (`reactivate`), and never reboot while it runs.
 - Do not copy embedded unlock assets into GitHub, logs or test guests.
 - Do not deploy a dev-tree copy, an untracked file, or a commit other than the one the review was computed from. If `HEAD` moves, the approval is for the old commit, not the new one.
 - Do not treat a passing fixture, VM or audit as permission to run a gate. The operator's explicit approval at each gate is the only permission.

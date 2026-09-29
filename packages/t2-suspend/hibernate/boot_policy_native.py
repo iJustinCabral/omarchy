@@ -22,6 +22,13 @@ Limine identity) before the marker. The read-only `assess` action recomputes the
 same items and classifies the current generation against it; it takes no
 inhibitor, writes nothing and leaves no lock behind, and never authorizes
 reactivation or an update (see assess()).
+
+The `reactivate` action (class (a) only: the assessment core reports `unchanged`)
+re-applies the retained source default without requalification: it changes one
+`default_entry` line of the current Limine bytes, then retires the marker. It
+runs under the same inhibitor, db.lck and physical lock as the other actions and
+its recovery is a re-run (see boot_policy_transition._reactivate). It is not
+requalification, qualification or power permission.
 """
 import argparse
 from contextlib import contextmanager
@@ -50,7 +57,7 @@ VENDOR_UNIT = "/usr/lib/systemd/system/systemd-hibernate.service"
 MAINTENANCE_NAME = "package-maintenance.pending"
 PROBE_BASE = Path("/run/omarchy-t2-maintenance-probe")
 EXEC_EXTRAS = ("ExecStartPre", "ExecStartPost", "ExecStop", "ExecStopPost", "ExecCondition")
-ACTIONS = ("activation", "deactivation", "maintenance")
+ACTIONS = ("activation", "deactivation", "maintenance", "reactivate")
 READ_ONLY = ("assess",)
 ASSESSMENT_SCHEMA = "omarchy-t2-generation-assessment-v1"
 BOOTLOADERS = ("boot/EFI/BOOT/BOOTX64.EFI", "boot/EFI/limine/limine_x64.efi")
@@ -456,7 +463,9 @@ def _maintenance_gate(engine, root, phase, pinned=None):
     if pinned is not None and resume != pinned.get("resume"): raise ValueError("Audited resume target differs from the archived evidence")
     engine.IMAGE_STATE.require_no_image(ROOT, resume)
   elif phase == "retained":
-    engine.IMAGE_STATE.require_no_image(ROOT, engine._pinned_resume(ROOT))
+    # `reactivate` pins the archived tuple: its own activation pending makes the guard's derivation refuse.
+    pinned_resume = None if pinned is None else pinned.get("resume")
+    engine.IMAGE_STATE.require_no_image(ROOT, engine._pinned_resume(ROOT) if pinned_resume is None else pinned_resume)
 
 
 def _driver_capture(root, release):
@@ -631,9 +640,13 @@ def assess(engine, root=ROOT):
   Limine's //Snapshots region never changes the class: limine is reported as
   exact bytes and as the guard's stock projection, and only a projection change
   counts.
+
+  The classification itself is _assess_core, which takes already-validated
+  evidence and never probes a lock, so `reactivate` can run it under its own
+  db.lck and physical lock without always reporting `unknown`.
   """
   root = Path(root)
-  report = {"protocol": ASSESSMENT_SCHEMA, "read_only": True, "reactivation_evaluated": False, "qualification_issued": False}
+  report = _assess_report()
   def unknown(reason, **extra):
     return {**report, "class": "unknown", "reason": reason, **extra}
   if engine._present(root / engine.DB_LOCK): return unknown("A package transaction holds db.lck", busy=True)
@@ -648,6 +661,25 @@ def assess(engine, root=ROOT):
     marker = engine._read(root, engine.MAINTENANCE)
   except (OSError, ValueError, BlockingIOError) as error:
     return unknown("Maintenance evidence not validated: " + type(error).__name__ + ": " + str(error)[:200])
+  # No lock is held while hashing, so a transaction may have started meanwhile.
+  return _assess_core(engine, root, evidence, marker, busy=lambda: engine._present(root / engine.DB_LOCK))
+
+
+def _assess_report(): return {"protocol": ASSESSMENT_SCHEMA, "read_only": True, "reactivation_evaluated": False, "qualification_issued": False}
+
+
+def _assess_core(engine, root, evidence, marker, *, busy=lambda: False):
+  """Lock-free classification of already-validated maintenance evidence against its baseline.
+
+  `evidence` is engine.G._maintenance(root)'s result and `marker` the bytes it
+  validated. Never probes db.lck or the physical lock (the caller's business:
+  `assess` probes, `reactivate` owns both); `busy()` is the caller's hook for a
+  transaction that may have started while hashing.
+  """
+  root = Path(root)
+  report = _assess_report()
+  def unknown(reason, **extra):
+    return {**report, "class": "unknown", "reason": reason, **extra}
   report["transition_id"] = evidence["transition_id"]
   report["maintenance_intent_sha256"] = evidence["maintenance_intent_sha256"]
   try: baseline = engine.read_baseline(root, marker)
@@ -655,8 +687,7 @@ def assess(engine, root=ROOT):
   except (OSError, ValueError) as error: return unknown("Generation baseline is invalid: " + str(error)[:200], baseline="invalid")
   current, errors = generation_items(engine, root)
   if engine._read(root, engine.MAINTENANCE) != marker: return unknown("Maintenance marker changed during assessment")
-  # No lock is held while hashing, so a transaction may have started meanwhile.
-  if engine._present(root / engine.DB_LOCK): return unknown("A package transaction started during assessment", busy=True)
+  if busy(): return unknown("A package transaction started during assessment", busy=True)
   raw = engine._read(root, engine.P.LIMINE, private=False)
   try: stock = engine.stock_identity(raw)
   except ValueError as error: return unknown("Current Limine configuration is not stock: " + str(error)[:200])
@@ -677,6 +708,42 @@ def assess(engine, root=ROOT):
           "changed_items": changed, "unknown_items": missing}
 
 
+def _reactivation_config(engine):
+  """Fresh qualified config, qualification and derived report from the fixed state (read-only)."""
+  product = engine.PRODUCT
+  config = product.TRIAL._private_json(STATE / "config.json")
+  qualification = product.TRIAL._private_json(STATE / "qualification.json")
+  report = product.ARTIFACTS.derive_artifacts(config["source_directory"], config["restore_directory"], config["production_uki"])
+  return config, qualification, report
+
+
+def _reactivation_inspect(engine, evidence):
+  """R0.5/R0.7: the derived resume equals the pinned one, and product.validate accepts the qualified configuration."""
+  config, qualification, report = _reactivation_config(engine)
+  if report["audited_details"]["restore_protocol"]["resume"] != evidence["resume"]:
+    raise ValueError("Derived resume target differs from the archived maintenance evidence")
+  engine.PRODUCT.validate(config, qualification, report)
+  return {"config": config, "manifest": report["manifest"]}
+
+
+def _reactivation_postchecks(engine, root, baseline):
+  """W6 native checks: deployment as source default, product validation, no image, generation == baseline."""
+  product = engine.PRODUCT
+  config, qualification, report = _reactivation_config(engine)
+  resume = report["audited_details"]["restore_protocol"]["resume"]
+  product.validate(config, qualification, report)
+  product.TRIAL._verify_deployment(root, config, report, source_default=True)
+  engine.IMAGE_STATE.require_no_image(root, resume)
+  items, errors = generation_items(engine, root)
+  if errors or items != {name: baseline[name] for name in engine.BASELINE_ITEMS}:
+    raise ValueError("Generation items differ from the baseline after reactivation")
+
+
+def _refuse_reactivation_pending(engine):
+  if engine.reactivation_pending(ROOT):
+    raise ValueError("A reactivation is pending or interrupted; re-run `reactivate` to recover it (it rolls back or finishes retirement) before any maintenance action")
+
+
 def native(action):
   """Fixed host action; no roots, runners, prechecks, force or approval APIs."""
   if action not in (*ACTIONS, *READ_ONLY): raise ValueError("Explicit policy action required")
@@ -690,7 +757,16 @@ def native(action):
     os.execve(command[0], command, ENV)
     raise RuntimeError("Inhibitor exec unexpectedly returned")
   with _exclusion(action) as guard:
+    if action == "reactivate":
+      capture = {}
+      gate = lambda root, phase: _maintenance_gate(engine, root, phase, capture)
+      result = engine._reactivate(ROOT, guard=guard, gate=gate, native=engine._NATIVE_MAINTENANCE, pinned=capture,
+                                  assess=lambda evidence, marker: _assess_core(engine, ROOT, evidence, marker),
+                                  inspect=lambda evidence: _reactivation_inspect(engine, evidence),
+                                  postchecks=lambda root, baseline: _reactivation_postchecks(engine, root, baseline))
+      return {**result, "live_execution": True, "power_operation": False}
     if action == "maintenance":
+      _refuse_reactivation_pending(engine)
       capture = {}
       gate = lambda root, phase: _maintenance_gate(engine, root, phase, capture)
       if engine._present(ROOT / engine.MAINTENANCE) and engine._present(ROOT / engine.PENDINGS["deactivation"]):

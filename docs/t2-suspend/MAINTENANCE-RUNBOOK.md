@@ -172,7 +172,7 @@ journalctl -b -1 -u systemd-hibernate.service --no-pager | tail -50
 ### Safe way forward
 
 1. Preferred: restore the original topology so the archived tuple is true again. Recreate the swapfile at the original offset only if it is byte-identical in placement, or restore the original `resume=`/`resume_offset=` cmdline entries. Regenerating the cmdline touches the boot image: follow the gate in section 3 and AGENTS.md first. Then re-run the guard (section 1 "Verify afterwards").
-2. Otherwise a reviewed re-publication is needed, meaning a new archived tuple for the new location. **The code offers no way to do this**: the resume tuple is written once, before the archived intent and marker exist (`_transition`), and the publisher refuses while the marker exists (`Existing package maintenance intent refuses new transition`). `maintenance-resume.json` is bound to the intent by canonical-byte equality, so editing it, or the marker, fails `Exact archived resume target evidence required`. Re-publication would require a reviewed retirement of the current maintenance state and a fresh publisher run under the physical lock; that is outside this runbook and needs a code review first (same for reactivation, RESUME.md item 4).
+2. Otherwise a reviewed re-publication is needed, meaning a new archived tuple for the new location. **The code offers no way to do this**: the resume tuple is written once, before the archived intent and marker exist (`_transition`), and the publisher refuses while the marker exists (`Existing package maintenance intent refuses new transition`). `maintenance-resume.json` is bound to the intent by canonical-byte equality, so editing it, or the marker, fails `Exact archived resume target evidence required`. Re-publication would require a reviewed retirement of the current maintenance state and a fresh publisher run under the physical lock; that is outside this runbook and needs a code review first (reactivation, section 6, does not re-publish anything: it requires an unchanged qualified generation, the same pinned tuple).
 
 Note the archived resume tuple is deliberately not re-derived (`_maintenance_gate`, phase `retained`), because a kernel or UKI update legitimately changes what a qualified audit would report; only the live topology has to keep matching the pinned tuple.
 
@@ -275,7 +275,51 @@ grep -n 'T2 hibernation\|hook' /var/log/pacman.log | tail -20
 
 Whether the publisher or guard log to the journal by their own identifier beyond stderr is **unverified**; the update runner's own log (where `omarchy-update` is used) carries the hook text.
 
-Reactivating hibernation after updates is a separate, reviewed step and is out of scope here: see RESUME.md item 4 ("Reactivation after updates"). An unchanged marker means hibernation stays unavailable and updates stay possible, which is the designed end state until that review.
+Reactivating hibernation after updates is the separate, operator-approved `reactivate` action (gate H5 in [DEPLOYMENT.md](DEPLOYMENT.md)); it is only possible while `assess` reports `unchanged`. An unchanged marker without that approval means hibernation stays unavailable and updates stay possible, which is the designed default.
+
+## 6. Interrupted or failed `reactivate`
+
+`boot_policy_native.py reactivate` re-applies the retained source default and retires the marker (DEPLOYMENT.md, gate H5). It shares the filename `source-default-activation.pending` with the runtime upgrade's barrier but writes its own protocol (`omarchy-t2-package-reactivation-intent-v1`); neither command ever adopts the other's bytes.
+
+### Recognize
+
+`source-default-activation.pending` exists and `jq -r .protocol` on it prints `omarchy-t2-package-reactivation-intent-v1` (anything else is the runtime upgrade's barrier: section 1 style rules apply, do not run `reactivate`, escalate). `maintenance` refuses with a message naming `reactivate`, and every update and every sleep route is refused. Depending on where it stopped the marker may still exist, `boot-policy.json`, the opt-in and the one changed `default_entry` line may already be present, and `/var/lib/pacman/db.lck` may be left over (section 4, only after its checks: a killed process cannot release it).
+
+```bash
+S=/var/lib/omarchy/t2-hibernate-product
+sudo jq . "$S/source-default-activation.pending"
+sudo ls -la "$S/boot-policy-transitions/$(sudo jq -r .transition_id "$S/source-default-activation.pending")"
+sudo ls "$S/package-maintenance.pending" "$S/boot-policy.json" /etc/omarchy/t2-hibernate-product.enabled 2>&1
+sudo grep -n default_entry /boot/limine.conf
+```
+
+### Do not reboot
+
+Sleep is vetoed until the pending is retired, but a reboot is not vetoed once the `default_entry` line was written. Do not reboot, power-cycle or suspend while a reactivation pending exists.
+
+### Resolution
+
+Re-run the same command; there is nothing else to run and nothing to delete by hand:
+
+```bash
+sudo /usr/bin/python3 -I -B "$NATIVE" reactivate
+```
+
+It authenticates the pending (byte-equal to its archived intent, bound to the current marker and baseline hashes, Limine unchanged apart from the snapshot region) and then, by state:
+
+| State found | What re-running does |
+| --- | --- |
+| Pending only, or archive partly written | Writes `rollback.json` in the archive and removes the pending |
+| `boot-policy.json` written, boot config untouched | Removes `boot-policy.json`, writes `rollback.json`, removes the pending; a stray `limine.conf.source-default-<id>` temporary is removed |
+| Boot-config line changed, with or without the opt-in, or the post-checks failed | Reverses that one line on the current bytes (snapshot entries are kept and only the canonical form is compared with the retained backup), removes the opt-in and `boot-policy.json`, re-verifies the inactive maintenance state, writes `rollback.json`, removes the pending |
+| `completion.json` present, marker still present | Re-runs the active-state checks; if they pass it removes the marker and the pending, otherwise it rolls back as above |
+| Marker already gone, completion present | Verifies the active state and removes the pending |
+
+It never continues forward past the boot-config write, so after a rollback (`"rolled_back": true`, `"reactivated": false`) the machine is in ordinary inactive maintenance again and a new `reactivate` may be attempted. If the re-run refuses (pending not authentic, unrelated Limine drift, a failed retained gate), it changes nothing: stop and ask for review.
+
+### Verify afterwards
+
+Section 5 indicators: after a rollback the marker exists, `boot-policy.json`, the opt-in and `source-default-*.pending` are absent and `default_entry: 2`. After a completed reactivation the marker and pending are gone and `boot-policy.json`, the opt-in and the source `default_entry` are present; the blanket guard then refuses updates until `maintenance` is run again.
 
 ## Summary of gaps
 

@@ -20,6 +20,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import time
 import uuid
@@ -58,6 +59,16 @@ MAX_UKI = 256 * 1024 * 1024
 # against hostile root; it keeps the public fixture API from naming live roots.
 _NATIVE_MAINTENANCE = object()
 GATE_PHASES = ("before", "after", "final", "retained")
+# Reactivation reuses the runtime upgrade's barrier FILENAME (the installed guard and sleep entry veto it by
+# presence) but a distinct protocol. Neither side may adopt the other's bytes: each recovery compares exact
+# canonical bytes and its own protocol string, and each start refuses when the name exists.
+REACTIVATION_SCHEMA = "omarchy-t2-package-reactivation-intent-v1"
+REACTIVATION_COMPARISON = "omarchy-t2-package-reactivation-comparison-v1"
+REACTIVATION_COMPLETE = "omarchy-t2-package-reactivation-complete-v1"
+REACTIVATION_ROLLBACK = "omarchy-t2-package-reactivation-rollback-v1"
+ROLLBACK_NAME = "rollback.json"
+REACTIVATION_KEYS = {"protocol", "transition_id", "action", "maintenance_transition_id", "marker_sha256", "baseline_sha256", "policy_sha256", "limine"}
+REACTIVATION_LIMINE = {"from_sha256", "to_sha256", "from_canonical_sha256", "to_canonical_sha256"}
 
 
 def _sync(directory):
@@ -489,8 +500,12 @@ def _transition(root, action, *, precheck, guard, maintenance_continuation=None,
     stock_limine = None if baseline is None else stock_identity(after)
     guard()
     transition_id = str(uuid.uuid4())
+    # A deactivation leaves the APPROVED source-default bytes (P.validate above proved the actual bytes equal them apart
+    # from the snapper snapshot region). The guard's maintenance validator pins exactly that approved hash, so recording
+    # digest(actual) would make every marker published after snapshot churn unverifiable and block all updates.
     intent = _encoded({"protocol": "omarchy-t2-source-default-transition-v1", "transition_id": transition_id,
-      "action": mechanics, "policy_sha256": P.digest(policy_raw), "from_sha256": P.digest(actual), "to_sha256": P.digest(after)})
+      "action": mechanics, "policy_sha256": P.digest(policy_raw),
+      "from_sha256": P.digest(actual) if mechanics == "activation" else policy["after_limine_sha256"], "to_sha256": P.digest(after)})
     pending = root / PENDINGS[mechanics]
     _new(pending, intent)
     guard()
@@ -732,3 +747,332 @@ def _complete_interrupted_maintenance(root, *, guard, gate, native=None, pinned=
   return {"protocol": "omarchy-t2-package-maintenance-verified-v1", "transition_id": result["transition_id"],
           "maintenance_intent_sha256": P.digest(marker), "completed_interrupted_maintenance": True,
           "live_execution": False, "qualification_issued": False}
+
+
+# --- reactivation --------------------------------------------------------------------------------
+#
+# Class (a) only: the qualified generation is provably unchanged (assess-core `unchanged`), so the
+# retained policy, backup and staged receipt are re-applied WITHOUT requalification. Everything else
+# refuses with zero writes. The boot-config write is one line: the current bytes (snapshot region and
+# all) with default_entry 2 replaced by the source entry, verified canonically against P.prepare(BACKUP).
+# Never restore `after` or BACKUP bytes: that would drop snapshot entries.
+#
+# Write order (each preceded by guard()):
+#   W1 activation pending   W2 archive intent/policy/comparison/opt-in   W3 boot-policy.json
+#   W4 boot-config line (point of no return)   W5 opt-in   W6 postchecks   W7 completion.json
+#   W8 unlink marker   W9 unlink pending   W10 release the package lock
+# Recovery of any interruption is a re-run, which authenticates the pending and rolls back (never forward
+# past W4); only a durable completion allows it to finish W8/W9. Do NOT reboot while it is mid-run: sleep is
+# vetoed through W9 but a reboot is not.
+
+
+def reactivation_pending(root):
+  """True when the activation-pending name holds THIS engine's reactivation intent (never the runtime barrier)."""
+  root = Path(root)
+  G._ancestors(root, root / PENDINGS["activation"], _owner(root))
+  try: value = P._json(_read(root, PENDINGS["activation"]))
+  except (OSError, ValueError): return False
+  return type(value) is dict and value.get("protocol") == REACTIVATION_SCHEMA
+
+
+def _default_line(entry): return ("default_entry: " + entry + "\n").encode()
+
+
+def _one_line_change(before, after):
+  old, new = before.splitlines(True), after.splitlines(True)
+  if len(old) != len(new) or sum(1 for left, right in zip(old, new) if left != right) != 1:
+    raise ValueError("Source-default change must differ from the current bytes in exactly one line")
+
+
+def _to_source_default(current, entry):
+  """prepare()'s exact one-line substitution, applied to the CURRENT bytes."""
+  P._line(current, b"default_entry: 2\n")
+  result, count = re.subn(rb"^default_entry: 2\n", lambda match: _default_line(entry), current, count=1, flags=re.M)
+  if count != 1: raise ValueError("Exactly one stock default_entry substitution required")
+  _one_line_change(current, result)
+  return result
+
+
+def _to_stock_default(current, entry):
+  """The reverse one-line transform; the result must be stock."""
+  P._line(current, _default_line(entry))
+  result, count = re.subn(b"^" + re.escape(_default_line(entry)), lambda match: b"default_entry: 2\n", current, count=1, flags=re.M)
+  if count != 1: raise ValueError("Exactly one source default_entry substitution required")
+  _one_line_change(current, result)
+  G._stock(result)
+  return result
+
+
+def _reactivation_state_refusals(root):
+  """Read-only refusals shared by every entry; nothing here writes."""
+  for relative in RUNTIME_PENDINGS:
+    G._ancestors(root, root / relative, _owner(root))
+    if _present(root / relative): raise ValueError("Runtime deployment/upgrade pending refuses reactivation; finish or recover it first")
+  G._ancestors(root, root / PENDINGS["deactivation"], _owner(root))
+  if _present(root / PENDINGS["deactivation"]):
+    raise ValueError("Interrupted deactivation/maintenance publication preserved; re-enter `maintenance` to finish it before reactivating")
+
+
+def _reactivation_refuse_assessment(assessment):
+  if type(assessment) is not dict or assessment.get("class") not in ("unchanged", "requalification-required", "unknown"):
+    raise ValueError("compatibility unknown: malformed assessment; nothing was changed")
+  if assessment["class"] == "requalification-required":
+    raise ValueError("requalification required: " + ", ".join(assessment.get("changed_items", [])) + "; nothing was changed and updates stay allowed")
+  if assessment["class"] == "unknown":
+    detail = assessment.get("reason") or "unknown items: " + ", ".join(assessment.get("unknown_items", []))
+    raise ValueError("compatibility unknown: " + detail + "; nothing was changed")
+  if assessment.get("limine", {}).get("stock_projection_equal") is not True:
+    raise ValueError("compatibility unknown: stock Limine projection is not equal; nothing was changed")
+
+
+def _canonical_digest(raw): return P.digest(P.limine_canonical(raw))
+
+
+def _retire(root, guard, release_db, pending, raw, marker):
+  """W8 then W9: marker first (the pending keeps the veto), then the pending; W10 releases the package lock."""
+  if _read(root, MAINTENANCE) != marker: raise ValueError("Maintenance marker changed before retirement")
+  guard()
+  (root / MAINTENANCE).unlink()
+  _sync((root / MAINTENANCE).parent)
+  _retire_pending(root, guard, release_db, pending, raw)
+
+
+def _retire_pending(root, guard, release_db, pending, raw):
+  release_db(verify_only=True)
+  try:
+    guard()
+    pending.unlink()
+    _sync(pending.parent)
+    guard()
+    release_db()
+  except BaseException:
+    if not _present(pending): _new(pending, raw)
+    raise
+
+
+def _reactivation_completion(transition_id, pending_intent, configuration):
+  return _encoded({"protocol": REACTIVATION_COMPLETE, "transition_id": transition_id, "action": "reactivation",
+                   "intent_sha256": P.digest(pending_intent), "configuration_canonical_sha256": _canonical_digest(configuration)})
+
+
+def _reactivate(root, *, guard, gate, assess, inspect, postchecks, native=None, pinned=None):
+  """Internal reactivation core; the live form needs the native capability and its own callbacks.
+
+  gate(root, "retained")      maintenance read-only prerequisites (route, vetoes, fallback, no image)
+  assess(evidence, marker)    lock-free assessment core; only `unchanged` may proceed
+  inspect(evidence)           {"config", "manifest"}: qualified config and freshly derived manifest,
+                              after product.validate and the derived-resume equality
+  postchecks(root, baseline)  native ACTIVE-state checks (deployment, product, generation == baseline, no image)
+  pinned                      dict the gate reads the archived resume tuple from (the activation pending
+                              makes the guard's own re-derivation refuse)
+  """
+  root = Path(root)
+  if not root.is_absolute() or root.resolve() != root or not root.is_dir(): raise ValueError("Canonical root required")
+  _live_maintenance(root, gate, native)
+  if not all(callable(item) for item in (guard, gate, assess, inspect, postchecks)): raise ValueError("Explicit callbacks required")
+  context = {"guard": guard, "gate": gate, "assess": assess, "inspect": inspect, "postchecks": postchecks, "pinned": {} if pinned is None else pinned}
+  guard()
+  _reactivation_state_refusals(root)
+  for relative in (PENDINGS["activation"], MAINTENANCE): G._ancestors(root, root / relative, _owner(root))
+  if not _present(root / PENDINGS["activation"]) and not _present(root / MAINTENANCE):
+    raise ValueError("Inactive package maintenance marker required; nothing to reactivate")
+  with _locks(root) as release_db:
+    guard()
+    _reactivation_state_refusals(root)
+    if _present(root / PENDINGS["activation"]): return _reactivation_recover(root, context, release_db)
+    return _reactivation_forward(root, context, release_db)
+
+
+def _reactivation_forward(root, context, release_db):
+  guard, gate, pinned = context["guard"], context["gate"], context["pinned"]
+  # R0: nothing of the source state may exist.
+  for relative in (P.POLICY, OPT_IN, PENDINGS["activation"], PENDINGS["deactivation"]):
+    G._ancestors(root, root / relative, _owner(root))
+    if _present(root / relative): raise ValueError("Existing source-default policy, opt-in or pending refuses reactivation: " + relative.name)
+  evidence = G._maintenance(root)
+  pinned["resume"] = evidence["resume"]
+  marker = _read(root, MAINTENANCE)
+  intent = P._json(marker)
+  identifier = evidence["transition_id"]
+  if _runtime(root) != intent["runtime_review_sha256"]: raise ValueError("Reviewed runtime differs from the maintenance intent")
+  gate(root, "retained")
+  # The assessment precedes derive_artifacts so a real kernel/UKI update reports requalification, not a derivation failure.
+  assessment = context["assess"](evidence, marker)
+  _reactivation_refuse_assessment(assessment)
+  if _read(root, MAINTENANCE) != marker: raise ValueError("Maintenance marker changed during assessment")
+  info = context["inspect"](evidence)
+  config, manifest = info["config"], info["manifest"]
+  baseline_raw = _read(root, HISTORY / identifier / BASELINE_NAME)
+  baseline_document, baseline = P._json(baseline_raw), read_baseline(root, marker)
+  receipt_raw = _read(root, P.RECEIPT)
+  digests = {P.digest(receipt_raw), config["staged_receipt_sha256"], intent["staged_receipt_sha256"], baseline_document["staged_receipt_sha256"]}
+  if len(digests) != 1: raise ValueError("Staged receipt digests differ between the file, configuration, marker and baseline")
+  review_raw = _read(root, REVIEW)
+  if P.digest(review_raw) != intent["old_policy_sha256"] or review_raw != _read(root, HISTORY / identifier / "policy.json"):
+    raise ValueError("Reviewed policy differs from the archived old policy")
+  if not manifest == config["manifest"] == baseline["manifest"]["fields"]: raise ValueError("Qualified manifest differs between derivation, configuration and baseline")
+  policy = P._json(review_raw)
+  backup = _read(root, P.BACKUP)
+  proposal = P.prepare(backup, receipt_raw)
+  P.validate(policy, backup, proposal["after"], receipt_raw)
+  current = _read(root, P.LIMINE, private=False)
+  G._stock(current)
+  if P.limine_canonical(current) != P.limine_canonical(backup):
+    raise ValueError("Unrelated Limine drift: the current configuration is not the retained backup apart from the snapshot region")
+  replacement = _to_source_default(current, policy["source_entry_id"])
+  if P.limine_canonical(replacement) != P.limine_canonical(proposal["after"]): raise ValueError("Source-default bytes differ from the approved proposal")
+  _idle(root)
+  # --- writes ---------------------------------------------------------------------------------
+  transition_id = str(uuid.uuid4())
+  limine = {"from_sha256": P.digest(current), "to_sha256": P.digest(replacement),
+            "from_canonical_sha256": _canonical_digest(current), "to_canonical_sha256": _canonical_digest(replacement)}
+  pending_intent = _encoded({"protocol": REACTIVATION_SCHEMA, "transition_id": transition_id, "action": "reactivation",
+    "maintenance_transition_id": identifier, "marker_sha256": P.digest(marker), "baseline_sha256": P.digest(baseline_raw),
+    "policy_sha256": P.digest(review_raw), "limine": limine})
+  comparison = _encoded({"protocol": REACTIVATION_COMPARISON, "transition_id": transition_id, "intent_sha256": P.digest(pending_intent),
+    "assessment": assessment, "limine": limine})
+  pending = root / PENDINGS["activation"]
+  guard()
+  _new(pending, pending_intent)  # W1: sleep and updates are vetoed from here on
+  archive = root / HISTORY / transition_id
+  guard()
+  archive.mkdir(mode=0o700)
+  _sync(archive.parent)
+  for name, raw, mode in (("intent.json", pending_intent, 0o600), ("policy.json", review_raw, 0o600), ("comparison.json", comparison, 0o600), ("opt-in", b"", 0o644)):
+    guard()
+    _new(archive / name, raw, mode)  # W2
+  guard()
+  _new(root / P.POLICY, review_raw)  # W3
+  guard()
+  _replace(root, current, replacement, transition_id, guard=guard)  # W4: point of no return; recovery only rolls back
+  guard()
+  _new(root / OPT_IN, b"", 0o644)  # W5
+  _reactivation_active(root, context, intent, baseline)  # W6
+  completion = _reactivation_completion(transition_id, pending_intent, replacement)
+  guard()
+  _new(archive / "completion.json", completion)  # W7
+  if _read(root, (archive / "completion.json").relative_to(root)) != completion: raise ValueError("Reactivation completion readback differs")
+  _retire(root, guard, release_db, pending, pending_intent, marker)  # W8, W9, W10
+  return {**json.loads(completion), "reactivated": True, "requalification_required": False, "maintenance_transition_id": identifier,
+          "live_execution": False, "qualification_issued": False}
+
+
+def _reactivation_active(root, context, marker_intent, baseline):
+  """The ACTIVE-state postchecks shared by W6, post-W7 recovery and post-W8 verification."""
+  receipt_raw = _read(root, P.RECEIPT)
+  if P.digest(receipt_raw) != marker_intent["staged_receipt_sha256"] or P.verify(root, marker_intent["staged_receipt_sha256"]) is not True:
+    raise ValueError("Source default is not active")
+  _opt_in(root)
+  _idle(root)
+  if _runtime(root) != marker_intent["runtime_review_sha256"]: raise ValueError("Reviewed runtime changed during reactivation")
+  context["postchecks"](root, baseline)
+
+
+def _reactivation_recover(root, context, release_db):
+  """Re-run after a crash or failure: authenticate our own pending, then roll back or finish retirement."""
+  guard, pinned = context["guard"], context["pinned"]
+  pending_path = PENDINGS["activation"]
+  raw = _read(root, pending_path)
+  pending = P._json(raw)
+  if type(pending) is not dict or pending.get("protocol") != REACTIVATION_SCHEMA or _encoded(pending) != raw:
+    raise ValueError("Activation pending is not a reactivation intent; a foreign or runtime-upgrade barrier is preserved untouched")
+  if set(pending) != REACTIVATION_KEYS or pending["action"] != "reactivation" or type(pending["limine"]) is not dict or set(pending["limine"]) != REACTIVATION_LIMINE:
+    raise ValueError("Exact reactivation intent required")
+  identifier, maintenance_id = PRODUCT.TX.uuid_value(pending["transition_id"]), PRODUCT.TX.uuid_value(pending["maintenance_transition_id"])
+  for name in ("marker_sha256", "baseline_sha256", "policy_sha256"): P._hash(pending[name])
+  limine = pending["limine"]
+  for name in REACTIVATION_LIMINE: P._hash(limine[name])
+  archive = root / HISTORY / identifier
+  G._ancestors(root, archive / "member", _owner(root))
+  marker_present = _present(root / MAINTENANCE)
+  marker = _read(root, MAINTENANCE) if marker_present else _read(root, HISTORY / maintenance_id / "maintenance-intent.json")
+  if P.digest(marker) != pending["marker_sha256"]: raise ValueError("Maintenance marker is not the one this reactivation bound")
+  marker_intent = P._json(marker)
+  if type(marker_intent) is not dict or marker_intent.get("transition_id") != maintenance_id: raise ValueError("Maintenance transition differs from the reactivation intent")
+  baseline_raw = _read(root, HISTORY / maintenance_id / BASELINE_NAME)
+  if P.digest(baseline_raw) != pending["baseline_sha256"]: raise ValueError("Generation baseline is not the one this reactivation bound")
+  baseline = read_baseline(root, marker)
+  review_raw = _read(root, REVIEW)
+  if P.digest(review_raw) != pending["policy_sha256"] or pending["policy_sha256"] != marker_intent["old_policy_sha256"]:
+    raise ValueError("Reviewed policy is not the one this reactivation bound")
+  receipt_raw, backup = _read(root, P.RECEIPT), _read(root, P.BACKUP)
+  proposal = P.prepare(backup, receipt_raw)
+  if _canonical_digest(backup) != limine["from_canonical_sha256"] or _canonical_digest(proposal["after"]) != limine["to_canonical_sha256"]:
+    raise ValueError("Retained backup or approved proposal differs from the reactivation intent")
+  current = _read(root, P.LIMINE, private=False)
+  digest = _canonical_digest(current)
+  if digest not in (limine["from_canonical_sha256"], limine["to_canonical_sha256"]): raise ValueError("Unrelated Limine drift; nothing was touched")
+  switched = digest == limine["to_canonical_sha256"]
+  present = {name: _present(archive / name) for name in ("intent.json", "comparison.json", "completion.json", ROLLBACK_NAME)}
+  if switched or _present(root / P.POLICY) or _present(root / OPT_IN):
+    # Boot state was changed: the archive written before it must be complete and exact (before that, a torn archive is only noise).
+    if not (present["intent.json"] and present["comparison.json"]) or _read(root, (archive / "intent.json").relative_to(root)) != raw:
+      raise ValueError("Reactivation archive does not match the pending while boot state is changed; nothing was touched")
+    comparison = P._json(_read(root, (archive / "comparison.json").relative_to(root)))
+    if type(comparison) is not dict or comparison.get("protocol") != REACTIVATION_COMPARISON or comparison.get("transition_id") != identifier or comparison.get("intent_sha256") != P.digest(raw):
+      raise ValueError("Archived comparison does not match the reactivation pending")
+    if _present(archive / "policy.json") and _read(root, (archive / "policy.json").relative_to(root)) != review_raw:
+      raise ValueError("Archived policy differs from the reviewed policy")
+  completion = _reactivation_completion(identifier, raw, proposal["after"])
+  # A torn or foreign completion is never trusted: it cannot lead forward.
+  complete = present["completion.json"] and _read(root, (archive / "completion.json").relative_to(root)) == completion
+  guard()
+  if not marker_present:
+    # Only W9 remains: the marker is gone and the completion is durable.
+    if not complete or present[ROLLBACK_NAME]: raise ValueError("Marker missing without a valid completion; state preserved")
+    _reactivation_active(root, context, marker_intent, baseline)
+    _retire_pending(root, guard, release_db, root / pending_path, raw)
+    return {**json.loads(completion), "reactivated": True, "recovered": "retired-pending", "requalification_required": False,
+            "maintenance_transition_id": maintenance_id, "live_execution": False, "qualification_issued": False}
+  if complete and not present[ROLLBACK_NAME]:
+    try: _reactivation_active(root, context, marker_intent, baseline)
+    except Exception: pass  # checks failed after W7: never proceed forward, roll back below
+    else:
+      _retire(root, guard, release_db, root / pending_path, raw, marker)
+      return {**json.loads(completion), "reactivated": True, "recovered": "finished-retirement", "requalification_required": False,
+              "maintenance_transition_id": maintenance_id, "live_execution": False, "qualification_issued": False}
+  return _reactivation_rollback(root, context, release_db, raw=raw, identifier=identifier, archive=archive, rolled=present[ROLLBACK_NAME],
+                                entry=P.source_entry(P._json(receipt_raw)), review_raw=review_raw, backup=backup, current=current,
+                                switched=switched, maintenance_id=maintenance_id)
+
+
+def _reactivation_rollback(root, context, release_db, *, raw, identifier, archive, rolled, entry, review_raw, backup, current, switched, maintenance_id):
+  """Reverse only what this reactivation wrote, in reverse order; every step is idempotent and resumable."""
+  guard, gate, pinned = context["guard"], context["gate"], context["pinned"]
+  pending_path = PENDINGS["activation"]
+  touched = switched or _present(root / P.POLICY) or _present(root / OPT_IN)
+  for name in ("limine.conf.source-default-" + identifier, "limine.conf.source-default-" + identifier + "-rollback"):
+    stray = (root / P.LIMINE).with_name(name)
+    if _present(stray):
+      if not stat.S_ISREG(stray.lstat().st_mode): raise ValueError("Stray staged configuration is not a regular file")
+      guard()
+      stray.unlink()
+      _sync(stray.parent)
+  if switched:
+    reverse = _to_stock_default(current, entry)
+    if P.limine_canonical(reverse) != P.limine_canonical(backup): raise ValueError("Rolled-back configuration is not the retained backup apart from the snapshot region")
+    guard()
+    _replace(root, current, reverse, identifier + "-rollback", guard=guard)
+  if _present(root / OPT_IN):
+    _opt_in(root)
+    guard()
+    (root / OPT_IN).unlink()
+    _sync((root / OPT_IN).parent)
+  if _present(root / P.POLICY):
+    if _read(root, P.POLICY) != review_raw: raise ValueError("Active policy is not the reviewed policy; preserved")
+    guard()
+    (root / P.POLICY).unlink()
+    _sync((root / P.POLICY).parent)
+  evidence = G._maintenance(root, ignore=(pending_path,))
+  pinned["resume"] = evidence["resume"]
+  if touched: gate(root, "retained")
+  if not rolled:
+    guard()
+    if not _present(archive):
+      archive.mkdir(mode=0o700)
+      _sync(archive.parent)
+    _new(archive / ROLLBACK_NAME, _encoded({"protocol": REACTIVATION_ROLLBACK, "transition_id": identifier, "intent_sha256": P.digest(raw),
+                                            "maintenance_transition_id": maintenance_id}))
+  _retire_pending(root, guard, release_db, root / pending_path, raw)
+  return {"protocol": REACTIVATION_ROLLBACK, "transition_id": identifier, "reactivated": False, "rolled_back": True,
+          "maintenance_transition_id": maintenance_id, "live_execution": False, "qualification_issued": False}
