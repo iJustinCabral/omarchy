@@ -99,7 +99,7 @@ RELEASE = "t2fixture"
 # 0755 user-owned ancestry, while the runtime and its state are root's.
 OPERATOR_UID = 1000
 ARTIFACTS = Path("/home/operator/.local/state/qualified-artifacts")
-MODULES = ("brcmfmac", "brcmfmac-wcc", "brcmfmac-cyw", "brcmfmac-bca", "t2bce_core", "t2bce_audio", "hci_bcm4377")
+MODULES = ("brcmfmac", "brcmfmac-wcc", "brcmfmac-cyw", "brcmfmac-bca", "hci_bcm4377")
 FORMOSA = "brcmfmac4377b3-pcie.apple,formosa"
 MODINFO = """#!/usr/bin/python3
 import sys

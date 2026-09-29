@@ -1,5 +1,7 @@
 import importlib.util
+import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -34,8 +36,10 @@ class Installer(unittest.TestCase):
     self.preparer.start()
     self.addCleanup(self.preparer.stop)
 
-  def prepare(self, wifi, bluetooth, t2bce_source_patch, output, profile):
+  def prepare(self, wifi, bluetooth, t2bce_source_patch, output, profile, include_bce=True):
     self.assertEqual(profile, 'wifi-reenable')
+    self.assertFalse(include_bce)
+    self.assertIsNone(t2bce_source_patch)
     output.mkdir()
     (output / 'source.c').write_text('verified source')
 
@@ -123,10 +127,26 @@ class Installer(unittest.TestCase):
     with self.assertRaises(ValueError): self.install()
     self.assertFalse(any(c[0] != '/usr/bin/lsinitcpio' for c in self.calls))
 
-  def test_audio_is_verified_without_forcing_early_load(self):
-    self.assertIn('t2bce_audio', m.MODULES)
-    self.assertNotIn('t2bce_audio', m.INITRAMFS_MODULES)
-    self.assertIn('t2bce_core', m.INITRAMFS_MODULES)
+  def test_package_is_radio_only(self):
+    self.assertEqual(set(m.MODULES), {'brcmfmac', 'brcmfmac-wcc', 'brcmfmac-cyw', 'brcmfmac-bca', 'hci_bcm4377'})
+    self.assertFalse(any('t2bce' in n for n in m.MODULES + m.INITRAMFS_MODULES))
+    conf = (m.HERE / 'dkms.conf').read_text()
+    built = set(re.findall(r'BUILT_MODULE_NAME\[\d+\]="([^"]+)"', conf))
+    self.assertEqual(built, set(m.MODULES))
+    self.assertIn('PACKAGE_VERSION="' + m.VERSION + '"', conf)
+    self.assertIn('PRE_BUILD="check-radio-qualification.sh ${kernelver}"', conf)
+    self.assertNotIn('t2bce', conf + (m.HERE / 'build-modules.sh').read_text())
+    self.assertIn('usr/src/omarchy-t2-radio-' + m.VERSION, (m.HERE / 'initcpio-install').read_text())
+    self.assertIn('omarchy-t2-radio/' + m.VERSION + '/', (m.HERE / 'initcpio-install').read_text())
+    self.assertTrue(os.access(m.HERE / 'check-radio-qualification.sh', os.X_OK))
+
+  def test_install_ships_gate_and_builds_no_bce(self):
+    self.install()
+    for name in m.SOURCE_FILES:
+      self.assertTrue((self.root / m.SOURCE / name).is_file(), name)
+    self.assertTrue(os.access(self.root / m.SOURCE / 'check-radio-qualification.sh', os.X_OK))
+    self.assertNotIn('t2bce', (self.root / m.SOURCE / 'dkms.conf').read_text())
+    self.assertFalse((self.root / m.SOURCE / 'drivers/staging').exists())
 
   def test_source_drift(self):
     self.install()

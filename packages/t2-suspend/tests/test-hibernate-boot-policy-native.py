@@ -791,7 +791,7 @@ class AssessFixture(unittest.TestCase):
     def config_changes(other): other.write_config(audited_details_sha256="d" * 64)
     def manifest_changes(other): other.write_config(manifest={**other.config["manifest"], "protocol": "fixture-2"})
     def write(relative, raw=b"changed"): return lambda other: other.write(relative, raw)
-    state, module = STATE_DIR + "/artifacts/", "usr/lib/modules/" + self.RELEASE + "/updates/dkms/t2bce_core.ko.zst"
+    state, module = STATE_DIR + "/artifacts/", "usr/lib/modules/" + self.RELEASE + "/updates/dkms/hci_bcm4377.ko.zst"
     cases = {
       "kernel": (lambda other: (other.root / "usr/lib/modules/7.3.0-new").mkdir(), ["kernel"]),
       "production_uki": (lambda other: other.coherent_kernel_update(), ["production_uki"]),

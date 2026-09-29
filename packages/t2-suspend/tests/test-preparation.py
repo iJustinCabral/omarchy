@@ -60,6 +60,15 @@ class Preparation(unittest.TestCase):
         self.assertTrue(json.loads((self.out / 'provenance.json').read_text())['source_parity'])
         self.assertEqual(self.out.stat().st_mode & 0o777, 0o755)
 
+    def test_radio_only_preparation_needs_and_publishes_no_bce(self):
+        self.manifest['patches'].append({'path': 'change.patch', 'sha256': module.digest(self.patch), 'series': 'bce'})
+        self.save()
+        self.bce_source.write_text('drifted but unused')
+        module.prepare(self.wifi, self.bt, None, self.out, 's3', include_bce=False)
+        self.assertEqual((self.out / 'drivers/net/wireless/broadcom/brcm80211/a.c').read_bytes(), b'new\n')
+        self.assertFalse((self.out / 'drivers/staging').exists())
+        self.assertNotIn('t2bce_source_commit', json.loads((self.out / 'provenance.json').read_text()))
+
     def test_existing_output_preserved(self):
         self.out.mkdir()
         (self.out / 'owned').write_text('keep')

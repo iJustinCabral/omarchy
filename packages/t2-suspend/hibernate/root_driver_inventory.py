@@ -1,7 +1,7 @@
 """Read-only exact root-side T2 radio module and firmware inventory.
 
-This covers only the installer's seven selected modules and matching Broadcom
-firmware, not the full hibernation dependency/effect closure or update safety.
+This covers only the installer's five selected radio modules (the BCE family is
+stock-only since package 1.6) and matching Broadcom firmware, not the full hibernation dependency/effect closure or update safety.
 Live callers must verify the reviewed installed runtime, supply an audited
 kernel release, and own package/physical exclusion throughout capture; fixed
 path checking alone is not code review.
@@ -15,8 +15,7 @@ import stat
 import subprocess
 
 SOURCE = Path("/var/lib/omarchy/t2-hibernate-product/runtime/packages/t2-suspend/hibernate/root_driver_inventory.py")
-MODULES = ("brcmfmac", "brcmfmac-wcc", "brcmfmac-cyw", "brcmfmac-bca",
-           "t2bce_core", "t2bce_audio", "hci_bcm4377")
+MODULES = ("brcmfmac", "brcmfmac-wcc", "brcmfmac-cyw", "brcmfmac-bca", "hci_bcm4377")
 FORMOSA = "brcmfmac4377b3-pcie.apple,formosa"
 SUFFIXES = (".bin", "-SPPR-m.txt", "-SPPR-u.txt", ".clm_blob", ".txcap_blob")
 MAX_FILE = 32 * 1024 * 1024

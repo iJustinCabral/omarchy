@@ -1,9 +1,17 @@
 #!/bin/bash
-# A failed DKMS build must not silently put stock radio drivers into a new image.
+# A failed DKMS build must not silently put stock radio drivers into a new image, and the
+# BCE family must never be mixed or foreign. Radio policy for one kernel:
+#   all five radio modules come from the package build -> accept;
+#   all five are stock, no package build exists, and the kernel is NOT qualified (DKMS
+#     skipped the package through its PRE_BUILD gate) -> accept with a warning;
+#   all five are stock, no package build exists, but the kernel IS qualified -> refuse
+#     (the build failed or was never run);
+#   any mixture, or any module that is neither the package build nor stock -> refuse.
 build() {
   [[ $KERNELVERSION == *-t2 ]] || return 0
-  local module selected built expected actual vermagic
+  local module selected built expected actual vermagic name
   local root=${_optmoduleroot%/}
+  local source=$root/usr/src/omarchy-t2-radio-1.6
   # Apple board-specific firmware is requested dynamically and is absent from
   # MODULE_FIRMWARE metadata. Wi-Fi probes before the real root is mounted.
   local firmware suffix
@@ -15,31 +23,65 @@ build() {
     [[ -f $firmware ]] || continue
     add_file "$firmware" "${firmware#"$root"}" || exit 1
   done
-  for module in brcmfmac brcmfmac-wcc brcmfmac-cyw brcmfmac-bca t2bce_core t2bce_audio hci_bcm4377; do
+  # BCE coherence: the stock t2bce_* family is one kernel-built unit; a replacement of
+  # any member (updates/, extra/, ...) loads against mismatched in-tree siblings.
+  for name in t2bce_dma t2bce_core t2bce_vhci t2bce_audio t2bce_ave; do
+    if ! selected=$(modinfo -b "${root:-/}" -k "$KERNELVERSION" -n "$name" 2>/dev/null); then
+      [[ $name == t2bce_ave ]] && continue
+      error "Missing T2 BCE module: $name"
+      exit 1
+    fi
+    [[ $selected == */kernel/drivers/staging/t2bce/* ]] || {
+      error "Mixed or foreign T2 BCE module family: $name resolves to $selected; every t2bce_* module must come from the stock kernel tree"
+      exit 1
+    }
+  done
+  local packaged=0 stock=0
+  for module in brcmfmac brcmfmac-wcc brcmfmac-cyw brcmfmac-bca hci_bcm4377; do
     selected=$(modinfo -b "${root:-/}" -k "$KERNELVERSION" -n "$module") || exit 1
-    built=$root/var/lib/dkms/omarchy-t2-radio/1.5/$KERNELVERSION/x86_64/module/$module.ko
+    built=$root/var/lib/dkms/omarchy-t2-radio/1.6/$KERNELVERSION/x86_64/module/$module.ko
     # DKMS may compress its stored modules to match the target kernel.
     if [[ ! -f $built ]]; then
       for actual in "$built.xz" "$built.zst" "$built.gz"; do
         if [[ -f $actual ]]; then built=$actual; break; fi
       done
     fi
-    [[ -f $built ]] || { error "Missing T2 DKMS build for $module / $KERNELVERSION"; exit 1; }
-    expected=$(modinfo -F srcversion "$built") || exit 1
-    actual=$(modinfo -F srcversion "$selected") || exit 1
     vermagic=$(modinfo -F vermagic "$selected") || exit 1
     [[ ${vermagic%% *} == "$KERNELVERSION" ]] || { error "Wrong T2 module ABI: $module"; exit 1; }
-    [[ -n $expected && $expected == "$actual" ]] || { error "Stock/conflicting T2 module selected: $module"; exit 1; }
+    actual=$(modinfo -F srcversion "$selected") || exit 1
+    if [[ -f $built ]]; then
+      expected=$(modinfo -F srcversion "$built") || exit 1
+      [[ -n $expected && $expected == "$actual" ]] || { error "Stock/conflicting T2 module selected: $module"; exit 1; }
+      packaged=$((packaged + 1))
+    elif [[ $selected == */kernel/drivers/* ]]; then
+      stock=$((stock + 1))
+    else
+      error "Foreign T2 radio module selected: $module ($selected)"
+      exit 1
+    fi
   done
-  add_file "$root/usr/src/omarchy-t2-radio-1.5/provenance.json" /etc/omarchy-t2-radio-source.json || exit 1
-  # Include Wi-Fi and the BCE parent. Audio stays on the root filesystem, and Bluetooth loads through its gate.
+  if (( packaged != 0 && stock != 0 )); then
+    error "Mixed T2 radio module set: $packaged package and $stock stock modules"
+    exit 1
+  elif (( stock != 0 )); then
+    local status=0
+    "$source/check-radio-qualification.sh" "$KERNELVERSION" "${root:-/}" >/dev/null 2>&1 || status=$?
+    case $status in
+      0) error "T2 radio package build is missing for a qualified kernel: $KERNELVERSION"; exit 1 ;;
+      1) warning "T2 radio package skipped for unqualified kernel $KERNELVERSION; using stock radio drivers" ;;
+      *) error "Cannot evaluate T2 radio qualification for $KERNELVERSION"; exit 1 ;;
+    esac
+  fi
+  add_file "$source/provenance.json" /etc/omarchy-t2-radio-source.json || exit 1
+  # Include Wi-Fi only. Audio and the BCE family stay stock on the root filesystem
+  # (t2bce_vhci is pulled in by the stock initramfs configuration), and Bluetooth
+  # loads through its gate.
   add_module brcmfmac || exit 1
   add_module brcmfmac-wcc || exit 1
   add_module brcmfmac-cyw || exit 1
   add_module brcmfmac-bca || exit 1
-  add_module t2bce_core || exit 1
   (( _builderrors == 0 )) || { error "T2 initramfs dependency errors; preserving existing image"; exit 1; }
 }
 help() {
-  echo "Verify the T2 DKMS modules and include Wi-Fi without early audio or Bluetooth loading."
+  echo "Verify the T2 radio drivers and include Wi-Fi without early audio or Bluetooth loading."
 }

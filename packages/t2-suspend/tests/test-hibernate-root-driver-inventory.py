@@ -55,10 +55,10 @@ class RootDrivers(unittest.TestCase):
 
   def test_same_srcversion_changed_bytes_are_detected(self):
     first = self.capture()
-    (self.modules / "t2bce_core.ko.zst").write_bytes(b"different but same srcversion")
+    (self.modules / "hci_bcm4377.ko.zst").write_bytes(b"different but same srcversion")
     second = self.capture()
-    self.assertEqual(first["modules"]["t2bce_core"]["srcversion"], second["modules"]["t2bce_core"]["srcversion"])
-    self.assertNotEqual(first["modules"]["t2bce_core"]["sha256"], second["modules"]["t2bce_core"]["sha256"])
+    self.assertEqual(first["modules"]["hci_bcm4377"]["srcversion"], second["modules"]["hci_bcm4377"]["srcversion"])
+    self.assertNotEqual(first["modules"]["hci_bcm4377"]["sha256"], second["modules"]["hci_bcm4377"]["sha256"])
 
   def hardlink_firmware(self):
     for suffix in (".bin", "-SPPR-m.txt"):
@@ -92,7 +92,7 @@ class RootDrivers(unittest.TestCase):
     self.assertIn("Bounded owned regular", result["errors"]["firmware"])
     self.assertEqual(set(result["modules"]), set(I.MODULES))  # a firmware failure never discards the modules
     (self.firmware / (I.FORMOSA + ".bin")).chmod(0o644)
-    (self.modules / "t2bce_core.ko.zst").chmod(0o666)
+    (self.modules / "hci_bcm4377.ko.zst").chmod(0o666)
     result = I.capture_baseline(self.root, self.release, query=self.query)
     self.assertIsNone(result["modules"])
     self.assertIn("Bounded owned regular", result["errors"]["modules"])

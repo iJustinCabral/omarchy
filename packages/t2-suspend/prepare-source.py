@@ -15,7 +15,7 @@ HERE = Path(__file__).resolve().parent
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
-def prepare(wifi, bluetooth, t2bce_source_patch, output, profile):
+def prepare(wifi, bluetooth, t2bce_source_patch, output, profile, include_bce=True):
     manifest = json.loads((HERE / 'manifest.json').read_text())
     if output.exists():
         raise ValueError('Output already exists; choose a new directory')
@@ -24,10 +24,12 @@ def prepare(wifi, bluetooth, t2bce_source_patch, output, profile):
             raise ValueError(f'Wi-Fi source mismatch: {name}')
     if digest(bluetooth) != manifest['bluetooth_base_sha256']:
         raise ValueError('Bluetooth source mismatch')
-    if digest(t2bce_source_patch) != manifest['t2bce_source']['sha256']:
+    if include_bce and digest(t2bce_source_patch) != manifest['t2bce_source']['sha256']:
         raise ValueError('T2 BCE source patch mismatch')
+    # include_bce=False is the radio DKMS package: Wi-Fi and Bluetooth only, no BCE source.
     selected = [p for p in manifest['patches']
-                if p['series'] != 'wifi-reenable' or profile == 'wifi-reenable']
+                if (p['series'] != 'wifi-reenable' or profile == 'wifi-reenable') and
+                (include_bce or p['series'] != 'bce')]
     for patch in selected:
         if digest(HERE / patch['path']) != patch['sha256']:
             raise ValueError(f"Patch mismatch: {patch['path']}")
@@ -42,18 +44,19 @@ def prepare(wifi, bluetooth, t2bce_source_patch, output, profile):
         bt = root / 'drivers/bluetooth/hci_bcm4377.c'
         bt.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(bluetooth, bt)
-        extracted = root / '.t2bce-extracted'
-        extracted.mkdir()
-        subprocess.run(['patch', '--batch', '--fuzz=0', '-p1', '-i',
-                        str(t2bce_source_patch)], cwd=extracted, check=True)
-        for name, expected in manifest['t2bce_source']['base'].items():
-            source = extracted / name
-            if digest(source) != expected:
-                raise ValueError(f'T2 BCE base source mismatch: {name}')
-            target = root / name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source, target)
-        shutil.rmtree(extracted)
+        if include_bce:
+            extracted = root / '.t2bce-extracted'
+            extracted.mkdir()
+            subprocess.run(['patch', '--batch', '--fuzz=0', '-p1', '-i',
+                            str(t2bce_source_patch)], cwd=extracted, check=True)
+            for name, expected in manifest['t2bce_source']['base'].items():
+                source = extracted / name
+                if digest(source) != expected:
+                    raise ValueError(f'T2 BCE base source mismatch: {name}')
+                target = root / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, target)
+            shutil.rmtree(extracted)
         for patch in selected:
             subprocess.run(['patch', '--batch', '--fuzz=0', '-p1', '-i',
                             str(HERE / patch['path'])], cwd=root, check=True)
@@ -62,15 +65,16 @@ def prepare(wifi, bluetooth, t2bce_source_patch, output, profile):
                 raise ValueError(f'Patched source mismatch: {name}')
         if digest(bt) != manifest[profile]['bluetooth_sha256']:
             raise ValueError('Patched Bluetooth mismatch')
-        for name, expected in manifest['t2bce_patched'].items():
-            if digest(root / name) != expected:
-                raise ValueError(f'Patched T2 BCE mismatch: {name}')
+        if include_bce:
+            for name, expected in manifest['t2bce_patched'].items():
+                if digest(root / name) != expected:
+                    raise ValueError(f'Patched T2 BCE mismatch: {name}')
         (bt.parent / 'Makefile').write_text('obj-m += hci_bcm4377.o\n')
         (root / 'provenance.json').write_text(json.dumps({
             'profile': profile, 'lab_commit': manifest['lab_commit'],
             'manifest_sha256': digest(HERE / 'manifest.json'),
             'kernel_release': manifest['kernel_release'],
-            't2bce_source_commit': manifest['t2bce_source']['commit'],
+            **({'t2bce_source_commit': manifest['t2bce_source']['commit']} if include_bce else {}),
             'source_parity': True,
         }, indent=2) + '\n')
         # Only a fully verified source tree is published; an existing output is refused.
