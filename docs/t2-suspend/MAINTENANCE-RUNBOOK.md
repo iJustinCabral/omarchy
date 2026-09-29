@@ -333,6 +333,23 @@ While hibernation is active, and at H3, Limine checks ignore only the region tha
 
 Entering maintenance writes back the retained stock bytes, whose snapshot list reflects the time hibernation was staged. Until `limine-snapper-sync` runs again (at the next snapshot, including the one `omarchy update` creates), the boot menu may list snapshots that were since deleted or miss newer ones. Selecting a missing snapshot entry fails to boot; it is never the default. To refresh immediately after H3, run `sudo limine-snapper-sync` (attended). This does not affect maintenance, which ignores the snapshot region.
 
+## 9. Retiring the staged UKI pair after a kernel update
+
+After a kernel update changes `/boot/EFI/Linux/omarchy_linux-t2.efi`, `stage-hibernation-uki-pair.py rollback` and `clear` fail closed (`Production UKI changed during pair staging`) and `stage` refuses while the old receipt or images exist. `retire-after-production-change` is the reviewed way out. It never touches the production UKI, other Limine entries, or the consumed-guard and vector evidence directories in `/var/lib/omarchy-t2-hibernation-pair/`.
+
+Preconditions (all checked, all read-only until they pass; any failure changes nothing): the maintenance marker `package-maintenance.pending` exists; `boot-policy.json`, the opt-in `/etc/omarchy/t2-hibernate-product.enabled`, the activation, deactivation and runtime-upgrade pendings, and any `LoaderEntryOneShot` or `LoaderEntryDefault` are absent; no `.pending*` entry under `/var/lib/omarchy/t2-hibernate-trial`; the current boot is the stock `Omarchy.linux-t2`; the receipt state is one of `staged`, `source-arming`, `restore-arming`, `restore-disarmed`, `rolled-back` or `stage-failed-recovered`; both ESP images still match the receipt SHA-256 and BLAKE2b; the production UKI SHA-256 differs from the receipt; and the Limine judgement below passes. It then takes `pacman` `db.lck` and the physical-cycle `flock`, as the product transitions do.
+
+Limine drift is judged with `boot_policy.limine_canonical`, imported and not reimplemented. The exact pair block rebuilt from the receipt is removed from the current bytes; both that remainder and the pre-staging backup are canonicalised (snapshot region removed) and the production path line hash is masked. The two must then be byte-equal, so only the production hash and the `limine-snapper-sync` snapshots may differ. The new hash must equal the BLAKE2b of the current production UKI, which proves the kernel update finished. Foreign entries, `default_entry`, cmdline, unrecognised snapshot text or edited pair text refuse. Do not edit `limine.conf` by hand to make it pass (section 7).
+
+Steps: archive to `/var/lib/omarchy-t2-hibernation-pair-retired/<receipt-sha16>-<n>/` (0700: images, receipt, backup, current `limine.conf`, `manifest.json` of hashes), fsync, write `journal.json`, remove only the pair block from the current Limine bytes (the new production hash and snapshots are kept; the old backup is never restored over them), remove the two ESP images, the backup and the receipt, then write `retirement.json` chaining to the old receipt SHA-256. Each step is detected from disk, so an interrupted run is finished by running it again; `retire-rollback` instead restores the archived images, backup, block and receipt of an interrupted (not completed) retirement. A second run after success only reports `already-retired`. `stage` may then run for the new generation.
+
+```bash
+P=/home/jjc/Projects/MBA_9_1/packages/t2-suspend/experiments/stage-hibernation-uki-pair.py
+sudo /usr/bin/python3 -I -B "$P" retire-after-production-change --dry-run   # read-only plan
+sudo /usr/bin/python3 -I -B "$P" retire-after-production-change             # attended; run once, re-run if interrupted
+sudo /usr/bin/python3 -I -B "$P" retire-rollback                            # only to undo an interrupted retirement
+```
+
 ## Summary of gaps
 
 - No code path re-publishes a new resume tuple, or retires maintenance, when the swapfile or cmdline changed; only restoring the original topology is supported today.

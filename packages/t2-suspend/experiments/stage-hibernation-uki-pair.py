@@ -8,6 +8,8 @@ PM and does not qualify either private image for hardware testing.
 """
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 from importlib.machinery import SourceFileLoader
 import importlib.util
@@ -17,6 +19,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+import time
 
 
 HERE = Path(__file__).resolve().parent
@@ -543,11 +546,424 @@ def clear_rolled_back(root):
   return {**receipt, "state": "cleared"}
 
 
+# ---- Retirement after a production kernel update -------------------------------------
+#
+# A kernel update (limine-mkinitcpio) rewrites the production UKI and the hash on the
+# production Limine path line, and limine-snapper-sync rewrites the snapshot region.
+# verify_staged() then fails closed forever, so rollback and clear cannot retire the
+# pair. retire() is the only path out: it is allowed only during inactive package
+# maintenance, never touches the production UKI, and archives everything first.
+ARCHIVE_ROOT = Path("var/lib/omarchy-t2-hibernation-pair-retired")
+PRODUCT_STATE = Path("var/lib/omarchy/t2-hibernate-product")
+MAINTENANCE = PRODUCT_STATE / "package-maintenance.pending"
+PRODUCT_ACTIVE = (
+  PRODUCT_STATE / "boot-policy.json",
+  PRODUCT_STATE / "source-default-activation.pending",
+  PRODUCT_STATE / "source-default-deactivation.pending",
+  PRODUCT_STATE / "runtime-upgrade.pending",
+  PRODUCT_STATE / ".runtime-pending",
+  Path("etc/omarchy/t2-hibernate-product.enabled"),
+)
+TRIAL_STATE = Path("var/lib/omarchy/t2-hibernate-trial")
+PHYSICAL_LOCK = TRIAL_STATE / "physical-cycle.lock"
+DB_LOCK = Path("var/lib/pacman/db.lck")
+RETIRE_PROTOCOL = "omarchy-t2-hibernation-pair-retirement-v1"
+WITH_IMAGES = ("staged", "source-arming", "restore-arming", "restore-disarmed")
+WITHOUT_IMAGES = ("rolled-back", "stage-failed-recovered")
+PRODUCTION_PATH = re.compile(
+  rb"^([ \t]*path:[ \t]*boot\(\):/EFI/Linux/" + re.escape(SINGLE.PRODUCTION_IMAGE.encode()) + rb")#([0-9a-f]{128})[ \t]*$",
+  re.M,
+)
+
+
+def boot_policy():
+  return import_path("pair_retire_boot_policy", HERE.parent / "hibernate/boot_policy.py")
+
+
+def bytes_digest(data):
+  return hashlib.sha256(data).hexdigest()
+
+
+def read_file(path):
+  if path.is_symlink() or not path.is_file():
+    raise ValueError("Missing or non-regular file: " + str(path))
+  return path.read_bytes()
+
+
+def tree_has_pending(path):
+  if not path.is_dir():
+    return False
+  for _directory, names, files in os.walk(path):
+    if any(name.startswith(".pending") for name in names + files):
+      return True
+  return False
+
+
+def mask_production_hash(canonical):
+  """(canonical Limine bytes with the production hash blanked, that BLAKE2b hash)."""
+  matches = PRODUCTION_PATH.findall(canonical)
+  if len(matches) != 1:
+    raise ValueError("Limine must have exactly one production UKI path line")
+  return PRODUCTION_PATH.sub(lambda match: match.group(1) + b"#<production-blake2>", canonical), matches[0][1].decode()
+
+
+def receipt_block(receipt):
+  for role in IMAGES:
+    metadata = receipt["images"][role]
+    if metadata["entry_id"] != entry_id(role, metadata["sha256"]):
+      raise ValueError("Receipt " + role + " entry is not bound to its UKI hash")
+  return stage_block({role: receipt["images"][role] for role in IMAGES})
+
+
+def judge_limine(root, receipt, current, backup):
+  """Return (current bytes without our block, new production BLAKE2b, block present).
+
+  The only drift accepted is what a production kernel update legitimately causes:
+  the hash on the production path line (which must be coherent with the current
+  production UKI) and the limine-snapper-sync snapshot region (removed from both
+  sides by boot_policy.limine_canonical). Everything else, including default_entry,
+  /+Omarchy and //linux-t2, the EFI fallback and foreign entries, must equal the
+  pre-staging backup byte for byte. Unrecognised snapshot text refuses.
+  """
+  policy = boot_policy()
+  if bytes_digest(backup) != receipt["original_limine_sha256"]:
+    raise ValueError("Pair Limine backup changed")
+  block = receipt_block(receipt)
+  present = current.count(block)
+  if present > 1:
+    raise ValueError("Managed pair block is duplicated")
+  remainder = current.replace(block, b"") if present else current
+  for marker in (BEGIN, END, SINGLE.BEGIN, SINGLE.END, "/MBA-T2-hibernation-"):
+    if marker.encode() in remainder:
+      raise ValueError("Limine holds unowned or modified pair text: " + marker)
+  expected, _old_hash = mask_production_hash(policy.limine_canonical(backup))
+  actual, new_hash = mask_production_hash(policy.limine_canonical(remainder))
+  if actual != expected:
+    raise ValueError("Limine changed beyond the production UKI hash and snapshot region")
+  production = rooted(root, Path("boot/EFI/Linux") / SINGLE.PRODUCTION_IMAGE)
+  if not production.is_file() or SINGLE.blake2(production) != new_hash:
+    raise ValueError("Production Limine hash is not coherent with the current production UKI; finish the kernel update first")
+  return remainder, new_hash, bool(present)
+
+
+def choose_archive(root, receipt_sha):
+  """First archive directory for this receipt that is not a completed retirement."""
+  base = rooted(root, ARCHIVE_ROOT)
+  index = 0
+  while True:
+    directory = base / (receipt_sha[:16] + "-" + str(index))
+    if not (directory / "retirement.json").exists():
+      return directory
+    index += 1
+
+
+def retirement_records(root):
+  base = rooted(root, ARCHIVE_ROOT)
+  records = []
+  if base.is_dir():
+    for directory in sorted(base.iterdir()):
+      record = directory / "retirement.json"
+      if record.is_file():
+        records.append(json.loads(record.read_text()))
+  return sorted(records, key=lambda record: (record["retired_at_unix"], record["retired_receipt_sha256"]))
+
+
+def incomplete_journals(root):
+  base = rooted(root, ARCHIVE_ROOT)
+  found = []
+  if base.is_dir():
+    for directory in sorted(base.iterdir()):
+      journal = directory / "journal.json"
+      if journal.is_file() and not (directory / "retirement.json").exists():
+        found.append((directory, json.loads(journal.read_text())))
+  return found
+
+
+def check_quiescent(root):
+  if not rooted(root, MAINTENANCE).is_file():
+    raise ValueError("Retirement is only allowed during package maintenance (marker absent)")
+  for relative in PRODUCT_ACTIVE:
+    path = rooted(root, relative)
+    if path.exists() or path.is_symlink():
+      raise ValueError("Hibernation product is active or transitioning: " + relative.name)
+  for relative in (SINGLE.ONESHOT, SINGLE.DEFAULT):
+    if rooted(root, relative).exists():
+      raise ValueError("A boot one-shot or persistent default is armed: " + relative.name)
+  if tree_has_pending(rooted(root, TRIAL_STATE)):
+    raise ValueError("A hibernation trial is pending")
+  if selected_entry(root) != "Omarchy.linux-t2":
+    raise ValueError("Pair retirement requires the stock boot")
+  if any(rooted(root, path).exists() for path in (SINGLE.RECEIPT, SINGLE.BACKUP, SINGLE.IMAGE)):
+    raise ValueError("A legacy candidate boot transaction is active")
+
+
+def check_images(root, receipt, *, fresh):
+  present = {}
+  for role, relative in IMAGES.items():
+    metadata = receipt["images"][role]
+    image = rooted(root, relative)
+    if not image.exists():
+      present[role] = False
+      continue
+    if not image.is_file() or digest(image) != metadata["sha256"] or SINGLE.blake2(image) != metadata["blake2"]:
+      raise ValueError("ESP " + role + " image does not match the staged receipt")
+    present[role] = True
+  if fresh and receipt["state"] in WITH_IMAGES and not all(present.values()):
+    raise ValueError("A staged pair image is missing from the ESP")
+  if fresh and receipt["state"] in WITHOUT_IMAGES and any(present.values()):
+    raise ValueError("A pair image remains after rollback; use rollback")
+  return present
+
+
+def plan_retirement(root, receipt, receipt_raw, backup, *, fresh):
+  if receipt.get("state") not in WITH_IMAGES + WITHOUT_IMAGES:
+    raise ValueError("Pair transaction state cannot be retired: " + str(receipt.get("state")))
+  check_quiescent(root)
+  state = rooted(root, STATE)
+  if state.exists():
+    validate_state(state, (RECEIPT.name, BACKUP.name))
+  production = rooted(root, Path("boot/EFI/Linux") / SINGLE.PRODUCTION_IMAGE)
+  if not production.is_file():
+    raise ValueError("Production UKI is missing")
+  new_production = digest(production)
+  if fresh and new_production == receipt["production_uki_sha256"]:
+    raise ValueError("Production UKI is unchanged; use rollback and clear")
+  present = check_images(root, receipt, fresh=fresh)
+  current = read_file(rooted(root, SINGLE.LIMINE))
+  remainder, new_hash, block_present = judge_limine(root, receipt, current, backup)
+  if fresh and receipt["state"] in WITH_IMAGES and not block_present:
+    raise ValueError("Managed pair block is missing from Limine")
+  if fresh and receipt["state"] in WITHOUT_IMAGES and block_present:
+    raise ValueError("Managed pair block remains after rollback; use rollback")
+  return {
+    "action": "retire-after-production-change",
+    "receipt_sha256": bytes_digest(receipt_raw),
+    "receipt_state": receipt["state"],
+    "old_production_uki_sha256": receipt["production_uki_sha256"],
+    "new_production_uki_sha256": new_production,
+    "new_production_blake2": new_hash,
+    "images_present": present,
+    "limine_block_present": block_present,
+    "limine_before_sha256": bytes_digest(current),
+    "limine_after_sha256": bytes_digest(remainder),
+    "steps": ["archive", "journal", "limine", "image-source", "image-restore", "backup", "receipt", "record"],
+  }, remainder
+
+
+@contextmanager
+def retirement_locks(root):
+  """Same exclusion the product transitions use: pacman db.lck plus the physical cycle lock."""
+  lock = rooted(root, PHYSICAL_LOCK)
+  if lock.is_symlink() or not lock.is_file():
+    raise ValueError("Fixed physical cycle lock is missing")
+  db = rooted(root, DB_LOCK)
+  try:
+    db_fd = os.open(db, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+  except FileExistsError:
+    raise ValueError("pacman db.lck is held; retry after the package transaction ends") from None
+  physical = None
+  try:
+    physical = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+      fcntl.flock(physical, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+      raise ValueError("A hibernation cycle holds the physical lock") from None
+    yield
+  finally:
+    if physical is not None:
+      os.close(physical)
+    held = os.fstat(db_fd)
+    os.close(db_fd)
+    current = db.lstat()
+    if (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino):
+      db.unlink()
+      SINGLE.fsync_directory(db.parent)
+
+
+def write_json(path, value):
+  atomic_write(path, (json.dumps(value, indent=2, sort_keys=True) + "\n").encode(), 0o600)
+
+
+def write_archive(root, plan, receipt_raw, backup, current):
+  base = rooted(root, ARCHIVE_ROOT)
+  directory = choose_archive(root, plan["receipt_sha256"])
+  for path in (base, directory, directory / "images"):
+    path.mkdir(parents=True, mode=0o700, exist_ok=True)
+    path.chmod(0o700)
+  files = {"receipt.json": receipt_raw, "limine.conf.before": backup, "limine.conf.at-retirement": current}
+  for role, relative in IMAGES.items():
+    if plan["images_present"][role]:
+      files["images/" + role + ".efi"] = rooted(root, relative).read_bytes()
+  for name, data in files.items():
+    atomic_write(directory / name, data, 0o600)
+  write_json(directory / "manifest.json", {
+    "protocol": RETIRE_PROTOCOL,
+    "receipt_sha256": plan["receipt_sha256"],
+    "files": {name: bytes_digest(data) for name, data in sorted(files.items())},
+  })
+  for path in (directory / "images", directory, base):
+    SINGLE.fsync_directory(path)
+  return directory
+
+
+def write_journal(directory, plan):
+  seed = {key: plan[key] for key in ("receipt_sha256", "receipt_state", "old_production_uki_sha256", "new_production_uki_sha256")}
+  write_json(directory / "journal.json", {**seed, "protocol": RETIRE_PROTOCOL, "phase": "archived"})
+  SINGLE.fsync_directory(directory)
+
+
+def verify_archive(directory, receipt_sha):
+  manifest = json.loads(read_file(directory / "manifest.json"))
+  if manifest.get("receipt_sha256") != receipt_sha or manifest.get("protocol") != RETIRE_PROTOCOL:
+    raise ValueError("Retirement archive manifest does not bind this receipt")
+  for name, expected in manifest["files"].items():
+    if bytes_digest(read_file(directory / name)) != expected:
+      raise ValueError("Retirement archive file changed: " + name)
+  return manifest
+
+
+def retire(root, *, dry_run=False, step_hook=None):
+  """Retire the pair after the production UKI changed. Idempotent and resumable."""
+  hook = step_hook or (lambda _name: None)
+  pending = incomplete_journals(root)
+  if len(pending) > 1:
+    raise ValueError("More than one incomplete retirement journal")
+  receipt_path = rooted(root, RECEIPT)
+  if pending:
+    directory, journal = pending[0]
+    receipt_raw = read_file(directory / "receipt.json")
+    if journal.get("receipt_sha256") != bytes_digest(receipt_raw):
+      raise ValueError("Retirement journal does not bind its archived receipt")
+    if receipt_path.exists() and read_file(receipt_path) != receipt_raw:
+      raise ValueError("Live receipt differs from the interrupted retirement")
+    fresh = False
+  else:
+    if not receipt_path.exists():
+      records = retirement_records(root)
+      if records:
+        return {"state": "already-retired", "retirement": records[-1]}
+      raise ValueError("Pair staging receipt is missing and no retirement record exists")
+    receipt_raw = read_file(receipt_path)
+    directory, fresh = None, True
+  receipt = json.loads(receipt_raw)
+  if not isinstance(receipt, dict):
+    raise ValueError("Pair staging receipt is malformed")
+
+  def backup_bytes():
+    live = rooted(root, BACKUP)
+    if live.exists():
+      return read_file(live)
+    if fresh:
+      raise ValueError("Pair Limine backup is missing")
+    return read_file(directory / "limine.conf.before")
+
+  plan, remainder = plan_retirement(root, receipt, receipt_raw, backup_bytes(), fresh=fresh)
+  plan["state"] = "dry-run" if dry_run else ("retiring" if fresh else "resume")
+  if dry_run:
+    return plan
+  limine = rooted(root, SINGLE.LIMINE)
+  with retirement_locks(root):
+    plan, remainder = plan_retirement(root, receipt, receipt_raw, backup_bytes(), fresh=fresh)
+    if fresh:
+      directory = write_archive(root, plan, receipt_raw, backup_bytes(), limine.read_bytes())
+      hook("archive")
+      write_journal(directory, plan)
+      hook("journal")
+    manifest = verify_archive(directory, plan["receipt_sha256"])
+    if plan["limine_block_present"]:
+      atomic_write(limine, remainder, 0o600)
+    hook("limine")
+    for role, relative in IMAGES.items():
+      image = rooted(root, relative)
+      if image.exists():
+        if digest(image) != receipt["images"][role]["sha256"]:
+          raise ValueError("Refusing to remove an unknown " + role + " image")
+        image.unlink()
+        SINGLE.fsync_directory(image.parent)
+      hook("image-" + role)
+    backup_path = rooted(root, BACKUP)
+    if backup_path.exists():
+      backup_path.unlink()
+      SINGLE.fsync_directory(backup_path.parent)
+    hook("backup")
+    if receipt_path.exists():
+      receipt_path.unlink()
+      SINGLE.fsync_directory(receipt_path.parent)
+    hook("receipt")
+    state = rooted(root, STATE)
+    if state.exists():
+      remove_state_if_empty(state)
+    record = {
+      "protocol": RETIRE_PROTOCOL,
+      "retired_receipt_sha256": plan["receipt_sha256"],
+      "receipt_state": plan["receipt_state"],
+      "old_production_uki_sha256": receipt["production_uki_sha256"],
+      "new_production_uki_sha256": plan["new_production_uki_sha256"],
+      "new_production_blake2": plan["new_production_blake2"],
+      "images": {
+        role: {"sha256": receipt["images"][role]["sha256"], "archived": "images/" + role + ".efi" in manifest["files"]}
+        for role in IMAGES
+      },
+      "limine_before_sha256": bytes_digest(read_file(directory / "limine.conf.at-retirement")),
+      "limine_after_sha256": digest(limine),
+      "archive": directory.name,
+      "archive_manifest_sha256": digest(directory / "manifest.json"),
+      "retired_at_unix": int(time.time()),
+    }
+    write_json(directory / "retirement.json", record)
+    SINGLE.fsync_directory(directory)
+    hook("record")
+  return {"state": "retired", "retirement": record}
+
+
+def retire_rollback(root):
+  """Undo an interrupted (not completed) retirement from its archive."""
+  pending = incomplete_journals(root)
+  if len(pending) != 1:
+    raise ValueError("Exactly one incomplete retirement journal is required")
+  directory, journal = pending[0]
+  receipt_raw = read_file(directory / "receipt.json")
+  receipt = json.loads(receipt_raw)
+  sha = bytes_digest(receipt_raw)
+  if journal.get("receipt_sha256") != sha:
+    raise ValueError("Retirement journal does not bind its archived receipt")
+  check_quiescent(root)
+  manifest = verify_archive(directory, sha)
+  archived_backup = read_file(directory / "limine.conf.before")
+  with retirement_locks(root):
+    limine = rooted(root, SINGLE.LIMINE)
+    judge_limine(root, receipt, read_file(limine), archived_backup)
+    for role, relative in IMAGES.items():
+      name = "images/" + role + ".efi"
+      image = rooted(root, relative)
+      if image.exists():
+        if digest(image) != receipt["images"][role]["sha256"]:
+          raise ValueError("Refusing to overwrite an unknown " + role + " image")
+      elif name in manifest["files"]:
+        atomic_write(image, read_file(directory / name), 0o600)
+    state = rooted(root, STATE)
+    state.mkdir(parents=True, mode=0o700, exist_ok=True)
+    if not rooted(root, BACKUP).exists():
+      atomic_write(rooted(root, BACKUP), archived_backup, 0o600)
+    _remainder, _hash, present = judge_limine(root, receipt, read_file(limine), archived_backup)
+    if "images/source.efi" in manifest["files"] and not present:
+      atomic_write(limine, limine.read_bytes() + receipt_block(receipt), 0o600)
+    if not rooted(root, RECEIPT).exists():
+      atomic_write(rooted(root, RECEIPT), receipt_raw, 0o600)
+    (directory / "journal.json").replace(directory / "journal.aborted.json")
+    SINGLE.fsync_directory(directory)
+  return {"state": "retirement-rolled-back", "receipt_sha256": sha}
+
+
 def main():
   parser = argparse.ArgumentParser(description=__doc__)
-  parser.add_argument("action", choices=("stage", "verify", "arm-source", "arm-restore", "disarm-restore", "rollback", "clear"))
+  parser.add_argument("action", choices=(
+    "stage", "verify", "arm-source", "arm-restore", "disarm-restore", "rollback", "clear",
+    "retire-after-production-change", "retire-rollback",
+  ))
   parser.add_argument("--source", type=Path)
   parser.add_argument("--restore", type=Path)
+  parser.add_argument("--dry-run", action="store_true", help="retire-after-production-change: print the plan and change nothing")
   args = parser.parse_args()
   if os.geteuid() != 0:
     raise SystemExit("Root required")
@@ -565,6 +981,10 @@ def main():
     result = arm_restore(root)
   elif args.action == "disarm-restore":
     result = disarm_restore(root)
+  elif args.action == "retire-after-production-change":
+    result = retire(root, dry_run=args.dry_run)
+  elif args.action == "retire-rollback":
+    result = retire_rollback(root)
   elif args.action == "rollback":
     result = rollback(root)
   else:
