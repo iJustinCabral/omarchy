@@ -243,11 +243,14 @@ def _maintenance(root, inventory=None, *, ignore=()):
         raise ValueError("Owned private maintenance evidence directories required")
   private_directories()
   paths = (transition.MAINTENANCE, archive / "maintenance-intent.json", archive / "policy.json",
-           archive / "intent.json", archive / "completion.json", policy.RECEIPT, policy.BACKUP, archive / RESUME_NAME)
+           archive / "intent.json", archive / "completion.json", policy.BACKUP, archive / RESUME_NAME)
   evidence = {path: transition._read(root, path) for path in paths}
+  # The receipt bytes the marker pins: the live staged receipt, or (after the stager retired that pair to stage a
+  # replacement) the retained copy under a retirement record chained to the same digest. Anything else refuses.
+  receipt = transition.marker_receipt(root, intent)
   if evidence[transition.MAINTENANCE] != raw or evidence[archive / "maintenance-intent.json"] != raw:
     raise ValueError("Maintenance marker/archive bytes differ")
-  old_raw, receipt = evidence[archive / "policy.json"], evidence[policy.RECEIPT]
+  old_raw = evidence[archive / "policy.json"]
   if policy.digest(old_raw) != intent["old_policy_sha256"] or policy.digest(receipt) != intent["staged_receipt_sha256"]:
     raise ValueError("Retained policy or staged receipt pin differs")
   old = policy._json(old_raw)
@@ -279,7 +282,7 @@ def _maintenance(root, inventory=None, *, ignore=()):
   transition._idle(root)
   fallback = maintenance._fallback(root)  # current coherent bytes may legitimately be NEW
   transition._idle(root)
-  if any(transition._read(root, path) != value for path, value in evidence.items()):
+  if any(transition._read(root, path) != value for path, value in evidence.items()) or transition.marker_receipt(root, intent) != receipt:
     raise ValueError("Maintenance evidence changed during verification")
   if transition._read(root, archive / "opt-in", private=False) != opt_in or transition._runtime(root) != intent["runtime_review_sha256"]:
     raise ValueError("Maintenance authority changed during verification")

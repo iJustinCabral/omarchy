@@ -29,6 +29,12 @@ re-applies the retained source default without requalification: it changes one
 runs under the same inhibitor, db.lck and physical lock as the other actions and
 its recovery is a re-run (see boot_policy_transition._reactivate). It is not
 requalification, qualification or power permission.
+
+The `rebind` action is the new-generation counterpart for a kernel update whose assessment is
+`requalification-required`: after the stager retired the old pair and a NEW pair was staged and qualified
+(externally issued config, qualification and boot-policy review, staged under distinct names), it installs that
+authority, activates the source default and retires the marker (see boot_policy_transition._rebind and
+docs/t2-suspend/REBIND-DESIGN.md). It issues no qualification and performs no power operation.
 """
 import argparse
 from contextlib import contextmanager
@@ -57,7 +63,7 @@ VENDOR_UNIT = "/usr/lib/systemd/system/systemd-hibernate.service"
 MAINTENANCE_NAME = "package-maintenance.pending"
 PROBE_BASE = Path("/run/omarchy-t2-maintenance-probe")
 EXEC_EXTRAS = ("ExecStartPre", "ExecStartPost", "ExecStop", "ExecStopPost", "ExecCondition")
-ACTIONS = ("activation", "deactivation", "maintenance", "reactivate")
+ACTIONS = ("activation", "deactivation", "maintenance", "reactivate", "rebind")
 READ_ONLY = ("assess",)
 ASSESSMENT_SCHEMA = "omarchy-t2-generation-assessment-v1"
 BOOTLOADERS = ("boot/EFI/BOOT/BOOTX64.EFI", "boot/EFI/limine/limine_x64.efi")
@@ -576,11 +582,12 @@ def _item_bootloader(engine, root, state):
   return {"files": files}
 
 
-def generation_items(engine, root=ROOT):
+def generation_items(engine, root=ROOT, *, config_name="config.json", qualification_name="qualification.json"):
   """Identity items of the generation the qualified config names, in the baseline's exact shape.
 
   Read-only and shared by the publisher (baseline provider) and `assess`, so both
-  sides recompute identically. Failures never raise: each item becomes
+  sides recompute identically. `rebind` passes the staged file names to capture the
+  generation its replacement authority names before installing it. Failures never raise: each item becomes
   {"unavailable": reason}. Returns (items, errors), errors mapping every
   unavailable item to its reason; the publisher refuses only when a
   CRITICAL_ITEMS entry is unavailable, so an unusual host still publishes and
@@ -591,7 +598,7 @@ def generation_items(engine, root=ROOT):
     if key not in state: raise ValueError("Prerequisite unavailable: " + key)
     return state[key]
   def config():
-    raw = engine._read(root, engine.P.STATE / "config.json")
+    raw = engine._read(root, engine.P.STATE / config_name)
     state["config"] = parsed = engine.P._json(raw)
     return {"sha256": engine.P.digest(raw), "audited_details_sha256": parsed["audited_details_sha256"],
             "staged_receipt_sha256": parsed["staged_receipt_sha256"]}
@@ -622,7 +629,7 @@ def generation_items(engine, root=ROOT):
       errors[name] = type(error).__name__ + ": " + str(error)[:200]
       items[name] = {"unavailable": errors[name]}
   run("config", config)
-  run("qualification", lambda: {"sha256": engine.P.digest(engine._read(root, engine.P.STATE / "qualification.json"))})
+  run("qualification", lambda: {"sha256": engine.P.digest(engine._read(root, engine.P.STATE / qualification_name))})
   run("manifest", manifest)
   run("_provenance", lambda: provenance() or {})
   items.pop("_provenance"); errors.pop("_provenance", None)
@@ -768,9 +775,49 @@ def _reactivation_postchecks(engine, root, baseline):
     raise ValueError("Generation items differ from the baseline after reactivation")
 
 
+def _rebind_inspect(engine, evidence, staged):
+  """Product-level validation of the STAGED replacement authority, before anything is installed (read-only).
+
+  The derived audit must reproduce the archived resume target (the swap location is not requalified here), the
+  product validator must accept the staged config and qualification for the derived manifest, the new pair must
+  verify as staged stock, and the fresh generation baseline is captured from the staged names.
+  """
+  product = engine.PRODUCT
+  config, qualification = staged["config"], staged["qualification"]
+  report = product.ARTIFACTS.derive_artifacts(config["source_directory"], config["restore_directory"], config["production_uki"])
+  if report["audited_details"]["restore_protocol"]["resume"] != evidence["resume"]:
+    raise ValueError("Derived resume target differs from the archived maintenance evidence")
+  product.validate(config, qualification, report)
+  product.TRIAL._verify_deployment(ROOT, config, report, source_default=False)
+  engine.IMAGE_STATE.require_no_image(ROOT, evidence["resume"])
+  items, errors = generation_items(engine, ROOT, config_name="rebind-config.json", qualification_name="rebind-qualification.json")
+  fatal = {name: errors[name] for name in CRITICAL_ITEMS if name in errors}
+  if fatal: raise ValueError("Fresh generation identity unavailable: " + json.dumps(fatal, sort_keys=True))
+  return {"manifest": report["manifest"], "baseline": items}
+
+
+def _rebind_postchecks(engine, root, fresh):
+  """W7 native checks on the INSTALLED authority: deployment as source default, product validation, no image, generation == fresh baseline."""
+  product = engine.PRODUCT
+  config, qualification, report = _reactivation_config(engine)
+  resume = report["audited_details"]["restore_protocol"]["resume"]
+  product.validate(config, qualification, report)
+  product.TRIAL._verify_deployment(root, config, report, source_default=True)
+  engine.IMAGE_STATE.require_no_image(root, resume)
+  items, errors = generation_items(engine, root)
+  fatal = {name: errors[name] for name in CRITICAL_ITEMS if name in errors}
+  if fatal: raise ValueError("Generation identity unavailable after rebind: " + json.dumps(fatal, sort_keys=True))
+  for name in engine.BASELINE_ITEMS:
+    if name in TOLERATED_ITEMS and (name in errors or "unavailable" in fresh[name]): continue  # tolerated items may be unreadable on either side
+    if _comparable(name, items[name]) != _comparable(name, fresh[name]):
+      raise ValueError("Generation item differs from the fresh baseline after rebind: " + name)
+
+
 def _refuse_reactivation_pending(engine):
   if engine.reactivation_pending(ROOT):
     raise ValueError("A reactivation is pending or interrupted; re-run `reactivate` to recover it (it rolls back or finishes retirement) before any maintenance action")
+  if engine.rebind_pending(ROOT) is True:
+    raise ValueError("A rebind is pending or interrupted; re-run `rebind` to recover it (it rolls back or finishes retirement) before any maintenance action")
 
 
 def native(action):
@@ -793,6 +840,14 @@ def native(action):
                                   assess=lambda evidence, marker: _assess_core(engine, ROOT, evidence, marker),
                                   inspect=lambda evidence: _reactivation_inspect(engine, evidence),
                                   postchecks=lambda root, baseline: _reactivation_postchecks(engine, root, baseline))
+      return {**result, "live_execution": True, "power_operation": False}
+    if action == "rebind":
+      capture = {}
+      gate = lambda root, phase: _maintenance_gate(engine, root, phase, capture)
+      result = engine._rebind(ROOT, guard=guard, gate=gate, native=engine._NATIVE_MAINTENANCE, pinned=capture,
+                              assess=lambda evidence, marker: _assess_core(engine, ROOT, evidence, marker),
+                              inspect=lambda evidence, staged: _rebind_inspect(engine, evidence, staged),
+                              postchecks=lambda root, fresh: _rebind_postchecks(engine, root, fresh))
       return {**result, "live_execution": True, "power_operation": False}
     if action == "maintenance":
       _refuse_reactivation_pending(engine)

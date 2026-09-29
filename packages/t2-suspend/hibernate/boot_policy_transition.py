@@ -67,6 +67,29 @@ REACTIVATION_COMPARISON = "omarchy-t2-package-reactivation-comparison-v1"
 REACTIVATION_COMPLETE = "omarchy-t2-package-reactivation-complete-v1"
 REACTIVATION_ROLLBACK = "omarchy-t2-package-reactivation-rollback-v1"
 ROLLBACK_NAME = "rollback.json"
+# New-generation rebind (docs/t2-suspend/REBIND-DESIGN.md). It reuses the activation-pending filename under its own
+# protocol string, exactly as reactivation does; each recovery authenticates its own canonical bytes and never adopts another's.
+REBIND_SCHEMA = "omarchy-t2-package-rebind-intent-v1"
+REBIND_COMPARISON = "omarchy-t2-package-rebind-comparison-v1"
+REBIND_COMPLETE = "omarchy-t2-package-rebind-complete-v1"
+REBIND_ROLLBACK = "omarchy-t2-package-rebind-rollback-v1"
+REBIND_BASELINE = "omarchy-t2-package-rebind-baseline-v1"
+RETIREMENT_SCHEMA = "omarchy-t2-pair-retirement-v1"
+RETIREMENT_KEYS = {"protocol", "retired_receipt_sha256", "source_sha256", "restore_sha256"}
+# Written by the pair stager's `retire` mode: custody of the old receipt outlives the receipt file itself.
+RETIREMENT = P.STATE / "pair-retirement.json"
+RETIRED_RECEIPT = P.STATE / "pair-retired-receipt.json"
+PAIR_BACKUP = Path("var/lib/omarchy-t2-hibernation-pair/limine.conf.before")
+CONFIG = P.STATE / "config.json"
+QUALIFICATION = P.STATE / "qualification.json"
+# Externally issued replacement authority, staged under distinct names; only `rebind` installs it.
+STAGED = {"config": P.STATE / "rebind-config.json", "qualification": P.STATE / "rebind-qualification.json",
+          "review": P.STATE / "rebind-boot-policy-review.json"}
+AUTHORITY = (("config", CONFIG), ("qualification", QUALIFICATION), ("review", REVIEW), ("backup", P.BACKUP))
+REBIND_KEYS = {"protocol", "transition_id", "action", "maintenance_transition_id", "marker_sha256", "baseline_sha256", "retirement_sha256",
+               "retired_receipt_sha256", "new_receipt_sha256", "new_baseline_sha256", "old", "new", "limine"}
+REBIND_ARCHIVE = {"old": {"config": "old-config.json", "qualification": "old-qualification.json", "review": "old-policy.json", "backup": "old-backup"},
+                  "new": {"config": "new-config.json", "qualification": "new-qualification.json", "review": "policy.json", "backup": "new-backup"}}
 REACTIVATION_KEYS = {"protocol", "transition_id", "action", "maintenance_transition_id", "marker_sha256", "baseline_sha256", "policy_sha256", "limine"}
 REACTIVATION_LIMINE = {"from_sha256", "to_sha256", "from_canonical_sha256", "to_canonical_sha256"}
 
@@ -1100,3 +1123,368 @@ def _reactivation_rollback(root, context, release_db, *, raw, identifier, archiv
   _retire_pending(root, guard, release_db, root / pending_path, raw)
   return {"protocol": REACTIVATION_ROLLBACK, "transition_id": identifier, "reactivated": False, "rolled_back": True,
           "maintenance_transition_id": maintenance_id, "live_execution": False, "qualification_issued": False}
+
+
+# --- pair retirement evidence and new-generation rebind -------------------------------------------
+#
+# A kernel update makes the qualified generation obsolete (assess: requalification-required). The old pair is
+# retired by the stager (its receipt file and images are deleted), a NEW pair is built, audited, staged and
+# qualified, and `rebind` then installs the new authority and returns maintenance to ACTIVE source-default
+# hibernation. It is modelled on reactivation: same locks, the activation-pending name under its own protocol,
+# archive-before-write, one point of no return (the default_entry line), rollback to the exact prior maintenance
+# state before completion, forward-only finish after it. It issues nothing: the config, qualification and boot
+# policy review are external inputs, and no hardware evidence is produced or implied.
+#
+# Custody of the old receipt: the maintenance chain (update guard, assess) reads the receipt bytes the marker pins.
+# Retiring the old pair deletes them, so the stager leaves RETIRED_RECEIPT plus a strict RETIREMENT record
+# chaining to the marker's staged_receipt_sha256. marker_receipt() resolves either source; a receipt whose
+# digest is neither is refused, so a NEW receipt at the fixed path never satisfies the OLD marker.
+#
+# Write order (each preceded by guard()):
+#   W1 rebind pending   W2 archive (intent, comparison, old and new authority copies, fresh baseline, retirement)
+#   W3 install config, qualification, boot-policy-review, backup (atomic replaces)   W4 boot-policy.json
+#   W5 boot-config line (point of no return)   W6 opt-in   W7 ACTIVE postchecks   W8 completion.json
+#   W9 unlink marker   W10 unlink pending, release the package lock
+# Recovery of any interruption is a re-run: it rolls back to the exact prior maintenance state (never forward
+# past W5) or, once a valid completion is durable, finishes W9/W10.
+
+
+def rebind_pending(root):
+  """True when the activation-pending name holds THIS engine's rebind intent (never a reactivation or runtime barrier)."""
+  root = Path(root)
+  G._ancestors(root, root / PENDINGS["activation"], _owner(root))
+  try: value = P._json(_read(root, PENDINGS["activation"]))
+  except (OSError, ValueError): return False
+  return type(value) is dict and value.get("protocol") == REBIND_SCHEMA
+
+
+def retirement(root, receipt_sha256):
+  """(record, record bytes, retained receipt bytes) proving the stager retired the pair whose receipt has this digest."""
+  raw = _required(root, RETIREMENT, "Pair retirement record")
+  record = P._json(raw)
+  if type(record) is not dict or set(record) != RETIREMENT_KEYS or record["protocol"] != RETIREMENT_SCHEMA:
+    raise ValueError("Exact pair retirement record required")
+  for name in RETIREMENT_KEYS - {"protocol"}: P._hash(record[name])
+  if record["retired_receipt_sha256"] != P._hash(receipt_sha256): raise ValueError("Pair retirement record does not chain to the maintenance receipt")
+  retained = _required(root, RETIRED_RECEIPT, "Retained retired receipt")
+  if P.digest(retained) != receipt_sha256: raise ValueError("Retained retired receipt differs from the maintenance receipt")
+  return record, raw, retained
+
+
+def marker_receipt(root, intent):
+  """The receipt bytes a maintenance intent pins: the live receipt while it is the old one, else the retained copy of a retired pair."""
+  wanted = intent["staged_receipt_sha256"]
+  try: live = _read(root, P.RECEIPT)
+  except FileNotFoundError: live = None
+  if live is not None and P.digest(live) == wanted: return live
+  return retirement(root, wanted)[2]
+
+
+def _required(root, relative, what):
+  try: return _read(root, relative)
+  except FileNotFoundError: raise ValueError(what + " required: " + relative.name + "; nothing was changed") from None
+
+
+def _swap(root, relative, expected, replacement, tag, guard):
+  """Atomically replace one private authority file whose current bytes must be exactly `expected`."""
+  path = root / relative
+  if _read(root, relative) != expected: raise ValueError("Authority file changed before replacement: " + relative.name)
+  temporary = path.with_name(relative.name + ".rebind-" + tag)
+  _new(temporary, replacement, stat.S_IMODE(path.lstat().st_mode))
+  guard()
+  if _read(root, relative) != expected: raise ValueError("Authority file changed immediately before replacement: " + relative.name)
+  os.replace(temporary, path)
+  _sync(path.parent)
+  if _read(root, relative) != replacement: raise ValueError("Authority replacement readback failed: " + relative.name)
+
+
+def _rebind_refuse_assessment(assessment):
+  if type(assessment) is not dict or assessment.get("class") not in ("unchanged", "requalification-required", "unknown"):
+    raise ValueError("compatibility unknown: malformed assessment; nothing was changed")
+  if assessment["class"] == "unchanged":
+    raise ValueError("generation unchanged: use `reactivate`, not `rebind`; nothing was changed")
+  if assessment["class"] == "unknown":
+    detail = assessment.get("reason") or "unknown items: " + ", ".join(assessment.get("unknown_items", []))
+    raise ValueError("compatibility unknown: " + detail + "; rebind needs a definite requalification-required assessment; nothing was changed")
+
+
+def _rebind_completion(transition_id, pending_intent, canonical_sha256):
+  return _encoded({"protocol": REBIND_COMPLETE, "transition_id": transition_id, "action": "rebind",
+                   "intent_sha256": P.digest(pending_intent), "configuration_canonical_sha256": canonical_sha256})
+
+
+def _rebind(root, *, guard, gate, assess, inspect, postchecks, native=None, pinned=None):
+  """Internal rebind core; the live form needs the native capability and its own callbacks.
+
+  gate(root, "retained")          maintenance read-only prerequisites (route, vetoes, fallback, no image)
+  assess(evidence, marker)        lock-free assessment core; only `requalification-required` may proceed
+  inspect(evidence, staged)       product-level validation of the staged {config, qualification} (parsed): must return
+                                  {"manifest": derived manifest, "baseline": freshly captured generation items}
+  postchecks(root, baseline)      native ACTIVE-state checks (deployment, product, generation == fresh baseline, no image)
+  pinned                          dict the gate reads the archived resume tuple from
+  """
+  root = Path(root)
+  if not root.is_absolute() or root.resolve() != root or not root.is_dir(): raise ValueError("Canonical root required")
+  _live_maintenance(root, gate, native)
+  if not all(callable(item) for item in (guard, gate, assess, inspect, postchecks)): raise ValueError("Explicit callbacks required")
+  context = {"guard": guard, "gate": gate, "assess": assess, "inspect": inspect, "postchecks": postchecks, "pinned": {} if pinned is None else pinned}
+  guard()
+  _reactivation_state_refusals(root)
+  for relative in (PENDINGS["activation"], MAINTENANCE): G._ancestors(root, root / relative, _owner(root))
+  if not _present(root / PENDINGS["activation"]) and not _present(root / MAINTENANCE):
+    raise ValueError("Inactive package maintenance marker required; nothing to rebind")
+  with _locks(root) as release_db:
+    guard()
+    _reactivation_state_refusals(root)
+    if _present(root / PENDINGS["activation"]): return _rebind_recover(root, context, release_db)
+    return _rebind_forward(root, context, release_db)
+
+
+def _rebind_forward(root, context, release_db):
+  guard, gate, pinned = context["guard"], context["gate"], context["pinned"]
+  for relative in (P.POLICY, OPT_IN, PENDINGS["activation"], PENDINGS["deactivation"]):
+    G._ancestors(root, root / relative, _owner(root))
+    if _present(root / relative): raise ValueError("Existing source-default policy, opt-in or pending refuses rebind: " + relative.name)
+  evidence = G._maintenance(root)
+  pinned["resume"] = evidence["resume"]
+  marker = _read(root, MAINTENANCE)
+  intent = P._json(marker)
+  identifier = evidence["transition_id"]
+  if _runtime(root) != intent["runtime_review_sha256"]: raise ValueError("Reviewed runtime differs from the maintenance intent; upgrade the runtime under maintenance first")
+  gate(root, "retained")
+  assessment = context["assess"](evidence, marker)
+  _rebind_refuse_assessment(assessment)
+  if _read(root, MAINTENANCE) != marker: raise ValueError("Maintenance marker changed during assessment")
+  baseline_raw = _read(root, HISTORY / identifier / BASELINE_NAME)
+  baseline = read_baseline(root, marker)
+  # The old pair must be gone and provably the one the marker pinned; a NEW pair must be staged in its place.
+  new_receipt_raw = _required(root, P.RECEIPT, "Staged replacement pair receipt")
+  new_receipt_sha = P.digest(new_receipt_raw)
+  if new_receipt_sha == intent["staged_receipt_sha256"]: raise ValueError("The old pair is still staged; retire it and stage the new pair first")
+  record, record_raw, old_receipt_raw = retirement(root, intent["staged_receipt_sha256"])
+  new_receipt = P._json(new_receipt_raw)
+  old_manifest = baseline["manifest"]["fields"]
+  for role in ("source", "restore"):
+    if record[role + "_sha256"] != old_manifest.get(role + "_sha256"): raise ValueError("Pair retirement record does not name the retired " + role + " image")
+    if P._hash(new_receipt["images"][role]["sha256"]) == record[role + "_sha256"]: raise ValueError("The staged " + role + " image is the retired one; a new pair is required")
+  raws = {name: _required(root, relative, "Staged replacement authority") for name, relative in STAGED.items()}
+  new_config, new_qualification = P._json(raws["config"]), P._json(raws["qualification"])
+  if type(new_config) is not dict or type(new_config.get("manifest")) is not dict: raise ValueError("Staged configuration lacks a manifest")
+  if new_config.get("staged_receipt_sha256") != new_receipt_sha: raise ValueError("Staged configuration does not bind the staged pair receipt")
+  PRODUCT.TX.receipt_value(new_qualification, new_config["manifest"])
+  if new_config["manifest"] == old_manifest: raise ValueError("Staged manifest equals the retired generation's; nothing was requalified")
+  for role in ("source", "restore"):
+    if new_config["manifest"].get(role + "_sha256") != new_receipt["images"][role]["sha256"]: raise ValueError("Staged manifest does not pin the staged " + role + " image")
+  info = context["inspect"](evidence, {"config": new_config, "qualification": new_qualification})
+  if type(info) is not dict or info.get("manifest") != new_config["manifest"]: raise ValueError("Derived manifest differs from the staged configuration")
+  fresh = _baseline_value(info["baseline"])
+  old_raws = {"config": _read(root, CONFIG), "qualification": _read(root, QUALIFICATION), "review": _read(root, REVIEW), "backup": _read(root, P.BACKUP)}
+  if P.digest(old_raws["review"]) != intent["old_policy_sha256"] or old_raws["review"] != _read(root, HISTORY / identifier / "policy.json"):
+    raise ValueError("Reviewed policy differs from the archived old policy")
+  if P._json(old_raws["config"]).get("staged_receipt_sha256") != intent["staged_receipt_sha256"]: raise ValueError("Current configuration does not bind the maintenance receipt")
+  # New boot policy: the staged pair bytes (the retained pair backup with the current snapshot region spliced in) must match the receipt.
+  policy = P._json(raws["review"])
+  donor = _required(root, PAIR_BACKUP, "Staged pair Limine backup")
+  if P.digest(donor) != new_receipt["original_limine_sha256"]: raise ValueError("Pair Limine backup differs from the staged receipt")
+  current = _read(root, P.LIMINE, private=False)
+  G._stock(current)
+  staged = P.with_region(current, donor)
+  if P.digest(staged) != P._hash(new_receipt["staged_limine_sha256"]):
+    raise ValueError("Unrelated Limine drift: the current configuration is not the staged pair bytes apart from the snapshot region")
+  proposal = P.prepare(staged, new_receipt_raw)
+  P.validate(policy, staged, proposal["after"], new_receipt_raw)
+  replacement = _to_source_default(current, policy["source_entry_id"])
+  if P.limine_canonical(replacement) != P.limine_canonical(proposal["after"]): raise ValueError("Source-default bytes differ from the approved proposal")
+  new_raws = {"config": raws["config"], "qualification": raws["qualification"], "review": raws["review"], "backup": staged}
+  same = [name for name in old_raws if old_raws[name] == new_raws[name]]
+  if same: raise ValueError("Replacement authority equals the current authority: " + ", ".join(same))
+  _idle(root)
+  # --- writes ---------------------------------------------------------------------------------
+  transition_id = str(uuid.uuid4())
+  limine = {"from_sha256": P.digest(current), "to_sha256": P.digest(replacement),
+            "from_canonical_sha256": _canonical_digest(current), "to_canonical_sha256": _canonical_digest(replacement)}
+  baseline_new = _encoded({"protocol": REBIND_BASELINE, "transition_id": transition_id, "items": {**fresh, "limine": stock_identity(current)}})
+  if len(baseline_new) > P.MAX_BYTES: raise ValueError("Fresh generation baseline exceeds the bounded evidence size")
+  pending_intent = _encoded({"protocol": REBIND_SCHEMA, "transition_id": transition_id, "action": "rebind", "maintenance_transition_id": identifier,
+    "marker_sha256": P.digest(marker), "baseline_sha256": P.digest(baseline_raw), "retirement_sha256": P.digest(record_raw),
+    "retired_receipt_sha256": P.digest(old_receipt_raw), "new_receipt_sha256": new_receipt_sha, "new_baseline_sha256": P.digest(baseline_new),
+    "old": {name: P.digest(raw) for name, raw in old_raws.items()}, "new": {name: P.digest(raw) for name, raw in new_raws.items()}, "limine": limine})
+  comparison = _encoded({"protocol": REBIND_COMPARISON, "transition_id": transition_id, "intent_sha256": P.digest(pending_intent),
+                         "assessment": assessment, "limine": limine})
+  pending = root / PENDINGS["activation"]
+  guard()
+  _new(pending, pending_intent)  # W1: sleep and updates are vetoed from here on
+  archive = root / HISTORY / transition_id
+  guard()
+  archive.mkdir(mode=0o700)
+  _sync(archive.parent)
+  files = [("intent.json", pending_intent, 0o600), ("comparison.json", comparison, 0o600), ("new-baseline.json", baseline_new, 0o600),
+           ("retirement.json", record_raw, 0o600), ("retired-receipt.json", old_receipt_raw, 0o600), ("new-receipt.json", new_receipt_raw, 0o600), ("opt-in", b"", 0o644)]
+  files += [(REBIND_ARCHIVE[side][name], raw, 0o600) for side, values in (("old", old_raws), ("new", new_raws)) for name, raw in values.items()]
+  for name, raw, mode in files:
+    guard()
+    _new(archive / name, raw, mode)  # W2
+  for name, relative in AUTHORITY:
+    guard()
+    _swap(root, relative, old_raws[name], new_raws[name], transition_id, guard)  # W3
+  guard()
+  _new(root / P.POLICY, raws["review"])  # W4
+  guard()
+  _replace(root, current, replacement, transition_id, guard=guard)  # W5: point of no return; recovery only rolls back
+  guard()
+  _new(root / OPT_IN, b"", 0o644)  # W6
+  _rebind_active(root, context, intent, new_receipt_sha, fresh)  # W7
+  completion = _rebind_completion(transition_id, pending_intent, limine["to_canonical_sha256"])
+  guard()
+  _new(archive / "completion.json", completion)  # W8
+  if _read(root, (archive / "completion.json").relative_to(root)) != completion: raise ValueError("Rebind completion readback differs")
+  _retire(root, guard, release_db, pending, pending_intent, marker)  # W9, W10
+  return {**json.loads(completion), "rebound": True, "requalification_required": False, "maintenance_transition_id": identifier,
+          "live_execution": False, "qualification_issued": False}
+
+
+def _rebind_active(root, context, marker_intent, new_receipt_sha, fresh):
+  """The ACTIVE-state postchecks shared by W7, post-W8 recovery and post-W9 verification."""
+  if P.digest(_read(root, P.RECEIPT)) != new_receipt_sha or P.verify(root, new_receipt_sha) is not True:
+    raise ValueError("Source default is not active for the new generation")
+  _opt_in(root)
+  _idle(root)
+  if _runtime(root) != marker_intent["runtime_review_sha256"]: raise ValueError("Reviewed runtime changed during rebind")
+  context["postchecks"](root, fresh)
+
+
+def _rebind_pending_value(raw):
+  """Exact canonical rebind intent, or a refusal that preserves whatever else uses the shared filename."""
+  pending = P._json(raw)
+  if type(pending) is not dict or pending.get("protocol") != REBIND_SCHEMA or _encoded(pending) != raw:
+    raise ValueError("Activation pending is not a rebind intent; a foreign, reactivation or runtime-upgrade barrier is preserved untouched")
+  if set(pending) != REBIND_KEYS or pending["action"] != "rebind" or type(pending["limine"]) is not dict or set(pending["limine"]) != REACTIVATION_LIMINE:
+    raise ValueError("Exact rebind intent required")
+  names = {name for name, _ in AUTHORITY}
+  if any(type(pending[side]) is not dict or set(pending[side]) != names for side in ("old", "new")): raise ValueError("Exact rebind authority digests required")
+  PRODUCT.TX.uuid_value(pending["transition_id"])
+  PRODUCT.TX.uuid_value(pending["maintenance_transition_id"])
+  for name in ("marker_sha256", "baseline_sha256", "retirement_sha256", "retired_receipt_sha256", "new_receipt_sha256", "new_baseline_sha256"): P._hash(pending[name])
+  for side in ("old", "new"):
+    for name in names: P._hash(pending[side][name])
+  for name in REACTIVATION_LIMINE: P._hash(pending["limine"][name])
+  return pending
+
+
+def _rebind_recover(root, context, release_db):
+  """Re-run after a crash or failure: authenticate our own pending, then roll back or finish retirement."""
+  guard = context["guard"]
+  pending_path = PENDINGS["activation"]
+  raw = _read(root, pending_path)
+  pending = _rebind_pending_value(raw)
+  identifier, maintenance_id = pending["transition_id"], pending["maintenance_transition_id"]
+  archive = root / HISTORY / identifier
+  G._ancestors(root, archive / "member", _owner(root))
+  marker_present = _present(root / MAINTENANCE)
+  marker = _read(root, MAINTENANCE) if marker_present else _read(root, HISTORY / maintenance_id / "maintenance-intent.json")
+  if P.digest(marker) != pending["marker_sha256"]: raise ValueError("Maintenance marker is not the one this rebind bound")
+  marker_intent = P._json(marker)
+  if type(marker_intent) is not dict or marker_intent.get("transition_id") != maintenance_id: raise ValueError("Maintenance transition differs from the rebind intent")
+  if P.digest(_read(root, HISTORY / maintenance_id / BASELINE_NAME)) != pending["baseline_sha256"]: raise ValueError("Generation baseline is not the one this rebind bound")
+  if P.digest(_read(root, HISTORY / maintenance_id / "policy.json")) != marker_intent["old_policy_sha256"]: raise ValueError("Archived old policy is not the one the marker pins")
+  # Where each authority file is: exactly the old bytes or exactly the new bytes, nothing else.
+  where = {}
+  for name, relative in AUTHORITY:
+    digest = P.digest(_required(root, relative, "Authority file"))
+    if digest == pending["old"][name]: where[name] = "old"
+    elif digest == pending["new"][name]: where[name] = "new"
+    else: raise ValueError("Authority file is neither the old nor the new bytes; nothing was touched: " + relative.name)
+  if _present(root / P.POLICY) and P.digest(_read(root, P.POLICY)) != pending["new"]["review"]:
+    raise ValueError("Active policy is not the new reviewed policy; preserved")
+  limine = pending["limine"]
+  current = _read(root, P.LIMINE, private=False)
+  digest = _canonical_digest(current)
+  if digest not in (limine["from_canonical_sha256"], limine["to_canonical_sha256"]): raise ValueError("Unrelated Limine drift; nothing was touched")
+  switched = digest == limine["to_canonical_sha256"]
+  touched = switched or "new" in where.values() or _present(root / P.POLICY) or _present(root / OPT_IN)
+  present = {name: _present(archive / name) for name in ("intent.json", "comparison.json", "completion.json", ROLLBACK_NAME, "new-baseline.json", "new-receipt.json")}
+  if touched:
+    # Boot state or authority was changed: the archive written before it must be complete and exact.
+    if not (present["intent.json"] and present["comparison.json"]) or _read(root, (archive / "intent.json").relative_to(root)) != raw:
+      raise ValueError("Rebind archive does not match the pending while state is changed; nothing was touched")
+    comparison = P._json(_read(root, (archive / "comparison.json").relative_to(root)))
+    if type(comparison) is not dict or comparison.get("protocol") != REBIND_COMPARISON or comparison.get("transition_id") != identifier or comparison.get("intent_sha256") != P.digest(raw):
+      raise ValueError("Archived comparison does not match the rebind pending")
+    for side in ("old", "new"):
+      for name, archived in REBIND_ARCHIVE[side].items():
+        if not _present(archive / archived) or P.digest(_read(root, (archive / archived).relative_to(root))) != pending[side][name]:
+          raise ValueError("Archived " + side + " " + name + " is missing or differs from the rebind pending; nothing was touched")
+    if not present["new-baseline.json"] or P.digest(_read(root, (archive / "new-baseline.json").relative_to(root))) != pending["new_baseline_sha256"]:
+      raise ValueError("Archived fresh baseline differs from the rebind pending; nothing was touched")
+    if not present["new-receipt.json"] or P.digest(_read(root, (archive / "new-receipt.json").relative_to(root))) != pending["new_receipt_sha256"]:
+      raise ValueError("Archived new receipt differs from the rebind pending; nothing was touched")
+  completion = _rebind_completion(identifier, raw, limine["to_canonical_sha256"])
+  # A torn or foreign completion is never trusted: it cannot lead forward.
+  complete = present["completion.json"] and _read(root, (archive / "completion.json").relative_to(root)) == completion
+  fresh = P._json(_read(root, (archive / "new-baseline.json").relative_to(root)))["items"] if touched else None
+  guard()
+  if not marker_present:
+    # Only W10 remains: the marker is gone and the completion is durable.
+    if not complete or present[ROLLBACK_NAME] or "old" in where.values(): raise ValueError("Marker missing without a valid completion; state preserved")
+    _rebind_active(root, context, marker_intent, pending["new_receipt_sha256"], fresh)
+    _retire_pending(root, guard, release_db, root / pending_path, raw)
+    return {**json.loads(completion), "rebound": True, "recovered": "retired-pending", "requalification_required": False,
+            "maintenance_transition_id": maintenance_id, "live_execution": False, "qualification_issued": False}
+  if complete and not present[ROLLBACK_NAME] and "old" not in where.values():
+    try: _rebind_active(root, context, marker_intent, pending["new_receipt_sha256"], fresh)
+    except Exception: pass  # checks failed after W8: never proceed forward, roll back below
+    else:
+      _retire(root, guard, release_db, root / pending_path, raw, marker)
+      return {**json.loads(completion), "rebound": True, "recovered": "finished-retirement", "requalification_required": False,
+              "maintenance_transition_id": maintenance_id, "live_execution": False, "qualification_issued": False}
+  return _rebind_rollback(root, context, release_db, raw=raw, pending=pending, archive=archive, rolled=present[ROLLBACK_NAME], where=where,
+                          current=current, switched=switched, touched=touched)
+
+
+def _rebind_rollback(root, context, release_db, *, raw, pending, archive, rolled, where, current, switched, touched):
+  """Reverse only what this rebind wrote, in reverse order; every step is idempotent and resumable."""
+  guard, gate, pinned = context["guard"], context["gate"], context["pinned"]
+  pending_path = PENDINGS["activation"]
+  identifier = pending["transition_id"]
+  strays = [(root / relative).with_name(relative.name + ".rebind-" + identifier + suffix) for _, relative in AUTHORITY for suffix in ("", "-rollback")]
+  strays += [(root / P.LIMINE).with_name("limine.conf.source-default-" + identifier + suffix) for suffix in ("", "-rollback")]
+  for stray in strays:
+    if _present(stray):
+      if not stat.S_ISREG(stray.lstat().st_mode): raise ValueError("Stray staged file is not a regular file")
+      guard()
+      stray.unlink()
+      _sync(stray.parent)
+  if switched:
+    entry = P.source_entry(P._json(_read(root, (archive / "new-receipt.json").relative_to(root))))
+    reverse = _to_stock_default(current, entry)
+    if _canonical_digest(reverse) != pending["limine"]["from_canonical_sha256"]: raise ValueError("Rolled-back configuration is not the prior maintenance configuration")
+    guard()
+    _replace(root, current, reverse, identifier + "-rollback", guard=guard)
+  if _present(root / OPT_IN):
+    _opt_in(root)
+    guard()
+    (root / OPT_IN).unlink()
+    _sync((root / OPT_IN).parent)
+  if _present(root / P.POLICY):
+    if P.digest(_read(root, P.POLICY)) != pending["new"]["review"]: raise ValueError("Active policy is not the new reviewed policy; preserved")
+    guard()
+    (root / P.POLICY).unlink()
+    _sync((root / P.POLICY).parent)
+  for name, relative in reversed(AUTHORITY):
+    if where[name] == "new":
+      guard()
+      _swap(root, relative, _read(root, relative), _read(root, (archive / REBIND_ARCHIVE["old"][name]).relative_to(root)), identifier + "-rollback", guard)
+      if P.digest(_read(root, relative)) != pending["old"][name]: raise ValueError("Rolled-back authority differs from the recorded old bytes: " + relative.name)
+  evidence = G._maintenance(root, ignore=(pending_path,))
+  pinned["resume"] = evidence["resume"]
+  if touched: gate(root, "retained")
+  if not rolled:
+    guard()
+    if not _present(archive):
+      archive.mkdir(mode=0o700)
+      _sync(archive.parent)
+    _new(archive / ROLLBACK_NAME, _encoded({"protocol": REBIND_ROLLBACK, "transition_id": identifier, "intent_sha256": P.digest(raw),
+                                            "maintenance_transition_id": pending["maintenance_transition_id"]}))
+  _retire_pending(root, guard, release_db, root / pending_path, raw)
+  return {"protocol": REBIND_ROLLBACK, "transition_id": identifier, "rebound": False, "rolled_back": True,
+          "maintenance_transition_id": pending["maintenance_transition_id"], "live_execution": False, "qualification_issued": False}
