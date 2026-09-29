@@ -15,6 +15,7 @@ def load(name, filename):
   spec.loader.exec_module(module)
   return module
 T = load("transition", HERE / "hibernate/boot_policy_transition.py")
+SLEEP = load("transition_sleep_entry", HERE / "hibernate/sleep_entry.py")
 F = load("policy_fixture", Path(__file__).with_name("test-hibernate-boot-policy.py"))
 
 
@@ -354,6 +355,201 @@ class Transitions(unittest.TestCase):
         self.assertTrue(fixture.pending("deactivation").exists())
         self.assertTrue((fixture.root / T.MAINTENANCE).exists())
         self.assertFalse((fixture.root / T.DB_LOCK).exists())
+
+
+class NativeMaintenance(unittest.TestCase):
+  """Internal maintenance core with the native adapter's gate seam, fixtures only."""
+  def setUp(self):
+    self.fixture = Transitions("test_activation_then_exact_fallback_preserves_all_authority_and_evidence")
+    self.fixture.setUp()
+    self.addCleanup(self.fixture.doCleanups)
+    self.root, self.f = self.fixture.root, self.fixture.f
+    self.fixture.run_action()
+    self.phases, self.fail = [], {}
+    self.image = False
+
+  def gate(self, root, phase):
+    self.phases.append(phase)
+    if phase == "before":
+      # No write of any kind may precede the first prerequisite gate.
+      self.assertFalse(any(self.pending_names()))
+      self.assertFalse((root / T.MAINTENANCE).exists())
+    if phase == "final":
+      self.assertTrue((root / T.MAINTENANCE).exists())
+      self.assertTrue(self.fixture.pending("deactivation").exists())
+    if phase in self.fail: raise ValueError("injected " + phase)
+    T.verify_fallback(root, T._read(root, T.P.BACKUP) if phase == "before" else None)
+    if self.image and phase in ("final", "retained"): raise ValueError("saved image present")
+
+  def pending_names(self): return [self.fixture.pending(name).exists() for name in T.PENDINGS]
+
+  def run_maintenance(self):
+    return T._transition(self.root, "maintenance", precheck=self.fixture.check, guard=lambda: None, maintenance_gate=self.gate)
+
+  def tree(self):
+    return {str(path.relative_to(self.root)): path.read_bytes() for path in sorted(self.root.rglob("*"))
+            if path.is_file() and path != self.root / T.DB_LOCK}
+
+  def new(self):
+    other = NativeMaintenance("test_happy_path_publishes_durable_marker_and_vetoes_every_route")
+    other.setUp()
+    self.addCleanup(other.doCleanups)
+    return other
+
+  def test_happy_path_publishes_durable_marker_and_vetoes_every_route(self):
+    result = self.run_maintenance()
+    self.assertEqual(self.phases, ["before", "after", "final"])
+    self.assertTrue((self.root / T.MAINTENANCE).is_file())
+    self.assertFalse(any(self.pending_names()))
+    self.assertFalse((self.root / T.DB_LOCK).exists())
+    self.assertEqual(stat.S_IMODE((self.root / T.MAINTENANCE).stat().st_mode), 0o600)
+    self.assertEqual(T.P.digest((self.root / T.MAINTENANCE).read_bytes()), result["maintenance_intent_sha256"])
+    self.assertFalse((self.root / T.OPT_IN).exists())
+    self.assertFalse((self.root / T.P.POLICY).exists())
+    self.assertEqual(T.verify_fallback(self.root)["classification"], "fallback-bytes-verified")
+    with self.assertRaisesRegex(ValueError, "package maintenance"): SLEEP.reject_pending(self.root)
+    with self.assertRaisesRegex(ValueError, "package maintenance"): F.PRODUCT.verify_deployment(self.root, self.f.config, self.f.report)
+    with self.assertRaisesRegex(ValueError, "maintenance intent"): self.fixture.run_action("activation")
+
+  def test_before_failures_write_nothing(self):
+    for failure in ("gate", "image", "inventory"):
+      with self.subTest(failure=failure):
+        other = self.new()
+        if failure == "gate": other.fail["before"] = True
+        elif failure == "image":
+          original = other.fixture.check
+          def image(root, action, phase, original=original):
+            original(root, action, phase)
+            raise ValueError("saved image present before")
+          other.fixture.check = image
+        else: next((other.root / T.P.STATE / "runtime").rglob("fixture.py")).write_bytes(b"drifted reviewed code\n")
+        before = other.tree()
+        with self.assertRaises(ValueError): other.run_maintenance()
+        self.assertEqual(other.tree(), before)
+        self.assertFalse((other.root / T.MAINTENANCE).exists())
+        self.assertFalse(any(other.pending_names()))
+        self.assertFalse((other.root / T.DB_LOCK).exists())
+        self.assertTrue((other.root / T.OPT_IN).exists())
+
+  def test_after_gate_failure_retains_deactivation_pending_veto_without_marker(self):
+    self.fail["after"] = True
+    with self.assertRaisesRegex(ValueError, "injected after"): self.run_maintenance()
+    self.assertTrue(self.fixture.pending("deactivation").exists())
+    self.assertFalse((self.root / T.MAINTENANCE).exists())
+    self.assertEqual((self.root / T.P.LIMINE).read_bytes(), self.f.before)
+    with self.assertRaisesRegex(ValueError, "package maintenance"): SLEEP.reject_pending(self.root)
+    self.assertFalse((self.root / T.DB_LOCK).exists())
+
+  def test_final_failures_retain_marker_and_old_pending_before_retirement(self):
+    for failure in ("gate", "image", "uki"):
+      with self.subTest(failure=failure):
+        other = self.new()
+        if failure == "gate": other.fail["final"] = True
+        elif failure == "image": other.image = True
+        else:
+          original = other.gate
+          def swap(root, phase, original=original):
+            if phase == "final": (root / T.PRODUCTION).write_bytes(b"different production image")
+            original(root, phase)
+          other.gate = swap
+        with self.assertRaises(ValueError): other.run_maintenance()
+        self.assertTrue((other.root / T.MAINTENANCE).exists())
+        self.assertTrue(other.fixture.pending("deactivation").exists())
+        self.assertFalse((other.root / T.DB_LOCK).exists())
+        with self.assertRaisesRegex(ValueError, "package maintenance"): SLEEP.reject_pending(other.root)
+
+  def test_fallback_rejects_uki_mismatch_wrong_default_and_missing_image(self):
+    backup = T._read(self.root, T.P.BACKUP)
+    self.assertEqual(T.verify_fallback(self.root, backup)["limine"]["sha256"], T.P.digest(self.f.before))
+    original = (self.root / T.PRODUCTION).read_bytes()
+    (self.root / T.PRODUCTION).write_bytes(original + b"x")
+    with self.assertRaisesRegex(ValueError, "does not bind"): T.verify_fallback(self.root, backup)
+    (self.root / T.PRODUCTION).write_bytes(original)
+    for mutated in (backup.replace(b"default_entry: 2", b"default_entry: 3"),
+                    backup.replace(b"default_entry: 2", b"default_entry: 2\nremember_last_entry: yes")):
+      with self.assertRaises(ValueError): T.verify_fallback(self.root, mutated)
+    (self.root / T.PRODUCTION).unlink()
+    with self.assertRaises(FileNotFoundError): T.verify_fallback(self.root, backup)
+
+  def test_lock_contention_never_publishes_anything(self):
+    before = self.tree()
+    held = os.open(self.root / T.PHYSICAL_LOCK, os.O_RDONLY)
+    try:
+      fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+      with self.assertRaises(BlockingIOError): self.run_maintenance()
+    finally: os.close(held)
+    db = self.f.write(T.DB_LOCK, b"pacman owns this")
+    with self.assertRaises(FileExistsError): self.run_maintenance()
+    self.assertEqual(db.read_bytes(), b"pacman owns this")
+    db.unlink()
+    self.assertEqual(self.tree(), before)
+    self.assertEqual(self.phases, [])
+
+  def test_idempotent_rerun_refuses_rewrite_and_reentry_is_read_only(self):
+    self.run_maintenance()
+    marker = (self.root / T.MAINTENANCE).read_bytes()
+    settled = self.tree()
+    with self.assertRaisesRegex(ValueError, "maintenance intent"): self.run_maintenance()
+    self.assertEqual(self.tree(), settled)
+    self.phases.clear()
+    result = T._verify_existing_maintenance(self.root, guard=lambda: None, gate=self.gate)
+    self.assertTrue(result["already_inactive"])
+    self.assertEqual(result["maintenance_intent_sha256"], T.P.digest(marker))
+    self.assertEqual(self.phases, ["retained"])
+    self.assertEqual(self.tree(), settled)
+    self.assertFalse((self.root / T.DB_LOCK).exists())
+
+  def test_reentry_fails_closed_on_drift_and_preserves_marker(self):
+    self.run_maintenance()
+    marker = (self.root / T.MAINTENANCE).read_bytes()
+    def attempt(): return T._verify_existing_maintenance(self.root, guard=lambda: None, gate=self.gate)
+    self.image = True
+    with self.assertRaisesRegex(ValueError, "saved image"): attempt()
+    self.image = False
+    (self.root / T.PRODUCTION).write_bytes(b"drift")
+    with self.assertRaisesRegex(ValueError, "does not bind"): attempt()
+    (self.root / T.PRODUCTION).write_bytes(b"production")
+    self.f.write(T.OPT_IN, b"").chmod(0o644)
+    with self.assertRaisesRegex(ValueError, "active/incomplete"): attempt()
+    (self.root / T.OPT_IN).unlink()
+    self.f.write(T.PENDINGS["activation"], b"partial")
+    with self.assertRaisesRegex(ValueError, "active/incomplete"): attempt()
+    self.fixture.pending("activation").unlink()
+    (self.root / T.MAINTENANCE).write_bytes(marker + b" ")
+    with self.assertRaises(ValueError): attempt()
+    (self.root / T.MAINTENANCE).write_bytes(marker)
+    self.assertEqual(attempt()["transition_id"], json.loads(marker)["transition_id"])
+    self.assertFalse((self.root / T.DB_LOCK).exists())
+
+  def test_reentry_without_marker_writes_nothing(self):
+    with self.assertRaises(FileNotFoundError): T._verify_existing_maintenance(self.root, guard=lambda: None, gate=self.gate)
+    self.assertFalse((self.root / T.MAINTENANCE).exists())
+    self.assertFalse((self.root / T.DB_LOCK).exists())
+
+  def test_live_roots_and_arbitrary_callbacks_are_never_accepted(self):
+    alias = self.root.parent / "live-alias"
+    alias.symlink_to("/")
+    noop = lambda *args: None
+    with patch.object(T.os, "open", side_effect=AssertionError("no live filesystem open")):
+      for root in ("/", "/tmp/..", "relative", alias, Path("/")):
+        with self.subTest(root=str(root)):
+          with self.assertRaises(ValueError): T.transition(root, "maintenance", precheck=noop)
+          with self.assertRaises(ValueError): T._transition(root, "maintenance", precheck=noop, guard=noop, maintenance_gate=noop)
+          with self.assertRaises(ValueError): T._transition(root, "maintenance", precheck=noop, guard=noop, maintenance_gate=noop, native=object())
+          with self.assertRaises(ValueError): T._verify_existing_maintenance(root, guard=noop, gate=noop)
+      with self.assertRaises(ValueError): T._transition(Path("/"), "maintenance", precheck=noop, guard=noop, native=T._NATIVE_MAINTENANCE)
+    # The public API cannot receive a gate or capability at all.
+    with self.assertRaises(TypeError): T.transition(self.root, "maintenance", precheck=noop, maintenance_gate=noop)
+    with self.assertRaises(TypeError): T.transition(self.root, "maintenance", precheck=noop, native=T._NATIVE_MAINTENANCE)
+    with self.assertRaisesRegex(ValueError, "only valid for the maintenance"):
+      T._transition(self.root, "deactivation", precheck=noop, guard=noop, maintenance_gate=noop)
+
+  def test_native_capability_passes_only_the_entry_check(self):
+    # With capability and gate the live root reaches the first inspection, which
+    # is stubbed to stop; nothing on the real host is opened or written.
+    with patch.object(T, "_locks", side_effect=RuntimeError("stop at exclusion")), patch.object(T.G, "_ancestors", side_effect=RuntimeError("stop at ancestors")):
+      with self.assertRaisesRegex(RuntimeError, "stop at"):
+        T._transition(Path("/"), "maintenance", precheck=lambda *a: None, guard=lambda: None, maintenance_gate=lambda *a: None, native=T._NATIVE_MAINTENANCE)
 
 
 if __name__ == "__main__": unittest.main()

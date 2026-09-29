@@ -38,7 +38,7 @@ class Native(unittest.TestCase):
 
   def test_cli_has_only_required_fixed_actions(self):
     with patch.object(N, "native") as native:
-      for args in ([], ["check"], ["maintenance"], ["activation", "--root", "/tmp"], ["deactivation", "--force"], ["activation", "--approve"]):
+      for args in ([], ["check"], ["maintenance", "--root", "/tmp"], ["maintenance", "--force"], ["activation", "--root", "/tmp"], ["deactivation", "--force"], ["activation", "--approve"]):
         with self.assertRaises(SystemExit): N.main(args)
       native.assert_not_called()
 
@@ -435,6 +435,173 @@ class Native(unittest.TestCase):
     self.assertTrue((fixture.root / F.T.P.POLICY).exists())
     self.assertEqual((fixture.root / F.T.P.LIMINE).read_bytes(), fixture.f.proposal["after"])
     self.assertFalse((fixture.root / F.T.DB_LOCK).exists())
+
+
+class Maintenance(unittest.TestCase):
+  """Native maintenance wiring; every host query and reviewed byte source is mocked."""
+  EXEC = ('{ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 -B ' + str(N.SLEEP_ENTRY) +
+          ' ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }')
+
+  def setUp(self):
+    self.properties = {"LoadState": "loaded", "FragmentPath": N.VENDOR_UNIT, "DropInPaths": str(N.DROPIN), "ExecStart": self.EXEC}
+    self.dropin = b"reviewed drop-in\n"
+    self.reviewed = {"systemd-hibernate.conf": self.dropin, "sleep_entry.py": b"reviewed entry\n"}
+
+  def show(self, argv):
+    self.assertEqual(argv[:3], ("/usr/bin/systemctl", "show", "--no-pager"))
+    return "\n".join(key + "=" + value for key, value in self.properties.items())
+
+  def route(self):
+    with patch.object(N, "_dropin_bytes", side_effect=lambda: self.dropin), patch.object(N, "_reviewed_identity", side_effect=lambda name: self.reviewed[name]), patch.object(N, "_command", side_effect=self.show):
+      N._hibernate_route()
+
+  def test_cli_accepts_only_fixed_maintenance_action(self):
+    with patch.object(N, "native", return_value={"ok": True}) as native, patch("builtins.print"):
+      self.assertEqual(N.main(["maintenance"]), 0)
+    native.assert_called_once_with("maintenance")
+    self.assertEqual(N._inhibit_command("maintenance")[-1], "maintenance")
+
+  def test_matching_reviewed_drop_in_and_effective_exec_start_pass(self):
+    self.route()
+
+  def test_drop_in_and_exec_start_drift_fail_closed(self):
+    original = dict(self.properties)
+    self.dropin = b"drifted drop-in\n"
+    with self.assertRaisesRegex(ValueError, "drop-in differs"): self.route()
+    self.dropin = self.reviewed["systemd-hibernate.conf"]
+    variants = {
+      "ExecStart": [self.EXEC.replace("-B ", "-I "), self.EXEC.replace(str(N.SLEEP_ENTRY), "/tmp/sleep_entry.py"),
+                    self.EXEC.replace("path=/usr/bin/python3", "path=/usr/bin/python"), "", self.EXEC + " " + self.EXEC,
+                    self.EXEC.replace("{ path", "{ ignore ; path")],
+      "DropInPaths": ["", str(N.DROPIN) + " /etc/systemd/system/systemd-hibernate.service.d/other.conf"],
+      "FragmentPath": ["/etc/systemd/system/systemd-hibernate.service", ""],
+      "LoadState": ["masked", "not-found"]}
+    for key, values in variants.items():
+      for value in values:
+        with self.subTest(key=key, value=value):
+          self.properties = {**original, key: value}
+          with self.assertRaises(ValueError): self.route()
+    self.properties = {**original, "Extra": "x"}
+    with self.assertRaises(ValueError): self.route()
+    self.properties = {key: value for key, value in original.items() if key != "ExecStart"}
+    with self.assertRaises(ValueError): self.route()
+
+  def test_unreviewed_sleep_entry_bytes_fail_closed(self):
+    with patch.object(N, "_dropin_bytes", return_value=self.dropin), patch.object(N, "_command", side_effect=self.show):
+      def identity(name):
+        if name == "sleep_entry.py": raise ValueError("Reviewed runtime file differs from approved inventory")
+        return self.dropin
+      with patch.object(N, "_reviewed_identity", side_effect=identity), self.assertRaisesRegex(ValueError, "approved inventory"):
+        N._hibernate_route()
+
+  def test_reviewed_identity_binds_bytes_to_inventory(self):
+    raw = b"reviewed entry\n"
+    review = json.dumps({"files": {"packages/t2-suspend/hibernate/sleep_entry.py": {"sha256": N.hashlib.sha256(raw).hexdigest(), "size": len(raw)}}}).encode()
+    def private(path): return review if path.name == "runtime-deployment-review.json" else raw
+    with patch.object(N, "_private_bytes", side_effect=private):
+      self.assertEqual(N._reviewed_identity("sleep_entry.py"), raw)
+      with self.assertRaisesRegex(ValueError, "approved inventory"): N._reviewed_identity("systemd-hibernate.conf")
+    with patch.object(N, "_private_bytes", side_effect=lambda path: review if path.name == "runtime-deployment-review.json" else raw + b"x"):
+      with self.assertRaisesRegex(ValueError, "approved inventory"): N._reviewed_identity("sleep_entry.py")
+
+  def engine(self):
+    fixture = F.Transitions("test_activation_then_exact_fallback_preserves_all_authority_and_evidence")
+    fixture.setUp()
+    self.addCleanup(fixture.doCleanups)
+    return fixture, SimpleNamespace(P=F.T.P, PRODUCT=F.T.PRODUCT, _transition=F.T._transition, _read=F.T._read,
+                                    verify_fallback=F.T.verify_fallback, GATE_PHASES=F.T.GATE_PHASES, IMAGE_STATE=Mock())
+
+  def test_vetoes_are_proven_behaviorally_against_reviewed_code(self):
+    _, engine = self.engine()
+    with patch.object(N, "SLEEP_ENTRY", HERE / "hibernate/sleep_entry.py"):
+      N._maintenance_vetoes(engine)
+      # An old sleep entry that ignores the marker name is refused.
+      old = HERE / "hibernate/sleep_entry.py"
+      stale = Path(self.enterContext(__import__("tempfile").TemporaryDirectory())) / "sleep_entry.py"
+      stale.write_bytes(old.read_bytes().replace(b', "package-maintenance.pending"', b""))
+      with patch.object(N, "SLEEP_ENTRY", stale), self.assertRaisesRegex(ValueError, "lacks maintenance veto"):
+        N._maintenance_vetoes(engine)
+      engine.PRODUCT = SimpleNamespace(verify_deployment=lambda *args: None)
+      with self.assertRaisesRegex(ValueError, "does not veto"): N._maintenance_vetoes(engine)
+      engine.PRODUCT = F.T.PRODUCT
+      engine._transition = lambda *args, **kwargs: None
+      with self.assertRaisesRegex(ValueError, "does not veto"): N._maintenance_vetoes(engine)
+
+  def test_gate_phases_bind_backup_then_live_fallback_and_final_no_image(self):
+    fixture, engine = self.engine()
+    fixture.run_action()
+    events = []
+    resume = {"device": "/dev/mapper/root", "devnum": "253:0", "offset": 1}
+    engine.IMAGE_STATE.require_no_image.side_effect = lambda root, value: events.append(("image", value))
+    engine.verify_fallback = lambda root, raw=None: events.append(("fallback", raw is not None))
+    with patch.object(N, "ROOT", fixture.root), patch.object(N, "_hibernate_route", side_effect=lambda: events.append("route")), \
+         patch.object(N, "_maintenance_vetoes", side_effect=lambda engine: events.append("vetoes")), patch.object(N, "_resume", return_value=resume):
+      expected = {"before": ["route", "vetoes", ("fallback", True)], "after": ["route", "vetoes", ("fallback", False)],
+                  "final": ["route", "vetoes", ("fallback", False), ("image", resume)],
+                  "retained": ["route", "vetoes", ("fallback", False), ("image", resume)]}
+      for phase, sequence in expected.items():
+        events.clear()
+        with self.subTest(phase=phase):
+          N._maintenance_gate(engine, fixture.root, phase)
+          self.assertEqual(events, sequence)
+      with self.assertRaises(ValueError): N._maintenance_gate(engine, fixture.root, "unknown")
+      with self.assertRaises(ValueError): N._maintenance_gate(engine, fixture.root.parent, "before")
+      # Each prerequisite failure propagates; the image check cannot be skipped by a later phase.
+      engine.IMAGE_STATE.require_no_image.side_effect = ValueError("saved image present")
+      with self.assertRaisesRegex(ValueError, "saved image"): N._maintenance_gate(engine, fixture.root, "final")
+      engine.IMAGE_STATE.require_no_image.side_effect = None
+      for name in ("_hibernate_route", "_maintenance_vetoes"):
+        with patch.object(N, name, side_effect=ValueError("drift")), self.assertRaisesRegex(ValueError, "drift"):
+          N._maintenance_gate(engine, fixture.root, "before")
+
+  def dispatch(self, marker_present, callbacks=lambda engine: None):
+    from contextlib import contextmanager
+    @contextmanager
+    def exclusion(action):
+      self.assertEqual(action, "maintenance")
+      yield lambda: None
+    engine = Mock()
+    engine.MAINTENANCE = Path("var/lib/omarchy/t2-hibernate-product/package-maintenance.pending")
+    engine._present.return_value = marker_present
+    engine._transition.return_value = {"qualification_issued": False, "live_execution": False}
+    engine._verify_existing_maintenance.return_value = {"already_inactive": True, "qualification_issued": False}
+    with patch.object(N, "_installed", return_value=engine), patch.object(Path, "readlink", return_value=Path("/usr/bin/systemd-inhibit")), \
+         patch.object(N, "_exclusion", side_effect=exclusion), patch.object(N, "_precheck") as precheck, patch.object(N, "_maintenance_gate") as gate:
+      result = N.native("maintenance")
+      callbacks(engine)
+    return engine, precheck, gate, result
+
+  def test_native_maintenance_dispatch_uses_fixed_root_capability_and_gate(self):
+    def callbacks(engine):
+      arguments = engine._transition.call_args
+      arguments.kwargs["precheck"](Path("/"), "deactivation", "before")
+      arguments.kwargs["maintenance_gate"](Path("/"), "final")
+    engine, precheck, gate, result = self.dispatch(False, callbacks)
+    arguments = engine._transition.call_args
+    self.assertEqual(arguments.args, (Path("/"), "maintenance"))
+    self.assertIs(arguments.kwargs["native"], engine._NATIVE_MAINTENANCE)
+    self.assertNotIn("recover", arguments.kwargs)
+    self.assertNotIn("maintenance_continuation", arguments.kwargs)
+    precheck.assert_called_once_with(engine, "deactivation", "before")
+    gate.assert_called_once_with(engine, Path("/"), "final")
+    engine._verify_existing_maintenance.assert_not_called()
+    self.assertTrue(result["live_execution"])
+    self.assertFalse(result["power_operation"])
+    self.assertFalse(result["qualification_issued"])
+
+  def test_native_maintenance_reentry_is_read_only_verification(self):
+    engine, precheck, gate, result = self.dispatch(True, lambda engine: engine._verify_existing_maintenance.call_args.kwargs["gate"](Path("/"), "retained"))
+    engine._transition.assert_not_called()
+    arguments = engine._verify_existing_maintenance.call_args
+    self.assertEqual(arguments.args, (Path("/"),))
+    self.assertIs(arguments.kwargs["native"], engine._NATIVE_MAINTENANCE)
+    gate.assert_called_once_with(engine, Path("/"), "retained")
+    self.assertTrue(result["already_inactive"])
+    self.assertTrue(result["live_execution"])
+
+  def test_native_maintenance_still_refuses_workspace_and_nonisolated_invocation(self):
+    with patch.object(N.os, "execve", side_effect=AssertionError("no inhibitor")), patch.object(N, "_command", side_effect=AssertionError("no host queries")):
+      with self.assertRaises(ValueError): N.native("maintenance")
 
 
 if __name__ == "__main__": unittest.main()

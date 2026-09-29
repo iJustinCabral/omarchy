@@ -8,11 +8,14 @@ power, qualification issuance or phase replay occurs here. Retained fixture
 recovery retries only settlement/veto repair under the original exclusions.
 Source tests and
 installation alone do not approve or execute any native policy transition.
-The explicit maintenance action is fixture-only groundwork: it leaves a durable
-sleep/update veto but grants no package admission or live maintenance route.
+The maintenance action leaves a durable sleep/update veto but grants no
+package admission. Its public fixture form refuses `/`. The live form exists only
+inside the internal core and requires the private native capability plus the
+native adapter's own verified gate; it has no runner, client or broker.
 """
 from contextlib import contextmanager
 import fcntl
+import hashlib
 import importlib.util
 import json
 import os
@@ -42,6 +45,12 @@ HISTORY = P.STATE / "boot-policy-transitions"
 PENDINGS = {action: P.STATE / ("source-default-" + action + ".pending") for action in ("activation", "deactivation")}
 MAINTENANCE = P.STATE / "package-maintenance.pending"
 MAINTENANCE_SCHEMA = "omarchy-t2-package-maintenance-intent-v1"
+PRODUCTION = Path("boot/EFI/Linux/omarchy_linux-t2.efi")
+MAX_UKI = 256 * 1024 * 1024
+# Internal capability for the reviewed native adapter only. It is not security
+# against hostile root; it keeps the public fixture API from naming live roots.
+_NATIVE_MAINTENANCE = object()
+GATE_PHASES = ("before", "after", "final", "retained")
 
 
 def _sync(directory):
@@ -107,6 +116,62 @@ def _veto(root, intent, *, durable=False):
     if os.read(fd, len(intent) + 1) != intent or metadata(os.fstat(fd)) != metadata(opened) or metadata((root / MAINTENANCE).lstat()) != metadata(opened):
       raise ValueError("Maintenance veto changed after durability check")
   finally: os.close(fd)
+
+
+def _owner(root): return 0 if root == Path("/") else os.geteuid()
+
+
+def _stable_bytes(root, relative, limit, *, keep=False):
+  """Bounded owned regular bytes with SHA-256/BLAKE2b and unchanged identity."""
+  path, owner = root / relative, _owner(root)
+  G._ancestors(root, path, owner)
+  named = path.lstat()
+  if not stat.S_ISREG(named.st_mode) or named.st_uid != owner or named.st_mode & 0o022 or named.st_nlink != 1 or not 0 < named.st_size <= limit:
+    raise ValueError("Bounded owned regular fallback bytes required")
+  def identity(info): return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+  fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+  try:
+    opened = os.fstat(fd)
+    if identity(opened) != identity(named): raise ValueError("Fallback changed before read")
+    sha, blake, count, chunks = hashlib.sha256(), hashlib.blake2b(), 0, []
+    while True:
+      raw = os.read(fd, min(1024 * 1024, limit + 1 - count))
+      if not raw: break
+      count += len(raw)
+      if count > limit: raise ValueError("Fallback exceeded byte bound")
+      sha.update(raw)
+      blake.update(raw)
+      if keep: chunks.append(raw)
+    if count != opened.st_size or identity(os.fstat(fd)) != identity(opened) or identity(path.lstat()) != identity(opened):
+      raise ValueError("Short or changed fallback read")
+    return {"sha256": sha.hexdigest(), "blake2b": blake.hexdigest(), "size": count}, b"".join(chunks)
+  finally: os.close(fd)
+
+
+def verify_fallback(root, raw=None):
+  """Prove canonical stock default 2 whose entry hash is the actual production UKI.
+
+  raw=None reads and rereads the live boot configuration; otherwise raw is a
+  retained candidate (for example the pre-transition backup). Matching bytes do
+  not prove ordinary bootability beyond the reviewed Limine BLAKE2b binding.
+  """
+  root = Path(root)
+  live = raw is None
+  if live: config, raw = _stable_bytes(root, P.LIMINE, P.MAX_BYTES, keep=True)
+  else: config = {"sha256": P.digest(raw), "size": len(raw)}
+  G._stock(raw)
+  lines = raw.decode().splitlines()
+  entries = [index for index, line in enumerate(lines) if line.strip().startswith("/")]
+  block = lines[entries[1] + 1:entries[2] if len(entries) > 2 else len(lines)]
+  paths = [line.strip().split(":", 1)[1].strip() for line in block if line.strip().split(":", 1)[0].strip().lower() == "path"]
+  if len(paths) != 1 or "#" not in paths[0]: raise ValueError("Exact production boot entry hash required")
+  expected = paths[0].rsplit("#", 1)[1]
+  image, _ = _stable_bytes(root, PRODUCTION, MAX_UKI)
+  if image["blake2b"] != expected: raise ValueError("Stock entry does not bind actual production UKI bytes")
+  if live:  # nothing may have changed while the UKI was hashed
+    repeated, repeated_raw = _stable_bytes(root, P.LIMINE, P.MAX_BYTES, keep=True)
+    if repeated_raw != raw or repeated != config: raise ValueError("Stock configuration changed while reading UKI")
+  return {"classification": "fallback-bytes-verified", "limine": config, "production": image}
 
 
 _read = P._read
@@ -228,13 +293,27 @@ def transition(root, action, *, precheck, maintenance_continuation=None, guard=N
   return _transition(root, action, precheck=precheck, guard=(lambda: None) if guard is None else guard, maintenance_continuation=maintenance_continuation, recover=recover)
 
 
-def _transition(root, action, *, precheck, guard, maintenance_continuation=None, recover=None):
-  """Internal core; maintenance is fixture-only groundwork, not update permission."""
+def _live_maintenance(root, gate, native):
+  """Only the reviewed native adapter may name `/`; it must bring its own gate."""
+  if not Path(root).is_absolute(): raise ValueError("Absolute maintenance root required")
+  if Path(root).resolve() == Path("/") and (native is not _NATIVE_MAINTENANCE or not callable(gate)):
+    raise ValueError("Live maintenance entry requires a separately reviewed native coordinator")
+
+
+def _transition(root, action, *, precheck, guard, maintenance_continuation=None, recover=None, maintenance_gate=None, native=None):
+  """Internal core; maintenance is a durable veto, not update permission.
+
+  maintenance_gate(root, phase) supplies additional read-only prerequisites at
+  "before" (before any policy write), "after" (stock fallback restored) and
+  "final" (marker durable, deactivation pending still retained). Any failure
+  leaves the deactivation pending and, once published, the maintenance marker.
+  """
   root = Path(root)
   if maintenance_continuation is not None and (root.resolve() == Path("/") or action != "maintenance" or not callable(maintenance_continuation)):
     raise ValueError("Explicit fixture-only maintenance continuation required")
-  if action == "maintenance" and root.resolve() == Path("/"):
-    raise ValueError("Live maintenance entry requires a separately reviewed native coordinator")
+  if maintenance_gate is not None and (action != "maintenance" or not callable(maintenance_gate)):
+    raise ValueError("Maintenance gate is only valid for the maintenance action")
+  if action == "maintenance": _live_maintenance(root, maintenance_gate, native)
   if recover is not None and (root.resolve() == Path("/") or action != "maintenance" or not callable(recover)):
     raise ValueError("Explicit fixture-only retained recovery required")
   if action not in (*PENDINGS, "maintenance"):
@@ -268,6 +347,7 @@ def _transition(root, action, *, precheck, guard, maintenance_continuation=None,
       P.validate(policy, before, actual, receipt_raw)
       after = before
     precheck(root, mechanics, "before")
+    if maintenance_gate is not None: maintenance_gate(root, "before")
     guard()
     transition_id = str(uuid.uuid4())
     intent = _encoded({"protocol": "omarchy-t2-source-default-transition-v1", "transition_id": transition_id,
@@ -322,6 +402,7 @@ def _transition(root, action, *, precheck, guard, maintenance_continuation=None,
     if mechanics == "deactivation":
       G._stock(after)
       if _present(root / OPT_IN) or _present(root / P.POLICY): raise ValueError("Deactivation remains active")
+      if maintenance_gate is not None: maintenance_gate(root, "after")
     else:
       if _read(root, P.POLICY) != policy_raw: raise ValueError("Final active policy differs")
       P.verify(root, P.digest(receipt_raw))
@@ -346,6 +427,12 @@ def _transition(root, action, *, precheck, guard, maintenance_continuation=None,
       _new(root / MAINTENANCE, maintenance_intent)
       if _read(root, MAINTENANCE) != maintenance_intent:
         raise ValueError("Package maintenance marker readback differs")
+      if maintenance_gate is not None:
+        # The marker is already a durable veto; the compatible deactivation
+        # pending is retired only after these final prerequisites hold again.
+        guard()
+        maintenance_gate(root, "final")
+        if _runtime(root) != runtime_review: raise ValueError("Reviewed runtime changed before pending retirement")
     # Both exclusions remain owned through durable pending cleanup. A failure
     # releasing our package lock reinstates pending and never deletes a foreign
     # replacement; only cooperating writers are within this lock contract.
@@ -382,3 +469,51 @@ def _transition(root, action, *, precheck, guard, maintenance_continuation=None,
         except BaseException as error:
           raise RuntimeError("Maintenance veto durability unconfirmed") from error
     return result
+
+
+def _verify_existing_maintenance(root, *, guard, gate, native=None):
+  """Read-only idempotent re-entry: validate an already durable inactive state.
+
+  Holds the same DB and physical locks; never writes, repairs or removes the
+  marker. Any deviation raises with the marker (a sleep veto) untouched.
+  """
+  root = Path(root)
+  if not root.is_absolute() or root.resolve() != root or not root.is_dir(): raise ValueError("Canonical root required")
+  _live_maintenance(root, gate, native)
+  if not callable(guard) or not callable(gate): raise ValueError("Explicit guard and gate required")
+  guard()
+  G._ancestors(root, root / MAINTENANCE, _owner(root))
+  with _locks(root) as release_db:
+    guard()
+    marker = _read(root, MAINTENANCE)
+    intent = P._json(marker)
+    keys = {"protocol", "transition_id", "old_policy_sha256", "runtime_review_sha256", "staged_receipt_sha256",
+            "fallback_limine_sha256", "deactivation_completion_sha256"}
+    if set(intent) != keys or intent["protocol"] != MAINTENANCE_SCHEMA or _encoded(intent) != marker:
+      raise ValueError("Exact canonical maintenance intent required")
+    PRODUCT.TX.uuid_value(intent["transition_id"])
+    archive = HISTORY / intent["transition_id"]
+    if _read(root, archive / "maintenance-intent.json") != marker: raise ValueError("Archived maintenance intent differs")
+    for name, expected in (("policy.json", intent["old_policy_sha256"]), ("completion.json", intent["deactivation_completion_sha256"])):
+      if P.digest(_read(root, archive / name)) != expected: raise ValueError("Retained maintenance authority changed")
+    completion = P._json(_read(root, archive / "completion.json"))
+    if (completion.get("action") != "deactivation" or completion.get("transition_id") != intent["transition_id"] or
+        completion.get("configuration_sha256") != intent["fallback_limine_sha256"] or
+        completion.get("intent_sha256") != P.digest(_read(root, archive / "intent.json"))):
+      raise ValueError("Maintenance deactivation completion chain differs")
+    if _read(root, archive / "opt-in", private=False) != b"": raise ValueError("Retained maintenance opt-in changed")
+    if P.digest(_read(root, P.RECEIPT)) != intent["staged_receipt_sha256"] or _runtime(root) != intent["runtime_review_sha256"]:
+      raise ValueError("Maintenance receipt/runtime review changed")
+    for name in (*PENDINGS.values(), P.POLICY, OPT_IN):
+      G._ancestors(root, root / name, _owner(root))
+      if _present(root / name): raise ValueError("Maintenance retains active/incomplete source state")
+    if P.digest(_read(root, P.LIMINE, private=False)) != intent["fallback_limine_sha256"]:
+      raise ValueError("Boot configuration differs from maintenance fallback")
+    _idle(root)
+    gate(root, "retained")
+    guard()
+    release_db(verify_only=True)
+    if _read(root, MAINTENANCE) != marker: raise ValueError("Maintenance marker changed during verification")
+  return {"protocol": "omarchy-t2-package-maintenance-verified-v1", "transition_id": intent["transition_id"],
+          "maintenance_intent_sha256": P.digest(marker), "already_inactive": True,
+          "live_execution": False, "qualification_issued": False}

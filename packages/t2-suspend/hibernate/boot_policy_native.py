@@ -9,6 +9,12 @@ the pending router veto, physical lock and power-state checks cover cooperating
 callers, not a hostile root. Policy transitions and exclusion startup refuse
 all queued jobs. The explicit ongoing-power mode permits ordinary nonpower
 jobs only after validating the complete typed inventory; no live entry uses it.
+
+The maintenance action reuses the exact deactivation mechanics, then durably
+retains package-maintenance.pending. It adds fixed read-only prerequisites (see
+_maintenance_gate) and is source-only: the installed runtime predates the marker
+and must first be upgraded by a reviewed runtime upgrade. No package runner,
+client or broker exists here, and no qualification or reactivation is issued.
 """
 import argparse
 from contextlib import contextmanager
@@ -22,12 +28,20 @@ import shlex
 import stat
 import subprocess
 import sys
+import tempfile
 
 sys.dont_write_bytecode = True
 ROOT = Path("/")
 STATE = Path("/var/lib/omarchy/t2-hibernate-product")
 SCRIPT = STATE / "runtime/packages/t2-suspend/hibernate/boot_policy_native.py"
 ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"}
+RUNTIME_HIBERNATE = STATE / "runtime/packages/t2-suspend/hibernate"
+SLEEP_ENTRY = RUNTIME_HIBERNATE / "sleep_entry.py"
+REVIEWED_DROPIN = RUNTIME_HIBERNATE / "systemd-hibernate.conf"
+DROPIN = Path("/etc/systemd/system/systemd-hibernate.service.d/omarchy-t2.conf")
+VENDOR_UNIT = "/usr/lib/systemd/system/systemd-hibernate.service"
+MAINTENANCE_NAME = "package-maintenance.pending"
+ACTIONS = ("activation", "deactivation", "maintenance")
 WHO = "omarchy-t2-source-default"
 WHY = "reviewed-boot-policy-transition"
 LOGIN = ("org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager")
@@ -278,9 +292,119 @@ def _precheck(engine, action, phase):
   return result
 
 
+def _resume(engine):
+  product = engine.PRODUCT
+  config = product.TRIAL._private_json(STATE / "config.json")
+  report = product.ARTIFACTS.derive_artifacts(config["source_directory"], config["restore_directory"], config["production_uki"])
+  return report["audited_details"]["restore_protocol"]["resume"]
+
+
+def _reviewed_identity(name):
+  """Reviewed private bytes for one runtime file, bound to the approved inventory."""
+  raw = _private_bytes(RUNTIME_HIBERNATE / name)
+  review = json.loads(_private_bytes(STATE / "runtime-deployment-review.json"))
+  expected = review["files"].get("packages/t2-suspend/hibernate/" + name)
+  if expected != {"sha256": hashlib.sha256(raw).hexdigest(), "size": len(raw)}:
+    raise ValueError("Reviewed runtime file differs from approved inventory: " + name)
+  return raw
+
+
+def _dropin_bytes():
+  fd = os.open(DROPIN, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+  try:
+    info = os.fstat(fd)
+    named = DROPIN.lstat()
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022 or info.st_nlink != 1 or info.st_size > 65536
+        or (info.st_dev, info.st_ino) != (named.st_dev, named.st_ino)):
+      raise ValueError("Root-owned regular installed hibernate drop-in required")
+    ancestors = [path for path in DROPIN.parents if path != Path("/")]
+    for path in ancestors:
+      parent = path.lstat()
+      if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != 0 or parent.st_mode & 0o022:
+        raise ValueError("Root-owned nonsymlink drop-in ancestors required")
+    raw = os.read(fd, 65537)
+    if len(raw) > 65536: raise ValueError("Oversized drop-in")
+    return raw
+  finally: os.close(fd)
+
+
+def _hibernate_route():
+  """Actual installed drop-in bytes and systemd's effective ExecStart, no reload."""
+  if _dropin_bytes() != _reviewed_identity("systemd-hibernate.conf"):
+    raise ValueError("Installed hibernate drop-in differs from reviewed bytes")
+  _reviewed_identity("sleep_entry.py")
+  raw = _command(("/usr/bin/systemctl", "show", "--no-pager", "--property=LoadState,FragmentPath,DropInPaths,ExecStart", "systemd-hibernate.service"))
+  fields = {}
+  for line in raw.splitlines():
+    key, separator, value = line.partition("=")
+    if not separator or key in fields: raise ValueError("Ambiguous systemd-hibernate.service properties")
+    fields[key] = value
+  if set(fields) != {"LoadState", "FragmentPath", "DropInPaths", "ExecStart"} or fields["LoadState"] != "loaded":
+    raise ValueError("Exact systemd-hibernate.service property inventory required")
+  if fields["FragmentPath"] != VENDOR_UNIT or fields["DropInPaths"] != str(DROPIN):
+    raise ValueError("Unexpected systemd-hibernate.service fragment or drop-in set")
+  execution = fields["ExecStart"]
+  if execution.count("{") != 1 or execution.count("}") != 1 or execution.count("argv[]=") != 1 or not (execution.startswith("{ ") and execution.endswith(" }")):
+    raise ValueError("Exactly one effective ExecStart required")
+  parts = execution[2:-2].split(" ; ")
+  if parts[0] != "path=/usr/bin/python3" or parts[1] != "argv[]=/usr/bin/python3 -B " + str(SLEEP_ENTRY):
+    raise ValueError("Effective ExecStart is not the reviewed sleep entry")
+
+
+def _load_reviewed(name, path):
+  spec = importlib.util.spec_from_file_location(name, path)
+  module = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(module)
+  return module
+
+
+def _maintenance_vetoes(engine):
+  """Behavioral proof that reviewed sleep, product and activation code honor the marker.
+
+  Uses only a private temporary synthetic root; a control without the marker
+  must pass so a vacuous or always-refusing probe cannot be mistaken for policy.
+  """
+  sleep_entry = _load_reviewed("native_reviewed_sleep_entry", SLEEP_ENTRY)
+  if MAINTENANCE_NAME not in sleep_entry.PENDING: raise ValueError("Reviewed sleep entry lacks maintenance veto")
+  with tempfile.TemporaryDirectory() as directory:
+    root = Path(directory).resolve()
+    state = root / engine.P.STATE
+    state.mkdir(parents=True, mode=0o700)
+    for path in (state, *state.parents):
+      if path == root.parent: break
+      path.chmod(0o700)
+    sleep_entry.reject_pending(root)  # control: absent marker admits
+    marker = state / MAINTENANCE_NAME
+    marker.write_bytes(b"synthetic marker")
+    def refuses(operation, text):
+      try: operation()
+      except ValueError as error:
+        if text not in str(error): raise
+        return
+      raise ValueError("Reviewed code does not veto package maintenance marker")
+    refuses(lambda: sleep_entry.reject_pending(root), "package maintenance")
+    refuses(lambda: engine.PRODUCT.verify_deployment(root, {}, {}), "package maintenance")
+    def refuse(*arguments): raise AssertionError("activation reached admission despite maintenance marker")
+    refuses(lambda: engine._transition(root, "activation", precheck=refuse, guard=lambda: None), "maintenance intent")
+
+
+def _maintenance_gate(engine, root, phase):
+  """Fixed read-only prerequisites, before any write and again before pending retirement."""
+  if root != ROOT or phase not in engine.GATE_PHASES: raise ValueError("Fixed live root and known gate phase required")
+  _hibernate_route()
+  _maintenance_vetoes(engine)
+  if phase == "before":
+    # The exact stock configuration retained before activation must bind the actual production UKI.
+    engine.verify_fallback(ROOT, engine._read(ROOT, engine.P.BACKUP))
+  else:
+    engine.verify_fallback(ROOT)
+  if phase in ("final", "retained"):
+    engine.IMAGE_STATE.require_no_image(ROOT, _resume(engine))
+
+
 def native(action):
   """Fixed host action; no roots, runners, prechecks, force or approval APIs."""
-  if action not in ("activation", "deactivation"): raise ValueError("Explicit policy action required")
+  if action not in ACTIONS: raise ValueError("Explicit policy action required")
   engine = _installed()
   parent = Path("/proc") / str(os.getppid()) / "exe"
   if parent.readlink() != Path("/usr/bin/systemd-inhibit"):
@@ -288,14 +412,23 @@ def native(action):
     os.execve(command[0], command, ENV)
     raise RuntimeError("Inhibitor exec unexpectedly returned")
   with _exclusion(action) as guard:
+    if action == "maintenance":
+      gate = lambda root, phase: _maintenance_gate(engine, root, phase)
+      if engine._present(ROOT / engine.MAINTENANCE):
+        # Idempotent re-entry validates the retained inactive state, never rewrites it.
+        result = engine._verify_existing_maintenance(ROOT, guard=guard, gate=gate, native=engine._NATIVE_MAINTENANCE)
+      else:
+        result = engine._transition(ROOT, action, precheck=lambda root, requested, phase: _precheck(engine, requested, phase),
+                                    guard=guard, maintenance_gate=gate, native=engine._NATIVE_MAINTENANCE)
+      return {**result, "live_execution": True, "power_operation": False}
     # The only live callback is this fixed adapter's own read-only verifier.
     result = engine._transition(ROOT, action, precheck=lambda root, requested, phase: _precheck(engine, requested, phase), guard=guard)
     return {**result, "live_execution": True, "power_operation": False}
 
 
 def main(argv=None):
-  parser = argparse.ArgumentParser(description="Reviewed installed source-default activation or exact stock fallback; no power transition")
-  parser.add_argument("action", choices=("activation", "deactivation"))
+  parser = argparse.ArgumentParser(description="Reviewed installed source-default activation, exact stock fallback or inactive maintenance; no power transition")
+  parser.add_argument("action", choices=ACTIONS)
   args = parser.parse_args(argv)
   print(json.dumps(native(args.action), sort_keys=True))
   return 0
