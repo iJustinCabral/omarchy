@@ -15,11 +15,20 @@ import tempfile
 HERE = Path(__file__).resolve().parent
 PACKAGE = HERE.parent
 REPO = HERE.parents[2]
-NAME, VERSION = 'omarchy-t2-radio', '1.0'
-SOURCE = f'usr/src/{NAME}-{VERSION}'
+NAME, VERSION = 'omarchy-t2-radio', '1.1'
+def source_name(version):
+  return f'usr/src/{NAME}-{version}'
+
+SOURCE = source_name(VERSION)
 STATE = 'var/lib/omarchy-t2-suspend'
 RECEIPT = STATE + '/receipt.json'
 MODULES = ('brcmfmac', 'brcmfmac-wcc', 'brcmfmac-cyw', 'brcmfmac-bca', 'hci_bcm4377')
+# Radio only. The BCE family (keyboard, trackpad, audio) is never replaced by this package.
+# Every one of these must resolve to the stock kernel tree; t2bce_ave is optional.
+BCE_FAMILY = ('t2bce_dma', 't2bce_core', 't2bce_vhci', 't2bce_audio', 't2bce_ave')
+BCE_STOCK = '/kernel/drivers/staging/t2bce/'
+# DKMS build gate and qualified stock fingerprints, shipped in the DKMS source tree.
+SOURCE_FILES = ('dkms.conf', 'build-modules.sh', 'check-radio-qualification.sh', 'qualified-radio.conf')
 
 def load_module(name, path):
   spec = importlib.util.spec_from_file_location(name, path)
@@ -57,6 +66,12 @@ def save(root, receipt):
 
 def load(root):
   return json.loads(bytes.fromhex(bt.read(root, RECEIPT)['hex']))
+
+def installed_version(receipt):
+  version = receipt.get('version')
+  if not isinstance(version, str) or not re.fullmatch(r'[0-9]+(?:\.[0-9]+)*', version):
+    raise ValueError('Invalid T2 suspend receipt version')
+  return version
 
 def tree_hash(path):
   return {str(p.relative_to(path)): hashlib.sha256(p.read_bytes()).hexdigest()
@@ -124,8 +139,45 @@ def check_dkms_policy(root):
   for path in (root / 'etc/dkms').glob(NAME + '*.conf'):
     raise ValueError('Preserving custom DKMS module configuration: ' + str(path))
 
-def check_selection(releases, runner=run):
+def qualified(root, release, runner=run):
+  """True when the kernel's stock radio srcversions match a qualified row."""
+  result = runner(['bash', str(HERE / 'check-radio-qualification.sh'), release, str(root)], check=False)
+  if result.returncode not in (0, 1):
+    raise ValueError('Cannot evaluate T2 radio qualification for ' + release)
+  return result.returncode == 0
+
+def check_bce_family(release, runner=run):
+  for name in BCE_FAMILY:
+    try:
+      selected = runner(['modinfo', '-k', release, '-n', name]).stdout.strip()
+    except subprocess.CalledProcessError:
+      if name == 't2bce_ave': continue
+      raise ValueError('Missing T2 BCE module: ' + name)
+    if BCE_STOCK not in selected:
+      raise ValueError('Mixed or foreign T2 BCE module family: ' + name + ' resolves to ' +
+                       selected + '; every t2bce_* module must come from the stock kernel tree')
+
+def check_selection(releases, runner=run, root=Path('/'), decided=None):
+  """Check the radio and BCE selection for every kernel.
+
+  DKMS moves each stock radio module it replaces into its original_module archive, so after
+  an install the stock tree no longer shows the stock fingerprint. Install therefore passes
+  `decided`, the kernels it judged qualified BEFORE building; those are trusted for the kernels
+  it just built. Later verification passes nothing and asks the gate, which reads the archive.
+  """
   for release in releases:
+    check_bce_family(release, runner)
+    is_qualified = release in decided if decided is not None else qualified(root, release, runner)
+    if not is_qualified:
+      # DKMS skipped the package: the whole radio set must be stock, with no package build.
+      build = root / f'var/lib/dkms/{NAME}/{VERSION}/{release}/x86_64/module'
+      for name in MODULES:
+        selected = runner(['modinfo', '-k', release, '-n', name]).stdout.strip()
+        if '/kernel/drivers/' not in selected or any(build.glob(name + '.ko*')):
+          raise ValueError('Unqualified kernel ' + release + ' must use stock radio drivers: ' + name)
+      print('Warning: T2 radio package skipped for unqualified kernel ' + release +
+            '; stock radio drivers stay in use', flush=True)
+      continue
     for name in MODULES:
       selected = runner(['modinfo', '-k', release, '-n', name]).stdout.strip()
       if not selected.startswith('/lib/modules/' + release + '/') and not selected.startswith('/usr/lib/modules/' + release + '/'):
@@ -134,7 +186,7 @@ def check_selection(releases, runner=run):
       if not vermagic or vermagic[0] != release:
         raise ValueError('Wrong module ABI: ' + name)
       actual = runner(['modinfo', '-F', 'srcversion', selected]).stdout.strip()
-      module = Path(f'/var/lib/dkms/{NAME}/{VERSION}/{release}/x86_64/module/{name}.ko')
+      module = root / f'var/lib/dkms/{NAME}/{VERSION}/{release}/x86_64/module/{name}.ko'
       candidates = [module] + [Path(str(module) + ext) for ext in ('.zst', '.xz', '.gz')]
       built = next((p for p in candidates if p.is_file()), None)
       if built is None:
@@ -163,13 +215,16 @@ def verify(root, runner=run, selection=check_selection):
   receipt = load(root)
   if receipt['state'] != 'installed':
     raise ValueError('Incomplete installation; run rollback before retry')
+  if installed_version(receipt) != VERSION:
+    raise ValueError('Installed T2 suspend drivers are version ' + installed_version(receipt) +
+                     ', not ' + VERSION + '; run omarchy setup t2-suspend to upgrade')
   for name, value in receipt['installed'].items():
     if bt.read(root, name) != value:
       raise ValueError('Changed owned configuration: ' + name)
   if tree_hash(safe(root, SOURCE)) != receipt['source_hashes']:
     raise ValueError('Changed DKMS source tree')
   releases = kernels(root)
-  selection(releases, runner)
+  selection(releases, runner, root)
   check_images(root, runner)
   return receipt
 
@@ -192,14 +247,16 @@ def rollback(root, runner=run, rebuild=True):
   receipt = load(root)
   if receipt['state'] == 'rolled-back':
     return
+  # Remove whatever version the receipt names, which may be older than this code.
+  version = installed_version(receipt)
   for name, original in receipt['original'].items():
     if bt.read(root, name) not in (original, receipt['installed'][name]):
       raise ValueError('Preserving edited configuration: ' + name)
-  source = safe(root, SOURCE)
+  source = safe(root, source_name(version))
   if source.exists() and tree_hash(source) != receipt['source_hashes']:
     raise ValueError('Preserving edited DKMS source tree')
-  if receipt.get('dkms_added') and (root / f'var/lib/dkms/{NAME}/{VERSION}').exists():
-    runner(['dkms', 'remove', '-m', NAME, '-v', VERSION, '--all'])
+  if receipt.get('dkms_added') and (root / f'var/lib/dkms/{NAME}/{version}').exists():
+    runner(['dkms', 'remove', '-m', NAME, '-v', version, '--all'])
   for name, original in reversed(list(receipt['original'].items())):
     bt.write(root, name, original)
   if source.exists(): shutil.rmtree(source)
@@ -216,9 +273,13 @@ def install(root, runner=run, selection=check_selection, fetch=fetcher.fetch):
   if bt.read(root, RECEIPT) is not None:
     receipt = load(root)
     if receipt['state'] == 'installed':
-      safe(root, SOURCE).chmod(0o755)
-      verify(root, runner, selection)
-      return
+      if installed_version(receipt) == VERSION:
+        safe(root, SOURCE).chmod(0o755)
+        verify(root, runner, selection)
+        return
+      # An older package version is upgraded by rolling it back to stock, then installing.
+      rollback(root, runner)
+      receipt = load(root)
     if receipt['state'] != 'rolled-back':
       raise ValueError('Incomplete installation; run rollback before retry')
   check_dkms_policy(root)
@@ -235,6 +296,11 @@ def install(root, runner=run, selection=check_selection, fetch=fetcher.fetch):
   if source.exists(): raise ValueError('Unowned DKMS source already exists')
   if (root / f'var/lib/dkms/{NAME}/{VERSION}').exists():
     raise ValueError('Unowned DKMS registration already exists')
+  # Only kernels whose stock radio drivers match a qualified fingerprint get a build;
+  # the rest keep stock drivers. With none qualified there is nothing to install.
+  buildable = [release for release in releases if qualified(root, release, runner)]
+  if not buildable:
+    raise ValueError('No installed linux-t2 kernel has a qualified stock radio fingerprint; keeping stock drivers')
   state = safe(root, STATE)
   state.mkdir(parents=True, exist_ok=True, mode=0o700)
   # Source download/patching finishes before any driver/configuration mutation.
@@ -243,12 +309,12 @@ def install(root, runner=run, selection=check_selection, fetch=fetcher.fetch):
     fetch(work / 'input')
     prepare.prepare(work / 'input/drivers/net/wireless/broadcom/brcm80211',
                     work / 'input/drivers/bluetooth/hci_bcm4377.c', work / 'source', 'wifi-reenable')
-    for name in ('dkms.conf', 'build-modules.sh'):
-      shutil.copyfile(HERE / name, work / 'source' / name)
+    for name in SOURCE_FILES:
+      shutil.copy2(HERE / name, work / 'source' / name)
     hashes = tree_hash(work / 'source')
     backup = Path(tempfile.mkdtemp(prefix='boot-', dir=state)) / 'boot'
     backup_boot(root, backup)
-    receipt = {'state': 'preparing', 'version': VERSION, 'kernels': releases,
+    receipt = {'state': 'preparing', 'version': VERSION, 'kernels': releases, 'qualified_kernels': buildable,
                'original': {name: bt.read(root, name) for name in payload},
                'installed': payload, 'source_hashes': hashes,
                'boot_backup': str(backup.relative_to(root)), 'dkms_added': False}
@@ -264,14 +330,15 @@ def install(root, runner=run, selection=check_selection, fetch=fetcher.fetch):
       save(root, receipt)
       runner(['dkms', 'add', '-m', NAME, '-v', VERSION])
       # Complete all builds before selecting any replacement modules.
-      for release in releases:
+      for release in buildable:
         print('Building T2 suspend drivers for ' + release, flush=True)
         runner(['dkms', 'build', '-m', NAME, '-v', VERSION, '-k', release])
       for name, value in payload.items(): bt.write(root, name, value)
-      for release in releases:
+      for release in buildable:
         runner(['dkms', 'install', '--force', '-m', NAME, '-v', VERSION, '-k', release])
+      for release in releases:
         runner(['depmod', '-a', release])
-      selection(releases, runner)
+      selection(releases, runner, root, buildable)
       runner(['limine-mkinitcpio', 'linux-t2'])
       check_images(root, runner)
       receipt['state'] = 'installed'

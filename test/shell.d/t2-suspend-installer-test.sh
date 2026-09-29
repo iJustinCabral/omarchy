@@ -2,6 +2,7 @@
 set -euo pipefail
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/base-test.sh"
 python3 "$ROOT/test/shell.d/t2-suspend-installer-unit.py"
+python3 "$ROOT/test/shell.d/t2-suspend-radio-gate-unit.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-preparation.py"
 pass "T2 suspend source and installer transactions"
 
@@ -51,7 +52,7 @@ mkdir -p "$test_tmp/root/usr/lib/firmware/brcm"
 for suffix in .bin -SPPR-m.txt -SPPR-u.txt .clm_blob .txcap_blob; do
   echo fixture > "$test_tmp/root/usr/lib/firmware/brcm/brcmfmac4377b3-pcie.apple,formosa$suffix"
 done
-if bash -c 'source "$1"; _optmoduleroot=$2; KERNELVERSION=7.2.4-test-t2; add_file() { return 0; }; modinfo() { echo MODULE_LOOKUP >&2; return 1; }; build; echo UNSAFE_CONTINUATION' bash "$ROOT/packages/t2-suspend/installer/initcpio-install" "$test_tmp/root" > "$test_tmp/hook-output" 2>&1; then
+if bash -c 'source "$1"; _optmoduleroot=$2; KERNELVERSION=7.2.4-test-t2; add_file() { return 0; }; modinfo() { case ${*: -1} in t2bce_*) echo /usr/lib/modules/x/kernel/drivers/staging/t2bce/x.ko ;; *) echo MODULE_LOOKUP >&2; return 1 ;; esac; }; build; echo UNSAFE_CONTINUATION' bash "$ROOT/packages/t2-suspend/installer/initcpio-install" "$test_tmp/root" > "$test_tmp/hook-output" 2>&1; then
   fail "missing replacement must abort mkinitcpio"
 fi
 ! grep -q UNSAFE_CONTINUATION "$test_tmp/hook-output" || fail "hook continued after failure"
