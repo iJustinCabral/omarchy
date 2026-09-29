@@ -1,0 +1,45 @@
+Subject: [PATCH] t2bce: limit the shared-link DMA gate to hibernation
+
+Patch 0005 registered t2bce_suspend_noirq()/t2bce_resume_noirq() as the
+ordinary .suspend_noirq/.resume_noirq callbacks and routed .resume through
+t2bce_resume_with_shared_dma().  The verify step in t2bce_resume_noirq()
+(fail with -EIO and latch pci_dma_restore_failed when any of the four 74:00.x
+functions has PCI_COMMAND bus-master set) only makes sense for hibernation,
+where DMA must stay blocked until the restored kernel rebuilds its state.
+After a real ACPI S3 wake firmware leaves bus-master set on the sibling
+functions (function 2 is the unbound SEP function), so every S3 resume failed:
+
+  t2bce_core: noirq: blocked shared-link DMA and saved disabled state mask=0x6
+  t2bce_core: noirq: shared-link DMA became enabled during restore
+  t2bce_core 0000:74:00.1: PM: failed to resume noirq: error -5
+
+Remove .suspend_noirq/.resume_noirq and use the plain t2bce_resume() for
+.resume so ordinary S3 takes the pre-0005 path: no noirq DMA gate, no latch
+consultation, and no bus-master clearing after a failed resume.  The
+hibernation mappings (.freeze_noirq, .thaw_noirq, .poweroff_noirq,
+.restore_noirq, .thaw, .restore) are unchanged, and .freeze_noirq still
+resets the latch and saved mask at the start of every hibernation transition.
+.resume is never invoked by the hibernation phases, so the latch is
+unreachable on S3.
+
+This is an unqualified source-only change; it has not been built, staged or
+tested on hardware.
+
+---
+diff --git a/drivers/staging/t2bce/t2bce_core/t2bce_main.c b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
+--- a/drivers/staging/t2bce/t2bce_core/t2bce_main.c
++++ b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
+@@ -1137,9 +1137,10 @@
+ struct dev_pm_ops t2bce_pci_driver_pm = {
+         .prepare = t2bce_prepare,
+         .suspend = t2bce_suspend,
+-        .resume = t2bce_resume_with_shared_dma,
+-        .suspend_noirq = t2bce_suspend_noirq,
+-        .resume_noirq = t2bce_resume_noirq,
++        /* Ordinary S3 uses the plain BCE resume and no noirq DMA gate; the
++         * shared-link block is hibernation-only (freeze/poweroff/thaw/restore).
++         */
++        .resume = t2bce_resume,
+         .freeze = t2bce_freeze,
+         .thaw = t2bce_resume_with_shared_dma,
+         .poweroff = t2bce_freeze,
