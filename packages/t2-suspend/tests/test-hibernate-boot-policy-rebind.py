@@ -774,6 +774,14 @@ class RebindNative(unittest.TestCase):
     with patch.object(N, "_rebind_postchecks") as postchecks: arguments.kwargs["postchecks"](Path("/"), {"kernel": {}})
     postchecks.assert_called_once_with(engine, Path("/"), {"kernel": {}})
 
+  def test_the_live_7_2_7_assessment_shape_is_accepted(self):
+    """Changed items win over unknown ones: the 2026-09-29 live report (kernel, production_uki, control_inventory changed; driver items unknown)."""
+    live = {"class": "requalification-required", "changed_items": ["control_inventory", "kernel", "production_uki"], "unknown_items": ["driver_modules", "firmware"],
+            "baseline": "valid", "limine": {"exact_equal": False, "state": "equal", "stock_projection_equal": True}}
+    F.T._rebind_refuse_assessment(live)
+    for bad in ({**live, "class": "unknown"}, {**live, "class": "unchanged"}):
+      with self.assertRaises(ValueError): F.T._rebind_refuse_assessment(bad)
+
   def test_the_action_is_fixed_and_the_cli_takes_no_paths_or_force(self):
     self.assertIn("rebind", N.ACTIONS)
     self.assertEqual(N._inhibit_command("rebind")[-1], "rebind")
