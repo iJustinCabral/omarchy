@@ -1,8 +1,10 @@
 """Read-only ALPM admission while the qualified source boot policy is inactive.
 
-Presence of boot-policy.json, source-default-activation.pending,
-source-default-deactivation.pending or package-maintenance.pending in the fixed
-product state blocks updates, regardless of contents. Routine opt-in and EFI
+The blanket check() (no maintenance marker) admits only when boot-policy.json,
+source-default-activation.pending, source-default-deactivation.pending,
+package-maintenance.pending and runtime upgrade markers are all absent; their
+presence blocks it regardless of contents. A present maintenance marker instead
+routes the fixed CLI to the native inactive-maintenance path described below. Routine opt-in and EFI
 loader overrides must also be absent, with efivarfs visible. Future
 activation/deactivation must retain evidence elsewhere and exclusively own both
 pacman's actual db.lck and the shared physical lock throughout their transition;
@@ -11,13 +13,26 @@ this one-shot guard cannot close an independently privileged activation race.
 No deactivation, boot writes, automatic rebuild or qualification occurs here.
 The fixed root CLI accepts no arguments or environment-based bypass. Explicit
 canonical fixture roots are available only to imported offline tests.
+
+Native inactive maintenance: when package-maintenance.pending exists the fixed
+root CLI does not fall back to the blanket refusal. It first authenticates the
+installed, root-isolated, reviewed-inventory runtime using only stdlib code in
+this file (no sibling import precedes the byte pins), then holds the physical
+cycle lock non-blockingly while the existing exact inactive-maintenance chain is
+validated. Success admits an ordinary transaction; the marker is retained (it is
+not a single-use grant), no qualification is issued and hibernation stays vetoed.
+Pacman already owns db.lck during a hook, so that lock is never required absent.
+Every unknown, partial, foreign or contended condition raises and blocks.
 """
+import hashlib
+import json
 import os
 import importlib.util
 from pathlib import Path
 import re
 import stat
 import sys
+import fcntl
 
 
 STATE = Path("var/lib/omarchy/t2-hibernate-product")
@@ -25,11 +40,18 @@ EFI = Path("sys/firmware/efi/efivars")
 LOADER_GUID = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
 ACTIVE = (STATE / "boot-policy.json", STATE / "source-default-activation.pending",
           STATE / "source-default-deactivation.pending", STATE / "package-maintenance.pending",
+          STATE / "runtime-upgrade.pending", STATE / ".runtime-pending",
           Path("etc/omarchy/t2-hibernate-product.enabled"),
           EFI / ("LoaderEntryOneShot-" + LOADER_GUID), EFI / ("LoaderEntryDefault-" + LOADER_GUID))
 LIMINE = Path("boot/limine.conf")
 PRODUCTION = "boot():/EFI/Linux/omarchy_linux-t2.efi"
 MAX_BYTES = 1024 * 1024
+MAINTENANCE = STATE / "package-maintenance.pending"
+PHYSICAL_LOCK = Path("var/lib/omarchy/t2-hibernate-trial/physical-cycle.lock")
+RUNTIME = STATE / "runtime"
+REVIEW = STATE / "runtime-deployment-review.json"
+SCRIPT = Path("/") / RUNTIME / "packages/t2-suspend/hibernate/update_guard.py"
+MAX_REVIEW = 2 * 1024 * 1024
 
 
 def _stock(raw):
@@ -114,6 +136,11 @@ def check_inactive_maintenance(root):
   root = Path(root)
   if not root.is_absolute() or root.resolve() != root or not root.is_dir() or root == Path("/"):
     raise ValueError("Fixture-only inactive maintenance refuses live roots and aliases")
+  return _maintenance(root)
+
+
+def _maintenance(root):
+  """Exact inactive-maintenance validation; callers authenticate and lock first."""
   # Lazy reuse avoids import-time cycles (the transition itself imports us).
   spec = importlib.util.spec_from_file_location("guard_maintenance_evidence", Path(__file__).with_name("package_maintenance.py"))
   maintenance = importlib.util.module_from_spec(spec)
@@ -185,11 +212,125 @@ def check_inactive_maintenance(root):
     "qualification_issued": False, "reactivation_evaluated": False}
 
 
+
+def _private_bytes(path, owner):
+  named = path.lstat()
+  fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+  try:
+    info = os.fstat(fd)
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != owner or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600 or
+        not 0 < info.st_size <= MAX_REVIEW or (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) != (named.st_dev, named.st_ino, named.st_size, named.st_mtime_ns)):
+      raise ValueError("Stable bounded owner-private reviewed bytes required")
+    raw = os.read(fd, MAX_REVIEW + 1)
+    if len(raw) != info.st_size or (os.fstat(fd).st_mtime_ns, os.fstat(fd).st_size) != (info.st_mtime_ns, info.st_size):
+      raise ValueError("Reviewed bytes changed or were short")
+    return raw
+  finally: os.close(fd)
+
+
+def _pairs(items):
+  value = {}
+  for key, item in items:
+    if key in value: raise ValueError("Duplicate reviewed inventory field")
+    value[key] = item
+  return value
+
+
+def _authenticate(prefix, owner, isolated, script):
+  """Installed, isolated, reviewed-inventory proof using ONLY this stdlib prelude.
+
+  No sibling module is loaded before this file and the pinned stdlib-only
+  runtime_deployment verifier match the externally reviewed inventory. A
+  writable-workspace copy, a non-isolated interpreter or an unreviewed tree is
+  refused. Hostile root is out of scope; this is not a defence against it.
+  """
+  prefix, script = Path(prefix), Path(script)
+  state, runtime = prefix / STATE, prefix / RUNTIME
+  if os.getresuid() != (owner,) * 3 or not isolated or script != runtime / "packages/t2-suspend/hibernate/update_guard.py":
+    raise ValueError("Fixed root-private isolated installed update guard required")
+  for path in (script, *script.parents):
+    info = path.lstat()
+    if info.st_uid != owner or info.st_mode & 0o022 or stat.S_ISLNK(info.st_mode) or (path != script and not stat.S_ISDIR(info.st_mode)):
+      raise ValueError("Owned nonsymlink installed-guard ancestry required")
+    if path == prefix: break
+  for path in (state, runtime, *runtime.rglob("*")):
+    info = path.lstat()
+    directory = stat.S_ISDIR(info.st_mode)
+    if (info.st_uid != owner or stat.S_ISLNK(info.st_mode) or not (directory or stat.S_ISREG(info.st_mode)) or
+        stat.S_IMODE(info.st_mode) != (0o700 if directory else 0o600) or (not directory and info.st_nlink != 1)):
+      raise ValueError("Whole runtime must be owner-private before imports")
+  review = json.loads(_private_bytes(state / REVIEW.name, owner), object_pairs_hook=_pairs)
+  if (type(review) is not dict or set(review) != {"protocol", "approved", "reviewed_commit", "files"} or review["approved"] is not True or
+      review["protocol"] != "omarchy-t2-product-runtime-snapshot-v1" or type(review["files"]) is not dict or
+      type(review["reviewed_commit"]) is not str or not re.fullmatch(r"[0-9a-f]{40}", review["reviewed_commit"])):
+    raise ValueError("External exact approved runtime inventory required")
+  def pin(path):
+    raw = _private_bytes(path, owner)
+    if review["files"].get(path.relative_to(runtime).as_posix()) != {"sha256": hashlib.sha256(raw).hexdigest(), "size": len(raw)}:
+      raise ValueError("Installed guard bytes differ from reviewed inventory")
+  bootstrap = script.with_name("runtime_deployment.py")
+  pin(script)
+  pin(bootstrap)
+  spec = importlib.util.spec_from_file_location("guard_reviewed_bootstrap", bootstrap)
+  deployment = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(deployment)  # first sibling import: byte-pinned, stdlib-only
+  deployment._verify_tree(runtime, review["files"])
+  pin(script)
+
+
+def _physical(root, owner):
+  """Non-blocking exclusive hold of the fixed cycle lock; contention blocks the update."""
+  path = root / PHYSICAL_LOCK
+  _ancestors(root, path, owner)
+  named = path.lstat()
+  fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+  try:
+    info = os.fstat(fd)
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != owner or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1 or
+        (info.st_dev, info.st_ino) != (named.st_dev, named.st_ino)):
+      raise ValueError("Fixed private physical cycle lock required")
+    try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError: raise ValueError("A hibernation cycle holds the physical lock; update refused") from None
+    return fd, (info.st_dev, info.st_ino)
+  except BaseException:
+    os.close(fd)
+    raise
+
+
+def _admit(root, owner, isolated, script):
+  """Authenticate, hold the physical lock, validate the exact chain, admit. Never mutates."""
+  root = Path(root)
+  _authenticate(root, owner, isolated, script)
+  fd, identity = _physical(root, owner)
+  try:
+    result = _maintenance(root)
+    current = (root / PHYSICAL_LOCK).lstat()
+    if (current.st_dev, current.st_ino) != identity or not os.fstat(fd).st_nlink == 1:
+      raise ValueError("Physical cycle lock changed during admission")
+  finally: os.close(fd)  # closing releases the flock
+  return {**result, "classification": "inactive-maintenance-update-admitted"}
+
+
+def native():
+  """Fixed live entry: no parameters, environment, files or arguments select authority."""
+  if os.geteuid() != 0: raise ValueError("Root update admission required")
+  if Path(__file__).absolute() != SCRIPT: raise ValueError("Fixed installed update guard path required")
+  return _admit(Path("/"), 0, sys.flags.isolated, SCRIPT)
+
+
+def _marker_present(root):
+  try: (Path(root) / MAINTENANCE).lstat()
+  except FileNotFoundError: return False
+  return True
+
+
+
 def main(argv=None):
   arguments = sys.argv[1:] if argv is None else argv
   if arguments: raise ValueError("No update-guard arguments or bypasses permitted")
   if os.geteuid() != 0: raise ValueError("Explicit root update-guard invocation required")
-  check(Path("/"))
+  if _marker_present(Path("/")): native()
+  else: check(Path("/"))
   return 0
 
 
