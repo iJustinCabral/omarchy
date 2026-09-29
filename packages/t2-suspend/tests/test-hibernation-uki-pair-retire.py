@@ -165,6 +165,126 @@ class Retire(unittest.TestCase):
     self.assertEqual(sha((archive / "limine.conf.at-retirement").read_bytes()), record["limine_before_sha256"])
     self.assertEqual(oct((archive / "receipt.json").stat().st_mode & 0o777), "0o600")
 
+  def crash_at(self, step):
+    def hook(name):
+      if name == step:
+        raise RuntimeError("injected crash")
+
+    with self.assertRaises(RuntimeError):
+      self.retire(step_hook=hook)
+
+  def test_snapper_rewrite_between_plan_and_write_is_not_reverted(self):
+    self.kernel_update()
+    newer = limine_text(self.new_production, 5, "d").encode()
+
+    def hook(name):
+      if name == "journal":
+        self.write(PAIR.SINGLE.LIMINE, newer + self.block)
+
+    self.retire(step_hook=hook)
+    self.assertEqual(self.path(PAIR.SINGLE.LIMINE).read_bytes(), newer)
+
+  def test_foreign_rewrite_between_plan_and_write_refuses(self):
+    self.kernel_update()
+
+    def hook(name):
+      if name == "journal":
+        self.write(PAIR.SINGLE.LIMINE, self.updated_limine.replace(b"timeout: 3", b"timeout: 9") + self.block)
+
+    with self.assertRaises(ValueError):
+      self.retire(step_hook=hook)
+    self.assertIn(self.block, self.path(PAIR.SINGLE.LIMINE).read_bytes())
+
+  def test_rollback_keeps_a_newer_snapshot_region(self):
+    self.kernel_update()
+    self.crash_at("limine")
+    newer = limine_text(self.new_production, 5, "d").encode()
+    self.write(PAIR.SINGLE.LIMINE, newer)
+    PAIR.retire_rollback(self.root)
+    self.assertEqual(self.path(PAIR.SINGLE.LIMINE).read_bytes(), newer + self.block)
+
+  def test_signals_release_only_our_db_lock_and_restore_handlers(self):
+    import signal
+    self.kernel_update()
+    for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+      with self.subTest(signal=number):
+        before = signal.getsignal(number)
+
+        def hook(name, number=number):
+          if name == "journal":
+            os.kill(os.getpid(), number)
+
+        with self.assertRaises(SystemExit):
+          self.retire(step_hook=hook)
+        self.assertFalse(self.path(PAIR.DB_LOCK).exists())
+        self.assertEqual(signal.getsignal(number), before)
+        self.assertEqual(self.retire()["state"], "retired")
+        self.assert_retired()
+        self.tearDown_fixture()
+        self.setUp()
+        self.kernel_update()
+
+  def test_rollback_refuses_foreign_live_state_before_any_work(self):
+    self.kernel_update()
+    self.crash_at("image-source")
+    self.write(PAIR.RECEIPT, self.receipt_raw + b" ")
+    self.refuses("differs from the archived copy", lambda: PAIR.retire_rollback(self.root))
+    self.write(PAIR.RECEIPT, self.receipt_raw)
+    self.write(PAIR.BACKUP, self.original + b"#")
+    self.refuses("differs from the archived copy", lambda: PAIR.retire_rollback(self.root))
+    self.write(PAIR.BACKUP, self.original)
+    self.write(PAIR.IMAGES["restore"], b"foreign")
+    self.refuses("ESP restore image differs", lambda: PAIR.retire_rollback(self.root))
+
+  def test_incomplete_manifest_refuses(self):
+    self.kernel_update()
+    self.crash_at("journal")
+    manifest_path = next(self.path(PAIR.ARCHIVE_ROOT).iterdir()) / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    saved = dict(manifest["files"])
+    del manifest["files"]["limine.conf.before"]
+    manifest_path.write_text(json.dumps(manifest))
+    self.refuses("manifest is incomplete")
+    manifest["files"] = {k: v for k, v in saved.items() if not k.startswith("images/")}
+    manifest_path.write_text(json.dumps(manifest))
+    self.refuses("no matching archived copy")
+
+  def test_production_line_whitespace_drift_refuses(self):
+    self.kernel_update()
+    raw = self.path(PAIR.SINGLE.LIMINE).read_bytes()
+    line = b"omarchy_linux-t2.efi#" + b2(self.new_production).encode() + b"\n"
+    self.assertIn(line, raw)
+    self.write(PAIR.SINGLE.LIMINE, raw.replace(line, line[:-1] + b" \n", 1))
+    self.refuses("exactly one production UKI path line")
+
+  def test_archive_index_is_fresh_after_a_rollback(self):
+    self.kernel_update()
+    self.crash_at("limine")
+    PAIR.retire_rollback(self.root)
+    record = self.retire()["retirement"]
+    self.assertTrue(record["archive"].endswith("-1"), record["archive"])
+    self.assertTrue((self.path(PAIR.ARCHIVE_ROOT) / (record["archive"][:-1] + "0") / "journal.aborted.json").exists())
+
+  def test_state_changed_under_the_locks_refuses(self):
+    self.kernel_update()
+    real = PAIR.retirement_locks
+    from contextlib import contextmanager
+
+    @contextmanager
+    def racing(root):
+      with real(root):
+        self.write(PAIR.RECEIPT, self.receipt_raw + b" ")
+        yield
+
+    PAIR.retirement_locks = racing
+    try:
+      with self.assertRaises(ValueError) as context:
+        self.retire()
+    finally:
+      PAIR.retirement_locks = real
+    self.assertIn("changed before the locks", str(context.exception))
+    self.assertFalse(self.path(PAIR.ARCHIVE_ROOT).exists())
+
   def test_dry_run_prints_plan_and_changes_nothing(self):
     self.kernel_update()
     before = self.snapshot()

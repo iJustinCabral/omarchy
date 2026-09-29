@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import tempfile
 import time
@@ -571,7 +572,7 @@ RETIRE_PROTOCOL = "omarchy-t2-hibernation-pair-retirement-v1"
 WITH_IMAGES = ("staged", "source-arming", "restore-arming", "restore-disarmed")
 WITHOUT_IMAGES = ("rolled-back", "stage-failed-recovered")
 PRODUCTION_PATH = re.compile(
-  rb"^([ \t]*path:[ \t]*boot\(\):/EFI/Linux/" + re.escape(SINGLE.PRODUCTION_IMAGE.encode()) + rb")#([0-9a-f]{128})[ \t]*$",
+  rb"^([ \t]*path:[ \t]*boot\(\):/EFI/Linux/" + re.escape(SINGLE.PRODUCTION_IMAGE.encode()) + rb")#([0-9a-f]{128})$",
   re.M,
 )
 
@@ -652,7 +653,7 @@ def choose_archive(root, receipt_sha):
   index = 0
   while True:
     directory = base / (receipt_sha[:16] + "-" + str(index))
-    if not (directory / "retirement.json").exists():
+    if not (directory / "retirement.json").exists() and not (directory / "journal.aborted.json").exists():
       return directory
     index += 1
 
@@ -762,7 +763,19 @@ def retirement_locks(root):
   except FileExistsError:
     raise ValueError("pacman db.lck is held; retry after the package transaction ends") from None
   physical = None
+  previous = {}
+
+  def terminate(signum, _frame):
+    raise SystemExit(128 + signum)
+
   try:
+    # A terminating signal must unwind through the finally below so that only the
+    # db.lck inode created here is released; a stale foreign lock is never removed.
+    for name in ("SIGTERM", "SIGHUP", "SIGINT"):
+      try:
+        previous[getattr(signal, name)] = signal.signal(getattr(signal, name), terminate)
+      except ValueError:
+        break  # not the main thread
     physical = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
       fcntl.flock(physical, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -770,6 +783,8 @@ def retirement_locks(root):
       raise ValueError("A hibernation cycle holds the physical lock") from None
     yield
   finally:
+    for number, handler in previous.items():
+      signal.signal(number, handler)
     if physical is not None:
       os.close(physical)
     held = os.fstat(db_fd)
@@ -816,15 +831,30 @@ def verify_archive(directory, receipt_sha):
   manifest = json.loads(read_file(directory / "manifest.json"))
   if manifest.get("receipt_sha256") != receipt_sha or manifest.get("protocol") != RETIRE_PROTOCOL:
     raise ValueError("Retirement archive manifest does not bind this receipt")
+  required = {"receipt.json", "limine.conf.before", "limine.conf.at-retirement"}
+  if not required.issubset(manifest["files"]):
+    raise ValueError("Retirement archive manifest is incomplete")
   for name, expected in manifest["files"].items():
     if bytes_digest(read_file(directory / name)) != expected:
       raise ValueError("Retirement archive file changed: " + name)
   return manifest
 
 
-def retire(root, *, dry_run=False, step_hook=None):
-  """Retire the pair after the production UKI changed. Idempotent and resumable."""
-  hook = step_hook or (lambda _name: None)
+def archived_image_matches(directory, manifest, role, expected_sha):
+  name = "images/" + role + ".efi"
+  return name in manifest["files"] and manifest["files"][name] == expected_sha and bytes_digest(read_file(directory / name)) == expected_sha
+
+
+def fresh_limine(limine, root, receipt, backup, planned_sha, remainder):
+  """Re-read limine.conf at the last moment; a concurrent snapper-sync rewrite is re-judged."""
+  current = read_file(limine)
+  if bytes_digest(current) == planned_sha:
+    return remainder
+  return judge_limine(root, receipt, current, backup)[0]
+
+
+def load_retirement_state(root):
+  """(fresh, directory, receipt_raw, receipt) or an already-retired report dict."""
   pending = incomplete_journals(root)
   if len(pending) > 1:
     raise ValueError("More than one incomplete retirement journal")
@@ -848,6 +878,17 @@ def retire(root, *, dry_run=False, step_hook=None):
   receipt = json.loads(receipt_raw)
   if not isinstance(receipt, dict):
     raise ValueError("Pair staging receipt is malformed")
+  return fresh, directory, receipt_raw, receipt
+
+
+def retire(root, *, dry_run=False, step_hook=None):
+  """Retire the pair after the production UKI changed. Idempotent and resumable."""
+  hook = step_hook or (lambda _name: None)
+  loaded = load_retirement_state(root)
+  if isinstance(loaded, dict):
+    return loaded
+  fresh, directory, receipt_raw, receipt = loaded
+  receipt_path = rooted(root, RECEIPT)
 
   def backup_bytes():
     live = rooted(root, BACKUP)
@@ -863,6 +904,10 @@ def retire(root, *, dry_run=False, step_hook=None):
     return plan
   limine = rooted(root, SINGLE.LIMINE)
   with retirement_locks(root):
+    # Everything decided before the locks is decided again under them.
+    again = load_retirement_state(root)
+    if isinstance(again, dict) or again[:3] != (fresh, directory, receipt_raw):
+      raise ValueError("Retirement state changed before the locks were held")
     plan, remainder = plan_retirement(root, receipt, receipt_raw, backup_bytes(), fresh=fresh)
     if fresh:
       directory = write_archive(root, plan, receipt_raw, backup_bytes(), limine.read_bytes())
@@ -870,14 +915,19 @@ def retire(root, *, dry_run=False, step_hook=None):
       write_journal(directory, plan)
       hook("journal")
     manifest = verify_archive(directory, plan["receipt_sha256"])
+    for role, relative in IMAGES.items():
+      if rooted(root, relative).exists() and not archived_image_matches(directory, manifest, role, receipt["images"][role]["sha256"]):
+        raise ValueError("Refusing to retire: the " + role + " image has no matching archived copy")
     if plan["limine_block_present"]:
-      atomic_write(limine, remainder, 0o600)
+      atomic_write(limine, fresh_limine(limine, root, receipt, backup_bytes(), plan["limine_before_sha256"], remainder), 0o600)
     hook("limine")
     for role, relative in IMAGES.items():
       image = rooted(root, relative)
       if image.exists():
         if digest(image) != receipt["images"][role]["sha256"]:
           raise ValueError("Refusing to remove an unknown " + role + " image")
+        if not archived_image_matches(directory, manifest, role, receipt["images"][role]["sha256"]):
+          raise ValueError("Refusing to remove the " + role + " image without a matching archived copy")
         image.unlink()
         SINGLE.fsync_directory(image.parent)
       hook("image-" + role)
@@ -930,24 +980,37 @@ def retire_rollback(root):
   check_quiescent(root)
   manifest = verify_archive(directory, sha)
   archived_backup = read_file(directory / "limine.conf.before")
+  # Refuse up front, before any work, on anything foreign to the archived state.
+  for path, archived in ((rooted(root, RECEIPT), receipt_raw), (rooted(root, BACKUP), archived_backup)):
+    if path.exists() and read_file(path) != archived:
+      raise ValueError("Live " + path.name + " differs from the archived copy; refusing rollback")
+  for role, relative in IMAGES.items():
+    image = rooted(root, relative)
+    if image.exists() and not (digest(image) == receipt["images"][role]["sha256"]
+                               and archived_image_matches(directory, manifest, role, receipt["images"][role]["sha256"])):
+      raise ValueError("ESP " + role + " image differs from the archived copy; refusing rollback")
   with retirement_locks(root):
+    again = incomplete_journals(root)
+    if len(again) != 1 or again[0][0] != directory:
+      raise ValueError("Retirement journal changed before the locks were held")
     limine = rooted(root, SINGLE.LIMINE)
     judge_limine(root, receipt, read_file(limine), archived_backup)
     for role, relative in IMAGES.items():
       name = "images/" + role + ".efi"
       image = rooted(root, relative)
-      if image.exists():
-        if digest(image) != receipt["images"][role]["sha256"]:
-          raise ValueError("Refusing to overwrite an unknown " + role + " image")
-      elif name in manifest["files"]:
+      if not image.exists() and name in manifest["files"]:
         atomic_write(image, read_file(directory / name), 0o600)
     state = rooted(root, STATE)
     state.mkdir(parents=True, mode=0o700, exist_ok=True)
     if not rooted(root, BACKUP).exists():
       atomic_write(rooted(root, BACKUP), archived_backup, 0o600)
-    _remainder, _hash, present = judge_limine(root, receipt, read_file(limine), archived_backup)
-    if "images/source.efi" in manifest["files"] and not present:
-      atomic_write(limine, limine.read_bytes() + receipt_block(receipt), 0o600)
+    if "images/source.efi" in manifest["files"]:
+      current = read_file(limine)
+      _remainder, _hash, present = judge_limine(root, receipt, current, archived_backup)
+      if not present:
+        current = read_file(limine)
+        judge_limine(root, receipt, current, archived_backup)
+        atomic_write(limine, current + receipt_block(receipt), 0o600)
     if not rooted(root, RECEIPT).exists():
       atomic_write(rooted(root, RECEIPT), receipt_raw, 0o600)
     (directory / "journal.json").replace(directory / "journal.aborted.json")
