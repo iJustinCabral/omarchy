@@ -34,6 +34,11 @@ bce_restore_dma = function(bce_source, "t2bce_restore_shared_dma")
 bce_resume_wrapper = function(bce_source, "t2bce_resume_with_shared_dma")
 bce_image_restore = function(bce_source, "t2bce_restore")
 bce_plain_resume = function(bce_source, "t2bce_resume")
+bce_resume_mode = function(bce_source, "t2bce_resume_mode")
+# The real ordinary resume re-enables BCE (pci) and function 0 itself; the stub
+# below models exactly those two calls and nothing for pci2 (SEP) or pci3 (audio).
+assert "pci_set_master(bce->pci);" in bce_resume_mode and "pci_set_master(bce->pci0);" in bce_resume_mode
+assert "pci_set_master(bce->pci2)" not in bce_resume_mode and "pci_set_master(bce->pci3)" not in bce_resume_mode
 pm_ops_match = re.search(r"struct dev_pm_ops t2bce_pci_driver_pm = \{(.*?)\n\};", bce_source, re.S)
 assert pm_ops_match, "missing t2bce_pci_driver_pm"
 pm_ops_body = re.sub(r"/\*.*?\*/", "", pm_ops_match.group(1), flags=re.S)
@@ -133,8 +138,11 @@ bce_harness += "struct dev_pm_ops {\n" + "".join(f"  int (*{name})(struct device
 bce_harness += r'''
 static int mode_calls, mode_status, freeze_calls;
 static int t2bce_resume_mode(struct device *dev, bool allow_cold_boot) {
-  (void)dev; (void)allow_cold_boot;
+  struct t2bce_device *b = pci_get_drvdata(to_pci_dev(dev));
+  (void)allow_cold_boot;
   mode_calls++;
+  pci_set_master(b->pci);
+  pci_set_master(b->pci0);
   return mode_status;
 }
 static int t2bce_suspend(struct device *dev) { (void)dev; return 0; }
@@ -295,6 +303,25 @@ static void test_latch_does_not_leak_into_s3(void) {
   assert(CALL(thaw_noirq) == -EIO);
   assert(bce.pci_dma_restore_failed && bce.pci_master_mask == 7);
   assert(CALL(thaw) == -EIO);
+
+  /* The failed thaw_noirq blocked all four functions and left them cleared.
+   * A later S3 with the stale latch must still resume: t2bce_resume_mode
+   * re-enables BCE (pci) and function 0 via pci_set_master; pci2 (unbound SEP)
+   * and pci3 (audio) are not touched by ordinary resume and stay cleared here,
+   * because audio restores itself in its own driver path.  Benign, and nothing
+   * on this path fails or re-latches.
+   */
+  for (int i = 0; i < 4; i++)
+    assert(!(functions[i].command & PCI_COMMAND_MASTER));
+  assert(CALL(suspend) == 0);
+  assert(CALL(resume) == 0);
+  assert(mode_calls == 1);
+  assert(functions[0].command & PCI_COMMAND_MASTER);
+  assert(functions[1].command & PCI_COMMAND_MASTER);
+  assert(!(functions[2].command & PCI_COMMAND_MASTER));
+  assert(!(functions[3].command & PCI_COMMAND_MASTER));
+  assert(bce.pci_dma_restore_failed && bce.pci_master_mask == 7);
+  mode_calls = 0;
 
   /* Later ordinary S3 with siblings bus-master ON and the stale latch/mask. */
   for (int i = 0; i < 3; i++)

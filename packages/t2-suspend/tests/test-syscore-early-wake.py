@@ -32,6 +32,9 @@ poll = function(mailbox, "bce_mailbox_send_locked_poll")
 retrieve = function(mailbox, "bce_mailbox_retrive_response")
 syscore_resume = function(core, "t2bce_syscore_resume", "void")
 resume_mode = function(core, "t2bce_resume_mode")
+suspend_s3 = function(core, "t2bce_suspend")
+suspend_hibernate = function(core, "t2bce_freeze")
+complete = function(core, "t2bce_complete", "void")
 
 assert "#include <linux/iopoll.h>" in mailbox
 assert "readl_poll_timeout_atomic" in poll
@@ -42,6 +45,16 @@ assert poll.index("bce_mailbox_retrive_response") < poll.index("atomic_set")
 assert "bce_mailbox_send_locked_poll" in mailbox_header
 assert "bool no_state_early_wake_attempted;" in header
 assert "int no_state_early_wake_status;" in header
+assert "bool hibernation_transition;" in header
+# The early wake and its bus-master check are hibernation-only: the flag is set
+# by freeze/poweroff, cleared by ordinary S3 suspend and by complete, and gates
+# the syscore hook before it can mark an attempt or fail on sibling bus-master.
+assert syscore_resume.index("hibernation_transition") < syscore_resume.index("no_state_early_wake_attempted = true")
+assert "hibernation_transition = true;" in suspend_hibernate
+assert "hibernation_transition = false;" in suspend_s3
+assert "hibernation_transition = false;" in complete
+assert ".freeze = t2bce_freeze" in core and ".poweroff = t2bce_freeze" in core
+assert ".suspend = t2bce_suspend," in core
 assert "#include <linux/syscore_ops.h>" in core
 assert "register_syscore(&t2bce_syscore);" in core
 assert "unregister_syscore(&t2bce_syscore);" in core
@@ -97,11 +110,16 @@ struct t2bce_device {
   bool no_state_resume;
   bool no_state_queues_dropped;
   bool no_state_early_wake_attempted;
+  bool hibernation_transition;
   int no_state_early_wake_status;
 };
 struct syscore_ops { void (*resume)(void *data); };
 struct syscore { const struct syscore_ops *ops; };
 
+struct device { struct t2bce_device *bce; };
+#define to_pci_dev(dev) (dev)
+#define pci_get_drvdata(pdev) ((pdev)->bce)
+static int last_force_no_state;
 static struct t2bce_device *global_bce;
 static struct pci_dev functions[4];
 static int writes;
@@ -134,6 +152,13 @@ static void iowrite32(u32 value, void *address) { *(u32 *)address = value; write
 '''
 harness += retrieve + poll + syscore_resume
 harness += r'''
+static int t2bce_suspend_common(struct device *dev, bool force_no_state) {
+  (void)dev;
+  last_force_no_state = force_no_state;
+  return 0;
+}
+''' + suspend_s3 + suspend_hibernate
+harness += r'''
 static void set_reply(u8 *mmio, u32 type) {
   u64 reply = (u64)type << 58;
   *(u32 *)(mmio + REG_MBOX_REPLY_COUNTER) = 1U << 20;
@@ -164,6 +189,7 @@ int main(void) {
   assert(writes == 0);
 
   reset_device(&bce, mmio);
+  bce.hibernation_transition = true;
   bce.no_state_resume = true;
   bce.no_state_queues_dropped = true;
   bce.pci3->command = PCI_COMMAND_MASTER;
@@ -174,6 +200,7 @@ int main(void) {
   assert(writes == 0);
 
   reset_device(&bce, mmio);
+  bce.hibernation_transition = true;
   bce.no_state_resume = true;
   bce.no_state_queues_dropped = true;
   set_reply(mmio, BCE_MB_RESTORE_NO_STATE);
@@ -187,6 +214,7 @@ int main(void) {
   assert(writes == 4);
 
   reset_device(&bce, mmio);
+  bce.hibernation_transition = true;
   bce.no_state_resume = true;
   bce.no_state_queues_dropped = true;
   set_reply(mmio, 0x1a);
@@ -196,12 +224,65 @@ int main(void) {
   assert(bce.mbox.mb_status.value == 0);
 
   reset_device(&bce, mmio);
+  bce.hibernation_transition = true;
   bce.no_state_resume = true;
   bce.no_state_queues_dropped = true;
   t2bce_syscore_resume(NULL);
   assert(bce.no_state_early_wake_attempted);
   assert(bce.no_state_early_wake_status == -ETIMEDOUT);
   assert(bce.mbox.mb_status.value == 0);
+
+  /* (a) Ordinary S3 whose suspend took the no-state fallback: firmware leaves
+   * every sibling bus-master after wake.  The hibernation-only hook must not
+   * run, mark an attempt or record -EIO, so t2bce_resume_mode() performs the
+   * pre-0011 wake itself.
+   */
+  reset_device(&bce, mmio);
+  struct device s3_dev = {.bce = &bce};
+  assert(t2bce_freeze(&s3_dev) == 0 && bce.hibernation_transition);
+  assert(t2bce_suspend(&s3_dev) == 0 && !bce.hibernation_transition);
+  assert(last_force_no_state == 0);
+  bce.no_state_resume = true;
+  bce.no_state_queues_dropped = true;
+  for (int i = 0; i < 4; i++)
+    functions[i].command = PCI_COMMAND_MASTER;
+  set_reply(mmio, BCE_MB_RESTORE_NO_STATE);
+  t2bce_syscore_resume(NULL);
+  assert(!bce.no_state_early_wake_attempted);
+  assert(bce.no_state_early_wake_status == 0);
+  assert(writes == 0);
+
+  /* (b) The hibernation no-state path keeps the 0011 protection: freeze sets
+   * the flag, and a bus-master sibling at syscore resume records -EIO without
+   * touching the mailbox.
+   */
+  reset_device(&bce, mmio);
+  struct device hib_dev = {.bce = &bce};
+  assert(t2bce_freeze(&hib_dev) == 0 && bce.hibernation_transition);
+  assert(last_force_no_state == 1);
+  bce.no_state_resume = true;
+  bce.no_state_queues_dropped = true;
+  functions[2].command = PCI_COMMAND_MASTER;
+  set_reply(mmio, BCE_MB_RESTORE_NO_STATE);
+  t2bce_syscore_resume(NULL);
+  assert(bce.no_state_early_wake_attempted);
+  assert(bce.no_state_early_wake_status == -EIO);
+  assert(writes == 0);
+
+  /* (c) A flag left by an aborted hibernation (freeze ran, complete did not
+   * clear it) must not leak into a later S3: t2bce_suspend clears it.
+   */
+  reset_device(&bce, mmio);
+  struct device leak_dev = {.bce = &bce};
+  assert(t2bce_freeze(&leak_dev) == 0 && bce.hibernation_transition);
+  assert(t2bce_suspend(&leak_dev) == 0 && !bce.hibernation_transition);
+  bce.no_state_resume = true;
+  bce.no_state_queues_dropped = true;
+  for (int i = 0; i < 4; i++)
+    functions[i].command = PCI_COMMAND_MASTER;
+  t2bce_syscore_resume(NULL);
+  assert(!bce.no_state_early_wake_attempted && bce.no_state_early_wake_status == 0);
+  assert(writes == 0);
 
   reset_device(&bce, mmio);
   bce.mbox.mb_status.value = 1;

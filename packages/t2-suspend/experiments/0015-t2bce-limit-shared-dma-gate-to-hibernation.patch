@@ -14,22 +14,87 @@ functions (function 2 is the unbound SEP function), so every S3 resume failed:
   t2bce_core 0000:74:00.1: PM: failed to resume noirq: error -5
 
 Remove .suspend_noirq/.resume_noirq and use the plain t2bce_resume() for
-.resume so ordinary S3 takes the pre-0005 path: no noirq DMA gate, no latch
-consultation, and no bus-master clearing after a failed resume.  The
-hibernation mappings (.freeze_noirq, .thaw_noirq, .poweroff_noirq,
-.restore_noirq, .thaw, .restore) are unchanged, and .freeze_noirq still
-resets the latch and saved mask at the start of every hibernation transition.
-.resume is never invoked by the hibernation phases, so the latch is
-unreachable on S3.
+.resume so ordinary S3 no longer runs the noirq DMA gate, consults the latch,
+or clears bus-master after a failed resume.  The hibernation mappings
+(.freeze_noirq, .thaw_noirq, .poweroff_noirq, .restore_noirq, .thaw,
+.restore) are unchanged, and .freeze_noirq still resets the latch and saved
+mask at the start of every hibernation transition.  .resume is never invoked
+by the hibernation phases, so the latch is unreachable on S3.
+
+The syscore early wake added by 0011 has the same defect: t2bce_syscore_resume
+runs before dpm_resume_noirq and rejects any bus-master sibling, which also
+hits an ordinary S3 whose suspend took the no-state fallback.  Add an explicit
+hibernation_transition flag, set in t2bce_freeze() (.freeze and .poweroff),
+cleared in the ordinary S3 t2bce_suspend() and in t2bce_complete(), and make
+the syscore hook return early unless it is set.  On S3 the wake is then left
+to t2bce_resume_mode(), as before 0011.  Hibernation behaviour is unchanged.
+
+S3 is not otherwise identical to the pre-0005 stack: 0006 changes the
+no-state suspend/resume internals, 0007 disables asynchronous system suspend
+for the four shared functions (ordering only) and 0011 adds the hibernation
+syscore wake.  Only the 0005 DMA gate, its latch and the 0011 early-wake
+master check are removed from the S3 path.
 
 This is an unqualified source-only change; it has not been built, staged or
 tested on hardware.
 
 ---
+diff --git a/drivers/staging/t2bce/t2bce_core/t2bce.h b/drivers/staging/t2bce/t2bce_core/t2bce.h
+--- a/drivers/staging/t2bce/t2bce_core/t2bce.h
++++ b/drivers/staging/t2bce/t2bce_core/t2bce.h
+@@ -32,6 +32,7 @@
+     bool no_state_queues_dropped;
+     bool no_state_rebuild_failed;
+     bool no_state_early_wake_attempted;
++    bool hibernation_transition;
+     int no_state_early_wake_status;
+     bool mailbox_channel_active;
+     bool pci_dma_restore_failed;
 diff --git a/drivers/staging/t2bce/t2bce_core/t2bce_main.c b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
 --- a/drivers/staging/t2bce/t2bce_core/t2bce_main.c
 +++ b/drivers/staging/t2bce/t2bce_core/t2bce_main.c
-@@ -1137,9 +1137,10 @@
+@@ -64,8 +64,12 @@
+     int status;
+
+     (void)data;
+-    if (!bce || !bce->no_state_resume || !bce->no_state_queues_dropped ||
+-            bce->no_state_early_wake_attempted)
++    /* The early wake and its bus-master check are hibernation-only.  After a
++     * real S3 wake firmware leaves the sibling functions bus-master, so ordinary
++     * S3 (including its no-state fallback) leaves the wake to t2bce_resume_mode().
++     */
++    if (!bce || !bce->hibernation_transition || !bce->no_state_resume ||
++            !bce->no_state_queues_dropped || bce->no_state_early_wake_attempted)
+         return;
+
+     bce->no_state_early_wake_attempted = true;
+@@ -872,11 +876,17 @@
+
+ static int t2bce_suspend(struct device *dev)
+ {
++    struct t2bce_device *bce = pci_get_drvdata(to_pci_dev(dev));
++
++    bce->hibernation_transition = false;
+     return t2bce_suspend_common(dev, false);
+ }
+
+ static int t2bce_freeze(struct device *dev)
+ {
++    struct t2bce_device *bce = pci_get_drvdata(to_pci_dev(dev));
++
++    bce->hibernation_transition = true;
+     return t2bce_suspend_common(dev, true);
+ }
+
+@@ -1124,6 +1134,7 @@
+     if (!bce->no_state_rebuild_failed)
+         t2bce_core_notify_resume_complete(bce);
+     bce->no_state_resume = false;
++    bce->hibernation_transition = false;
+     pr_debug("t2bce_core: complete: exit\n");
+ }
+
+@@ -1137,9 +1148,10 @@
  struct dev_pm_ops t2bce_pci_driver_pm = {
          .prepare = t2bce_prepare,
          .suspend = t2bce_suspend,
