@@ -31,6 +31,7 @@ PATCHES = (
   "0014-t2bce-remove-vhci-before-hibernate-queue-pause.patch",
   "0015-t2bce-limit-shared-dma-gate-to-hibernation.patch",
   "0016-t2bce-idempotent-mailbox-channel-pause.patch",
+  "0017-t2bce-bound-command-queue-idle-wait.patch",
 )
 
 
@@ -143,6 +144,7 @@ def run_candidate_regressions(candidate):
     ("test-shared-pci-pm-serialization.py", candidate),
     ("test-ave-hibernation-idle.py", candidate),
     ("test-mailbox-channel-pairing.py", candidate),
+    ("test-command-queue-idle-timeout.py", candidate),
     ("test-wifi-hibernate-isolation.py",),
   )
   for command in commands:
