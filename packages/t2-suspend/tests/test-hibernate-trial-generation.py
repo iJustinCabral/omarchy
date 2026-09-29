@@ -45,8 +45,11 @@ class Generation(unittest.TestCase):
     self.base = Path(self.temp.name) / "trial"
     self.old_manifest, self.new_manifest = manifest("old"), manifest("new")
     self.identity = T.TX.digest(self.new_manifest)[:12]
+    self.old_identity = T.TX.digest(self.old_manifest)[:12]
     self.legacy = self.make_root(self.base)
-    (self.legacy / "guards/trial-consumed.json").write_bytes(b"immutable consumed guard")
+    self.guard_bytes = json.dumps({"protocol": TX.TRIAL_PROTOCOL, "authorization_sha256": "a" * 64, "cycle": {"manifest": self.old_manifest}}).encode()
+    (self.legacy / "config.json").write_text(json.dumps({"manifest": self.old_manifest, "source_directory": "/s", "restore_directory": "/r", "production_uki": "/p"}))
+    (self.legacy / "guards/trial-consumed.json").write_bytes(self.guard_bytes)
     (self.legacy / "guards/trial-consumed.json").chmod(0o600)
     (self.legacy / "physical-cycle.lock").write_bytes(b"")
     self.generations = self.base / "generations"
@@ -73,7 +76,9 @@ class Generation(unittest.TestCase):
     if directory.is_symlink() or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
       raise ValueError("Fixed existing root-private trial state directories required")
 
-  def private_json(self, path): return {"source_directory": "/s", "restore_directory": "/r", "production_uki": "/p", "path": str(path)}
+  def private_json(self, path):
+    if Path(path) in (self.legacy / "config.json", self.legacy / "guards/trial-consumed.json"): return json.loads(Path(path).read_bytes())
+    return {"source_directory": "/s", "restore_directory": "/r", "production_uki": "/p", "path": str(path)}
 
   def snapshot(self, directory):
     return {str(path.relative_to(directory)): path.read_bytes() for path in sorted(Path(directory).rglob("*")) if path.is_file()}
@@ -134,7 +139,7 @@ class Generation(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "permanently consumed"): self.dispatch("execute", generation=self.identity)
     self.assertEqual(self.calls, [])
     (self.root / "guards/trial-consumed.json").unlink()
-    (self.legacy / "guards/trial-consumed.json").write_bytes(b"immutable consumed guard")
+    (self.legacy / "guards/trial-consumed.json").write_bytes(self.guard_bytes)
     self.assertEqual(self.dispatch("execute", generation=self.identity)[0], 0)  # an unconsumed generation is not blocked by the historical guard
 
   def test_inspect_and_check_in_a_generation_never_execute(self):
@@ -142,6 +147,21 @@ class Generation(unittest.TestCase):
       status, output = self.dispatch(action, generation=self.identity)
       self.assertEqual(status, 0)
       self.assertEqual(json.loads(output)["manifest_sha256"], TX.digest(self.new_manifest))
+    self.assertEqual(self.calls, [])
+
+  def test_a_generation_root_cannot_re_run_the_original_trials_manifest_under_any_name(self):
+    self.make_root(self.generations / self.old_identity)  # a freshly provisioned alias of the consumed trial
+    with self.assertRaisesRegex(ValueError, "original one-use trial manifest"): self.dispatch("execute", generation=self.old_identity, report={"manifest": self.old_manifest})
+    (self.legacy / "guards/trial-consumed.json").unlink()  # the config alone still names it
+    with self.assertRaisesRegex(ValueError, "original one-use trial manifest"): self.dispatch("execute", generation=self.old_identity, report={"manifest": self.old_manifest})
+    (self.legacy / "guards/trial-consumed.json").write_bytes(self.guard_bytes)
+    (self.legacy / "config.json").unlink()  # and so does the consumed guard alone
+    with self.assertRaisesRegex(ValueError, "original one-use trial manifest"): self.dispatch("execute", generation=self.old_identity, report={"manifest": self.old_manifest})
+    self.assertEqual(self.calls, [])
+    (self.legacy / "guards/trial-consumed.json").write_bytes(b"not json")  # an unreadable consumed guard fails closed
+    with self.assertRaises(ValueError): self.dispatch("execute", generation=self.identity)
+    (self.legacy / "guards/trial-consumed.json").write_bytes(json.dumps({"cycle": {}}).encode())
+    with self.assertRaisesRegex(ValueError, "unreadable"): self.dispatch("execute", generation=self.identity)
     self.assertEqual(self.calls, [])
 
   def test_the_generation_root_must_bind_the_audited_manifest(self):
@@ -210,7 +230,7 @@ class Generation(unittest.TestCase):
     self.assertEqual(cycle["manifest"], self.new_manifest)
     guard = json.loads((self.root / "guards/trial-consumed.json").read_text())
     self.assertEqual(guard["cycle"]["cycle_id"], cycle["cycle_id"])
-    self.assertEqual((self.legacy / "guards/trial-consumed.json").read_bytes(), b"immutable consumed guard")
+    self.assertEqual((self.legacy / "guards/trial-consumed.json").read_bytes(), self.guard_bytes)
     with self.assertRaisesRegex(ValueError, "already consumed"): ledger.authorize_trial(authorization(self.new_manifest, boot), self.root / "guards")
     second = manifest("newer")
     other = self.make_root(self.generations / T.TX.digest(second)[:12])

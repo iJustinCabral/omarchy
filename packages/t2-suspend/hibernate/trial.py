@@ -316,6 +316,25 @@ def _global_lock():
     os.close(fd)
 
 
+def _refuse_original_manifest(manifest):
+  """A generation root may never re-run the original one-use trial, under any name.
+
+  The original root's manifest is known from its consumed guard record and its config; both are read fail-closed.
+  """
+  known = set()
+  guard = STATE / "guards/trial-consumed.json"
+  if guard.exists() or guard.is_symlink():
+    record = _private_json(guard)
+    cycle = record.get("cycle") if type(record) is dict else None
+    if type(cycle) is not dict or type(cycle.get("manifest")) is not dict: raise ValueError("Original consumed guard is unreadable; no generation trial")
+    known.add(TX.digest(cycle["manifest"]))
+  config = STATE / "config.json"
+  if config.exists() or config.is_symlink():
+    value = _private_json(config)
+    if type(value) is dict and type(value.get("manifest")) is dict: known.add(TX.digest(value["manifest"]))
+  if TX.digest(manifest) in known: raise ValueError("The original one-use trial manifest cannot be re-run through a generation root")
+
+
 def generation_root(manifest_or_id):
   """Fixed one-use state root of one requalified generation, from its manifest (or its 12-hex digest prefix)."""
   identity = manifest_or_id if type(manifest_or_id) is str else TX.digest(TX.manifest_value(manifest_or_id))[:12]
@@ -350,7 +369,9 @@ def _dispatch(action, generation=None):
   config = _private_json(state / "config.json")
   authorization = _private_json(state / "authorization.json")
   report = ARTIFACTS.derive_artifacts(config["source_directory"], config["restore_directory"], config["production_uki"])
-  if generation is not None: HOST.CT.exact(TX.digest(report["manifest"])[:12], generation, "Generation state root binds the audited manifest")
+  if generation is not None:
+    HOST.CT.exact(TX.digest(report["manifest"])[:12], generation, "Generation state root binds the audited manifest")
+    _refuse_original_manifest(report["manifest"])
   validate(config, authorization, report, HOST._raw(Path("/proc/sys/kernel/random/boot_id")).decode().strip())
   verify_deployment(Path("/"), config, report)
   verify_readiness(Path("/"), config, authorization, report)
