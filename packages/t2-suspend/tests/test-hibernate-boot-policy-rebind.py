@@ -44,6 +44,11 @@ class Rebind(NT.AssessFixture):
 
   def setUp(self):
     super().setUp()
+    # Make generation 1 self-consistent as on the host: the receipt's image hashes ARE the manifest's pins.
+    P = self.T.P
+    for role in ("source", "restore"): self.write(STATE_DIR + "/artifacts/" + role + "/mba-t2-hibernation-candidate.efi", role.encode())
+    self.config["manifest"] = {**self.config["manifest"], "source_sha256": P.digest(b"source"), "restore_sha256": P.digest(b"restore")}
+    self.write_config()
     self.published()
     self.pinned = {}
     self.marker = (self.root / self.T.MAINTENANCE).read_bytes()
@@ -294,7 +299,7 @@ class Rebind(NT.AssessFixture):
              "extra key": (lambda o: o.write(T.RETIREMENT, json.dumps({**record, "extra": 1}).encode()), "Exact pair retirement record"),
              "wrong protocol": (lambda o: o.write(T.RETIREMENT, json.dumps({**record, "protocol": "other"}).encode()), "Exact pair retirement record"),
              "other receipt": (lambda o: o.write(T.RETIREMENT, json.dumps({**record, "retired_receipt_sha256": "1" * 64}).encode()), "does not chain"),
-             "bad digest": (lambda o: o.write(T.RETIREMENT, json.dumps({**record, "source_sha256": "zz"}).encode()), "Invalid boot policy hash"),
+             "bad digest": (lambda o: o.write(T.RETIREMENT, json.dumps({**record, "source_sha256": "zz"}).encode()), "Invalid pair retirement hash"),
              "altered retained receipt": (lambda o: o.write(T.RETIRED_RECEIPT, o.old_receipt_raw + b" "), "differs from the maintenance receipt")}
     for label, (mutate, pattern) in cases.items():
       with self.subTest(label):
@@ -686,7 +691,7 @@ class AssessAfterRetirement(NT.AssessFixture):
   def retire(self, record=True):
     T, P = self.T, self.T.P
     self.write(T.RETIRED_RECEIPT, self.receipt_raw)
-    self.write(T.RETIREMENT, json.dumps({"protocol": T.RETIREMENT_SCHEMA, "retired_receipt_sha256": self.receipt_sha, "source_sha256": "1" * 64, "restore_sha256": "2" * 64}).encode())
+    self.write(T.RETIREMENT, json.dumps({"protocol": T.RETIREMENT_SCHEMA, "retired_receipt_sha256": self.receipt_sha, "source_sha256": self.T.P.digest(b"source"), "restore_sha256": self.T.P.digest(b"restore")}).encode())
     (self.root / P.RECEIPT).unlink()
 
   def test_marker_receipt_resolves_the_live_or_the_retained_copy_only_when_chained(self):
@@ -709,6 +714,19 @@ class AssessAfterRetirement(NT.AssessFixture):
     self.T.G._maintenance(self.root)
     self.assertIn(self.assess()["class"], ("unchanged", "requalification-required", "unknown"))
     self.assertNotIn("Maintenance evidence not validated", self.assess().get("reason", ""))
+
+  def test_the_guard_cross_checks_the_record_images_against_the_retained_receipt(self):
+    T = self.T
+    self.retire()
+    self.T.G._maintenance(self.root)
+    for role in ("source", "restore"):
+      record = json.loads((self.root / T.RETIREMENT).read_bytes())
+      record[role + "_sha256"] = "1" * 64
+      self.write(T.RETIREMENT, json.dumps(record).encode())
+      with self.assertRaisesRegex(ValueError, "does not name the retired " + role + " image"): T.G._maintenance(self.root)
+      record[role + "_sha256"] = T.P.digest(role.encode())
+      self.write(T.RETIREMENT, json.dumps(record).encode())
+    T.G._maintenance(self.root)
 
   def test_without_the_retirement_evidence_a_missing_or_foreign_receipt_still_blocks_the_guard(self):
     T = self.T

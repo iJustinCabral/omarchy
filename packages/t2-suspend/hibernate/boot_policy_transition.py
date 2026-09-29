@@ -37,6 +37,7 @@ P = _module("transition_policy", "boot_policy.py")
 D = _module("transition_snapshot", "runtime_deployment.py")
 G = _module("transition_update_guard", "update_guard.py")
 PRODUCT = _module("transition_product", "product.py")
+CUSTODY = _module("transition_pair_custody", "pair_custody.py")
 DB_LOCK = Path("var/lib/pacman/db.lck")
 PHYSICAL_LOCK = Path("var/lib/omarchy/t2-hibernate-trial/physical-cycle.lock")
 REVIEW = P.STATE / "boot-policy-review.json"
@@ -74,11 +75,11 @@ REBIND_COMPARISON = "omarchy-t2-package-rebind-comparison-v1"
 REBIND_COMPLETE = "omarchy-t2-package-rebind-complete-v1"
 REBIND_ROLLBACK = "omarchy-t2-package-rebind-rollback-v1"
 REBIND_BASELINE = "omarchy-t2-package-rebind-baseline-v1"
-RETIREMENT_SCHEMA = "omarchy-t2-pair-retirement-v1"
-RETIREMENT_KEYS = {"protocol", "retired_receipt_sha256", "source_sha256", "restore_sha256"}
-# Written by the pair stager's `retire` mode: custody of the old receipt outlives the receipt file itself.
-RETIREMENT = P.STATE / "pair-retirement.json"
-RETIRED_RECEIPT = P.STATE / "pair-retired-receipt.json"
+# Written by the pair stager's retire mode (the names and the validator live in pair_custody.py, shared with it).
+RETIREMENT_SCHEMA = CUSTODY.RETIREMENT_SCHEMA
+RETIREMENT_KEYS = CUSTODY.RETIREMENT_KEYS
+RETIREMENT = P.STATE / CUSTODY.RETIREMENT_NAME
+RETIRED_RECEIPT = P.STATE / CUSTODY.RETIRED_RECEIPT_NAME
 PAIR_BACKUP = Path("var/lib/omarchy-t2-hibernation-pair/limine.conf.before")
 CONFIG = P.STATE / "config.json"
 QUALIFICATION = P.STATE / "qualification.json"
@@ -1162,12 +1163,11 @@ def retirement(root, receipt_sha256):
   """(record, record bytes, retained receipt bytes) proving the stager retired the pair whose receipt has this digest."""
   raw = _required(root, RETIREMENT, "Pair retirement record")
   record = P._json(raw)
-  if type(record) is not dict or set(record) != RETIREMENT_KEYS or record["protocol"] != RETIREMENT_SCHEMA:
-    raise ValueError("Exact pair retirement record required")
-  for name in RETIREMENT_KEYS - {"protocol"}: P._hash(record[name])
-  if record["retired_receipt_sha256"] != P._hash(receipt_sha256): raise ValueError("Pair retirement record does not chain to the maintenance receipt")
+  if type(record) is dict and record.get("retired_receipt_sha256") != P._hash(receipt_sha256) and set(record) == RETIREMENT_KEYS:
+    raise ValueError("Pair retirement record does not chain to the maintenance receipt")
   retained = _required(root, RETIRED_RECEIPT, "Retained retired receipt")
   if P.digest(retained) != receipt_sha256: raise ValueError("Retained retired receipt differs from the maintenance receipt")
+  CUSTODY.check(record, retained)  # exact keys, hashes, and the record's images equal the retained receipt's own
   return record, raw, retained
 
 
