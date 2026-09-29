@@ -15,6 +15,13 @@ retains package-maintenance.pending. It adds fixed read-only prerequisites (see
 _maintenance_gate) and is source-only: the installed runtime predates the marker
 and must first be upgraded by a reviewed runtime upgrade. No package runner,
 client or broker exists here, and no qualification or reactivation is issued.
+
+The maintenance publisher also archives generation-baseline.json (the qualified
+generation's kernel, UKIs, module stack, driver/control inventories and stock
+Limine identity) before the marker. The read-only `assess` action recomputes the
+same items and classifies the current generation against it; it takes no
+inhibitor, writes nothing and leaves no lock behind, and never authorizes
+reactivation or an update (see assess()).
 """
 import argparse
 from contextlib import contextmanager
@@ -44,6 +51,16 @@ MAINTENANCE_NAME = "package-maintenance.pending"
 PROBE_BASE = Path("/run/omarchy-t2-maintenance-probe")
 EXEC_EXTRAS = ("ExecStartPre", "ExecStartPost", "ExecStop", "ExecStopPost", "ExecCondition")
 ACTIONS = ("activation", "deactivation", "maintenance")
+READ_ONLY = ("assess",)
+ASSESSMENT_SCHEMA = "omarchy-t2-generation-assessment-v1"
+BOOTLOADERS = ("boot/EFI/BOOT/BOOTX64.EFI", "boot/EFI/limine/limine_x64.efi")
+MAX_IMAGE = 256 * 1024 * 1024
+MAX_SMALL = 2 * 1024 * 1024
+# Items whose change means the qualified generation may no longer match: never
+# snapshot churn, which lives only in the Limine //Snapshots region.
+CRITICAL_ITEMS = ("kernel", "production_uki", "source_uki", "restore_uki", "module_stack", "manifest", "config", "qualification")
+TOLERATED_ITEMS = ("driver_modules", "firmware", "control_inventory", "bootloader")
+CONTROL_EXCLUDED = ("boot/limine.conf",)
 WHO = "omarchy-t2-source-default"
 WHY = "reviewed-boot-policy-transition"
 LOGIN = ("org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager")
@@ -442,10 +459,220 @@ def _maintenance_gate(engine, root, phase, pinned=None):
     engine.IMAGE_STATE.require_no_image(ROOT, engine._pinned_resume(ROOT))
 
 
+def _driver_capture(root, release):
+  return _load_reviewed("native_reviewed_root_driver_inventory", RUNTIME_HIBERNATE / "root_driver_inventory.py").capture(root, release)
+
+
+def _control_capture(root):
+  return _load_reviewed("native_reviewed_root_control_inventory", RUNTIME_HIBERNATE / "root_control_inventory.py").capture(root)
+
+
+def _running_release(): return os.uname().release
+
+
+def _absolute(root, path):
+  path = Path(path)
+  if not path.is_absolute(): raise ValueError("Absolute qualified artifact path required")
+  return Path(root) / path.relative_to("/")
+
+
+def _file(engine, root, path, limit):
+  value, _ = engine._stable_bytes(root, path.relative_to(root), limit)
+  return value
+
+
+def _small(engine, root, path):
+  value, raw = engine._stable_bytes(root, path.relative_to(root), MAX_SMALL, keep=True)
+  return value, raw
+
+
+def _digest(engine, value): return engine.P.digest(engine._encoded(value))
+
+
+def _node_digests(engine, values):
+  return {name: _digest(engine, node) for name, node in sorted(values.items())}
+
+
+def _item_kernel(engine, root, state):
+  modules = root / "usr/lib/modules"
+  engine.G._ancestors(root, modules / "member", engine._owner(root))
+  return {"running_release": _running_release(), "qualified_release": state["release"],
+          "installed_releases": sorted(entry.name for entry in modules.iterdir())}
+
+
+def _item_module_stack(engine, root, state):
+  identity = {"runtime_sha256": state["config"]["manifest"]["runtime_sha256"],
+              "runtime_modules_sha256": _digest(engine, state["source_provenance"].get("modules"))}
+  for role in ("source", "restore"):
+    directory = _absolute(root, state["config"][role + "_directory"])
+    identity[role + "_provenance_sha256"] = _small(engine, root, directory / "provenance.json")[0]["sha256"]
+    identity[role + "_initrd_sha256"] = _file(engine, root, directory / "mba-t2-hibernation-candidate.initrd", MAX_IMAGE)["sha256"]
+  return identity
+
+
+def _item_driver(engine, root, state):
+  capture = _driver_capture(root, state["release"])
+  return ({"kernel_release": capture["kernel_release"], "capture_sha256": _digest(engine, capture["modules"]),
+           "modules": _node_digests(engine, capture["modules"])},
+          {"capture_sha256": _digest(engine, capture["firmware"]), "files": _node_digests(engine, capture["firmware"])})
+
+
+def _item_control(engine, root, state):
+  capture = _control_capture(root)
+  files = {name: node for name, node in capture["files"].items() if name not in CONTROL_EXCLUDED}
+  filtered = {"files": files, "directories": capture["directories"]}
+  return {"excluded": list(CONTROL_EXCLUDED), "capture_sha256": _digest(engine, filtered),
+          "files": _node_digests(engine, files), "directories": _node_digests(engine, capture["directories"])}
+
+
+def _item_bootloader(engine, root, state):
+  files = {}
+  for name in BOOTLOADERS:
+    try: files[name] = _file(engine, root, root / name, MAX_IMAGE)
+    except FileNotFoundError: files[name] = {"present": False}
+  return {"files": files}
+
+
+def generation_items(engine, root=ROOT):
+  """Identity items of the generation the qualified config names, in the baseline's exact shape.
+
+  Read-only and shared by the publisher (baseline provider) and `assess`, so both
+  sides recompute identically. Failures never raise: each item becomes
+  {"unavailable": reason}. Returns (items, errors), errors mapping every
+  unavailable item to its reason; the publisher refuses only when a
+  CRITICAL_ITEMS entry is unavailable, so an unusual host still publishes and
+  assessment later reports the other items unknown instead of blocking updates.
+  """
+  root, items, errors, state = Path(root), {}, {}, {}
+  def need(key):
+    if key not in state: raise ValueError("Prerequisite unavailable: " + key)
+    return state[key]
+  def config():
+    raw = engine._read(root, engine.P.STATE / "config.json")
+    state["config"] = parsed = engine.P._json(raw)
+    return {"sha256": engine.P.digest(raw), "audited_details_sha256": parsed["audited_details_sha256"],
+            "staged_receipt_sha256": parsed["staged_receipt_sha256"]}
+  def manifest():
+    value = need("config")["manifest"]
+    if type(value) is not dict: raise ValueError("Qualified manifest required")
+    return {"sha256": _digest(engine, value), "fields": value}
+  def provenance():
+    directory = _absolute(root, need("config")["source_directory"])
+    state["source_provenance"] = parsed = engine.P._json(_small(engine, root, directory / "provenance.json")[1])
+    if type(parsed.get("kernel_release")) is not str: raise ValueError("Qualified kernel release required")
+    state["release"] = parsed["kernel_release"]
+  def uki(role):
+    return lambda: _file(engine, root, _absolute(root, need("config")[role + "_directory"]) / "mba-t2-hibernation-candidate.efi", engine.MAX_UKI)
+  driver = {}
+  def drivers():
+    if not driver:
+      try: driver["value"] = _item_driver(engine, root, {"release": need("release")})
+      except Exception as error: driver["error"] = error
+    if "error" in driver: raise driver["error"]
+    return driver["value"]
+  def run(name, thunk):
+    try: items[name] = thunk()
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError) as error:
+      errors[name] = type(error).__name__ + ": " + str(error)[:200]
+      items[name] = {"unavailable": errors[name]}
+  run("config", config)
+  run("qualification", lambda: {"sha256": engine.P.digest(engine._read(root, engine.P.STATE / "qualification.json"))})
+  run("manifest", manifest)
+  run("_provenance", lambda: provenance() or {})
+  items.pop("_provenance"); errors.pop("_provenance", None)
+  run("kernel", lambda: _item_kernel(engine, root, {"release": need("release")}))
+  run("production_uki", lambda: _file(engine, root, root / engine.PRODUCTION, engine.MAX_UKI))
+  run("source_uki", uki("source"))
+  run("restore_uki", uki("restore"))
+  run("module_stack", lambda: _item_module_stack(engine, root, {"config": need("config"), "source_provenance": need("source_provenance")}))
+  run("driver_modules", lambda: drivers()[0])
+  run("firmware", lambda: drivers()[1])
+  run("control_inventory", lambda: _item_control(engine, root, None))
+  run("bootloader", lambda: _item_bootloader(engine, root, None))
+  return {name: items[name] for name in engine.BASELINE_ITEMS}, errors
+
+
+def _baseline(engine, root=ROOT):
+  """Publisher's provider: the qualified generation, or refuse to publish without its core identity."""
+  items, errors = generation_items(engine, root)
+  fatal = {name: errors[name] for name in CRITICAL_ITEMS if name in errors}
+  if fatal: raise ValueError("Qualified generation identity unavailable for the baseline: " + json.dumps(fatal, sort_keys=True))
+  return items
+
+
+def _differences(recorded, current, path="", depth=0):
+  """Paths that differ between two JSON-plain values, bounded and deterministic."""
+  if recorded == current: return []
+  if type(recorded) is dict and type(current) is dict and depth < 3:
+    found = []
+    for key in sorted(set(recorded) | set(current)):
+      found += _differences(recorded.get(key), current.get(key), path + "/" + key, depth + 1)
+    return found
+  return [path or "/"]
+
+
+def assess(engine, root=ROOT):
+  """Classify the current generation against the archived publish-time baseline.
+
+  Strictly read-only: no writes, no db.lck, no inhibitor, no admission or
+  derive_artifacts (a kernel/UKI update legitimately invalidates those). The
+  physical cycle lock is only probed non-blockingly and released; a busy lock,
+  ledger or package transaction reports `unknown`, never blocks. A result of
+  `unchanged` says the recomputed partial inventories equal the baseline's; it is
+  not update safety, qualification or permission to reactivate. Snapshot churn in
+  Limine's //Snapshots region never changes the class: limine is reported as
+  exact bytes and as the guard's stock projection, and only a projection change
+  counts.
+  """
+  root = Path(root)
+  report = {"protocol": ASSESSMENT_SCHEMA, "read_only": True, "reactivation_evaluated": False, "qualification_issued": False}
+  def unknown(reason, **extra):
+    return {**report, "class": "unknown", "reason": reason, **extra}
+  if engine._present(root / engine.DB_LOCK): return unknown("A package transaction holds db.lck", busy=True)
+  owner = engine._owner(root)
+  try: fd, _ = engine.G._physical(root, owner)
+  except ValueError as error: return unknown(str(error), busy="holds the physical lock" in str(error))
+  try:
+    try:
+      evidence = engine.G._maintenance(root)
+      marker = engine._read(root, engine.MAINTENANCE)
+    except (OSError, ValueError, BlockingIOError) as error:
+      return unknown("Maintenance evidence not validated: " + type(error).__name__ + ": " + str(error)[:200])
+    report["transition_id"] = evidence["transition_id"]
+    report["maintenance_intent_sha256"] = evidence["maintenance_intent_sha256"]
+    try: baseline = engine.read_baseline(root, marker)
+    except FileNotFoundError: return unknown("Generation baseline is missing", baseline="missing")
+    except (OSError, ValueError) as error: return unknown("Generation baseline is invalid: " + str(error)[:200], baseline="invalid")
+    current, errors = generation_items(engine, root)
+    if engine._read(root, engine.MAINTENANCE) != marker: return unknown("Maintenance marker changed during assessment")
+    raw = engine._read(root, engine.P.LIMINE, private=False)
+    try: stock = engine.stock_identity(raw)
+    except ValueError as error: return unknown("Current Limine configuration is not stock: " + str(error)[:200])
+  finally: os.close(fd)
+  items = {}
+  for name in (*CRITICAL_ITEMS, *TOLERATED_ITEMS):
+    if "unavailable" in baseline[name]: items[name] = {"state": "unknown", "reason": "baseline item unavailable: " + baseline[name]["unavailable"]}
+    elif name in errors: items[name] = {"state": "unknown", "reason": errors[name]}
+    elif baseline[name] == current[name]: items[name] = {"state": "equal"}
+    else: items[name] = {"state": "changed", "paths": _differences(baseline[name], current[name])[:32]}
+  recorded = baseline["limine"]
+  projection = recorded.get("projection_sha256") == stock["projection_sha256"]
+  limine = {"exact_equal": recorded.get("exact_sha256") == stock["exact_sha256"], "stock_projection_equal": projection,
+            "state": "equal" if projection else "changed"}
+  changed = sorted(name for name, item in items.items() if item["state"] == "changed") + ([] if projection else ["limine"])
+  missing = sorted(name for name, item in items.items() if item["state"] == "unknown")
+  classification = "requalification-required" if changed else ("unknown" if missing else "unchanged")
+  return {**report, "class": classification, "baseline": "valid", "items": items, "limine": limine,
+          "changed_items": changed, "unknown_items": missing}
+
+
 def native(action):
   """Fixed host action; no roots, runners, prechecks, force or approval APIs."""
-  if action not in ACTIONS: raise ValueError("Explicit policy action required")
+  if action not in (*ACTIONS, *READ_ONLY): raise ValueError("Explicit policy action required")
   engine = _installed()
+  if action == "assess":
+    # Read-only: no inhibitor re-exec, exclusion, lock file or write of any kind.
+    return assess(engine, ROOT)
   parent = Path("/proc") / str(os.getppid()) / "exe"
   if parent.readlink() != Path("/usr/bin/systemd-inhibit"):
     command = _inhibit_command(action)
@@ -464,7 +691,8 @@ def native(action):
       else:
         result = engine._transition(ROOT, action, precheck=lambda root, requested, phase: _precheck(engine, requested, phase, capture),
                                     guard=guard, maintenance_gate=gate, native=engine._NATIVE_MAINTENANCE,
-                                    maintenance_resume=lambda: capture["resume"])
+                                    maintenance_resume=lambda: capture["resume"],
+                                    maintenance_baseline=lambda: _baseline(engine, ROOT))
       return {**result, "live_execution": True, "power_operation": False}
     # The only live callback is this fixed adapter's own read-only verifier.
     result = engine._transition(ROOT, action, precheck=lambda root, requested, phase: _precheck(engine, requested, phase), guard=guard)
@@ -473,7 +701,7 @@ def native(action):
 
 def main(argv=None):
   parser = argparse.ArgumentParser(description="Reviewed installed source-default activation, exact stock fallback or inactive maintenance; no power transition")
-  parser.add_argument("action", choices=ACTIONS)
+  parser.add_argument("action", choices=(*ACTIONS, *READ_ONLY))
   args = parser.parse_args(argv)
   print(json.dumps(native(args.action), sort_keys=True))
   return 0

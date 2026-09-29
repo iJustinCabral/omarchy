@@ -642,6 +642,140 @@ class NativeMaintenance(unittest.TestCase):
     self.f.write(T.P.LIMINE, good)
     self.assertTrue(self.reenter()["already_inactive"])
 
+  # --- generation baseline sidecar -------------------------------------------------
+  def baseline(self): return {name: {"identity": name, "sha256": T.P.digest(name.encode())} for name in T.BASELINE_ITEMS}
+
+  def publish(self, provider=None, order=None):
+    calls = self.phases
+    calls.clear()
+    def called():
+      # Captured pre-write: the qualified generation is still active, nothing is published yet.
+      self.assertEqual(calls, ["before"])
+      self.assertFalse(any(self.pending_names()) or (self.root / T.MAINTENANCE).exists())
+      self.assertTrue((self.root / T.OPT_IN).exists())
+      return (self.baseline if provider is None else provider)()
+    original = T._new
+    def record(path, raw, mode=0o600):
+      if order is not None and path.name in ("maintenance-resume.json", T.BASELINE_NAME, "maintenance-intent.json", "package-maintenance.pending"): order.append(path.name)
+      return original(path, raw, mode)
+    with patch.object(T, "_new", side_effect=record):
+      return T._transition(self.root, "maintenance", precheck=self.fixture.check, guard=lambda: None, maintenance_gate=self.gate,
+                           maintenance_resume=lambda: dict(RESUME), maintenance_baseline=called)
+
+  def test_baseline_is_archived_exactly_before_intent_and_marker_and_guard_ignores_it(self):
+    order = []
+    result = self.publish(order=order)
+    self.assertEqual(order, ["maintenance-resume.json", "generation-baseline.json", "maintenance-intent.json", "package-maintenance.pending"])
+    archive = self.root / T.HISTORY / result["transition_id"]
+    marker = (self.root / T.MAINTENANCE).read_bytes()
+    intent = json.loads(marker)
+    raw = (archive / T.BASELINE_NAME).read_bytes()
+    self.assertEqual(stat.S_IMODE((archive / T.BASELINE_NAME).stat().st_mode), 0o600)
+    expected_items = {**self.baseline(), "limine": {"exact_sha256": T.P.digest(self.f.before), "projection_sha256": T.P.digest(T._encoded(T.stock_projection(self.f.before)))}}
+    document = {"protocol": "omarchy-t2-generation-baseline-v1", "transition_id": result["transition_id"], "maintenance_intent_sha256": T.P.digest(marker),
+                "old_policy_sha256": intent["old_policy_sha256"], "staged_receipt_sha256": intent["staged_receipt_sha256"],
+                "deactivation_completion_sha256": intent["deactivation_completion_sha256"], "items": expected_items}
+    self.assertEqual(raw, T._encoded(document))
+    self.assertEqual(T.read_baseline(self.root), expected_items)
+    self.assertEqual(set(intent), {"protocol", "transition_id", "old_policy_sha256", "runtime_review_sha256", "staged_receipt_sha256",
+                                    "fallback_limine_sha256", "deactivation_completion_sha256"})  # marker field set unchanged
+    self.assertNotIn(b"cryptkey", raw)
+    if self.REAL:  # the guard's exact validator neither requires nor reads the sidecar
+      self.assertEqual(T.G._maintenance(self.root)["resume"], RESUME)
+      (archive / T.BASELINE_NAME).write_bytes(b"not even json")
+      self.assertEqual(T.G._maintenance(self.root)["resume"], RESUME)
+      (archive / T.BASELINE_NAME).unlink()
+      self.assertEqual(T.G._maintenance(self.root)["resume"], RESUME)
+
+  def test_baseline_write_crash_leaves_no_marker_and_keeps_the_old_pending_veto(self):
+    original = T._new
+    def fault(path, *args, **kwargs):
+      if path.name == T.BASELINE_NAME: raise OSError("baseline write fault")
+      return original(path, *args, **kwargs)
+    with patch.object(T, "_new", side_effect=fault):
+      with self.assertRaisesRegex(OSError, "baseline write fault"):
+        T._transition(self.root, "maintenance", precheck=self.fixture.check, guard=lambda: None, maintenance_gate=self.gate,
+                      maintenance_resume=lambda: dict(RESUME), maintenance_baseline=self.baseline)
+    archive = next((self.root / T.HISTORY).glob("*/completion.json")).parent
+    self.assertFalse((self.root / T.MAINTENANCE).exists())
+    self.assertFalse((archive / "maintenance-intent.json").exists() or (archive / T.BASELINE_NAME).exists())
+    self.assertTrue(self.fixture.pending("deactivation").exists())
+    with self.assertRaisesRegex(ValueError, "package maintenance"): SLEEP.reject_pending(self.root)
+    self.assertFalse((self.root / T.DB_LOCK).exists())
+
+  def test_baseline_readback_fault_and_partial_file_never_reach_a_marker(self):
+    original = T._read
+    def wrong(root, relative, *args, **kwargs):
+      raw = original(root, relative, *args, **kwargs)
+      return raw + b" " if Path(relative).name == T.BASELINE_NAME else raw
+    with patch.object(T, "_read", side_effect=wrong):
+      with self.assertRaisesRegex(ValueError, "baseline readback differs"):
+        T._transition(self.root, "maintenance", precheck=self.fixture.check, guard=lambda: None, maintenance_gate=self.gate,
+                      maintenance_resume=lambda: dict(RESUME), maintenance_baseline=self.baseline)
+    self.assertFalse((self.root / T.MAINTENANCE).exists())
+    self.assertTrue(self.fixture.pending("deactivation").exists())
+
+  def test_bad_baseline_provider_publishes_nothing(self):
+    good = self.baseline()
+    bad = {"missing item": {k: v for k, v in good.items() if k != "kernel"}, "extra item": {**good, "extra": {}}, "limine supplied by provider": {**good, "limine": {}},
+           "non-dict item": {**good, "kernel": "x"}, "float": {**good, "kernel": {"x": 1.5}}, "non-string key": {**good, "kernel": {1: "x"}},
+           "object": {**good, "kernel": {"x": object()}}, "tuple": {**good, "kernel": {"x": (1,)}}, "not a dict": [], "none": None}
+    before = self.tree()
+    for label, value in bad.items():
+      with self.subTest(label), self.assertRaises(ValueError): self.publish(lambda value=value: value)
+      self.assertEqual(self.tree(), before)
+      self.assertFalse(any(self.pending_names()) or (self.root / T.MAINTENANCE).exists() or (self.root / T.DB_LOCK).exists())
+    def refuses(): raise ValueError("provider refused")
+    with self.assertRaisesRegex(ValueError, "provider refused"): self.publish(refuses)
+    self.assertEqual(self.tree(), before)
+    huge = {**good, "kernel": {"blob": "x" * (T.P.MAX_BYTES + 1)}}
+    with self.assertRaises(ValueError): self.publish(lambda: huge)
+    self.assertEqual(self.tree(), before)
+    self.assertFalse(any(self.pending_names()) or (self.root / T.MAINTENANCE).exists())
+    for invalid in ("not callable", {}):
+      with self.assertRaisesRegex(ValueError, "only valid for the maintenance|Maintenance baseline provider"):
+        T._transition(self.root, "maintenance", precheck=self.fixture.check, guard=lambda: None, maintenance_gate=self.gate, maintenance_baseline=invalid)
+    with self.assertRaisesRegex(ValueError, "only valid for the maintenance"):
+      T._transition(self.root, "deactivation", precheck=self.fixture.check, guard=lambda: None, maintenance_baseline=self.baseline)
+    self.assertEqual(self.tree(), before)
+
+  def test_read_baseline_reports_missing_and_refuses_forged_or_unbound_documents(self):
+    self.publish()
+    archive = next((self.root / T.HISTORY).glob("*/" + T.BASELINE_NAME)).parent
+    path = archive / T.BASELINE_NAME
+    good, marker = path.read_bytes(), (self.root / T.MAINTENANCE).read_bytes()
+    document = json.loads(good)
+    def variant(**changes): return T._encoded({**document, **changes})
+    forged = {"not canonical": good + b"\n", "not json": b"{", "wrong protocol": variant(protocol="other"),
+              "other transition": variant(transition_id=str(uuid.uuid4())), "other intent": variant(maintenance_intent_sha256="0" * 64),
+              "other policy": variant(old_policy_sha256="1" * 64), "extra field": variant(extra=1),
+              "tampered item": variant(items={**document["items"], "kernel": {"identity": "kernel", "sha256": "2" * 64}, "extra": {}}),
+              "missing limine": variant(items={k: v for k, v in document["items"].items() if k != "limine"}),
+              "float": variant(items={**document["items"], "kernel": {"x": 0.5}})}
+    for label, raw in forged.items():
+      with self.subTest(label):
+        path.write_bytes(raw)
+        with self.assertRaises(ValueError): T.read_baseline(self.root)
+    path.write_bytes(good)
+    self.assertEqual(T.read_baseline(self.root), document["items"])
+    # Bound to the marker: an equally canonical document for a different intent digest is refused.
+    with self.assertRaises(ValueError): T.read_baseline(self.root, marker.replace(b'"old_policy_sha256":"', b'"old_policy_sha256":"0', 1))
+    path.unlink()
+    with self.assertRaises(FileNotFoundError): T.read_baseline(self.root)
+
+  def test_stock_projection_ignores_snapshot_churn_but_not_the_stock_binding(self):
+    base = self.f.before
+    churned = with_snapshots(base, [1, 2])
+    self.assertNotEqual(T.stock_identity(base)["exact_sha256"], T.stock_identity(churned)["exact_sha256"])
+    self.assertEqual(T.stock_identity(base)["projection_sha256"], T.stock_identity(churned)["projection_sha256"])
+    self.assertEqual(T.stock_projection(base), T.stock_projection(with_snapshots(base, [7, 8, 9], reverse=True)))
+    rehashed = base.replace(hashlib.blake2b((self.root / T.PRODUCTION).read_bytes()).hexdigest().encode(), b"0" * 128)
+    self.assertEqual(T.stock_projection(base), T.stock_projection(rehashed))  # the UKI is compared by its own bytes
+    with_cmdline = base.replace(b"protocol: efi\n", b"protocol: efi\ncmdline: root=/dev/other\n", 1)
+    self.assertNotEqual(T.stock_projection(base), T.stock_projection(with_cmdline))
+    for text in (base.replace(b"default_entry: 2", b"default_entry: 3"), churned.replace(b"comment: 4.0.2-1", b"default_entry: 5", 1)):
+      with self.assertRaises(ValueError): T.stock_projection(text)
+
   def test_reentry_refuses_incoherent_or_drifted_state_and_preserves_marker(self):
     self.run_maintenance()
     marker = (self.root / T.MAINTENANCE).read_bytes()
@@ -859,7 +993,10 @@ class NativeMaintenance(unittest.TestCase):
     with patch.object(T, "_locks", side_effect=RuntimeError("stop at exclusion")), patch.object(T.G, "_ancestors", side_effect=RuntimeError("stop at ancestors")):
       with self.assertRaisesRegex(RuntimeError, "stop at"):
         T._transition(Path("/"), "maintenance", precheck=lambda *a: None, guard=lambda: None, maintenance_gate=lambda *a: None, native=T._NATIVE_MAINTENANCE,
-                       maintenance_resume=lambda: dict(RESUME))
+                       maintenance_resume=lambda: dict(RESUME), maintenance_baseline=lambda: {})
+    with self.assertRaisesRegex(ValueError, "generation baseline"):
+      T._transition(Path("/"), "maintenance", precheck=lambda *a: None, guard=lambda: None, maintenance_gate=lambda *a: None, native=T._NATIVE_MAINTENANCE,
+                    maintenance_resume=lambda: dict(RESUME))
 
 
 if __name__ == "__main__": unittest.main()

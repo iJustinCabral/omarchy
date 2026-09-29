@@ -42,6 +42,13 @@ SIMULATED (each is a seam, not evidence of the host):
   S6 Activation before it is a fixture activation through the same engine core.
   S7 The reviewed runtime inventory is authored by this guest (external review
      approval is not modeled).
+  S8 The qualified generation the baseline pins is synthetic: config.json,
+     qualification.json, source/restore candidate files, seven fixture module
+     files and the Formosa firmware set are guest bytes, and /usr/bin/modinfo is
+     a guest stub answering only the driver inventory's exact queries (the guest
+     has no kmod). The baseline itself is captured by the REAL provider
+     (boot_policy_native._baseline: real root_driver_inventory/root_control_inventory
+     against guest '/') and `assess` runs through the REAL CLI.
 Kernel update is a test package plus the S4 hook; no real kernel/initramfs,
 DKMS, EFI, PM or power operation exists. Not a host, hibernation or hardware claim.
 """
@@ -79,6 +86,19 @@ PAGE = 4096
 ENV = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
 HOOKS = Path("/etc/pacman.d/hooks")
 KERNEL_FILE = Path("/usr/lib/modules/t2fixture/version")
+RELEASE = "t2fixture"
+ARTIFACTS = STATE / "artifacts"
+MODULES = ("brcmfmac", "brcmfmac-wcc", "brcmfmac-cyw", "brcmfmac-bca", "t2bce_core", "t2bce_audio", "hci_bcm4377")
+FORMOSA = "brcmfmac4377b3-pcie.apple,formosa"
+MODINFO = """#!/usr/bin/python3
+import sys
+arguments = sys.argv[1:]
+if arguments[:1] == ["-b"] and arguments[2:3] == ["-k"] and arguments[4:5] == ["-n"]:
+  print("//lib/modules/" + arguments[3] + "/updates/dkms/" + arguments[5] + ".ko.zst")
+elif arguments[:2] == ["-F", "srcversion"]: print("A1B2C3D4E5F60718293A4B5C")
+elif arguments[:2] == ["-F", "vermagic"]: print("t2fixture SMP preempt mod_unload")
+else: sys.exit(2)
+"""
 
 
 def require(value, message):
@@ -241,6 +261,62 @@ def native_cli():
   return process.returncode, process.stdout.strip(), process.stderr.strip()
 
 
+def assess_cli():
+  """The real read-only CLI; parses the canonical JSON report."""
+  process = subprocess.run(["/usr/bin/python3", "-I", "-B", str(NATIVE), "assess"], env=ENV, capture_output=True, text=True, timeout=90)
+  require(process.returncode == 0, "Native assess failed: " + process.stdout + process.stderr)
+  return json.loads(process.stdout.splitlines()[-1])
+
+
+def evidence_tree():
+  """Every byte, mode, size and timestamp that assess must leave untouched."""
+  state = {}
+  for base in (STATE, Path("/boot"), Path("/var/lib/omarchy/t2-hibernate-trial"), Path("/var/lib/pacman/local")):
+    for path in [base, *sorted(base.rglob("*"))]:
+      info = path.lstat()
+      raw = path.read_bytes() if stat.S_ISREG(info.st_mode) else None
+      state[str(path)] = (info.st_mode, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, None if raw is None else hashlib.sha256(raw).hexdigest())
+  return state
+
+
+def assessed(expected, *, changed=None, limine_exact=None):
+  """Run assess through the real CLI; it must write nothing and leave no lock."""
+  before = evidence_tree()
+  report = assess_cli()
+  require(evidence_tree() == before, "assess changed evidence bytes, modes or timestamps")
+  require(not Path("/var/lib/pacman/db.lck").exists(), "assess left db.lck")
+  held = os.open("/var/lib/omarchy/t2-hibernate-trial/physical-cycle.lock", os.O_RDONLY | os.O_CLOEXEC)
+  try: fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)  # assess left no flock behind
+  finally: os.close(held)
+  require(report["class"] == expected and report["read_only"] is True, "Assessment class differs: " + json.dumps(report, sort_keys=True))
+  if changed is not None: require(report["changed_items"] == changed, "Changed items differ: " + json.dumps(report, sort_keys=True))
+  if expected != "unknown":
+    require(report["limine"]["stock_projection_equal"] is True, "Snapshot churn must not change the stock projection")
+    if limine_exact is not None: require(report["limine"]["exact_equal"] is limine_exact, "Limine exact-equality differs")
+  return report
+
+
+def setup_generation():
+  """S8: a synthetic qualified generation for the baseline to pin."""
+  write_file(Path("/usr/bin/modinfo"), MODINFO.encode(), 0o755)
+  if not os.path.lexists("/lib"): os.symlink("usr/lib", "/lib")
+  require(os.readlink("/lib") == "usr/lib", "Guest /lib must alias usr/lib for the driver inventory")
+  for name in MODULES: write_file(Path("/usr/lib/modules/" + RELEASE + "/updates/dkms/" + name + ".ko.zst"), (name + " module bytes\n").encode(), 0o644)
+  for suffix in (".bin", "-SPPR-m.txt", "-SPPR-u.txt", ".clm_blob", ".txcap_blob"):
+    write_file(Path("/usr/lib/firmware/brcm/" + FORMOSA + suffix), ("firmware " + suffix + "\n").encode(), 0o644)
+  for role in ("source", "restore"):
+    directory = ARTIFACTS / role
+    directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+    for directory_parent in (ARTIFACTS, directory): directory_parent.chmod(0o700)
+    write_file(directory / "provenance.json", json.dumps({"kernel_release": RELEASE, "modules": {"t2bce_core": {"sha256": role}}}).encode(), 0o600)
+    write_file(directory / "mba-t2-hibernation-candidate.efi", (role + " candidate uki\n").encode(), 0o600)
+    write_file(directory / "mba-t2-hibernation-candidate.initrd", (role + " candidate initrd\n").encode(), 0o600)
+  write_file(STATE / "config.json", json.dumps({"source_directory": str(ARTIFACTS / "source"), "restore_directory": str(ARTIFACTS / "restore"),
+    "production_uki": str(UKI), "audited_details_sha256": "a" * 64, "staged_receipt_sha256": "b" * 64,
+    "manifest": {"protocol": "guest-fixture", "runtime_sha256": "c" * 64}}).encode(), 0o600)
+  write_file(STATE / "qualification.json", b'{"approved":true}', 0o600)
+
+
 def setup_topology():
   """S1, S2 and the real disk/sysfs resume topology."""
   subprocess.run(["/usr/bin/mount", "-t", "tmpfs", "-o", "mode=0755", "tmpfs", "/sys/firmware"], check=True, timeout=20)
@@ -319,6 +395,7 @@ def owner():
   with patch.object(tempfile, "TemporaryDirectory", side_effect=lambda: original_temporary(prefix="maintenance-native-", dir="/run")):
     fixture.setUp()
   copy_fixture(fixture)
+  setup_generation()
   count, digest, completion = deploy_real_runtime(D)
   step("runtime-deploy", "files=" + str(count) + " inventory_sha256=" + digest + " reviewed_commit=" + completion["reviewed_commit"])
   N = load("native_installed", NATIVE)
@@ -351,7 +428,8 @@ def owner():
   N._resume = lambda engine_arg: dict(resume)
   gate = lambda root, phase: N._maintenance_gate(engine, root, phase, capture)
   result = engine._transition(N.ROOT, "maintenance", precheck=precheck, guard=block.check, maintenance_gate=gate,
-                              native=engine._NATIVE_MAINTENANCE, maintenance_resume=lambda: capture["resume"])
+                              native=engine._NATIVE_MAINTENANCE, maintenance_resume=lambda: capture["resume"],
+                              maintenance_baseline=lambda: N._baseline(engine, N.ROOT))
   block.check()
   marker = (STATE / "package-maintenance.pending")
   require(marker.exists() and not (STATE / "source-default-deactivation.pending").exists() and not (STATE / "boot-policy.json").exists(), "Maintenance publication state wrong")
@@ -362,6 +440,17 @@ def owner():
     time.sleep(.02)
   step("publish-marker", "S5 seam; real _maintenance_gate (drop-in/ExecStart/vetoes/fallback/no-image) passed; intent_sha256=" + result["maintenance_intent_sha256"])
   del block
+
+  baseline_file = next((STATE / "boot-policy-transitions").iterdir()) / "generation-baseline.json"
+  require(baseline_file.is_file() and stat.S_IMODE(baseline_file.stat().st_mode) == 0o600, "Baseline sidecar was not archived")
+  document = json.loads(baseline_file.read_bytes())
+  require(document["protocol"] == "omarchy-t2-generation-baseline-v1" and document["transition_id"] == result["transition_id"] and
+          set(document["items"]) == {*engine.BASELINE_ITEMS, "limine"}, "Baseline sidecar shape differs")
+  require(all("unavailable" not in item for item in document["items"].values()), "Real baseline provider left an item unavailable: " + json.dumps(document["items"], sort_keys=True)[:600])
+  step("baseline-archived", "generation-baseline.json sha256=" + hashlib.sha256(baseline_file.read_bytes()).hexdigest() + " items=" + ",".join(sorted(document["items"])))
+  report = assessed("unchanged", changed=[], limine_exact=True)
+  require(all(item == {"state": "equal"} for item in report["items"].values()), "Fresh baseline items differ")
+  step("assess-0-published", "class=unchanged, every item equal, read-only (evidence bytes/mtimes and locks unchanged)")
 
   # --- (b) real native CLI re-entry ---
   code, out, err = native_cli()
@@ -381,6 +470,8 @@ def owner():
   admitted(app("1.0-1"))
   require(installed("t2fixture-app") == "1.0-1" and Path("/opt/t2fixture/app").read_bytes() == b"app 1.0-1\n", "Admitted app transaction did not install")
   step("txn-1-app-admitted", "app 1.0-1 installed via real pacman -U; hook AbortOnFail passed")
+  report = assessed("unchanged", changed=[], limine_exact=False)
+  step("assess-1-after-userspace-txn", "class=unchanged; limine snapshot churn: exact_equal=False stock_projection_equal=True")
 
   # --- (d) kernel package update, coherent stock rewrite ---
   admitted(kernel("1.0-1"))
@@ -389,6 +480,8 @@ def owner():
   admitted(kernel("2.0-1"))
   uki2 = UKI.read_bytes()
   require(uki2 != uki1 and installed("t2fixture-kernel") == "2.0-1" and blake2(uki2) in LIMINE.read_text(), "Kernel update did not coherently rewrite UKI + limine")
+  report = assessed("requalification-required", changed=["production_uki"], limine_exact=False)
+  step("assess-2-after-kernel-update", "class=requalification-required changed=" + json.dumps(report["changed_items"]) + " paths=" + json.dumps(report["items"]["production_uki"]["paths"]))
   step("txn-2-3-kernel-update-admitted", "kernel 1.0-1 then 2.0-1 admitted; uki blake2b " + blake2(original_uki)[:16] + " -> " + blake2(uki1)[:16] + " -> " + blake2(uki2)[:16])
 
   # --- (e) transaction after the kernel update still admitted, with the NEW stock bytes ---
@@ -396,6 +489,8 @@ def owner():
   require(installed("t2fixture-app") == "2.0-1", "Post-kernel-update transaction did not install")
   churned = LIMINE.read_text()
   require("limine-snapper-sync" in churned and len(re.findall(r"^     ///\d+ ", churned, re.M)) == 2 and re.findall(r"^default_entry:.*$", churned, re.M) == ["default_entry: 2"], "Snapshot churn did not accompany the transactions")
+  report = assessed("requalification-required", changed=["production_uki"])
+  step("assess-3-after-post-kernel-userspace-txn", "still requalification-required; nothing but the production UKI differs")
   step("txn-4-after-kernel-update-admitted", "app 2.0-1 upgraded against updated coherent stock bytes; snapshot sub-entries added/pruned by every transaction: " + json.dumps(re.findall(r"^     ///(\d+) ", churned, re.M)))
 
   # --- (f) native maintenance re-entry after the update ---
@@ -437,6 +532,8 @@ def owner():
   code, out, err = native_cli()
   require(code != 0, "Native CLI accepted incoherent stock bytes")
   print("NATIVE_CLI_REFUSAL rc=" + str(code) + " stderr_tail=" + (err.splitlines()[-1] if err else out[-200:]), flush=True)
+  report = assessed("unknown")
+  require("Stock entry does not bind actual production UKI bytes" in report["reason"], "Incoherent stock bytes must make the evidence unknown, not assessable: " + report["reason"])
   atomic(LIMINE, re.sub(r"(omarchy_linux-t2\.efi#)[0-9a-f]{128}", lambda match: match.group(1) + blake2(UKI.read_bytes()), LIMINE.read_text()).encode())
   admitted(app("3.0-1"))
   step("neg-incoherent-kernel-update", "UKI changed without limine hash: pacman + native CLI refuse; repaired coherent bytes admit again")
@@ -450,6 +547,17 @@ def owner():
   code, text = run_hook()
   require(code == 0, "Restored resume evidence not admitted: " + text)
   step("neg-missing-resume-evidence", "removed archived resume file aborts pacman; exact restore admits again")
+
+  saved_baseline = baseline_file.read_bytes()
+  baseline_file.unlink()
+  report = assessed("unknown")
+  require(report["baseline"] == "missing", "Missing baseline must be reported")
+  write_file(baseline_file, saved_baseline.replace(b'"transition_id":"', b'"transition_id":"0', 1), 0o600)
+  report = assessed("unknown")
+  require(report["baseline"] == "invalid", "Forged baseline binding must be refused")
+  write_file(baseline_file, saved_baseline, 0o600)
+  assessed("requalification-required", changed=["production_uki"])
+  step("neg-baseline-missing-and-forged", "removed and mis-bound baseline sidecars are unknown (compatibility unknown); exact restore assesses again")
 
   marker_bytes = marker.read_bytes()
   admitted(app("4.0-1"))

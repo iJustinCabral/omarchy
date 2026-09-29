@@ -45,6 +45,12 @@ HISTORY = P.STATE / "boot-policy-transitions"
 PENDINGS = {action: P.STATE / ("source-default-" + action + ".pending") for action in ("activation", "deactivation")}
 MAINTENANCE = P.STATE / "package-maintenance.pending"
 MAINTENANCE_SCHEMA = "omarchy-t2-package-maintenance-intent-v1"
+BASELINE_NAME = "generation-baseline.json"
+BASELINE_SCHEMA = "omarchy-t2-generation-baseline-v1"
+# Items the native provider must return; the engine adds "limine" itself from the
+# exact stock bytes it retains, so the provider never sees or guesses them.
+BASELINE_ITEMS = ("kernel", "production_uki", "source_uki", "restore_uki", "module_stack", "manifest", "config",
+                  "qualification", "driver_modules", "firmware", "control_inventory", "bootloader")
 RUNTIME_PENDINGS = (P.STATE / D.UPGRADE_PENDING, P.STATE / D.PENDING)
 PRODUCTION = Path("boot/EFI/Linux/omarchy_linux-t2.efi")
 MAX_UKI = 256 * 1024 * 1024
@@ -285,7 +291,98 @@ def _replace(root, expected, replacement, transition_id, *, guard=lambda: None):
   if _read(root, P.LIMINE, private=False) != replacement: raise ValueError("Configuration replacement readback failed")
 
 
-def transition(root, action, *, precheck, maintenance_continuation=None, guard=None, recover=None, maintenance_resume=None):
+def stock_projection(raw):
+  """Canonical stock-boot identity the guard cares about, blind to snapshot churn.
+
+  Reuses the guard's exact stock validator, then keeps only default_entry 2, the
+  two leading entry names and the //linux-t2 properties with the production UKI
+  hash masked (the UKI itself is compared by its own bytes). limine-snapper-sync
+  rewrites its //Snapshots region after the //linux-t2 block, so it never enters
+  this value; theme or other unrelated configuration is not part of it either.
+  """
+  G._stock(raw)
+  lines = raw.decode().splitlines()
+  entries = [(index, line.strip()) for index, line in enumerate(lines) if line.strip().startswith("/")]
+  end = entries[2][0] if len(entries) > 2 else len(lines)
+  properties = {}
+  for line in lines[entries[1][0] + 1:end]:
+    if not line.strip() or line.lstrip().startswith("#"): continue
+    key, value = line.strip().split(":", 1)
+    key = key.strip().lower()
+    if key != "comment": properties[key] = value.strip()
+  properties["path"] = properties["path"].rsplit("#", 1)[0] + "#<production-uki-blake2b>"
+  return {"default_entry": 2, "entries": [entries[0][1], entries[1][1]], "linux_t2": properties}
+
+
+def stock_identity(raw):
+  """Exact bytes and snapshot-blind stock projection digests of one Limine configuration."""
+  return {"exact_sha256": P.digest(raw), "projection_sha256": P.digest(_encoded(stock_projection(raw)))}
+
+
+def _plain(value, depth=0):
+  """JSON-plain data only: no floats, non-string keys or excessive nesting."""
+  if depth > 12: raise ValueError("Generation baseline nests too deeply")
+  if value is None or type(value) in (bool, int, str): return
+  if type(value) is list:
+    for item in value: _plain(item, depth + 1)
+  elif type(value) is dict:
+    for key, item in value.items():
+      if type(key) is not str: raise ValueError("Generation baseline keys must be strings")
+      _plain(item, depth + 1)
+  else: raise ValueError("Generation baseline holds a non-JSON value")
+
+
+def _baseline_value(value):
+  """Exact provider shape: one JSON-plain dict per required item, nothing else."""
+  if type(value) is not dict or set(value) != set(BASELINE_ITEMS) or any(type(item) is not dict for item in value.values()):
+    raise ValueError("Exact generation baseline item set required")
+  _plain(value)
+  raw = _encoded(value)
+  # Refused before any write; the document adds only fixed-size bindings and the limine identity.
+  if len(raw) > P.MAX_BYTES // 2: raise ValueError("Generation baseline exceeds the bounded evidence size")
+  return json.loads(raw)
+
+
+def _baseline_document(identifier, items, intent, intent_raw):
+  """Canonical archived baseline, bound to the transition and the maintenance intent digest.
+
+  Written after maintenance-resume.json and before maintenance-intent.json and the
+  marker, so no marker ever exists without it. The marker/intent field set is
+  unchanged; only new reviewed code reads this object (the guard ignores it).
+  """
+  document = {"protocol": BASELINE_SCHEMA, "transition_id": identifier, "maintenance_intent_sha256": P.digest(intent_raw), "items": items}
+  for name in ("old_policy_sha256", "staged_receipt_sha256", "deactivation_completion_sha256"):
+    document[name] = intent[name]
+  raw = _encoded(document)
+  if len(raw) > P.MAX_BYTES: raise ValueError("Generation baseline exceeds the bounded evidence size")
+  return raw
+
+
+def read_baseline(root, marker_raw=None):
+  """Validated archived baseline items for the published maintenance transition.
+
+  Read-only. Raises FileNotFoundError when the sidecar is absent (an older or
+  fixture publication) and ValueError when it is not exactly the canonical
+  document bound to this marker; callers turn both into "compatibility unknown".
+  """
+  root = Path(root)
+  marker = _read(root, MAINTENANCE) if marker_raw is None else marker_raw
+  intent = P._json(marker)
+  if type(intent) is not dict or _encoded(intent) != marker: raise ValueError("Exact canonical maintenance intent required")
+  identifier = PRODUCT.TX.uuid_value(intent.get("transition_id"))
+  raw = _read(root, HISTORY / identifier / BASELINE_NAME)
+  document = P._json(raw)
+  if type(document) is not dict or document.get("protocol") != BASELINE_SCHEMA or type(document.get("items")) is not dict:
+    raise ValueError("Exact generation baseline document required")
+  items = document["items"]
+  if set(items) != {*BASELINE_ITEMS, "limine"} or any(type(item) is not dict for item in items.values()):
+    raise ValueError("Exact generation baseline item set required")
+  _plain(document)
+  if _baseline_document(identifier, items, intent, marker) != raw: raise ValueError("Generation baseline is not bound to the maintenance intent")
+  return items
+
+
+def transition(root, action, *, precheck, maintenance_continuation=None, guard=None, recover=None, maintenance_resume=None, maintenance_baseline=None):
   root = Path(root)
   if not root.is_absolute() or root.resolve() != root or not root.is_dir() or root.resolve() == Path("/"):
     raise ValueError("Fixture-only transition refuses live root and aliases")
@@ -294,7 +391,7 @@ def transition(root, action, *, precheck, maintenance_continuation=None, guard=N
   if recover is not None and (action != "maintenance" or not callable(recover)):
     raise ValueError("Explicit fixture maintenance recovery required")
   return _transition(root, action, precheck=precheck, guard=(lambda: None) if guard is None else guard, maintenance_continuation=maintenance_continuation, recover=recover,
-                     maintenance_resume=maintenance_resume)
+                     maintenance_resume=maintenance_resume, maintenance_baseline=maintenance_baseline)
 
 
 def _runtime_pending(root, action):
@@ -312,7 +409,7 @@ def _live_maintenance(root, gate, native):
     raise ValueError("Live maintenance entry requires a separately reviewed native coordinator")
 
 
-def _transition(root, action, *, precheck, guard, maintenance_continuation=None, recover=None, maintenance_gate=None, native=None, maintenance_resume=None):
+def _transition(root, action, *, precheck, guard, maintenance_continuation=None, recover=None, maintenance_gate=None, native=None, maintenance_resume=None, maintenance_baseline=None):
   """Internal core; maintenance is a durable veto, not update permission.
 
   maintenance_gate(root, phase) supplies additional read-only prerequisites at
@@ -325,10 +422,20 @@ def _transition(root, action, *, precheck, guard, maintenance_continuation=None,
   archived intent and marker exist) in maintenance-resume.json so the update
   guard can prove image absence later without re-deriving qualified artifacts,
   which a kernel/UKI update legitimately invalidates. The live root requires it.
+
+  maintenance_baseline() returns the qualified generation's identity items
+  (exactly BASELINE_ITEMS), called in the pre-write "before" phase while that
+  generation is still active. The engine adds the stock Limine identity it
+  retains and archives the canonical document in generation-baseline.json after
+  the resume evidence and before maintenance-intent.json and the marker. The
+  live root requires it; fixtures may omit it, and an absent sidecar later means
+  compatibility unknown.
   """
   root = Path(root)
   if maintenance_resume is not None and (action != "maintenance" or not callable(maintenance_resume)):
     raise ValueError("Maintenance resume provider is only valid for the maintenance action")
+  if maintenance_baseline is not None and (action != "maintenance" or not callable(maintenance_baseline)):
+    raise ValueError("Maintenance baseline provider is only valid for the maintenance action")
   if maintenance_continuation is not None and (root.resolve() == Path("/") or action != "maintenance" or not callable(maintenance_continuation)):
     raise ValueError("Explicit fixture-only maintenance continuation required")
   if maintenance_gate is not None and (action != "maintenance" or not callable(maintenance_gate)):
@@ -336,6 +443,8 @@ def _transition(root, action, *, precheck, guard, maintenance_continuation=None,
   if action == "maintenance": _live_maintenance(root, maintenance_gate, native)
   if action == "maintenance" and root.resolve() == Path("/") and maintenance_resume is None:
     raise ValueError("Live maintenance requires the audited resume target for durable evidence")
+  if action == "maintenance" and root.resolve() == Path("/") and maintenance_baseline is None:
+    raise ValueError("Live maintenance requires the qualified generation baseline for durable evidence")
   if recover is not None and (root.resolve() == Path("/") or action != "maintenance" or not callable(recover)):
     raise ValueError("Explicit fixture-only retained recovery required")
   if action not in (*PENDINGS, "maintenance"):
@@ -374,6 +483,8 @@ def _transition(root, action, *, precheck, guard, maintenance_continuation=None,
     # Validated before any write: a bad tuple must not strand a half-finished deactivation.
     resume = None if maintenance_resume is None else G._resume_target(maintenance_resume())
     if maintenance_gate is not None: maintenance_gate(root, "before")
+    # Captured while the qualified generation is still active and before any write.
+    baseline = None if maintenance_baseline is None else _baseline_value(maintenance_baseline())
     guard()
     transition_id = str(uuid.uuid4())
     intent = _encoded({"protocol": "omarchy-t2-source-default-transition-v1", "transition_id": transition_id,
@@ -452,6 +563,12 @@ def _transition(root, action, *, precheck, guard, maintenance_continuation=None,
         _new(archive / G.RESUME_NAME, resume_raw)
         if _read(root, (archive / G.RESUME_NAME).relative_to(root)) != resume_raw:
           raise ValueError("Archived maintenance resume target readback differs")
+      if baseline is not None:
+        baseline_raw = _baseline_document(transition_id, {**baseline, "limine": stock_identity(after)}, fields, maintenance_intent)
+        guard()
+        _new(archive / BASELINE_NAME, baseline_raw)
+        if _read(root, (archive / BASELINE_NAME).relative_to(root)) != baseline_raw:
+          raise ValueError("Archived generation baseline readback differs")
       guard()
       _new(archive / "maintenance-intent.json", maintenance_intent)
       if _read(root, (archive / "maintenance-intent.json").relative_to(root)) != maintenance_intent:

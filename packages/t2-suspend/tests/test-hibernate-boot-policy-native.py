@@ -1,4 +1,6 @@
 """Offline native wiring tests; never invoke host power/inhibitor/lock operations."""
+import fcntl
+import hashlib
 import importlib.util
 import json
 import os
@@ -6,6 +8,7 @@ import stat
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+import uuid
 from unittest.mock import patch, Mock
 
 HERE = Path(__file__).resolve().parents[1]
@@ -478,7 +481,10 @@ class Maintenance(unittest.TestCase):
   def test_cli_accepts_only_fixed_maintenance_action(self):
     with patch.object(N, "native", return_value={"ok": True}) as native, patch("builtins.print"):
       self.assertEqual(N.main(["maintenance"]), 0)
-    native.assert_called_once_with("maintenance")
+      self.assertEqual(N.main(["assess"]), 0)
+      for args in (["assess", "--root", "/tmp"], ["assess", "--force"], ["reactivate"], ["assess", "maintenance"]):
+        with self.assertRaises(SystemExit): N.main(args)
+    self.assertEqual([call.args for call in native.call_args_list], [("maintenance",), ("assess",)])
     self.assertEqual(N._inhibit_command("maintenance")[-1], "maintenance")
 
   def test_matching_reviewed_drop_in_and_effective_exec_start_pass(self):
@@ -644,6 +650,9 @@ class Maintenance(unittest.TestCase):
     with patch.object(N, "_precheck", side_effect=record) as precheck_mock:
       engine, precheck, gate, result = self.dispatch(False, callbacks)
     self.assertEqual(self.provider(), {"device": "/dev/mapper/root", "devnum": "253:0", "offset": 9})  # archived tuple = audited tuple
+    with patch.object(N, "_baseline", return_value={"kernel": {}}) as baseline:  # live publication always supplies the baseline provider
+      self.assertEqual(engine._transition.call_args.kwargs["maintenance_baseline"](), {"kernel": {}})
+      baseline.assert_called_once_with(engine, Path("/"))
     arguments = engine._transition.call_args
     self.assertEqual(arguments.args, (Path("/"), "maintenance"))
     self.assertIs(arguments.kwargs["native"], engine._NATIVE_MAINTENANCE)
@@ -685,6 +694,316 @@ class Maintenance(unittest.TestCase):
   def test_native_maintenance_still_refuses_workspace_and_nonisolated_invocation(self):
     with patch.object(N.os, "execve", side_effect=AssertionError("no inhibitor")), patch.object(N, "_command", side_effect=AssertionError("no host queries")):
       with self.assertRaises(ValueError): N.native("maintenance")
+
+
+DRIVER = load("assess_driver_inventory", HERE / "hibernate/root_driver_inventory.py")
+CONTROL = load("assess_control_inventory", HERE / "hibernate/root_control_inventory.py")
+STATE_DIR = "var/lib/omarchy/t2-hibernate-product"
+ARTIFACTS = "/" + STATE_DIR + "/artifacts"
+
+
+class Assess(unittest.TestCase):
+  """Baseline sidecar and read-only assessment against a disposable root; nothing touches the host."""
+  RELEASE = "7.2.6-fixture-t2"
+
+  def query(self, argv):
+    if argv[1] == "-b":
+      name = argv[-1]
+      return str(self.root / "lib/modules" / self.RELEASE / "updates/dkms" / (name + ".ko.zst"))
+    if argv[2] == "srcversion": return "A1B2C3D4E5F60718293A4B5C"
+    return self.RELEASE + " SMP preempt mod_unload"
+
+  def write(self, relative, raw, mode=0o600):
+    path = self.f.write(relative, raw)
+    path.chmod(mode)
+    return path
+
+  def setUp(self):
+    self.fx = F.NativeMaintenance("test_happy_path_publishes_durable_marker_and_vetoes_every_route")
+    self.fx.setUp()
+    self.addCleanup(self.fx.doCleanups)
+    self.root, self.f, self.T = self.fx.root, self.fx.f, F.T
+    self.running = self.RELEASE
+    for target, replacement in (("_driver_capture", lambda root, release: DRIVER.capture(root, release, query=self.query)),
+                                ("_control_capture", CONTROL.capture), ("_running_release", lambda: self.running)):
+      patcher = patch.object(N, target, replacement)
+      patcher.start()
+      self.addCleanup(patcher.stop)
+    self.config = {"source_directory": ARTIFACTS + "/source", "restore_directory": ARTIFACTS + "/restore",
+                   "production_uki": "/boot/EFI/Linux/omarchy_linux-t2.efi", "audited_details_sha256": "a" * 64,
+                   "staged_receipt_sha256": self.T.P.digest(self.f.raw),
+                   "manifest": {"protocol": "fixture", "runtime_sha256": "b" * 64, "source_sha256": "c" * 64}}
+    self.write_config()
+    self.write(STATE_DIR + "/qualification.json", b'{"approved":true}')
+    for role in ("source", "restore"):
+      self.write(STATE_DIR + "/artifacts/" + role + "/provenance.json", json.dumps({"kernel_release": self.RELEASE, "modules": {"t2bce_core": {"sha256": role}}}).encode())
+      self.write(STATE_DIR + "/artifacts/" + role + "/mba-t2-hibernation-candidate.efi", (role + " uki").encode())
+      self.write(STATE_DIR + "/artifacts/" + role + "/mba-t2-hibernation-candidate.initrd", (role + " initrd").encode())
+    (self.root / "lib").symlink_to("usr/lib")
+    for name in DRIVER.MODULES: self.write("usr/lib/modules/" + self.RELEASE + "/updates/dkms/" + name + ".ko.zst", (name + " bytes").encode())
+    for suffix in DRIVER.SUFFIXES: self.write("usr/lib/firmware/brcm/" + DRIVER.FORMOSA + suffix, ("firmware " + suffix).encode())
+
+  def write_config(self, **changes):
+    self.write(STATE_DIR + "/config.json", json.dumps({**self.config, **changes}).encode())
+
+  def publish(self):
+    return self.T._transition(self.root, "maintenance", precheck=self.fx.fixture.check, guard=lambda: None, maintenance_gate=self.fx.gate,
+                              maintenance_resume=lambda: dict(F.RESUME), maintenance_baseline=lambda: N._baseline(self.T, self.root))
+
+  def assess(self): return N.assess(self.T, self.root)
+
+  def published(self):
+    self.result = self.publish()
+    return self
+
+  def fresh(self):
+    other = Assess("test_unchanged_generation_reports_every_item_equal")
+    other.setUp()
+    self.addCleanup(other.doCleanups)
+    return other.published()
+
+  def archive(self): return self.root / self.T.HISTORY / self.result["transition_id"]
+
+  def snapshot(self):
+    state = {}
+    for path in sorted(self.root.rglob("*")) + [self.root]:
+      info = path.lstat()
+      content = os.readlink(path) if stat.S_ISLNK(info.st_mode) else (path.read_bytes() if stat.S_ISREG(info.st_mode) else None)
+      state[str(path.relative_to(self.root))] = (info.st_mode, info.st_ino, info.st_uid, info.st_size, info.st_mtime_ns, info.st_ctime_ns, content)
+    return state
+
+  def coherent_kernel_update(self, image=b"updated production image"):
+    old = (self.root / self.T.PRODUCTION).read_bytes()
+    limine = (self.root / self.T.P.LIMINE).read_bytes()
+    (self.root / self.T.PRODUCTION).write_bytes(image)
+    self.f.write(self.T.P.LIMINE, limine.replace(hashlib.blake2b(old).hexdigest().encode(), hashlib.blake2b(image).hexdigest().encode()))
+
+  def test_unchanged_generation_reports_every_item_equal(self):
+    self.published()
+    report = self.assess()
+    self.assertEqual(report["class"], "unchanged")
+    self.assertEqual(set(report["items"]), set(self.T.BASELINE_ITEMS))
+    self.assertTrue(all(item == {"state": "equal"} for item in report["items"].values()))
+    self.assertEqual(report["limine"], {"exact_equal": True, "stock_projection_equal": True, "state": "equal"})
+    self.assertEqual((report["changed_items"], report["unknown_items"]), ([], []))
+    self.assertEqual(report["transition_id"], self.result["transition_id"])
+    self.assertEqual(report["maintenance_intent_sha256"], self.result["maintenance_intent_sha256"])
+    self.assertEqual((report["read_only"], report["reactivation_evaluated"], report["qualification_issued"]), (True, False, False))
+    self.assertEqual(json.loads(json.dumps(report, sort_keys=True)), report)
+    baseline = self.T.read_baseline(self.root)
+    self.assertEqual(baseline["kernel"], {"running_release": self.RELEASE, "qualified_release": self.RELEASE, "installed_releases": [self.RELEASE]})
+    self.assertEqual(baseline["source_uki"], {"sha256": hashlib.sha256(b"source uki").hexdigest(), "blake2b": hashlib.blake2b(b"source uki").hexdigest(), "size": 10})
+    self.assertEqual(baseline["production_uki"]["sha256"], hashlib.sha256((self.root / self.T.PRODUCTION).read_bytes()).hexdigest())
+    self.assertEqual(baseline["config"]["sha256"], hashlib.sha256((self.root / self.T.P.STATE / "config.json").read_bytes()).hexdigest())
+    self.assertEqual(baseline["manifest"]["fields"], self.config["manifest"])
+    self.assertEqual(set(baseline["driver_modules"]["modules"]), set(DRIVER.MODULES))
+    self.assertEqual(len(baseline["firmware"]["files"]), 5)
+    self.assertNotIn("boot/limine.conf", baseline["control_inventory"]["files"])  # rewritten by every snapshot sync and by our own deactivation
+    self.assertEqual(baseline["bootloader"]["files"], {name: {"present": False} for name in N.BOOTLOADERS})
+    self.assertEqual(baseline["limine"], self.T.stock_identity(self.f.before))
+
+  def test_each_changed_item_requires_requalification(self):
+    def limine_cmdline(other):
+      raw = (other.root / other.T.P.LIMINE).read_bytes()
+      other.f.write(other.T.P.LIMINE, raw.replace(b"protocol: efi\n", b"protocol: efi\ncmdline: root=/dev/other\n", 1))
+    def config_changes(other): other.write_config(audited_details_sha256="d" * 64)
+    def manifest_changes(other): other.write_config(manifest={**other.config["manifest"], "source_sha256": "e" * 64})
+    def write(relative, raw=b"changed"): return lambda other: other.write(relative, raw)
+    state, module = STATE_DIR + "/artifacts/", "usr/lib/modules/" + self.RELEASE + "/updates/dkms/t2bce_core.ko.zst"
+    cases = {
+      "kernel": (lambda other: (other.root / "usr/lib/modules/7.3.0-new").mkdir(), ["kernel"]),
+      "production_uki": (lambda other: other.coherent_kernel_update(), ["production_uki"]),
+      "source_uki": (write(state + "source/mba-t2-hibernation-candidate.efi"), ["source_uki"]),
+      "restore_uki": (write(state + "restore/mba-t2-hibernation-candidate.efi"), ["restore_uki"]),
+      "module_stack initrd": (write(state + "restore/mba-t2-hibernation-candidate.initrd"), ["module_stack"]),
+      "module_stack provenance": (write(state + "source/provenance.json", json.dumps({"kernel_release": self.RELEASE, "modules": {"t2bce_core": {"sha256": "new"}}}).encode()), ["module_stack"]),
+      "config": (config_changes, ["config"]), "manifest": (manifest_changes, None),
+      "qualification": (write(STATE_DIR + "/qualification.json", b'{"approved":true,"new":1}'), ["qualification"]),
+      "driver_modules": (write(module), ["driver_modules"]),
+      "firmware": (write("usr/lib/firmware/brcm/" + DRIVER.FORMOSA + ".bin"), ["firmware"]),
+      "control_inventory": (write("etc/modprobe.d/t2.conf"), ["control_inventory"]),
+      "bootloader": (write("boot/EFI/BOOT/BOOTX64.EFI"), ["bootloader"]),
+      "limine stock projection": (limine_cmdline, ["limine"])}
+    for label, (mutate, expected) in cases.items():
+      with self.subTest(label):
+        other = self.fresh()
+        before = other.assess()
+        self.assertEqual(before["class"], "unchanged")
+        mutate(other)
+        report = other.assess()
+        self.assertEqual(report["class"], "requalification-required")
+        if expected is not None: self.assertEqual(report["changed_items"], expected)
+        else: self.assertIn(label, report["changed_items"])
+        self.assertEqual(report["unknown_items"], [])
+    other = self.fresh()  # the running kernel alone
+    other.running = "7.3.0-new"
+    report = other.assess()
+    self.assertEqual((report["class"], report["changed_items"]), ("requalification-required", ["kernel"]))
+    self.assertEqual(report["items"]["kernel"]["paths"], ["/running_release"])
+
+  def test_snapshot_churn_alone_never_requires_requalification(self):
+    self.published()
+    for numbers, reverse in (([1], False), ([1, 2], False), ([2, 3, 4], True), ([], False)):
+      self.f.write(self.T.P.LIMINE, F.with_snapshots((self.root / self.T.P.LIMINE).read_bytes(), numbers, reverse))
+      report = self.assess()
+      self.assertEqual(report["class"], "unchanged", numbers)
+      self.assertTrue(report["limine"]["stock_projection_equal"])
+      self.assertEqual(report["limine"]["exact_equal"], not numbers)
+      self.assertEqual(report["changed_items"], [])
+    self.f.write(self.T.P.LIMINE, F.with_snapshots((self.root / self.T.P.LIMINE).read_bytes(), [5]))
+    self.coherent_kernel_update(b"kernel update with churn")
+    report = self.assess()
+    self.assertEqual((report["class"], report["changed_items"]), ("requalification-required", ["production_uki"]))
+    self.assertEqual((report["limine"]["exact_equal"], report["limine"]["stock_projection_equal"]), (False, True))
+    self.f.write(self.T.P.LIMINE, (self.root / self.T.P.LIMINE).read_bytes().replace(b"default_entry: 2", b"default_entry: 5"))
+    report = self.assess()  # a promoted snapshot default is not stock: the guard's validator refuses the evidence
+    self.assertEqual(report["class"], "unknown")
+    self.assertIn("canonical stock default 2", report["reason"])
+
+  def test_missing_or_forged_baseline_means_unknown(self):
+    other = self.fresh()
+    path = other.archive() / self.T.BASELINE_NAME
+    good = path.read_bytes()
+    document = json.loads(good)
+    path.unlink()
+    report = other.assess()
+    self.assertEqual((report["class"], report["baseline"]), ("unknown", "missing"))
+    self.assertNotIn("items", report)
+    forged = {"garbage": b"{", "not canonical": good + b"\n", "other transition": self.T._encoded({**document, "transition_id": str(uuid.uuid4())}),
+              "other intent": self.T._encoded({**document, "maintenance_intent_sha256": "0" * 64}),
+              "extra item": self.T._encoded({**document, "items": {**document["items"], "extra": {}}}),
+              "everything equal but unbound": self.T._encoded({**document, "old_policy_sha256": "1" * 64}),
+              "extra field": self.T._encoded({**document, "extra": 1})}
+    for label, raw in forged.items():
+      with self.subTest(label):
+        path.write_bytes(raw)
+        path.chmod(0o600)
+        report = other.assess()
+        self.assertEqual((report["class"], report["baseline"]), ("unknown", "invalid"))
+    path.write_bytes(good)
+    self.assertEqual(other.assess()["class"], "unchanged")
+    # The marker cannot vouch for item values (its field set is fixed by the guard): a canonical, correctly bound
+    # document with edited values is trusted as written, and such an edit can only surface as a difference.
+    path.write_bytes(good.replace(b'"installed_releases":["' + self.RELEASE.encode() + b'"]', b'"installed_releases":[]'))
+    self.assertEqual(other.assess()["changed_items"], ["kernel"])
+    path.write_bytes(good)
+    # A fixture publication without a provider archives no sidecar, so nothing can be claimed later.
+    older = Assess("test_unchanged_generation_reports_every_item_equal")
+    older.setUp()
+    self.addCleanup(older.doCleanups)
+    older.result = older.T._transition(older.root, "maintenance", precheck=older.fx.fixture.check, guard=lambda: None,
+                                       maintenance_gate=older.fx.gate, maintenance_resume=lambda: dict(F.RESUME))
+    self.assertFalse((older.archive() / self.T.BASELINE_NAME).exists())
+    self.assertEqual(older.assess()["baseline"], "missing")
+    self.assertEqual(older.assess()["class"], "unknown")
+
+  def test_unreadable_items_are_unknown_and_never_unchanged(self):
+    other = self.fresh()
+    for name in list((other.root / "usr/lib/firmware/brcm").iterdir()): name.unlink()
+    report = other.assess()
+    self.assertEqual(report["class"], "unknown")
+    self.assertEqual(report["unknown_items"], ["driver_modules", "firmware"])
+    self.assertEqual(report["items"]["control_inventory"], {"state": "equal"})
+    self.assertIn("firmware", report["items"]["firmware"]["reason"])
+    # A definite change outranks an unreadable item.
+    other.coherent_kernel_update()
+    report = other.assess()
+    self.assertEqual((report["class"], report["changed_items"], report["unknown_items"]), ("requalification-required", ["production_uki"], ["driver_modules", "firmware"]))
+    # A tolerated item that could not be captured at publication stays unknown, the core items still compare.
+    third = Assess("test_unchanged_generation_reports_every_item_equal")
+    third.setUp()
+    self.addCleanup(third.doCleanups)
+    with patch.object(N, "_control_capture", side_effect=ValueError("control unreadable at publication")):
+      third.published()
+    self.assertIn("unavailable", third.T.read_baseline(third.root)["control_inventory"])
+    report = third.assess()
+    self.assertEqual((report["class"], report["unknown_items"]), ("unknown", ["control_inventory"]))
+    self.assertIn("baseline item unavailable", report["items"]["control_inventory"]["reason"])
+
+  def test_publication_refuses_when_the_qualified_core_identity_is_unavailable(self):
+    for label, relative in (("source uki", STATE_DIR + "/artifacts/source/mba-t2-hibernation-candidate.efi"), ("config", STATE_DIR + "/config.json"),
+                            ("provenance", STATE_DIR + "/artifacts/restore/provenance.json"), ("qualification", STATE_DIR + "/qualification.json"),
+                            ("production", "boot/EFI/Linux/omarchy_linux-t2.efi")):
+      with self.subTest(label):
+        other = Assess("test_unchanged_generation_reports_every_item_equal")
+        other.setUp()
+        self.addCleanup(other.doCleanups)
+        (other.root / relative).unlink()
+        before = other.fx.tree()
+        with self.assertRaises((ValueError, FileNotFoundError)): other.publish()
+        self.assertEqual(other.fx.tree(), before)
+        self.assertFalse(any(other.fx.pending_names()) or (other.root / self.T.MAINTENANCE).exists())
+
+  def test_assess_writes_nothing_leaves_no_lock_and_never_blocks(self):
+    other = self.fresh()
+    opened = []
+    real_open = os.open
+    def spy(path, flags, *args, **kwargs):
+      if flags & (os.O_WRONLY | os.O_TRUNC | os.O_EXCL) or (flags & os.O_CREAT and not os.path.lexists(path)):
+        raise AssertionError("assess opened for writing/creation: " + str(path))
+      opened.append(str(path))
+      return real_open(path, flags, *args, **kwargs)
+    scenarios = {"unchanged": lambda: None, "snapshot churn": lambda: other.f.write(self.T.P.LIMINE, F.with_snapshots((other.root / self.T.P.LIMINE).read_bytes(), [3])),
+                 "changed": lambda: other.coherent_kernel_update(), "missing baseline": lambda: (other.archive() / self.T.BASELINE_NAME).unlink()}
+    for label, mutate in scenarios.items():
+      with self.subTest(label):
+        mutate()
+        before = other.snapshot()
+        with patch.object(N.os, "open", side_effect=spy):
+          report = other.assess()
+        after = other.snapshot()
+        self.assertEqual([name for name in after if after[name] != before.get(name)], [], label)  # every byte, mode, inode and timestamp
+        self.assertEqual(set(after), set(before))
+        self.assertFalse((other.root / self.T.DB_LOCK).exists())
+        self.assertTrue(report["read_only"])
+        held = os.open(other.root / self.T.PHYSICAL_LOCK, os.O_RDONLY)
+        try: fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)  # released: assess left no flock behind
+        finally: os.close(held)
+        ledger = os.open(other.root / self.T.P.STATE / "ledger/lock", os.O_RDWR)
+        try: fcntl.flock(ledger, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally: os.close(ledger)
+    self.assertTrue(opened)
+    # Busy locks report unknown without waiting, changing anything or leaving a lock.
+    before = other.snapshot()
+    held = os.open(other.root / self.T.PHYSICAL_LOCK, os.O_RDONLY)
+    try:
+      fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+      busy = other.assess()
+    finally: os.close(held)
+    self.assertEqual((busy["class"], busy["busy"]), ("unknown", True))
+    ledger = os.open(other.root / self.T.P.STATE / "ledger/lock", os.O_RDWR)
+    try:
+      fcntl.flock(ledger, fcntl.LOCK_EX | fcntl.LOCK_NB)
+      self.assertEqual(other.assess()["class"], "unknown")
+    finally: os.close(ledger)
+    (other.root / self.T.DB_LOCK).write_bytes(b"pacman")
+    pacman = other.assess()
+    self.assertEqual((pacman["class"], pacman["busy"]), ("unknown", True))
+    self.assertEqual((other.root / self.T.DB_LOCK).read_bytes(), b"pacman")
+    (other.root / self.T.DB_LOCK).unlink()
+    settled = other.snapshot()  # only the test's own db.lck write touched its directory entry
+    self.assertEqual({k: v for k, v in settled.items() if k != "var/lib/pacman"}, {k: v for k, v in before.items() if k != "var/lib/pacman"})
+
+  def test_assess_without_maintenance_evidence_is_unknown_and_does_not_wire_admission(self):
+    report = self.assess()  # the fixture is still active source-default: no marker exists
+    self.assertEqual(report["class"], "unknown")
+    self.assertFalse((self.root / self.T.MAINTENANCE).exists())
+    self.published()
+    with patch.object(self.T.PRODUCT, "check", side_effect=AssertionError("no product admission")), \
+         patch.object(self.T.PRODUCT.ARTIFACTS, "derive_artifacts", side_effect=AssertionError("no artifact derivation")):
+      self.assertEqual(self.assess()["class"], "unchanged")
+    (self.root / self.T.MAINTENANCE).write_bytes(b"foreign")
+    self.assertEqual(self.assess()["class"], "unknown")
+
+  def test_native_assess_takes_no_inhibitor_and_no_exclusion(self):
+    engine = Mock()
+    with patch.object(N, "_installed", return_value=engine), patch.object(N, "assess", return_value={"class": "unchanged"}) as assess, \
+         patch.object(N.os, "execve", side_effect=AssertionError("no inhibitor")), patch.object(N, "_exclusion", side_effect=AssertionError("no exclusion")):
+      self.assertEqual(N.native("assess"), {"class": "unchanged"})
+    assess.assert_called_once_with(engine, Path("/"))
+    engine._transition.assert_not_called()
+    with patch.object(N.os, "execve", side_effect=AssertionError("no inhibitor")), patch.object(N, "_command", side_effect=AssertionError("no host queries")):
+      with self.assertRaises(ValueError): N.native("assess")  # workspace/nonroot invocation refuses before anything runs
 
 
 if __name__ == "__main__": unittest.main()
