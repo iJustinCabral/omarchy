@@ -1,5 +1,7 @@
 import importlib.util
+import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -103,6 +105,26 @@ class Installer(unittest.TestCase):
     (self.root / f'usr/lib/modules/{RELEASE}/build/Makefile').unlink()
     with self.assertRaises(ValueError): self.install()
     self.assertFalse(any(c[0] != '/usr/bin/lsinitcpio' for c in self.calls))
+
+  def test_package_is_radio_only_and_versions_agree(self):
+    self.assertEqual(set(m.MODULES), {'brcmfmac', 'brcmfmac-wcc', 'brcmfmac-cyw', 'brcmfmac-bca', 'hci_bcm4377'})
+    conf = (m.HERE / 'dkms.conf').read_text()
+    built = set(re.findall(r'BUILT_MODULE_NAME\[\d+\]="([^"]+)"', conf))
+    self.assertEqual(built, set(m.MODULES))
+    self.assertNotIn('t2bce', conf + (m.HERE / 'build-modules.sh').read_text())
+    self.assertIn('PACKAGE_VERSION="' + m.VERSION + '"', conf)
+    self.assertIn('PRE_BUILD="check-radio-qualification.sh ${kernelver}"', conf)
+    hook = (m.HERE / 'initcpio-install').read_text()
+    self.assertIn('usr/src/omarchy-t2-radio-' + m.VERSION, hook)
+    self.assertIn('omarchy-t2-radio/' + m.VERSION + '/', hook)
+    self.assertTrue(os.access(m.HERE / 'check-radio-qualification.sh', os.X_OK))
+
+  def test_install_ships_gate_with_modes_preserved(self):
+    self.install()
+    for name in m.SOURCE_FILES:
+      self.assertTrue((self.root / m.SOURCE / name).is_file(), name)
+    self.assertTrue(os.access(self.root / m.SOURCE / 'check-radio-qualification.sh', os.X_OK))
+    self.assertEqual(m.load(self.root)['qualified_kernels'], [RELEASE])
 
   def test_source_drift(self):
     self.install()
