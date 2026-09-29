@@ -537,3 +537,82 @@ def _verify_existing_maintenance(root, *, guard, gate, native=None):
   return {"protocol": "omarchy-t2-package-maintenance-verified-v1", "transition_id": result["transition_id"],
           "maintenance_intent_sha256": P.digest(marker), "already_inactive": True,
           "live_execution": False, "qualification_issued": False}
+
+
+def _complete_interrupted_maintenance(root, *, guard, gate, native=None, pinned=None):
+  """Finish exactly the state a crash left between marker publication and pending retirement.
+
+  Only the step the interrupted publisher would have done next: marker and
+  deactivation pending both present, nothing else active, and the pending
+  byte-identical to the archived intent the marker chains to. Runs the guard's
+  exact maintenance validator (its only relaxation is ignoring that one proven
+  pending), the caller's "final" gate with the archived resume tuple pinned,
+  retires the pending as _transition does, then re-verifies as inactive
+  maintenance ("retained"). Any mismatch raises with every file untouched; the
+  marker is never written or removed. A failure after retirement reinstates the
+  identical pending.
+  """
+  root = Path(root)
+  if not root.is_absolute() or root.resolve() != root or not root.is_dir(): raise ValueError("Canonical root required")
+  _live_maintenance(root, gate, native)
+  if not callable(guard) or not callable(gate): raise ValueError("Explicit guard and gate required")
+  if pinned is not None and type(pinned) is not dict: raise ValueError("Pinned evidence dictionary required")
+  validator = getattr(G, "_maintenance", None)
+  if not callable(validator) or not hasattr(G, "ACTIVE"): raise ValueError("Reviewed update guard lacks the exact maintenance validator")
+  pending_path = PENDINGS["deactivation"]
+  pending = root / pending_path
+  guard()
+  for path in (MAINTENANCE, pending_path): G._ancestors(root, root / path, _owner(root))
+  def expected_state():
+    """Prove the pending is exactly the archived intent the marker chains to; return marker bytes."""
+    marker, raw = _read(root, MAINTENANCE), _read(root, pending_path)
+    intent = P._json(marker)
+    if type(intent) is not dict or _encoded(intent) != marker: raise ValueError("Exact canonical maintenance intent required")
+    identifier = PRODUCT.TX.uuid_value(intent.get("transition_id"))
+    archived = _read(root, HISTORY / identifier / "intent.json")
+    pinned_intent = P._json(raw)
+    if (raw != archived or type(pinned_intent) is not dict or _encoded(pinned_intent) != raw or pinned_intent.get("transition_id") != identifier or
+        pinned_intent.get("action") != "deactivation" or pinned_intent.get("policy_sha256") != intent.get("old_policy_sha256")):
+      raise ValueError("Deactivation pending is not the archived intent of the maintenance transition")
+    completion = _read(root, HISTORY / identifier / "completion.json")
+    completed = P._json(completion)
+    if (P.digest(completion) != intent.get("deactivation_completion_sha256") or type(completed) is not dict or
+        completed.get("intent_sha256") != P.digest(raw) or completed.get("transition_id") != identifier):
+      raise ValueError("Deactivation pending does not chain to the completed deactivation")
+    return marker
+  def evaluate():
+    """The guard's exact validator, relaxed only for the one proven pending."""
+    original = G.ACTIVE
+    G.ACTIVE = tuple(path for path in original if path != pending_path)
+    try: return validator(root)
+    finally: G.ACTIVE = original
+  with _locks(root) as release_db:
+    guard()
+    marker = expected_state()
+    result = evaluate()
+    if _read(root, MAINTENANCE) != marker or expected_state() != marker: raise ValueError("Maintenance evidence changed during verification")
+    resume = result["resume"]
+    if pinned is not None: pinned["resume"] = resume
+    guard()
+    gate(root, "final")
+    guard()
+    release_db(verify_only=True)
+    if expected_state() != marker: raise ValueError("Maintenance evidence changed before pending retirement")
+    raw = _read(root, pending_path)
+    try:
+      guard()
+      pending.unlink()
+      _sync(pending.parent)
+      guard()
+      verified = validator(root)
+      gate(root, "retained")
+      guard()
+      if _read(root, MAINTENANCE) != marker or verified["transition_id"] != result["transition_id"]:
+        raise ValueError("Maintenance marker changed during completion")
+      release_db()
+    except BaseException:
+      if not _present(pending): _new(pending, raw)
+      raise
+  return {"protocol": "omarchy-t2-package-maintenance-verified-v1", "transition_id": result["transition_id"],
+          "maintenance_intent_sha256": P.digest(marker), "completed_interrupted_maintenance": True,
+          "live_execution": False, "qualification_issued": False}

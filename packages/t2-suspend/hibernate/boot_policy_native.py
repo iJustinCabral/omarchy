@@ -455,7 +455,10 @@ def native(action):
     if action == "maintenance":
       capture = {}
       gate = lambda root, phase: _maintenance_gate(engine, root, phase, capture)
-      if engine._present(ROOT / engine.MAINTENANCE):
+      if engine._present(ROOT / engine.MAINTENANCE) and engine._present(ROOT / engine.PENDINGS["deactivation"]):
+        # Crash/gate failure between marker and pending retirement: finish that one step only.
+        result = engine._complete_interrupted_maintenance(ROOT, guard=guard, gate=gate, native=engine._NATIVE_MAINTENANCE, pinned=capture)
+      elif engine._present(ROOT / engine.MAINTENANCE):
         # Idempotent re-entry reuses the guard's exact inactive validator, never rewrites.
         result = engine._verify_existing_maintenance(ROOT, guard=guard, gate=gate, native=engine._NATIVE_MAINTENANCE)
       else:

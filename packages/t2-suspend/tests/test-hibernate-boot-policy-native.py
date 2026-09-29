@@ -611,7 +611,7 @@ class Maintenance(unittest.TestCase):
         with patch.object(N, name, side_effect=ValueError("drift")), self.assertRaisesRegex(ValueError, "drift"):
           N._maintenance_gate(engine, fixture.root, "before")
 
-  def dispatch(self, marker_present, callbacks=lambda engine: None):
+  def dispatch(self, marker_present, callbacks=lambda engine: None, pending_present=False):
     from contextlib import contextmanager
     @contextmanager
     def exclusion(action):
@@ -619,7 +619,9 @@ class Maintenance(unittest.TestCase):
       yield lambda: None
     engine = Mock()
     engine.MAINTENANCE = Path("var/lib/omarchy/t2-hibernate-product/package-maintenance.pending")
-    engine._present.return_value = marker_present
+    engine.PENDINGS = {"deactivation": Path("var/lib/omarchy/t2-hibernate-product/source-default-deactivation.pending")}
+    engine._present.side_effect = lambda path: marker_present if path.name == "package-maintenance.pending" else pending_present
+    engine._complete_interrupted_maintenance.return_value = {"completed_interrupted_maintenance": True, "qualification_issued": False}
     engine._transition.return_value = {"qualification_issued": False, "live_execution": False}
     engine._verify_existing_maintenance.return_value = {"already_inactive": True, "qualification_issued": False}
     with patch.object(N, "_installed", return_value=engine), patch.object(Path, "readlink", return_value=Path("/usr/bin/systemd-inhibit")), \
@@ -653,6 +655,21 @@ class Maintenance(unittest.TestCase):
     self.assertTrue(result["live_execution"])
     self.assertFalse(result["power_operation"])
     self.assertFalse(result["qualification_issued"])
+
+  def test_native_maintenance_completes_only_marker_plus_deactivation_pending(self):
+    engine, precheck, gate, result = self.dispatch(True, lambda engine: engine._complete_interrupted_maintenance.call_args.kwargs["gate"](Path("/"), "final"), pending_present=True)
+    engine._transition.assert_not_called()
+    engine._verify_existing_maintenance.assert_not_called()
+    arguments = engine._complete_interrupted_maintenance.call_args
+    self.assertEqual(arguments.args, (Path("/"),))
+    self.assertIs(arguments.kwargs["native"], engine._NATIVE_MAINTENANCE)
+    self.assertEqual(gate.call_args.args[:3], (engine, Path("/"), "final"))
+    self.assertIs(gate.call_args.args[3], arguments.kwargs["pinned"])  # archived tuple flows into the final gate's pin
+    self.assertTrue(result["completed_interrupted_maintenance"] and result["live_execution"] and not result["power_operation"])
+    # A pending without a marker is still the publisher's incomplete state, never completed here.
+    engine, *_ = self.dispatch(False, pending_present=True)
+    engine._complete_interrupted_maintenance.assert_not_called()
+    engine._transition.assert_called_once()
 
   def test_native_maintenance_reentry_is_read_only_verification(self):
     engine, precheck, gate, result = self.dispatch(True, lambda engine: engine._verify_existing_maintenance.call_args.kwargs["gate"](Path("/"), "retained"))

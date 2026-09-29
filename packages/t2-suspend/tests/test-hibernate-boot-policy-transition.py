@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import stat
 import unittest
+import uuid
 from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parents[1]
@@ -614,6 +615,150 @@ class NativeMaintenance(unittest.TestCase):
     (self.root / T.MAINTENANCE).write_bytes(marker)
     self.assertTrue(self.reenter()["already_inactive"])
     self.assertFalse((self.root / T.DB_LOCK).exists())
+
+  def complete(self, pinned=None):
+    return T._complete_interrupted_maintenance(self.root, guard=lambda: None, gate=self.gate, pinned=pinned)
+
+  def interrupt(self, how="gate"):
+    """Publish maintenance, then leave marker + deactivation pending exactly as a crash would."""
+    if how == "gate":
+      self.fail["final"] = True
+      with self.assertRaisesRegex(ValueError, "injected final"): self.run_maintenance()
+      self.fail.clear()
+    else:
+      real = T._sync
+      def crash(directory):
+        if Path(directory) == self.root / T.PENDINGS["deactivation"].parent and not self.fixture.pending("deactivation").exists():
+          raise OSError("crash at retirement")
+        return real(directory)
+      with patch.object(T, "_sync", crash), self.assertRaisesRegex(OSError, "crash at retirement"): self.run_maintenance()
+    self.assertTrue((self.root / T.MAINTENANCE).exists())
+    self.assertTrue(self.fixture.pending("deactivation").exists())
+    self.assertFalse((self.root / T.DB_LOCK).exists())
+    self.phases.clear()
+
+  def archive(self): return next((self.root / T.HISTORY).iterdir())
+
+  def refuses_unchanged(self, pattern=None):
+    before = self.tree()
+    with (self.assertRaisesRegex(Exception, pattern) if pattern else self.assertRaises(Exception)): self.complete()
+    self.assertEqual(self.tree(), before)
+    self.assertFalse((self.root / T.DB_LOCK).exists())
+
+  @unittest.skipUnless(REAL, "requires the update guard's exact maintenance validator")
+  def test_interrupted_maintenance_completes_only_the_pending_retirement(self):
+    for how in ("gate", "crash"):
+      with self.subTest(how=how):
+        other = self.new()
+        other.interrupt(how)
+        with self.assertRaisesRegex(ValueError, "Active or incomplete"): T.G._maintenance(other.root)
+        with self.assertRaises(ValueError): other.reenter()
+        with self.assertRaisesRegex(ValueError, "Existing package maintenance intent"): other.run_maintenance()
+        before = other.tree()
+        marker, pending = (other.root / T.MAINTENANCE).read_bytes(), other.fixture.pending("deactivation").read_bytes()
+        pinned = {}
+        result = other.complete(pinned)
+        self.assertTrue(result["completed_interrupted_maintenance"])
+        self.assertEqual(pinned["resume"], RESUME)
+        self.assertEqual(other.phases, ["final", "retained"])
+        self.assertEqual(pinned["resume"], T._pinned_resume(other.root))
+        self.assertFalse(other.fixture.pending("deactivation").exists())
+        self.assertEqual((other.root / T.MAINTENANCE).read_bytes(), marker)
+        self.assertEqual(T.P.digest(marker), result["maintenance_intent_sha256"])
+        self.assertEqual(other.tree(), {name: value for name, value in before.items() if not name.endswith("source-default-deactivation.pending")})
+        self.assertEqual(T.G._maintenance(other.root)["transition_id"], result["transition_id"])
+        self.assertFalse((other.root / T.DB_LOCK).exists())
+        self.assertTrue(other.reenter()["already_inactive"])  # second run: nothing pending, plain re-entry
+        with self.assertRaises(FileNotFoundError): other.complete()  # the completion itself never runs twice
+
+  @unittest.skipUnless(REAL, "requires the update guard's exact maintenance validator")
+  def test_interrupted_maintenance_refuses_mismatch_without_any_change(self):
+    self.interrupt()
+    pending = self.fixture.pending("deactivation")
+    original = pending.read_bytes()
+    pending.write_bytes(original.replace(b"deactivation", b"deactivatioN"))
+    self.refuses_unchanged("not the archived intent")
+    pending.write_bytes(json.dumps(json.loads(original), indent=1).encode())
+    self.refuses_unchanged()
+    pending.write_bytes(original)
+    # transition_id mismatch: a foreign but self-consistent pending id, archive left alone
+    swapped = json.loads(original)
+    swapped["transition_id"] = str(uuid.uuid4())
+    pending.write_bytes(T._encoded(swapped))
+    self.refuses_unchanged()
+    pending.write_bytes(original)
+    # archived intent changed too, pending identical to it: chain to completion/marker breaks
+    intent = self.archive() / "intent.json"
+    changed = json.loads(original)
+    changed["policy_sha256"] = "0" * 64
+    intent.write_bytes(T._encoded(changed)); pending.write_bytes(T._encoded(changed))
+    self.refuses_unchanged()
+    intent.write_bytes(original); pending.write_bytes(original)
+    # marker pins a different completion
+    marker = (self.root / T.MAINTENANCE).read_bytes()
+    (self.root / T.MAINTENANCE).write_bytes(marker + b" ")
+    self.refuses_unchanged()
+    (self.root / T.MAINTENANCE).write_bytes(marker)
+    self.assertEqual(self.phases, [])
+    self.assertTrue(self.complete()["completed_interrupted_maintenance"])
+
+  @unittest.skipUnless(REAL, "requires the update guard's exact maintenance validator")
+  def test_interrupted_maintenance_refuses_any_other_active_state(self):
+    self.interrupt()
+    for path, mode in ((T.PENDINGS["activation"], 0o600), (T.RUNTIME_PENDINGS[0], 0o600), (T.RUNTIME_PENDINGS[1], 0o600), (T.P.POLICY, 0o600), (T.OPT_IN, 0o644)):
+      with self.subTest(path=path.name):
+        extra = self.f.write(path, b"partial")
+        extra.chmod(mode)
+        self.refuses_unchanged()
+        extra.unlink()
+    self.assertTrue(self.complete()["completed_interrupted_maintenance"])
+
+  @unittest.skipUnless(REAL, "requires the update guard's exact maintenance validator")
+  def test_interrupted_maintenance_refuses_failed_gates_and_saved_image_without_change(self):
+    self.interrupt()
+    self.image = True
+    self.refuses_unchanged("saved image")
+    self.image = False
+    self.fail["final"] = True
+    self.refuses_unchanged("injected final")
+    self.fail.clear()
+    (self.root / T.PRODUCTION).write_bytes(b"different production image")
+    self.refuses_unchanged()
+
+  @unittest.skipUnless(REAL, "requires the update guard's exact maintenance validator")
+  def test_retained_failure_after_retirement_reinstates_identical_pending(self):
+    self.interrupt()
+    self.fail["retained"] = True
+    self.refuses_unchanged("injected retained")
+    self.assertEqual(self.phases, ["final", "retained"])
+
+  @unittest.skipUnless(REAL, "requires the update guard's exact maintenance validator")
+  def test_interrupted_maintenance_lock_contention_and_guard_restore(self):
+    self.interrupt()
+    active = tuple(T.G.ACTIVE)
+    before = self.tree()
+    held = os.open(self.root / T.PHYSICAL_LOCK, os.O_RDONLY)
+    try:
+      fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+      with self.assertRaises(BlockingIOError): self.complete()
+    finally: os.close(held)
+    db = self.f.write(T.DB_LOCK, b"pacman owns this")
+    with self.assertRaises(FileExistsError): self.complete()
+    self.assertEqual(db.read_bytes(), b"pacman owns this")
+    db.unlink()
+    self.assertEqual(self.tree(), before)
+    self.assertEqual(self.phases, [])
+    self.assertEqual(tuple(T.G.ACTIVE), active)
+    self.complete()
+    self.assertEqual(tuple(T.G.ACTIVE), active)  # the relaxation never leaks past the call
+
+  def test_interrupted_maintenance_completion_needs_native_capability_on_live_root(self):
+    noop = lambda *a: None
+    for root in (Path("/"), Path("/tmp")):
+      with self.assertRaises(ValueError): T._complete_interrupted_maintenance(root, guard=noop, gate=noop)
+    with self.assertRaises(ValueError): T._complete_interrupted_maintenance(Path("/"), guard=noop, gate=noop, native=object())
+    self.assertFalse(hasattr(T, "complete_interrupted_maintenance"))
+    with self.assertRaises(TypeError): T.transition(self.root, "maintenance", precheck=noop, pinned={})
 
   def test_runtime_pending_markers_refuse_maintenance_with_no_writes(self):
     for relative in T.RUNTIME_PENDINGS:
