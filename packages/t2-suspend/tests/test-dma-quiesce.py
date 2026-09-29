@@ -99,6 +99,7 @@ struct pci_dev {
 struct t2bce_device {
   struct pci_dev *pci, *pci0, *pci2, *pci3;
   bool pci_dma_restore_failed;
+  bool resume_skipped;
   bool queue_dma_blocked;
   bool queue_dma_was_master;
   unsigned long pci_master_mask;

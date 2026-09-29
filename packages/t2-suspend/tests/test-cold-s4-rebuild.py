@@ -138,6 +138,7 @@ struct t2bce_device {
   bool no_state_rebuild_failed;
   bool no_state_early_wake_attempted;
   int no_state_early_wake_status;
+  bool resume_skipped;
   bool queue_dma_blocked;
   bool queue_dma_was_master;
 };
