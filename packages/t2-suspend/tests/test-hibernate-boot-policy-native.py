@@ -1,4 +1,5 @@
 """Offline native wiring tests; never invoke host power/inhibitor/lock operations."""
+import contextlib
 import fcntl
 import hashlib
 import importlib.util
@@ -735,7 +736,8 @@ class AssessFixture(unittest.TestCase):
     self.config = {"source_directory": ARTIFACTS + "/source", "restore_directory": ARTIFACTS + "/restore",
                    "production_uki": "/boot/EFI/Linux/omarchy_linux-t2.efi", "audited_details_sha256": "a" * 64,
                    "staged_receipt_sha256": self.T.P.digest(self.f.raw),
-                   "manifest": {"protocol": "fixture", "runtime_sha256": "b" * 64, "source_sha256": "c" * 64}}
+                   "manifest": {"protocol": "fixture", "runtime_sha256": "b" * 64,
+                                **{role + "_sha256": hashlib.sha256((role + " uki").encode()).hexdigest() for role in ("source", "restore")}}}
     self.write_config()
     self.write(STATE_DIR + "/qualification.json", b'{"approved":true}')
     for role in ("source", "restore"):
@@ -787,14 +789,13 @@ class AssessFixture(unittest.TestCase):
       raw = (other.root / other.T.P.LIMINE).read_bytes()
       other.f.write(other.T.P.LIMINE, raw.replace(b"protocol: efi\n", b"protocol: efi\ncmdline: root=/dev/other\n", 1))
     def config_changes(other): other.write_config(audited_details_sha256="d" * 64)
-    def manifest_changes(other): other.write_config(manifest={**other.config["manifest"], "source_sha256": "e" * 64})
+    def manifest_changes(other): other.write_config(manifest={**other.config["manifest"], "protocol": "fixture-2"})
     def write(relative, raw=b"changed"): return lambda other: other.write(relative, raw)
     state, module = STATE_DIR + "/artifacts/", "usr/lib/modules/" + self.RELEASE + "/updates/dkms/t2bce_core.ko.zst"
     cases = {
       "kernel": (lambda other: (other.root / "usr/lib/modules/7.3.0-new").mkdir(), ["kernel"]),
       "production_uki": (lambda other: other.coherent_kernel_update(), ["production_uki"]),
-      "source_uki": (write(state + "source/mba-t2-hibernation-candidate.efi"), ["source_uki"]),
-      "restore_uki": (write(state + "restore/mba-t2-hibernation-candidate.efi"), ["restore_uki"]),
+      # A changed source/restore UKI no longer matches the manifest pin: fail closed as unknown (see ArtifactOwnership).
       "module_stack initrd": (write(state + "restore/mba-t2-hibernation-candidate.initrd"), ["module_stack"]),
       "module_stack provenance": (write(state + "source/provenance.json", json.dumps({"kernel_release": self.RELEASE, "modules": {"t2bce_core": {"sha256": "new"}}}).encode()), ["module_stack"]),
       "config": (config_changes, ["config"]), "manifest": (manifest_changes, None),
@@ -806,6 +807,94 @@ class AssessFixture(unittest.TestCase):
       "limine stock projection": (limine_cmdline, ["limine"])}
     return cases
 
+
+
+USER_UID = 4242
+
+
+class ArtifactOwnership(AssessFixture):
+  """The live gate: qualified artifacts belong to the operator's account while the runtime and its state are root's.
+
+  A different-owner fixture cannot be chowned unprivileged, so the artifact tree
+  is presented under another uid exactly where the check reads metadata.
+  """
+  def as_user(self, *, file_uid=USER_UID):
+    real_lstat, real_fstat = Path.lstat, os.fstat
+    marker = "/" + STATE_DIR + "/artifacts"
+    def view(info, path):
+      path = str(path)
+      if marker not in path: return info
+      uid = file_uid if path.endswith((".efi", ".initrd", ".json")) else USER_UID
+      fields = {name: getattr(info, name) for name in dir(info) if name.startswith("st_")}
+      return SimpleNamespace(**{**fields, "st_uid": uid})
+    def lstat(path, *args, **kwargs): return view(real_lstat(path, *args, **kwargs), path)
+    def fstat(fd): return view(real_fstat(fd), os.readlink("/proc/self/fd/" + str(fd)))
+    stack = contextlib.ExitStack()
+    stack.enter_context(patch.object(Path, "lstat", lstat))
+    stack.enter_context(patch.object(os, "fstat", fstat))
+    return stack
+
+  def dir(self, role): return self.root / STATE_DIR / "artifacts" / role
+
+  def test_user_owned_artifacts_publish_and_record_the_manifest_identities(self):
+    with self.as_user():
+      self.published()
+      baseline = self.T.read_baseline(self.root)
+      for role in ("source", "restore"):
+        self.assertEqual(baseline[role + "_uki"]["sha256"], self.config["manifest"][role + "_sha256"])
+      self.assertEqual(baseline["kernel"]["qualified_release"], self.RELEASE)
+      self.assertNotIn("unavailable", baseline["module_stack"])
+      report = self.assess()
+    self.assertEqual((report["class"], report["unknown_items"], report["changed_items"]), ("unchanged", [], []))
+
+  def test_manifest_pin_mismatch_fails_closed(self):
+    with self.as_user():
+      for role in ("source", "restore"):
+        self.write_config(manifest={**self.config["manifest"], role + "_sha256": "e" * 64})
+        items, errors = N.generation_items(self.T, self.root)
+        self.assertIn("manifest pin", errors[role + "_uki"])
+        self.assertIn(role + "_uki", errors)
+        with self.assertRaisesRegex(ValueError, "identity unavailable"): N._baseline(self.T, self.root)
+        self.write_config()
+
+  def test_symlinked_artifact_directory_is_refused(self):
+    with self.as_user():
+      real = self.dir("source")
+      moved = real.with_name("elsewhere")
+      real.rename(moved)
+      real.symlink_to(moved)
+      items, errors = N.generation_items(self.T, self.root)
+      self.assertIn("source_uki", errors)
+      self.assertIn("module_stack", errors)
+      with self.assertRaises(ValueError): N._baseline(self.T, self.root)
+
+  def test_group_writable_artifact_directory_or_file_is_refused(self):
+    for target in ("dir", "file"):
+      with self.subTest(target), self.as_user():
+        path = self.dir("restore") if target == "dir" else self.dir("restore") / "mba-t2-hibernation-candidate.efi"
+        original = path.stat().st_mode
+        self.addCleanup(path.chmod, original)
+        path.chmod(original | 0o020)
+        items, errors = N.generation_items(self.T, self.root)
+        self.assertIn("restore_uki", errors)
+        self.assertNotIn("source_uki", errors)
+
+  def test_artifact_file_owned_by_another_account_than_its_directory_is_refused(self):
+    with self.as_user(file_uid=USER_UID + 1):
+      items, errors = N.generation_items(self.T, self.root)
+      self.assertIn("source_uki", errors)
+
+  def test_root_owned_strictness_is_unchanged_for_the_production_image(self):
+    with self.as_user():
+      real_lstat = Path.lstat
+      def foreign(path, *a, **k):
+        info = real_lstat(path, *a, **k)
+        if str(path).endswith("/boot/EFI/Linux") or "/boot/EFI/Linux" in str(path):
+          return SimpleNamespace(**{**{n: getattr(info, n) for n in dir(info) if n.startswith("st_")}, "st_uid": USER_UID})
+        return info
+      with patch.object(Path, "lstat", foreign):
+        items, errors = N.generation_items(self.T, self.root)
+      self.assertIn("production_uki", errors)
 
 
 class Assess(AssessFixture):

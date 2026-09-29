@@ -139,10 +139,34 @@ def _veto(root, intent, *, durable=False):
 def _owner(root): return 0 if root == Path("/") else os.geteuid()
 
 
-def _stable_bytes(root, relative, limit, *, keep=False):
-  """Bounded owned regular bytes with SHA-256/BLAKE2b and unchanged identity."""
+def _artifact_ancestors(root, path, owner):
+  """Qualified private-artifact ancestry: the artifacts' own account (the directory owner) may own the chain.
+
+  Same trust the product artifact audit extends to the configured source/restore
+  directories. Every component must be a real directory (no symlink) that no
+  group/other can write, owned by root, the runtime or the artifact owner.
+  Returns the artifact owner uid. Root-owned strictness stays in _stable_bytes.
+  """
+  allowed = {0, os.geteuid(), owner}
+  for directory in path.parents:
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid not in allowed or info.st_mode & 0o022:
+      raise ValueError("Owned nonsymlink qualified artifact ancestors required")
+    if directory == root: break
+
+
+def _stable_bytes(root, relative, limit, *, keep=False, artifact=False):
+  """Bounded owned regular bytes with SHA-256/BLAKE2b and unchanged identity.
+
+  `artifact=True` is only for the configured qualified source/restore artifact
+  directories, which the product audit reads without a root-ownership rule and
+  which live under the operator's account; callers pin the bytes to the manifest.
+  """
   path, owner = root / relative, _owner(root)
-  G._ancestors(root, path, owner)
+  if artifact:
+    owner = path.parent.lstat().st_uid
+    _artifact_ancestors(root, path, owner)
+  else: G._ancestors(root, path, owner)
   named = path.lstat()
   if not stat.S_ISREG(named.st_mode) or named.st_uid != owner or named.st_mode & 0o022 or named.st_nlink != 1 or not 0 < named.st_size <= limit:
     raise ValueError("Bounded owned regular fallback bytes required")

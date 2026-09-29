@@ -485,14 +485,24 @@ def _absolute(root, path):
   return Path(root) / path.relative_to("/")
 
 
-def _file(engine, root, path, limit):
-  value, _ = engine._stable_bytes(root, path.relative_to(root), limit)
+def _file(engine, root, path, limit, artifact=False):
+  value, _ = engine._stable_bytes(root, path.relative_to(root), limit, artifact=artifact)
   return value
 
 
-def _small(engine, root, path):
-  value, raw = engine._stable_bytes(root, path.relative_to(root), MAX_SMALL, keep=True)
+def _small(engine, root, path, artifact=False):
+  value, raw = engine._stable_bytes(root, path.relative_to(root), MAX_SMALL, keep=True, artifact=artifact)
   return value, raw
+
+
+def _pinned_uki(engine, root, state, role):
+  """A configured artifact UKI, read as the product audit reads it and pinned to the qualified manifest."""
+  directory = _absolute(root, state["config"][role + "_directory"])
+  value = _file(engine, root, directory / "mba-t2-hibernation-candidate.efi", engine.MAX_UKI, artifact=True)
+  expected = state["config"]["manifest"].get(role + "_sha256")
+  if type(expected) is not str or value["sha256"] != expected:
+    raise ValueError("Qualified " + role + " UKI differs from the manifest pin")
+  return value
 
 
 def _digest(engine, value): return engine.P.digest(engine._encoded(value))
@@ -514,8 +524,8 @@ def _item_module_stack(engine, root, state):
               "runtime_modules_sha256": _digest(engine, state["source_provenance"].get("modules"))}
   for role in ("source", "restore"):
     directory = _absolute(root, state["config"][role + "_directory"])
-    identity[role + "_provenance_sha256"] = _small(engine, root, directory / "provenance.json")[0]["sha256"]
-    identity[role + "_initrd_sha256"] = _file(engine, root, directory / "mba-t2-hibernation-candidate.initrd", MAX_IMAGE)["sha256"]
+    identity[role + "_provenance_sha256"] = _small(engine, root, directory / "provenance.json", artifact=True)[0]["sha256"]
+    identity[role + "_initrd_sha256"] = _file(engine, root, directory / "mba-t2-hibernation-candidate.initrd", MAX_IMAGE, artifact=True)["sha256"]
   return identity
 
 
@@ -572,11 +582,11 @@ def generation_items(engine, root=ROOT):
     return {"sha256": _digest(engine, value), "fields": value}
   def provenance():
     directory = _absolute(root, need("config")["source_directory"])
-    state["source_provenance"] = parsed = engine.P._json(_small(engine, root, directory / "provenance.json")[1])
+    state["source_provenance"] = parsed = engine.P._json(_small(engine, root, directory / "provenance.json", artifact=True)[1])
     if type(parsed.get("kernel_release")) is not str: raise ValueError("Qualified kernel release required")
     state["release"] = parsed["kernel_release"]
   def uki(role):
-    return lambda: _file(engine, root, _absolute(root, need("config")[role + "_directory"]) / "mba-t2-hibernation-candidate.efi", engine.MAX_UKI)
+    return lambda: _pinned_uki(engine, root, {"config": need("config")}, role)
   driver = {}
   def drivers():
     if not driver:

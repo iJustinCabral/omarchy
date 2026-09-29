@@ -95,7 +95,10 @@ ENV = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
 HOOKS = Path("/etc/pacman.d/hooks")
 KERNEL_FILE = Path("/usr/lib/modules/t2fixture/version")
 RELEASE = "t2fixture"
-ARTIFACTS = STATE / "artifacts"
+# Mirror the host: the qualified artifact tree lives in the operator's account (uid 1000, 0700/0600) under a
+# 0755 user-owned ancestry, while the runtime and its state are root's.
+OPERATOR_UID = 1000
+ARTIFACTS = Path("/home/operator/.local/state/qualified-artifacts")
 MODULES = ("brcmfmac", "brcmfmac-wcc", "brcmfmac-cyw", "brcmfmac-bca", "t2bce_core", "t2bce_audio", "hci_bcm4377")
 FORMOSA = "brcmfmac4377b3-pcie.apple,formosa"
 MODINFO = """#!/usr/bin/python3
@@ -325,9 +328,16 @@ def setup_generation():
     write_file(directory / "provenance.json", json.dumps({"kernel_release": RELEASE, "modules": {"t2bce_core": {"sha256": role}}}).encode(), 0o600)
     write_file(directory / "mba-t2-hibernation-candidate.efi", (role + " candidate uki\n").encode(), 0o600)
     write_file(directory / "mba-t2-hibernation-candidate.initrd", (role + " candidate initrd\n").encode(), 0o600)
+  for path in (Path("/home/operator"), Path("/home/operator/.local"), Path("/home/operator/.local/state"), ARTIFACTS):
+    path.chmod(0o755 if path != ARTIFACTS else 0o700)
+    os.chown(path, OPERATOR_UID, OPERATOR_UID)
+  for role in ("source", "restore"):
+    for path in (ARTIFACTS / role, *(ARTIFACTS / role).iterdir()): os.chown(path, OPERATOR_UID, OPERATOR_UID)
+  pins = {role + "_sha256": hashlib.sha256((role + " candidate uki\n").encode()).hexdigest() for role in ("source", "restore")}
+  require(all(os.lstat(path).st_uid == OPERATOR_UID for path in (ARTIFACTS, ARTIFACTS / "source" / "provenance.json")), "Guest artifacts must be operator-owned")
   write_file(STATE / "config.json", json.dumps({"source_directory": str(ARTIFACTS / "source"), "restore_directory": str(ARTIFACTS / "restore"),
     "production_uki": str(UKI), "audited_details_sha256": "a" * 64, "staged_receipt_sha256": "b" * 64,
-    "manifest": {"protocol": "guest-fixture", "runtime_sha256": "c" * 64}}).encode(), 0o600)
+    "manifest": {"protocol": "guest-fixture", "runtime_sha256": "c" * 64, **pins}}).encode(), 0o600)
   write_file(STATE / "qualification.json", b'{"approved":true}', 0o600)
 
 
