@@ -13,6 +13,8 @@ RETIREMENT_KEYS = {"protocol", "retired_receipt_sha256", "source_sha256", "resto
 RETIREMENT_NAME = "pair-retirement.json"
 RETIRED_RECEIPT_NAME = "pair-retired-receipt.json"
 ROLES = ("source", "restore")
+# The ESP images the stager stages (its IMAGES table must equal this; a test asserts it).
+IMAGE_PATHS = {"source": "boot/EFI/Linux/mba_t2_hibernation_source.efi", "restore": "boot/EFI/Linux/mba_t2_hibernation_restore.efi"}
 
 
 def digest(raw): return hashlib.sha256(raw).hexdigest()

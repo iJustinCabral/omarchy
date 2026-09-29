@@ -186,6 +186,9 @@ class Retire(unittest.TestCase):
     self.assertEqual((transition.RETIREMENT.name, transition.RETIRED_RECEIPT.name), (PAIR.custody().RETIREMENT_NAME, PAIR.custody().RETIRED_RECEIPT_NAME))
     self.assertEqual(transition.RETIREMENT_KEYS, PAIR.custody().RETIREMENT_KEYS)
 
+  def test_the_shared_image_paths_equal_the_stagers(self):
+    self.assertEqual({role: str(path) for role, path in PAIR.IMAGES.items()}, PAIR.custody().IMAGE_PATHS)
+
   def test_stale_custody_of_a_previous_generation_is_replaced_atomically(self):
     self.kernel_update()
     record, copy = self.custody_paths()

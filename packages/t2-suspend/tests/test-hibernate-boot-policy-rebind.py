@@ -4,6 +4,8 @@ Nothing here touches the host: no inhibitor, package lock, EFI, boot, module or 
 """
 import contextlib
 import fcntl
+import shutil
+import signal
 import hashlib
 import importlib.util
 import json
@@ -96,10 +98,12 @@ class Rebind(NT.AssessFixture):
       self.write(base + "/provenance.json", json.dumps({"kernel_release": self.RELEASE, "modules": {"t2bce_core": {"sha256": role + " v2"}}}).encode())
       self.write(base + "/mba-t2-hibernation-candidate.efi", ukis[role])
       self.write(base + "/mba-t2-hibernation-candidate.initrd", (role + " initrd v2").encode())
-    self.manifest = {"protocol": "fixture", "runtime_sha256": "9" * 64, "source_sha256": P.digest(ukis["source"]), "restore_sha256": P.digest(ukis["restore"])}
+    self.manifest = {"protocol": T.PRODUCT.TX.PROTOCOL, "model": "MacBookAir9,1", "runtime_sha256": "9" * 64, "linux_sha256": "8" * 64, "cmdline_sha256": "7" * 64,
+                     "source_sha256": P.digest(ukis["source"]), "restore_sha256": P.digest(ukis["restore"])}
+    self.stage_trial()
     self.new_config = {**self.config, "source_directory": NT.ARTIFACTS + "2/source", "restore_directory": NT.ARTIFACTS + "2/restore",
                        "audited_details_sha256": "e" * 64, "staged_receipt_sha256": P.digest(self.receipt_raw), "manifest": self.manifest}
-    self.new_qualification = {"protocol": "omarchy-t2-product-cycle-v1", "manifest_sha256": T.PRODUCT.TX.digest(self.manifest), "evidence_sha256": "1" * 64, "qualified": True}
+    self.new_qualification = {"protocol": "omarchy-t2-product-cycle-v1", "manifest_sha256": T.PRODUCT.TX.digest(self.manifest), "evidence_sha256": P.digest(self.cycle_raw), "qualified": True}
     self.new_policy = {**P.prepare(staged, self.receipt_raw)["policy"], "approved": True}
     self.staged_raw = {"config": json.dumps(self.new_config).encode(), "qualification": json.dumps(self.new_qualification).encode(),
                        "review": json.dumps(self.new_policy).encode()}
@@ -107,6 +111,28 @@ class Rebind(NT.AssessFixture):
     self.deployment_config = {"staged_receipt_sha256": P.digest(self.receipt_raw)}
     self.deployment_report = {"manifest": {role + "_sha256": images[role]["sha256"] for role in images},
                               "audited_details": {"production_uki_sha256": P.digest(self.new_production), "provenance_sha256": {role: "f" * 64 for role in images}}}
+
+  def stage_trial(self, *, cycle_changes=None, manifest=None):
+    """The generation trial's durable terminal state: reconciled cycle, unblocked ledger, consumed guard, all under generations/<manifest12>."""
+    T, TX = self.T, self.T.PRODUCT.TX
+    manifest = self.manifest if manifest is None else manifest
+    self.trial = self.root / T.TRIAL_GENERATIONS / TX.digest(self.manifest)[:12]
+    for directory in (self.root / T.TRIAL_GENERATIONS, self.trial, self.trial / "guards", self.trial / "ledger", self.trial / "archives"):
+      directory.mkdir(parents=True, exist_ok=True)
+      directory.chmod(0o700)
+    cycle_id = str(uuid.uuid4())
+    identity = {"protocol": TX.PROTOCOL, "cycle_id": cycle_id, "original_boot_id": str(uuid.uuid4()), "manifest": manifest, "qualification_sha256": "6" * 64}
+    vector = TX.digest(identity)
+    self.reserved = {**identity, "qualification_vector": TX.qualification_vector(manifest), "vector": vector, "prefix": vector[:24], "state": "reserved"}
+    self.cycle = {**self.reserved, "state": "reconciled", **{action + "_evidence_sha256": "1" * 64 for action in ("prepared", "returned", "archive", "release", "reconcile")}, "archive_sha256": "2" * 64}
+    self.cycle.update(cycle_changes or {})
+    self.cycle_raw = json.dumps(self.cycle, sort_keys=True).encode()
+    for relative, raw in (("ledger/cycle-" + cycle_id + ".json", self.cycle_raw),
+                          ("ledger/state.json", json.dumps({"manifest": manifest, "qualification": None, "blocked": False}).encode()),
+                          ("guards/trial-consumed.json", json.dumps({"protocol": TX.TRIAL_PROTOCOL, "authorization_sha256": "3" * 64, "cycle": self.reserved}).encode())):
+      path = self.trial / relative
+      path.write_bytes(raw)
+      path.chmod(0o600)
 
   # --- seams -----------------------------------------------------------------------------------
   def assess_core(self, evidence, marker): return N._assess_core(self.T, self.root, evidence, marker)
@@ -228,7 +254,8 @@ class Rebind(NT.AssessFixture):
     archive = self.root / T.HISTORY / result["transition_id"]
     self.assertEqual(sorted(item.name for item in archive.iterdir()), sorted(["intent.json", "comparison.json", "completion.json", "new-baseline.json", "retirement.json",
       "retired-receipt.json", "new-receipt.json", "opt-in", "old-config.json", "old-qualification.json", "old-policy.json", "old-backup",
-      "policy.json", "new-config.json", "new-qualification.json", "new-backup"]))
+      "policy.json", "new-config.json", "new-qualification.json", "new-backup", "trial-cycle.json", "trial-guard.json"]))
+    self.assertEqual((archive / "trial-cycle.json").read_bytes(), self.cycle_raw)
     for name, archived in T.REBIND_ARCHIVE["old"].items(): self.assertEqual((archive / archived).read_bytes(), old[name])
     for name, archived in T.REBIND_ARCHIVE["new"].items(): self.assertEqual((archive / archived).read_bytes(), self.staged_raw[name] if name != "backup" else self.staged_limine)
     self.assertEqual((archive / "retired-receipt.json").read_bytes(), self.old_receipt_raw)
@@ -359,6 +386,77 @@ class Rebind(NT.AssessFixture):
     other = self.new()
     def malformed(evidence, staged): return {"manifest": staged["config"]["manifest"], "baseline": {"kernel": {}}}
     other.refuses("Exact generation baseline item set", inspect=malformed)
+
+  # --- the qualification must point at the generation trial's real successful record ---------------------
+  def test_a_qualification_that_does_not_bind_the_generation_trial_is_refused(self):
+    T = self.T
+    for label, evidence in (("fabricated digest", "0" * 64), ("digest of the guard, not the cycle", None)):
+      with self.subTest(label):
+        other = self.new()
+        value = evidence or T.P.digest((other.trial / "guards/trial-consumed.json").read_bytes())
+        other.write(T.STAGED["qualification"], json.dumps({**other.new_qualification, "evidence_sha256": value}).encode())
+        other.refuses("does not bind the generation trial")
+
+  def test_generation_trial_state_must_exist_be_private_and_belong_to_the_manifest(self):
+    T = self.T
+    def cycle_path(o): return next((o.trial / "ledger").glob("cycle-*.json"))
+    def other_manifest(o):
+      shutil.rmtree(o.trial)
+      o.stage_trial(manifest={**o.manifest, "cmdline_sha256": "5" * 64})
+    def two_cycles(o): (o.trial / "ledger" / ("cycle-" + str(uuid.uuid4()) + ".json")).write_bytes(o.cycle_raw)
+    def blocked(o): (o.trial / "ledger/state.json").write_text(json.dumps({"manifest": o.manifest, "qualification": None, "blocked": True}))
+    def other_guard(o):
+      guard = json.loads((o.trial / "guards/trial-consumed.json").read_bytes())
+      guard["cycle"] = {**guard["cycle"], "cycle_id": str(uuid.uuid4())}
+      (o.trial / "guards/trial-consumed.json").write_text(json.dumps(guard))
+    def original_root(o):  # the record of the ORIGINAL (non-generation) trial root: the same files, not under generations/
+      base = o.root / "var/lib/omarchy/t2-hibernate-trial"
+      (base / "ledger").mkdir(mode=0o700, exist_ok=True)
+      (base / "guards").mkdir(mode=0o700, exist_ok=True)
+      shutil.copy(cycle_path(o), base / "ledger" / cycle_path(o).name)
+      shutil.copy(o.trial / "guards/trial-consumed.json", base / "guards/trial-consumed.json")
+      shutil.rmtree(o.trial)
+    def failed(o): (cycle_path(o)).write_bytes(json.dumps({**o.cycle, "state": "failed"}).encode())
+    def unreconciled(o): (cycle_path(o)).write_bytes(json.dumps({**{k: v for k, v in o.cycle.items() if k not in ("release_evidence_sha256", "reconcile_evidence_sha256")}, "state": "archived"}).encode())
+    def mode(path, bits): return lambda o: (o.trial / path).chmod(bits)
+    cases = {"missing generation directory": (lambda o: shutil.rmtree(o.trial), "Generation trial state required"),
+             "missing generations root": (lambda o: shutil.rmtree(o.root / T.TRIAL_GENERATIONS), "Generation trial state required"),
+             "unconsumed guard": (lambda o: (o.trial / "guards/trial-consumed.json").unlink(), "Consumed generation trial guard required"),
+             "failed cycle": (failed, "not reconciled: failed"), "unreconciled cycle": (unreconciled, "not reconciled: archived"),
+             "cycle for another manifest": (other_manifest, "does not belong to the staged manifest"),
+             "no cycle": (lambda o: cycle_path(o).unlink(), "Exactly one generation trial cycle"), "two cycles": (two_cycles, "Exactly one generation trial cycle"),
+             "blocked ledger": (blocked, "blocked or for another manifest"), "guard for another cycle": (other_guard, "does not name this cycle"),
+             "record of the original trial root": (original_root, "Generation trial state required"),
+             "generation directory not private": (lambda o: o.trial.chmod(0o755), "Private real generation trial directory"),
+             "ledger directory not private": (mode("ledger", 0o755), "Private real generation trial directory"),
+             "cycle file not private": (lambda o: cycle_path(o).chmod(0o644), "Private boot policy evidence required"),
+             "guard file not private": (mode("guards/trial-consumed.json", 0o644), "Private boot policy evidence required")}
+    for label, (mutate, pattern) in cases.items():
+      with self.subTest(label):
+        other = self.new()
+        mutate(other)
+        other.refuses(pattern)
+
+  def test_symlinked_trial_records_and_directories_are_refused_without_a_write(self):
+    def symlink_file(o):
+      path = next((o.trial / "ledger").glob("cycle-*.json"))
+      target = o.trial / "elsewhere.json"
+      path.rename(target)
+      path.symlink_to(target)
+    def symlink_guard(o):
+      (o.trial / "guards/trial-consumed.json").rename(o.trial / "guards/real.json")
+      (o.trial / "guards/trial-consumed.json").symlink_to("real.json")
+    def symlink_dir(o):
+      o.trial.rename(o.trial.with_name("moved"))
+      o.trial.symlink_to("moved")
+    for label, mutate in (("cycle", symlink_file), ("guard", symlink_guard), ("generation directory", symlink_dir)):
+      with self.subTest(label):
+        other = self.new()
+        mutate(other)
+        before = other.tree()
+        with self.assertRaises((ValueError, OSError)): other.rebind()
+        self.assertEqual(other.tree(), before)
+        self.assertFalse(other.pending().exists())
 
   def test_the_fresh_capture_must_have_read_exactly_the_staged_bytes(self):
     for name in ("config", "qualification"):
@@ -693,6 +791,7 @@ class AssessAfterRetirement(NT.AssessFixture):
     self.write(T.RETIRED_RECEIPT, self.receipt_raw)
     self.write(T.RETIREMENT, json.dumps({"protocol": T.RETIREMENT_SCHEMA, "retired_receipt_sha256": self.receipt_sha, "source_sha256": self.T.P.digest(b"source"), "restore_sha256": self.T.P.digest(b"restore")}).encode())
     (self.root / P.RECEIPT).unlink()
+    for role in ("source", "restore"): (self.root / PAIR.IMAGES[role]).unlink()  # the real retirement removes the ESP images too
 
   def test_marker_receipt_resolves_the_live_or_the_retained_copy_only_when_chained(self):
     T = self.T
@@ -714,6 +813,20 @@ class AssessAfterRetirement(NT.AssessFixture):
     self.T.G._maintenance(self.root)
     self.assertIn(self.assess()["class"], ("unchanged", "requalification-required", "unknown"))
     self.assertNotIn("Maintenance evidence not validated", self.assess().get("reason", ""))
+
+  def test_the_guard_requires_the_retired_images_to_be_gone(self):
+    T = self.T
+    self.retire()
+    T.G._maintenance(self.root)  # retire() removed the images
+    old = self.write(PAIR.IMAGES["source"], b"source")  # a retired image still on the ESP
+    with self.assertRaisesRegex(ValueError, "retired source image is still on the ESP"): T.G._maintenance(self.root)
+    old.write_bytes(b"a different new-pair image")
+    T.G._maintenance(self.root)
+    old.unlink()
+    old.symlink_to("elsewhere")
+    with self.assertRaises(ValueError): T.G._maintenance(self.root)
+    old.unlink()
+    T.G._maintenance(self.root)
 
   def test_the_guard_cross_checks_the_record_images_against_the_retained_receipt(self):
     T = self.T
@@ -781,6 +894,45 @@ class RebindNative(unittest.TestCase):
     F.T._rebind_refuse_assessment(live)
     for bad in ({**live, "class": "unknown"}, {**live, "class": "unchanged"}):
       with self.assertRaises(ValueError): F.T._rebind_refuse_assessment(bad)
+
+  def test_signals_become_systemexit_and_previous_handlers_are_restored(self):
+    before = {number: signal.getsignal(number) for number in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)}
+    for number in before:
+      with self.subTest(signal=number), self.assertRaises(SystemExit) as caught:
+        with N._signals_raise(): os.kill(os.getpid(), number)
+      self.assertEqual(caught.exception.code, 128 + number)
+      self.assertEqual({n: signal.getsignal(n) for n in before}, before)
+
+  def test_a_dropped_session_signal_releases_db_lock_and_leaves_a_recoverable_pending(self):
+    other = Rebind("runTest")
+    other.setUp()
+    self.addCleanup(other.doCleanups)
+    def guard():
+      if other.stage() == "W3": os.kill(os.getpid(), signal.SIGHUP)
+    with self.assertRaises(SystemExit):
+      with N._signals_raise(): other.rebind(guard=guard)
+    self.assertFalse((other.root / other.T.DB_LOCK).exists())  # the lock did not leak
+    other.assert_vetoed()
+    self.assertTrue(other.rebind()["rolled_back"])
+    other.assert_rolled_back()
+
+  def test_the_native_actions_run_inside_the_signal_conversion(self):
+    from contextlib import contextmanager
+    seen = []
+    @contextmanager
+    def exclusion(action):
+      seen.append(signal.getsignal(signal.SIGHUP))
+      yield lambda: None
+    engine = Mock()
+    engine.reactivation_pending.return_value = False
+    engine.rebind_pending.return_value = False
+    engine._rebind.return_value = {}
+    engine._reactivate.return_value = {}
+    for action in ("rebind", "reactivate"):
+      with patch.object(N, "_installed", return_value=engine), patch.object(Path, "readlink", return_value=Path("/usr/bin/systemd-inhibit")), patch.object(N, "_exclusion", side_effect=exclusion):
+        N.native(action)
+    self.assertEqual(len(seen), 2)
+    self.assertTrue(all(callable(item) and item not in (signal.SIG_DFL, signal.SIG_IGN) for item in seen))
 
   def test_the_action_is_fixed_and_the_cli_takes_no_paths_or_force(self):
     self.assertIn("rebind", N.ACTIONS)

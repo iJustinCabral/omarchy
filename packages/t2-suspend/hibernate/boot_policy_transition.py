@@ -88,7 +88,9 @@ STAGED = {"config": P.STATE / "rebind-config.json", "qualification": P.STATE / "
           "review": P.STATE / "rebind-boot-policy-review.json"}
 AUTHORITY = (("config", CONFIG), ("qualification", QUALIFICATION), ("review", REVIEW), ("backup", P.BACKUP))
 REBIND_KEYS = {"protocol", "transition_id", "action", "maintenance_transition_id", "marker_sha256", "baseline_sha256", "retirement_sha256",
-               "retired_receipt_sha256", "new_receipt_sha256", "new_baseline_sha256", "old", "new", "limine"}
+               "retired_receipt_sha256", "new_receipt_sha256", "new_baseline_sha256", "trial_evidence_sha256", "old", "new", "limine"}
+# The generation trial's durable terminal record: state root per generation, named by 12 hex of the manifest digest.
+TRIAL_GENERATIONS = Path("var/lib/omarchy/t2-hibernate-trial/generations")
 REBIND_ARCHIVE = {"old": {"config": "old-config.json", "qualification": "old-qualification.json", "review": "old-policy.json", "backup": "old-backup"},
                   "new": {"config": "new-config.json", "qualification": "new-qualification.json", "review": "policy.json", "backup": "new-backup"}}
 REACTIVATION_KEYS = {"protocol", "transition_id", "action", "maintenance_transition_id", "marker_sha256", "baseline_sha256", "policy_sha256", "limine"}
@@ -1171,13 +1173,35 @@ def retirement(root, receipt_sha256):
   return record, raw, retained
 
 
+def _file_sha256(path):
+  fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+  try:
+    sha = hashlib.sha256()
+    while True:
+      chunk = os.read(fd, 1024 * 1024)
+      if not chunk: return sha.hexdigest()
+      sha.update(chunk)
+  finally: os.close(fd)
+
+
+def _retired_images_gone(root, record):
+  """Retirement really happened: no ESP image still has a retired image's hash (absent, or different bytes of the new pair)."""
+  for role, relative in CUSTODY.IMAGE_PATHS.items():
+    path = root / relative
+    if not _present(path): continue
+    if not stat.S_ISREG(path.lstat().st_mode) or _file_sha256(path) == record[role + "_sha256"]:
+      raise ValueError("A retired " + role + " image is still on the ESP; the pair is not retired")
+
+
 def marker_receipt(root, intent):
   """The receipt bytes a maintenance intent pins: the live receipt while it is the old one, else the retained copy of a retired pair."""
   wanted = intent["staged_receipt_sha256"]
   try: live = _read(root, P.RECEIPT)
   except FileNotFoundError: live = None
   if live is not None and P.digest(live) == wanted: return live
-  return retirement(root, wanted)[2]
+  record, _raw, retained = retirement(root, wanted)
+  _retired_images_gone(root, record)
+  return retained
 
 
 def _required(root, relative, what):
@@ -1208,6 +1232,44 @@ def _publish(path, raw, mode, tag):
   _new(temporary, raw, mode)
   os.replace(temporary, path)
   _sync(path.parent)
+
+
+def trial_evidence(root, manifest):
+  """The generation trial's terminal record for this manifest, read and validated before rebind writes anything.
+
+  Authoritative record: the ledger's reconciled cycle file `generations/<manifest12>/ledger/cycle-<id>.json` (the state
+  `trial.execute` makes durable when the trial retires its slots and reconciles). The qualification's evidence_sha256 must be the
+  SHA-256 of its exact bytes. The generation's consumed guard must name the same reserved cycle, and the ledger must be unblocked
+  and hold exactly this one cycle. Every directory is a real 0700 owner directory and every file a private single-link regular file.
+  """
+  identity = PRODUCT.TX.digest(manifest)[:12]
+  base = TRIAL_GENERATIONS / identity
+  for relative in (TRIAL_GENERATIONS, base, base / "guards", base / "ledger"):
+    G._ancestors(root, root / relative / "member", _owner(root))
+    try: info = (root / relative).lstat()
+    except FileNotFoundError: raise ValueError("Generation trial state required: " + str(relative)) from None
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != _owner(root) or stat.S_IMODE(info.st_mode) != 0o700:
+      raise ValueError("Private real generation trial directory required: " + str(relative))
+  def load(relative, what):
+    try: return _read(root, relative)
+    except FileNotFoundError: raise ValueError(what + " required: " + str(relative)) from None
+  cycles = sorted(path.name for path in (root / base / "ledger").iterdir() if path.name.startswith("cycle-") and path.name.endswith(".json"))
+  if len(cycles) != 1: raise ValueError("Exactly one generation trial cycle required")
+  cycle_raw = load(base / "ledger" / cycles[0], "Generation trial cycle")
+  cycle = PRODUCT.TX.cycle_value(P._json(cycle_raw))
+  if cycles[0] != "cycle-" + cycle["cycle_id"] + ".json" or cycle["manifest"] != manifest:
+    raise ValueError("Generation trial cycle does not belong to the staged manifest")
+  if cycle["state"] != "reconciled": raise ValueError("Generation trial cycle is not reconciled: " + cycle["state"])
+  ledger_state = P._json(load(base / "ledger" / "state.json", "Generation trial ledger state"))
+  if type(ledger_state) is not dict or ledger_state.get("blocked") is not False or ledger_state.get("manifest") != manifest:
+    raise ValueError("Generation trial ledger is blocked or for another manifest")
+  guard_raw = load(base / "guards" / "trial-consumed.json", "Consumed generation trial guard")
+  guard = P._json(guard_raw)
+  reserved = guard.get("cycle") if type(guard) is dict else None
+  if (type(reserved) is not dict or guard.get("protocol") != PRODUCT.TX.TRIAL_PROTOCOL or reserved.get("cycle_id") != cycle["cycle_id"] or
+      reserved.get("vector") != cycle["vector"] or reserved.get("manifest") != manifest):
+    raise ValueError("Consumed generation trial guard does not name this cycle")
+  return {"cycle_sha256": P.digest(cycle_raw), "cycle_raw": cycle_raw, "guard_raw": guard_raw}
 
 
 def _rebind_refuse_assessment(assessment):
@@ -1287,6 +1349,9 @@ def _rebind_forward(root, context, release_db):
   if new_config["manifest"] == old_manifest: raise ValueError("Staged manifest equals the retired generation's; nothing was requalified")
   for role in ("source", "restore"):
     if new_config["manifest"].get(role + "_sha256") != new_receipt["images"][role]["sha256"]: raise ValueError("Staged manifest does not pin the staged " + role + " image")
+  trial = trial_evidence(root, new_config["manifest"])
+  if new_qualification["evidence_sha256"] != trial["cycle_sha256"]:
+    raise ValueError("Qualification evidence does not bind the generation trial's reconciled cycle; nothing was changed")
   info = context["inspect"](evidence, {"config": new_config, "qualification": new_qualification})
   if type(info) is not dict or info.get("manifest") != new_config["manifest"]: raise ValueError("Derived manifest differs from the staged configuration")
   fresh = _baseline_value(info["baseline"])
@@ -1322,6 +1387,7 @@ def _rebind_forward(root, context, release_db):
   pending_intent = _encoded({"protocol": REBIND_SCHEMA, "transition_id": transition_id, "action": "rebind", "maintenance_transition_id": identifier,
     "marker_sha256": P.digest(marker), "baseline_sha256": P.digest(baseline_raw), "retirement_sha256": P.digest(record_raw),
     "retired_receipt_sha256": P.digest(old_receipt_raw), "new_receipt_sha256": new_receipt_sha, "new_baseline_sha256": P.digest(baseline_new),
+    "trial_evidence_sha256": trial["cycle_sha256"],
     "old": {name: P.digest(raw) for name, raw in old_raws.items()}, "new": {name: P.digest(raw) for name, raw in new_raws.items()}, "limine": limine})
   comparison = _encoded({"protocol": REBIND_COMPARISON, "transition_id": transition_id, "intent_sha256": P.digest(pending_intent),
                          "assessment": assessment, "limine": limine})
@@ -1339,7 +1405,8 @@ def _rebind_forward(root, context, release_db):
   archive.mkdir(mode=0o700)
   _sync(archive.parent)
   files = [("intent.json", pending_intent, 0o600), ("comparison.json", comparison, 0o600), ("new-baseline.json", baseline_new, 0o600),
-           ("retirement.json", record_raw, 0o600), ("retired-receipt.json", old_receipt_raw, 0o600), ("new-receipt.json", new_receipt_raw, 0o600), ("opt-in", b"", 0o644)]
+           ("retirement.json", record_raw, 0o600), ("retired-receipt.json", old_receipt_raw, 0o600), ("new-receipt.json", new_receipt_raw, 0o600), ("opt-in", b"", 0o644),
+           ("trial-cycle.json", trial["cycle_raw"], 0o600), ("trial-guard.json", trial["guard_raw"], 0o600)]
   files += [(REBIND_ARCHIVE[side][name], raw, 0o600) for side, values in (("old", old_raws), ("new", new_raws)) for name, raw in values.items()]
   for name, raw, mode in files:
     guard()
@@ -1384,7 +1451,7 @@ def _rebind_pending_value(raw):
   if any(type(pending[side]) is not dict or set(pending[side]) != names for side in ("old", "new")): raise ValueError("Exact rebind authority digests required")
   PRODUCT.TX.uuid_value(pending["transition_id"])
   PRODUCT.TX.uuid_value(pending["maintenance_transition_id"])
-  for name in ("marker_sha256", "baseline_sha256", "retirement_sha256", "retired_receipt_sha256", "new_receipt_sha256", "new_baseline_sha256"): P._hash(pending[name])
+  for name in ("marker_sha256", "baseline_sha256", "retirement_sha256", "retired_receipt_sha256", "new_receipt_sha256", "new_baseline_sha256", "trial_evidence_sha256"): P._hash(pending[name])
   for side in ("old", "new"):
     for name in names: P._hash(pending[side][name])
   for name in REACTIVATION_LIMINE: P._hash(pending["limine"][name])
@@ -1436,7 +1503,7 @@ def _rebind_recover(root, context, release_db):
           raise ValueError("Archived " + side + " " + name + " is missing or differs from the rebind pending; nothing was touched")
     if not present["new-baseline.json"] or P.digest(_read(root, (archive / "new-baseline.json").relative_to(root))) != pending["new_baseline_sha256"]:
       raise ValueError("Archived fresh baseline differs from the rebind pending; nothing was touched")
-    for name, digest_ in (("new-receipt.json", pending["new_receipt_sha256"]), ("retirement.json", pending["retirement_sha256"]), ("retired-receipt.json", pending["retired_receipt_sha256"])):
+    for name, digest_ in (("new-receipt.json", pending["new_receipt_sha256"]), ("retirement.json", pending["retirement_sha256"]), ("retired-receipt.json", pending["retired_receipt_sha256"]), ("trial-cycle.json", pending["trial_evidence_sha256"])):
       if not _present(archive / name) or P.digest(_read(root, (archive / name).relative_to(root))) != digest_:
         raise ValueError("Archived " + name + " differs from the rebind pending; nothing was touched")
   completion = _rebind_completion(identifier, raw, limine["to_canonical_sha256"])
