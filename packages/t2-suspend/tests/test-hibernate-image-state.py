@@ -1,8 +1,10 @@
 """Synthetic read-only image-header checks; never open the host resume block."""
+import hashlib
 import importlib.util
 import os
 from pathlib import Path
 import tempfile
+import types
 import unittest
 from unittest.mock import patch
 
@@ -113,6 +115,59 @@ class ImageState(unittest.TestCase):
       S.require_no_image(self.root, self.resume)
     with self.assertRaisesRegex(ValueError, "root-private live"):
       S.require_no_image(Path("/"), self.resume, query=self.query, fixture_identity=lambda fd: (253, 0))
+
+
+  def load_as(self, filename, **attributes):
+    """Execute this module's exact bytes as a fresh module claiming `filename` (what a loader would do)."""
+    module = types.ModuleType("image_state_identity")
+    module.__file__ = str(filename)
+    exec(compile((HERE / "hibernate/image_state.py").read_bytes(), str(filename), "exec"), module.__dict__)
+    for name, value in attributes.items(): setattr(module, name, value)
+    return module
+
+  def live_gate(self, module):
+    """Run only the live-root gate: a malformed resume target fails right after it passes."""
+    with patch.object(module.os, "geteuid", return_value=0):
+      module.require_no_image(Path("/"), {})
+
+  def test_live_gate_accepts_only_installed_runtime_or_pinned_helper_identity(self):
+    with self.assertRaisesRegex(ValueError, "qualified resume target"):
+      self.live_gate(self.load_as(S.SOURCE))
+    with self.assertRaisesRegex(ValueError, "qualified resume target"):
+      self.live_gate(self.load_as(S.HELPER, PARSER_PIN="a" * 64))
+    # The helper identity is only meaningful when the adapter supplied its parser pin.
+    with self.assertRaisesRegex(ValueError, "root-private live"):
+      self.live_gate(self.load_as(S.HELPER))
+    for other in (HERE / "hibernate/image_state.py", Path("/tmp/image_state.py"), S.SOURCE.with_name("other.py"),
+                  S.HELPER.with_name("runtime-upgrade-image-state.py.bak"), Path("/var/lib/omarchy/t2-hibernate-product/runtime/image_state.py")):
+      with self.subTest(path=str(other)), self.assertRaisesRegex(ValueError, "root-private live"):
+        self.live_gate(self.load_as(other, PARSER_PIN="a" * 64))
+
+  def test_live_gate_still_refuses_fixture_callbacks_and_non_root(self):
+    module = self.load_as(S.SOURCE)
+    with patch.object(module.os, "geteuid", return_value=0), self.assertRaisesRegex(ValueError, "root-private live"):
+      module.require_no_image(Path("/"), self.resume, query=self.query)
+    with patch.object(module.os, "geteuid", return_value=1000), self.assertRaisesRegex(ValueError, "root-private live"):
+      module.require_no_image(Path("/"), self.resume)
+
+  def test_parser_comes_from_fixed_runtime_path_live_and_sibling_source_for_synthetic_root(self):
+    self.assertEqual(S.LIVE_PARSER, Path("/var/lib/omarchy/t2-hibernate-product/runtime/packages/t2-suspend/experiments/audit-hibernation-swap-header.py"))
+    self.assertEqual(S._parser_source(Path("/")), (S.LIVE_PARSER, None))
+    module = self.load_as(S.HELPER, PARSER_PIN="b" * 64)
+    self.assertEqual(module._parser_source(Path("/")), (module.LIVE_PARSER, "b" * 64))
+    self.assertEqual(module.LIVE_PARSER, S.LIVE_PARSER)
+    self.assertEqual(S._parser_source(self.root), (S.PARSER, None))
+    self.assertEqual(S.PARSER, HERE / "experiments/audit-hibernation-swap-header.py")
+
+  def test_parser_bytes_are_pinned_and_executed_without_reopening(self):
+    parser = HERE / "experiments/audit-hibernation-swap-header.py"
+    good = hashlib.sha256(parser.read_bytes()).hexdigest()
+    self.assertTrue(callable(S._parser(parser, good).parse_header))
+    with self.assertRaisesRegex(ValueError, "differs from reviewed pin"):
+      S._parser(parser, "0" * 64)
+    link = self.root / "parser-link.py"
+    link.symlink_to(parser)
+    with self.assertRaises(OSError): S._parser(link, good)
 
 
 if __name__ == "__main__": unittest.main()

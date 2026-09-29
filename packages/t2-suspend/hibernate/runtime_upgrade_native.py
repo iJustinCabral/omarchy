@@ -17,6 +17,7 @@ import select
 import stat
 import sys
 import time
+import types
 import uuid
 
 sys.dont_write_bytecode = True
@@ -25,11 +26,20 @@ STATE = Path("/var/lib/omarchy/t2-hibernate-product")
 SCRIPT = STATE / "runtime-upgrade-native.py"
 APPROVAL = STATE / "runtime-upgrade-approval.json"
 BOOTSTRAP = STATE / "runtime-upgrade-bootstrap.py"
+IMAGE_STATE = STATE / "runtime-upgrade-image-state.py"
 WHO = "omarchy-t2-runtime-upgrade"
 WHY = "reviewed-v2-runtime-upgrade"
 ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"}
 RUNTIME_REL = "packages/t2-suspend/hibernate/runtime_deployment.py"
-HASHES = {"old_review", "old_bootstrap", "old_config", "new_review", "new_bootstrap", "new_config"}
+IMAGE_STATE_REL = "packages/t2-suspend/hibernate/image_state.py"
+PARSER_REL = "packages/t2-suspend/experiments/audit-hibernation-swap-header.py"
+# The runtime-deployment core pins exactly these six hashes. The seventh pin,
+# new_image_state, belongs to this adapter alone and is never passed to the core.
+# The v2 approval protocol was never issued live, so it is extended in place:
+# the installed e489bab7 generation has no image_state.py, so the pre-barrier
+# no-image check runs a root-staged, externally pinned helper instead.
+CORE_HASHES = {"old_review", "old_bootstrap", "old_config", "new_review", "new_bootstrap", "new_config"}
+HASHES = CORE_HASHES | {"new_image_state"}
 DB_LOCK = Path("var/lib/pacman/db.lck")
 PHYSICAL_LOCK = Path("var/lib/omarchy/t2-hibernate-trial/physical-cycle.lock")
 UNCHANGED = {
@@ -81,7 +91,7 @@ def _parse_approval(raw, adapter_raw):
   if type(identity) is not str or not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", identity) or uuid.UUID(identity).version != 4:
     raise ValueError("Fresh canonical UUID4 runtime upgrade approval required")
   if type(approval["expected"]) is not dict or set(approval["expected"]) != HASHES:
-    raise ValueError("Six exact old/new authority pins required")
+    raise ValueError("Seven exact old/new authority pins required")
   for value in approval["expected"].values(): _pin(value)
   if approval["expected"]["old_config"] != approval["expected"]["new_config"]:
     raise ValueError("Runtime-only approval must preserve exact configuration pin")
@@ -151,6 +161,36 @@ def _load(name, path):
   return module
 
 
+def _pinned_module(name, raw, path):
+  """Execute exactly the bytes already verified; the path is only the module identity."""
+  module = types.ModuleType(name)
+  module.__file__ = str(path)
+  exec(compile(raw, str(path), "exec"), module.__dict__)
+  return module
+
+
+def _helper_image_state(approval, new_review):
+  """Load the root-staged, doubly pinned image_state helper for the pre-barrier check.
+
+  The installed old runtime may lack image_state.py, so its bytes are never
+  imported here. The staged file must match both the external approval pin and
+  the new reviewed inventory. The old review must pin the installed parser bytes
+  that the helper will read from the fixed runtime path.
+  """
+  raw = _private_bytes(IMAGE_STATE)
+  entry = {"size": len(raw), "sha256": _digest(raw)}
+  if entry["sha256"] != approval["expected"]["new_image_state"]:
+    raise ValueError("Staged image-state helper differs from external approval")
+  if new_review["files"].get(IMAGE_STATE_REL) != entry:
+    raise ValueError("Staged image-state helper differs from reviewed new runtime")
+  old_review = _review(_private_bytes(STATE / "runtime-deployment-review.json"), approval["expected"]["old_review"])
+  parser = old_review["files"].get(PARSER_REL)
+  if type(parser) is not dict or type(parser.get("sha256")) is not str: raise ValueError("Old review lacks the swap-header parser")
+  module = _pinned_module("reviewed_upgrade_image_state_helper", raw, IMAGE_STATE)
+  module.PARSER_PIN = _pin(parser["sha256"])
+  return module
+
+
 def _verified_engines(approval):
   expected = approval["expected"]
   old_review_raw = _private_bytes(STATE / "runtime-deployment-review.json")
@@ -215,14 +255,16 @@ def _guard(old_native, approval):
   return fd, check
 
 
-def _product_check(product, *, barrier):
+def _product_check(product, *, barrier, image_state=None):
   config = product.TRIAL._private_json(STATE / "config.json")
   qualification = product.TRIAL._private_json(STATE / "qualification.json")
   report = product.ARTIFACTS.derive_artifacts(config["source_directory"], config["restore_directory"], config["production_uki"])
-  # Every caller holds both native exclusions and has verified this installed
-  # runtime tree. Never load a helper from the incoming workspace. Ledger
-  # reconciliation alone cannot establish that the resume page has no image.
-  image_state = _load("reviewed_upgrade_image_state", STATE / "runtime/packages/t2-suspend/hibernate/image_state.py")
+  # Every caller holds both native exclusions. Never load a helper from the
+  # incoming workspace. Ledger reconciliation alone cannot establish that the
+  # resume page has no image. The pre-barrier caller supplies the pinned staged
+  # helper; later callers have verified the new installed runtime tree instead.
+  if image_state is None:
+    image_state = _load("reviewed_upgrade_image_state", STATE / "runtime/packages/t2-suspend/hibernate/image_state.py")
   image_state.require_no_image(ROOT, report["audited_details"]["restore_protocol"]["resume"])
   arguments = {"ledger": product.TX.Ledger(STATE / "ledger"), "archive_directory": STATE / "archives", "root": ROOT}
   if not barrier: return product.check(config, qualification, report, **arguments)
@@ -532,9 +574,13 @@ def native():
       try:
         guard()
         old_product = engine.PRODUCT
-        def before(): _product_check(old_product, barrier=False)
+        def before():
+          new_review = _review(_private_bytes(STATE / "runtime-upgrade-review.json"),
+                               approval["expected"]["new_review"], approval["reviewed_commit"])
+          _product_check(old_product, barrier=False, image_state=_helper_image_state(approval, new_review))
         def after(): _postcheck(core, approval)
-        result = core._upgrade_snapshot(approval["source_directory"], root=ROOT, expected=approval["expected"],
+        result = core._upgrade_snapshot(approval["source_directory"], root=ROOT,
+                                        expected={name: approval["expected"][name] for name in CORE_HASHES},
                                         guard=guard, precheck=before, postcheck=after, approval_id=approval["approval_id"])
         guard()
         # After barrier retirement, ordinary admission and db release must

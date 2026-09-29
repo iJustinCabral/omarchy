@@ -3,17 +3,30 @@
 The caller must separately own power/physical exclusion and prove reconciled
 ledger and absent EFI stages. A normal header alone never permits an update.
 The parser is the reviewed runtime copy of the existing Linux 7.2.6 auditor.
+
+Live use has exactly two identities: the installed runtime copy (`SOURCE`), or
+the pinned upgrade helper (`HELPER`). The native upgrade adapter executes the
+helper's exact reviewed bytes into a fresh module whose `__file__` it sets to
+`HELPER`, then sets `PARSER_PIN` to the old review's parser digest. Any other
+`__file__` (workspace copies, other paths) is refused for the live root.
 """
-import importlib.util
+import hashlib
 import os
 from pathlib import Path
 import re
 import stat
 import subprocess
+import types
 
 RUNTIME = Path("/var/lib/omarchy/t2-hibernate-product/runtime")
 SOURCE = RUNTIME / "packages/t2-suspend/hibernate/image_state.py"
+HELPER = RUNTIME.parent / "runtime-upgrade-image-state.py"
+# Live parser: fixed installed runtime path (unchanged bytes in the old generation).
+LIVE_PARSER = RUNTIME / "packages/t2-suspend/experiments/audit-hibernation-swap-header.py"
+# Synthetic-root (test) parser: the sibling experiments tree of this source file.
 PARSER = Path(__file__).resolve().parents[1] / "experiments/audit-hibernation-swap-header.py"
+# Set by the pinned upgrade adapter to the old-review digest of LIVE_PARSER.
+PARSER_PIN = None
 ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"}
 PAGE = 4096
 
@@ -38,6 +51,27 @@ def _alias(root, owner):
   return alias, (info.st_dev, info.st_ino, target), root / "dev" / target[3:]
 
 
+def _parser(path, pin):
+  """Execute exactly the parser bytes read from `path`, checked against `pin` when given."""
+  fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+  try:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 1024 * 1024: raise ValueError("Bounded regular swap-header parser required")
+    raw = os.read(fd, 1024 * 1024 + 1)
+  finally: os.close(fd)
+  if len(raw) != info.st_size: raise ValueError("Short swap-header parser read")
+  if pin is not None and hashlib.sha256(raw).hexdigest() != pin: raise ValueError("Swap-header parser differs from reviewed pin")
+  module = types.ModuleType("reviewed_swap_header")
+  module.__file__ = str(path)
+  exec(compile(raw, str(path), "exec"), module.__dict__)
+  return module
+
+
+def _parser_source(root):
+  """(path, pin): the fixed runtime parser for live `/`, the sibling source copy for a synthetic root."""
+  return (LIVE_PARSER, PARSER_PIN) if root == Path("/") else (PARSER, None)
+
+
 def _stable_alias(alias, identity, target, opened):
   now = alias.lstat()
   if (now.st_dev, now.st_ino, os.readlink(alias)) != identity:
@@ -60,7 +94,9 @@ def require_no_image(root, resume, *, query=None, fixture_identity=None):
   if not root.is_absolute() or root.resolve() != root or not root.is_dir():
     raise ValueError("Canonical explicit image-check root required")
   if root == Path("/"):
-    if os.geteuid() != 0 or query is not None or fixture_identity is not None or Path(__file__).absolute() != SOURCE:
+    identity = Path(__file__).absolute()
+    if (os.geteuid() != 0 or query is not None or fixture_identity is not None or identity not in (SOURCE, HELPER) or
+        (identity == HELPER and PARSER_PIN is None)):
       raise ValueError("Only fixed root-private live image check is allowed")
   elif query is None or fixture_identity is None:
     raise ValueError("Synthetic root requires explicit query and block identity fixture")
@@ -94,9 +130,7 @@ def require_no_image(root, resume, *, query=None, fixture_identity=None):
     _stable_alias(alias, identity, target, opened)
     page = os.pread(fd, PAGE, resume["offset"] * PAGE)
     if len(page) != PAGE: raise ValueError("Truncated resume header page")
-    spec = importlib.util.spec_from_file_location("reviewed_swap_header", PARSER)
-    parser = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(parser)
+    parser = _parser(*_parser_source(root))
     header = parser.parse_header(page)
     # The existing parser also labels legacy SWAP-SPACE normal; this fixed
     # x86-64 generation requires the exact version-1 SWAPSPACE2 page instead.

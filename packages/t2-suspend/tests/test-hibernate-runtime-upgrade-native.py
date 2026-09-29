@@ -4,6 +4,8 @@ import fcntl
 import importlib.util
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -49,7 +51,7 @@ class NativeUpgrade(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "adapter differs"):
       N._parse_approval(json.dumps(approval).encode(), b"other")
     del approval["expected"]["old_config"]
-    with self.assertRaisesRegex(ValueError, "Six exact"):
+    with self.assertRaisesRegex(ValueError, "Seven exact"):
       N._parse_approval(json.dumps(approval).encode(), b"adapter")
     approval["expected"]["old_config"] = "c" * 64
     approval["unchanged"].pop("limine")
@@ -884,6 +886,267 @@ class NativeUpgrade(unittest.TestCase):
         self.assertGreater(clock[0], N.RECOVERY_BOUND)
         self.assertEqual(barrier.read_bytes(), core._encoded(intent))
         self.assertFalse(db.exists())
+
+
+  # --- pinned staged image-state helper -------------------------------------
+
+  @contextmanager
+  def as_root(self, uid=0):
+    """Present opened files as owned by `uid` so the real private-bytes reader runs unprivileged."""
+    real = os.fstat
+    def fake(fd):
+      info = real(fd)
+      return SimpleNamespace(st_mode=info.st_mode, st_uid=uid, st_nlink=info.st_nlink, st_size=info.st_size)
+    with patch.object(N.os, "fstat", side_effect=fake): yield
+
+  def helper_fixture(self):
+    """Temp STATE with a staged helper, an old review pinning the parser, and a matching approval."""
+    temporary = tempfile.TemporaryDirectory()
+    self.addCleanup(temporary.cleanup)
+    state = Path(temporary.name)
+    source = (HERE / "hibernate/image_state.py").read_bytes()
+    parser_sha = digest((HERE / "experiments/audit-hibernation-swap-header.py").read_bytes())
+    old = json.dumps({"protocol": "omarchy-t2-product-runtime-snapshot-v1", "approved": True, "reviewed_commit": "e" * 40,
+                      "files": {N.PARSER_REL: {"size": 1, "sha256": parser_sha}}}).encode()
+    (state / "runtime-deployment-review.json").write_bytes(old)
+    (state / "runtime-deployment-review.json").chmod(0o600)
+    (state / "runtime-upgrade-image-state.py").write_bytes(source)
+    (state / "runtime-upgrade-image-state.py").chmod(0o600)
+    approval = self.approval()
+    approval["expected"].update(old_review=digest(old), new_image_state=digest(source))
+    review = {"files": {N.IMAGE_STATE_REL: {"size": len(source), "sha256": digest(source)}}}
+    patches = (patch.object(N, "STATE", state), patch.object(N, "IMAGE_STATE", state / "runtime-upgrade-image-state.py"))
+    for item in patches:
+      item.start()
+      self.addCleanup(item.stop)
+    return state, approval, review, source, parser_sha
+
+  def test_helper_is_executed_from_exact_pinned_bytes_with_fixed_identity_and_parser_pin(self):
+    state, approval, review, source, parser_sha = self.helper_fixture()
+    real_open = os.open
+    opened = []
+    def spy(path, *args, **kwargs):
+      opened.append(str(path))
+      return real_open(path, *args, **kwargs)
+    with self.as_root(), patch.object(N.os, "open", side_effect=spy):
+      module = N._helper_image_state(approval, review)
+    self.assertEqual(module.__file__, str(N.IMAGE_STATE))
+    self.assertEqual(module.PARSER_PIN, parser_sha)
+    self.assertTrue(callable(module.require_no_image))
+    self.assertEqual(opened.count(str(state / "runtime-upgrade-image-state.py")), 1)  # read once, never re-opened for exec
+    self.assertFalse(any("/runtime/packages" in path for path in opened))
+
+  def test_helper_wrong_pin_review_mode_owner_symlink_hardlink_and_absence_refuse(self):
+    state, approval, review, source, _ = self.helper_fixture()
+    helper = state / "runtime-upgrade-image-state.py"
+    with self.as_root():
+      with self.assertRaisesRegex(ValueError, "external approval"):
+        N._helper_image_state({**approval, "expected": {**approval["expected"], "new_image_state": "0" * 64}}, review)
+      with self.assertRaisesRegex(ValueError, "reviewed new runtime"):
+        N._helper_image_state(approval, {"files": {N.IMAGE_STATE_REL: {"size": len(source), "sha256": "0" * 64}}})
+      with self.assertRaisesRegex(ValueError, "reviewed new runtime"):
+        N._helper_image_state(approval, {"files": {}})
+      # Changed bytes fail the approval pin; even a re-pinned approval cannot override the reviewed inventory.
+      helper.write_bytes(source + b"\n# altered\n")
+      with self.assertRaisesRegex(ValueError, "external approval"):
+        N._helper_image_state(approval, review)
+      other = {**approval, "expected": {**approval["expected"], "new_image_state": digest(helper.read_bytes())}}
+      with self.assertRaisesRegex(ValueError, "reviewed new runtime"):
+        N._helper_image_state(other, review)
+      helper.write_bytes(source)
+      helper.chmod(0o644)
+      with self.assertRaisesRegex(ValueError, "Bounded regular owned"): N._helper_image_state(approval, review)
+      helper.chmod(0o600)
+    with self.as_root(uid=1000), self.assertRaisesRegex(ValueError, "Bounded regular owned"):
+      N._helper_image_state(approval, review)
+    with self.as_root():
+      os.link(helper, state / "second-link")
+      with self.assertRaisesRegex(ValueError, "Bounded regular owned"): N._helper_image_state(approval, review)
+      (state / "second-link").unlink()
+      real = state / "real-helper"
+      helper.rename(real)
+      helper.symlink_to(real)
+      with self.assertRaises(OSError): N._helper_image_state(approval, review)
+      helper.unlink()
+      with self.assertRaises(FileNotFoundError): N._helper_image_state(approval, review)
+
+  def test_helper_requires_old_review_parser_pin(self):
+    state, approval, review, _, _ = self.helper_fixture()
+    old = json.dumps({"protocol": "omarchy-t2-product-runtime-snapshot-v1", "approved": True, "reviewed_commit": "e" * 40, "files": {}}).encode()
+    (state / "runtime-deployment-review.json").write_bytes(old)
+    (state / "runtime-deployment-review.json").chmod(0o600)
+    approval["expected"]["old_review"] = digest(old)
+    with self.as_root(), self.assertRaisesRegex(ValueError, "parser"):
+      N._helper_image_state(approval, review)
+
+  def test_precheck_uses_pinned_helper_and_never_loads_the_installed_image_state(self):
+    product, helper = Mock(), Mock()
+    product.TRIAL._private_json.side_effect = [{"source_directory": "/source", "restore_directory": "/restore", "production_uki": "/uki"}, {}]
+    resume = {"device": "/dev/mapper/root", "devnum": "253:0", "offset": 10}
+    product.ARTIFACTS.derive_artifacts.return_value = {"audited_details": {"restore_protocol": {"resume": resume}}}
+    with patch.object(N, "_load", side_effect=AssertionError("must not import installed image_state")):
+      N._product_check(product, barrier=False, image_state=helper)
+    helper.require_no_image.assert_called_once_with(N.ROOT, resume)
+    product.check.assert_called_once()
+
+  def test_core_receives_only_its_six_pins(self):
+    self.assertEqual(N.HASHES, N.CORE_HASHES | {"new_image_state"})
+    approval = self.approval()
+    self.assertEqual(set(approval["expected"]), N.HASHES)
+    approval["adapter_sha256"] = digest(b"adapter")
+    N._parse_approval(json.dumps(approval).encode(), b"adapter")
+    del approval["expected"]["new_image_state"]
+    with self.assertRaisesRegex(ValueError, "Seven exact"):
+      N._parse_approval(json.dumps(approval).encode(), b"adapter")
+
+  # --- old-generation regression ----------------------------------------------
+
+  OLD_COMMIT = "e489bab7"
+
+  def old_generation(self, *, stage_helper=True):
+    """Installed tree from the real e489bab7 blobs (no image_state.py) plus a new tree from this checkout."""
+    repository = HERE.parents[1]
+    try:
+      commit = subprocess.run(["git", "-C", str(repository), "rev-parse", "--verify", self.OLD_COMMIT + "^{commit}"],
+                              capture_output=True, text=True, check=True, timeout=30).stdout.strip()
+    except (OSError, subprocess.SubprocessError): self.skipTest("e489bab7 history is not available")
+    spec = importlib.util.spec_from_file_location("old_generation_core", HERE / "hibernate/runtime_deployment.py")
+    D = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(D)
+    temporary = tempfile.TemporaryDirectory()
+    self.addCleanup(temporary.cleanup)
+    base = Path(temporary.name)
+    old_src, new_src, root = base / "old", base / "new", base / "root"
+    old_src.mkdir()
+    archive = subprocess.run(["git", "-C", str(repository), "archive", commit, "packages/t2-suspend/hibernate", "packages/t2-suspend/experiments"],
+                             capture_output=True, check=True, timeout=60).stdout
+    subprocess.run(["tar", "-x", "-C", str(old_src)], input=archive, check=True, timeout=60)
+    self.assertFalse((old_src / D.TREES[0] / "image_state.py").exists())
+    for tree in D.TREES:
+      shutil.copytree(repository / tree, new_src / tree, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    state = root / D.STATE.relative_to("/")
+    state.mkdir(parents=True)
+    state.chmod(0o700)
+    def write(path, raw):
+      path.parent.mkdir(parents=True, exist_ok=True)
+      path.write_bytes(raw)
+      path.chmod(0o600)
+    old_review = {"protocol": D.SCHEMA, "approved": True, "reviewed_commit": commit, "files": D.inventory(old_src)}
+    write(state / D.REVIEW.name, D._encoded(old_review))
+    D.deploy_snapshot(old_src, root=root)
+    old_bootstrap = (old_src / D.TREES[0] / "runtime_deployment.py").read_bytes()
+    write(state / D.BOOTSTRAP, old_bootstrap)
+    config = D._encoded({"schema": "omarchy-t2-qualified-product-config-v2",
+                         "power_policy": {"schema": "omarchy-t2-attended-battery-policy-v1", "min_charge_percent": 30}})
+    write(state / D.CONFIG, config)
+    write(state / D.CANDIDATE_CONFIG, config)
+    hook = root / D.HOOK
+    write(hook, (old_src / D.UPDATE_GUARD_HOOK).read_bytes())
+    hook.chmod(0o644)
+    new_review = {"protocol": D.SCHEMA, "approved": True, "reviewed_commit": "b" * 40, "files": D.inventory(new_src)}
+    new_raw, new_bootstrap = D._encoded(new_review), (new_src / D.TREES[0] / "runtime_deployment.py").read_bytes()
+    write(state / D.CANDIDATE_REVIEW, new_raw)
+    write(state / D.CANDIDATE_BOOTSTRAP, new_bootstrap)
+    helper = (new_src / D.TREES[0] / "image_state.py").read_bytes()
+    if stage_helper: write(state / "runtime-upgrade-image-state.py", helper)
+    old_raw = (state / D.REVIEW.name).read_bytes()
+    approval = {**self.approval(), "source_directory": str(new_src), "reviewed_commit": "b" * 40,
+                "approval_id": "306521e4-998e-4477-b603-31b93144d101",
+                "expected": {"old_review": digest(old_raw), "old_bootstrap": digest(old_bootstrap), "old_config": digest(config),
+                             "new_review": digest(new_raw), "new_bootstrap": digest(new_bootstrap), "new_config": digest(config),
+                             "new_image_state": digest(helper)}}
+    physical, db = root / N.PHYSICAL_LOCK, root / N.DB_LOCK
+    db.parent.mkdir(parents=True)
+    write(physical, b"")
+    return SimpleNamespace(D=D, root=root, state=state, approval=approval, physical=physical, db=db, old_src=old_src,
+                           config=config, old_raw=old_raw, new_review=new_review)
+
+  def run_old_generation(self, case, events):
+    """native() with real locks, real core and real helper loading; only host probes are stubbed."""
+    D = case.D
+    resume = {"device": "/dev/mapper/root", "devnum": "253:0", "offset": 10}
+    def product():
+      item = Mock()
+      item.TRIAL._private_json.side_effect = [{"source_directory": "/source", "restore_directory": "/restore", "production_uki": "/uki"}, {}]
+      item.ARTIFACTS.derive_artifacts.return_value = {"audited_details": {"restore_protocol": {"resume": resume}}}
+      return item
+    old_product, final_product = product(), product()
+    old_product.check.side_effect = lambda *args, **kwargs: events.append("old_admission")
+    final_product.check.side_effect = lambda *args, **kwargs: events.append("final_admission")
+    real_private, real_helper = N._private_bytes, N._helper_image_state
+    def private(path, mode=0o600):
+      with self.as_root(): return real_private(path, mode)
+    def helper(approval, review):
+      module = real_helper(approval, review)
+      module.require_no_image = lambda root, target: events.append("helper_no_image") or {}
+      return module
+    def load(name, path):
+      if name == "reviewed_final_product": return final_product
+      if name == "reviewed_upgrade_image_state":
+        events.append("runtime_image_state:" + str(Path(path).relative_to(case.state)))
+        return SimpleNamespace(require_no_image=lambda root, target: events.append("final_no_image"))
+      raise AssertionError("Unexpected import " + name)
+    def postcheck(core, approval):
+      events.append("postcheck")
+      self.assertTrue((case.state / D.COMPATIBLE_BARRIER).exists())
+      self.assertTrue((case.state / "runtime" / D.TREES[0] / "image_state.py").exists())
+    physical = os.open(case.physical, os.O_RDONLY)  # native() closes it
+    with patch.object(N, "ROOT", case.root), patch.object(N, "STATE", case.state), \
+         patch.object(N, "IMAGE_STATE", case.state / "runtime-upgrade-image-state.py"), \
+         patch.object(N, "_installed_approval", return_value=case.approval), patch.object(N, "_unchanged"), \
+         patch.object(Path, "readlink", return_value=Path("/usr/bin/systemd-inhibit")), \
+         patch.object(N, "_verified_engines", return_value=(D, object(), SimpleNamespace(PRODUCT=old_product))), \
+         patch.object(N, "_guard", return_value=(physical, lambda: None)), patch.object(N, "_private_bytes", side_effect=private), \
+         patch.object(N, "_helper_image_state", side_effect=helper), patch.object(N, "_load", side_effect=load), \
+         patch.object(N, "_postcheck", side_effect=postcheck):
+      return N.native()
+
+  def test_installed_e489bab7_runtime_upgrades_v2_to_v2_through_pinned_staged_helper(self):
+    case = self.old_generation()
+    D, events = case.D, []
+    result = self.run_old_generation(case, events)
+    self.assertEqual(result["review_sha256"], case.approval["expected"]["new_review"])
+    # The pre-barrier image check ran on the pinned helper before postcheck, and nothing was
+    # imported from the old runtime (which has no image_state.py).
+    self.assertEqual(events, ["helper_no_image", "old_admission", "postcheck", "runtime_image_state:runtime/packages/t2-suspend/hibernate/image_state.py",
+                              "final_no_image", "final_admission"])
+    consumed = case.state / ("runtime-upgrade-approval-consumed-" + case.approval["approval_id"] + ".json")
+    completed = json.loads((case.state / "runtime-upgrade-completed-bbbbbbbbbbbb.json").read_bytes())
+    self.assertEqual(completed["protocol"], "omarchy-t2-runtime-upgrade-completed-v2")
+    self.assertEqual(completed["intent"], json.loads(consumed.read_bytes()))
+    self.assertFalse((case.state / D.COMPATIBLE_BARRIER).exists())
+    self.assertFalse((case.state / D.UPGRADE_PENDING).exists())
+    self.assertEqual(D.inventory(case.state / "runtime"), case.new_review["files"])
+    self.assertEqual((case.state / D.CONFIG).read_bytes(), case.config)
+    self.assertFalse(case.db.exists())
+    # Replaying the consumed approval is refused and cannot re-publish.
+    before = consumed.read_bytes()
+    with self.assertRaises(ValueError): self.run_old_generation(case, [])
+    self.assertEqual(consumed.read_bytes(), before)
+    self.assertEqual(D.inventory(case.state / "runtime"), case.new_review["files"])
+
+  def test_missing_helper_refuses_before_barrier_with_old_generation_intact(self):
+    case = self.old_generation(stage_helper=False)
+    D, events = case.D, []
+    old_inventory = D.inventory(case.state / "runtime")
+    with self.assertRaises(FileNotFoundError): self.run_old_generation(case, events)
+    self.assertEqual(events, [])
+    self.assertEqual(D.inventory(case.state / "runtime"), old_inventory)
+    self.assertFalse((case.state / "runtime" / D.TREES[0] / "image_state.py").exists())
+    self.assertEqual((case.state / D.REVIEW.name).read_bytes(), case.old_raw)
+    self.assertEqual((case.state / D.CONFIG).read_bytes(), case.config)
+    for name in (D.COMPATIBLE_BARRIER, D.UPGRADE_PENDING, "runtime-upgrade-completed-bbbbbbbbbbbb.json",
+                 "runtime-upgrade-approval-consumed-" + case.approval["approval_id"] + ".json"):
+      self.assertFalse((case.state / name).exists(), name)
+    self.assertFalse(case.db.exists())
+
+  def test_helper_mismatch_with_approval_refuses_before_barrier_with_old_generation_intact(self):
+    case = self.old_generation()
+    D = case.D
+    case.approval["expected"]["new_image_state"] = "0" * 64
+    with self.assertRaisesRegex(ValueError, "external approval"): self.run_old_generation(case, [])
+    self.assertFalse((case.state / D.COMPATIBLE_BARRIER).exists())
+    self.assertEqual((case.state / D.REVIEW.name).read_bytes(), case.old_raw)
 
 
 if __name__ == "__main__": unittest.main()
