@@ -40,6 +40,10 @@ Consequence for ordering: the runtime that contains this resolver must be deploy
 
 New backup bytes are the reconstructed staged bytes, not the current bytes, because `boot_policy.prepare` binds the receipt's staged hash to exact bytes including the snapshot region.
 
+The fresh generation capture is checked to have read exactly the staged config and qualification bytes this run will install (their SHA-256 in the capture must equal the bytes read earlier), so a swap between capture and install is refused before any write instead of only at W7.
+
+Torn writes: the pending (W1) and `boot-policy.json` (W4) are published by writing a complete temporary and renaming it, so those names never hold partial bytes. A stray temporary holds no authority; rollback removes its own, and a forward run clears an earlier run's torn pending temporary without adopting it. The runtime marker rewrite retains its old copies the same way.
+
 ### Write order
 
 Each write is preceded by `guard()`. The pending uses the activation-pending filename with protocol `omarchy-t2-package-rebind-intent-v1`. It chains the old marker digest, the old baseline digest, the retirement record digest, the old receipt digest, the new receipt digest, the fresh baseline digest and the old and new SHA-256 of the four authority files (config, qualification, boot-policy review, Limine backup) plus the Limine change.
@@ -57,7 +61,7 @@ Each write is preceded by `guard()`. The pending uses the activation-pending fil
 | W9 | unlink the marker |
 | W10 | unlink the pending, release the package lock |
 
-W7 verifies `boot_policy.verify` for the new receipt, the opt-in, an idle ledger, the unchanged reviewed runtime and the native postchecks: deployment as source default, `product.validate` on the installed authority, no saved image, and every critical generation item equal to the fresh baseline (tolerated items unreadable on either side are skipped).
+W2 archives also let recovery authenticate the retirement record and the retained receipt (their digests are in the pending), not only the new receipt. W7 verifies `boot_policy.verify` for the new receipt, the opt-in, an idle ledger, the unchanged reviewed runtime and the native postchecks: deployment as source default, `product.validate` on the installed authority, no saved image, and every critical generation item equal to the fresh baseline (tolerated items unreadable on either side are skipped).
 
 ### Recovery and rollback exactness
 
@@ -83,6 +87,8 @@ The installed adapter selects the mode from its approval protocol (`omarchy-t2-r
 
 `trial.py` gains `--generation MANIFEST12`. Its state root becomes `/var/lib/omarchy/t2-hibernate-trial/generations/<first 12 hex of the manifest digest>/` (config, authorization, `guards/`, `ledger/`, `archives/`, all root-private 0700 real directories provisioned by the operator). The derived manifest digest must match the directory name. The physical-cycle lock stays the single global lock. Without the flag, behaviour is unchanged, including the permanent consumed-guard refusal; `repair-constructor` is bound to the original root and refuses with `--generation`. Nothing reads, moves or resets the original guard.
 
+An alias of the original trial is refused: with `--generation`, the audited manifest must not equal the manifest named by the original root's consumed guard record or its config (both read fail-closed), so provisioning `generations/<original manifest12>/` cannot mint a second one-use trial of the manifest whose guard was consumed.
+
 ## Ledger continuity
 
 The product ledger needed no change. `Ledger.configure(new manifest)` drops the qualification but keeps every cycle and allocation link; `begin` requires all previous cycles reconciled and links the new allocation to the exact old head, and `_allocation_head` never compares manifests between links. Synthetic tests cover the first and later cycles under the new manifest, immutability of old records, refusal after an unreconciled or failed old cycle (a failure block persists across `configure` and needs external reconciliation, which is intended), a foreign qualification, and a tampered predecessor. The routine dispatcher's `_admission_state` only requires immediate same-session predecessor evidence when the restore entry is selected, which is never the case for a first cycle after a rebind.
@@ -93,7 +99,8 @@ It issues no qualification, config or policy review. It does not restage or rebo
 
 ## Open questions
 
-- The stager's `retire` mode must write `pair-retirement.json` and `pair-retired-receipt.json` exactly as above (or the constants in `boot_policy_transition.py` must change). The engine's record parser is strict.
+- The stager's `retire` mode must write `pair-retirement.json` and `pair-retired-receipt.json` exactly as above (or the constants in `boot_policy_transition.py` must change). The engine's record parser is strict. Nothing in this repository produces them yet, and nothing enforces that they exist before the old receipt is deleted: if the stager deletes the receipt without them, the guard refuses updates and `assess` reports `unknown` until they exist. The stager must also atomically replace an existing record whose `retired_receipt_sha256` is not the receipt being retired, because a successful rebind leaves the previous generation's two files in place (they are archived in the rebind archive and never consumed).
+- The qualification is operator-attested: `rebind` checks its protocol, `qualified: true` and manifest binding, but `evidence_sha256` is not tied to any archived cycle or trial ledger, exactly as for `activation`. Tying it to a reconciled generation cycle would need a reviewed evidence format.
 - No override for `unknown` assessments exists. If a reviewed override is wanted, it should be a further staged, externally issued evidence file bound to the marker digest, not a flag.
 - `post_return_reconcile.py` still names the original trial root; it needs a generation-aware variant before it is used for a generation trial.
 - Rebind installs a boot policy review that an external reviewer must author (`prepare` output with `approved: true`); the existing activation has the same manual step.
