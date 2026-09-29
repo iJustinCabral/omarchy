@@ -257,6 +257,35 @@ class Canonical(unittest.TestCase):
     for name, text in bad.items():
       with self.subTest(name), self.assertRaises(ValueError): P.limine_canonical(text.encode())
 
+  def test_sub_entry_names_are_kernel_ids_never_top_level_names(self):
+    good = self.entry(1).decode()
+    self.assertIn("     ////linux-t2\n", good)
+    for name in ("linux-t2", "linux-lts", "linux"): 
+      with self.subTest(name): P.limine_canonical(good.replace("////linux-t2", "////" + name).encode())
+    source = PAIR.entry_id("source", P.digest(b"source"))
+    restore = PAIR.entry_id("restore", P.digest(b"restore"))
+    for name in (source, restore, "Omarchy", "EFI fallback", "notlinux", "Evil"):
+      with self.subTest(name), self.assertRaises(ValueError): P.limine_canonical(good.replace("////linux-t2", "////" + name).encode())
+    for extra in (source, "linux-t2"):  # a real top-level entry of that name elsewhere in the file
+      with self.subTest(extra), self.assertRaises(ValueError):
+        P.limine_canonical(good.replace("/EFI fallback", "/" + extra + "\nprotocol: efi\n/EFI fallback").replace("////linux-t2", "////" + extra).encode())
+    for name in ("..", "."):
+      with self.subTest(name), self.assertRaises(ValueError):
+        P.limine_canonical(good.replace("/limine_history/omarchy", "/limine_history/" + name + "#x\n     path: boot():/" + MACHINE + "/limine_history/omarchy", 1).encode())
+      with self.subTest("only " + name), self.assertRaises(ValueError):
+        P.limine_canonical(good.replace("/limine_history/omarchy_linux-t2.efi_sha256_" + "a" * 64, "/limine_history/" + name).encode())
+
+  def test_region_errors_name_the_line_and_truncated_text(self):
+    good = self.entry(1).decode()
+    bad = good.replace("     comment: 1 snapshots\n", "     comment: 1 snapshots\n     bogus " + "x" * 200 + "\n")
+    line = bad.split("\n").index("     bogus " + "x" * 200) + 1
+    with self.assertRaises(ValueError) as caught: P.limine_canonical(bad.encode())
+    message = str(caught.exception)
+    self.assertTrue(message.startswith("Unexpected line inside snapshot region"))
+    self.assertIn("line " + str(line) + ":", message)
+    self.assertIn("bogus", message)
+    self.assertLess(len(message), 160)
+
   def test_region_outside_the_omarchy_entry_or_before_the_kernel_is_refused(self):
     region = region_text(1)
     good = self.entry(0).decode()

@@ -103,7 +103,14 @@ def _locate(lines):
   return entry, kernels[0], end
 
 
-def _snapshot_line(line, state, identifier):
+def _refuse(message, lineno, line):
+  """ValueError naming the 1-based file line and at most 80 characters of it."""
+  shown = repr(line.decode("utf-8", "replace"))
+  if len(shown) > 80: shown = shown[:77] + "..."
+  return ValueError(message + " (line " + str(lineno) + ": " + shown + ")")
+
+
+def _snapshot_line(line, state, identifier, taken):
   try: text = line[len(_INDENT):].decode("utf-8")
   except UnicodeDecodeError: raise ValueError("Snapshot region is not UTF-8") from None
   if "\r" in text or "\0" in text: raise ValueError("Snapshot region contains control characters")
@@ -111,11 +118,15 @@ def _snapshot_line(line, state, identifier):
   if key in ("default_entry", "remember_last_entry"): raise ValueError("Snapshot region may not set the default or remembered entry")
   if text.startswith("comment: "): return
   if re.fullmatch(r"///[0-9]+ \u2502 \S.*", text): state["sub"] = False; return
-  if re.fullmatch(r"////" + _ENTRY.decode(), text): state["sub"] = True; return
+  if re.fullmatch(r"////linux[A-Za-z0-9._+-]*", text):
+    # Default selection is by entry name: a sub-entry may never reuse a top-level name.
+    if text[4:] in taken: raise ValueError("Snapshot sub-entry reuses a top-level entry name")
+    state["sub"] = True; return
   if not state["sub"]: raise ValueError("Unexpected line inside snapshot region")
   if text == "protocol: efi": return
   if re.fullmatch(r"cmdline: \S.*", text): return
-  if re.fullmatch(r"path: boot\(\):/" + re.escape(identifier.decode()) + r"/limine_history/" + _ENTRY.decode() + r"(#[0-9a-f]+)?", text): return
+  match = re.fullmatch(r"path: boot\(\):/" + re.escape(identifier.decode()) + r"/limine_history/(" + _ENTRY.decode() + r")(#[0-9a-f]+)?", text)
+  if match and match.group(1) not in (".", ".."): return
   raise ValueError("Unexpected line inside snapshot region")
 
 
@@ -137,14 +148,20 @@ def snapshot_region(raw):
   identifiers = {match for index in range(entry, end) if not first <= index for match in _MACHINE.findall(lines[index])}
   if len(identifiers) != 1: raise ValueError("Exactly one machine-id required for the snapshot region")
   identifier = next(iter(identifiers))
+  taken = set()
+  for line in lines:
+    if line[:1] == b"/": taken.add(line[1:].lstrip(b"+").decode("utf-8", "replace"))
   state = {"sub": False}
   stop = first + 2
   while stop < len(lines):
     line = lines[stop]
     if line == b"": stop += 1; continue
     if stop >= end or line[:1] in (b"/", b"#"): break
-    if not line.startswith(_INDENT): raise ValueError("Unexpected line inside snapshot region")
-    _snapshot_line(line, state, identifier)
+    if not line.startswith(_INDENT): raise _refuse("Unexpected line inside snapshot region", stop + 1, line)
+    try: _snapshot_line(line, state, identifier, taken)
+    except ValueError as error:
+      if "(line " in str(error): raise
+      raise _refuse(str(error), stop + 1, line) from None
     stop += 1
   return starts[first], starts[stop]
 
