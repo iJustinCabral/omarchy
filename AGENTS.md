@@ -17,7 +17,9 @@ Before touching the MacBookAir9,1 boot image or power state, reconcile the curre
 
 # Autonomous T2 Agent Routing
 
-For the autonomous MacBookAir9,1 hibernation goal, use `gpt-6-astra` with `medium` reasoning as the orchestrator for planning, discovery, review and integration. Delegate implementation and independent audits to `gpt-6-sol` with `high` reasoning, using explicit model/effort overrides and bounded task context. Parallelize independent work with clearly separated file ownership; keep physical boot, EFI, module-load and power transitions serialized under the orchestrator. Do not let delegation weaken the hardware safety rules or reinterpret a diagnostic boundary as successful hibernation.
+For the autonomous MacBookAir9,1 hibernation goal, Claude Code drives the work: Claude Opus orchestrates planning, discovery, review and integration, and delegates implementation and independent audits to Claude Sonnet sub-agents with an explicit model override and bounded task context. Parallelize independent work with clearly separated file ownership, using isolated worktrees for concurrent implementation; keep physical boot, EFI, module-load and power transitions serialized under the orchestrator. An implementation is not integrated until a separate sub-agent has audited it. Do not let delegation weaken the hardware safety rules or reinterpret a diagnostic boundary as successful hibernation.
+
+Only one autonomous agent may drive this checkout and hardware at a time. The earlier Codex arrangement (`gpt-6-astra` medium orchestrator, `gpt-6-sol` high workers) is retained as an alternative in [`docs/t2-suspend/AUTOMATION.md`](docs/t2-suspend/AUTOMATION.md), which also documents how to rebuild the unattended reboot loop.
 
 # Documentation Layout
 
