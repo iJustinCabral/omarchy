@@ -1,0 +1,1 @@
+obj-m := mba_hibernate_efi_restore_marker.o

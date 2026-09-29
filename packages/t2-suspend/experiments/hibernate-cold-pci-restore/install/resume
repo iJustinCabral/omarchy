@@ -1,0 +1,6 @@
+build() {
+  add_runscript
+}
+help() {
+  echo "Pinned synchronous stock resume; pending returns stop before normal boot."
+}

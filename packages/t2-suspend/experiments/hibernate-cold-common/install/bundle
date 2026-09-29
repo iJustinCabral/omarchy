@@ -1,0 +1,14 @@
+build_cold_abort_bundle() {
+  local destination=$1 bundle=${OMARCHY_T2_COLD_ABORT_BUNDLE:-} name
+  [[ -d $bundle && ! -L $bundle ]] || return 1
+  for name in functions common.functions common.protocol abort.ko abort.sha256 abort.srcversion restore.variable header-reader header-reader.sha256 resume.device resume.offset resume.devnum stock-resume stock-resume.sha256; do
+    [[ -f $bundle/$name && ! -L $bundle/$name ]] || return 1
+  done
+  add_file "$bundle/common.functions" /usr/lib/omarchy-t2-cold-common/functions 600 || return 1
+  add_file "$bundle/common.protocol" /usr/lib/omarchy-t2-cold-common/protocol 600 || return 1
+  add_binary "$bundle/header-reader" "$destination/header-reader" 700 || return 1
+  for name in functions abort.ko abort.sha256 abort.srcversion restore.variable header-reader.sha256 resume.device resume.offset resume.devnum stock-resume stock-resume.sha256; do
+    add_file "$bundle/$name" "$destination/$name" 600 || return 1
+  done
+  return 0
+}

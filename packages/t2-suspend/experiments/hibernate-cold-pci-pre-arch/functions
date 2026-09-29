@@ -1,0 +1,258 @@
+# Private combined protocol; sourced only by its own mkinitcpio hooks.
+pg_paths() {
+  pg_root=${OMARCHY_T2_COLD_PRE_CPU_ROOT:-}
+  pg_dir=$pg_root/usr/lib/omarchy-t2-cold-pci-pre-arch
+  pg_vars=$pg_root/sys/firmware/efi/efivars
+  pg_guid=5e17d2ad-021f-4d45-a8e5-f4c191983e27
+  pg_abort=$pg_root/sys/module/mba_hibernate_cold_pre_arch
+  pg_guard=$pg_root/sys/module/mba_hibernate_cold_pci_guard
+  pg_intent=$pg_root/run/omarchy-t2-cold-pci-pre-arch.intent
+  pg_failure=paths
+  [[ -d $pg_dir && ! -L $pg_dir ]] || return 1
+  [[ -f $pg_dir/restore.variable && ! -L $pg_dir/restore.variable ]] || return 1
+  read -r pg_variable < "$pg_dir/restore.variable" || return 1
+  [[ $pg_variable == "OmarchyT2RestoreStageV2-$pg_guid" ]] || return 1
+  pg_marker=$pg_vars/$pg_variable
+}
+
+pg_order() {
+  local hook phase=0 encrypted=0 other
+  for hook in $HOOKS; do
+    case $hook in
+      encrypt) [[ $phase == "0" && $encrypted == "0" ]] || return 1; encrypted=1 ;;
+      omarchy-t2-cold-pci-pre-arch) [[ $phase == "0" && $encrypted == "1" ]] || return 1; phase=1 ;;
+      omarchy-t2-restore-marker) [[ $phase == "1" ]] || return 1; phase=2 ;;
+      resume) [[ $phase == "2" ]] || return 1; phase=3 ;;
+      omarchy-t2-cold-pci-pre-arch-return) [[ $phase == "3" ]] || return 1; phase=4 ;;
+      omarchy-t2-cold-*) return 1 ;;
+      *) [[ $phase == "0" || $phase == "4" ]] || return 1 ;;
+    esac
+  done
+  [[ $phase == "4" ]] || return 1
+  for other in "$EARLYHOOKS" "$LATEHOOKS" "$CLEANUPHOOKS" "$EMERGENCYHOOKS"; do
+    for hook in $other; do
+      case $hook in omarchy-t2-cold-*|omarchy-t2-restore-marker|resume) return 1 ;; esac
+    done
+  done
+}
+
+pg_hash() {
+  local expected actual pin=$1.sha256
+  case $1 in abort.ko|guard.ko) pin=${1%.ko}.sha256 ;; esac
+  [[ -f $pg_dir/$1 && ! -L $pg_dir/$1 && -f $pg_dir/$pin && ! -L $pg_dir/$pin ]] || return 1
+  read -r expected < "$pg_dir/$pin" || return 1
+  [[ ${#expected} == "64" ]] || return 1
+  case $expected in *[!0-9a-f]*) return 1 ;; esac
+  actual=$(sha256sum "$pg_dir/$1") || return 1
+  [[ ${actual%% *} == "$expected" ]]
+}
+
+pg_header_gate() {
+  local tracing device offset devnum commandline token count=0 offsets=0 actual
+  pg_failure=header-contract
+  tracing=$(set -o pipefail; cat "$pg_root/proc/sys/kernel/ftrace_enabled" | hexdump -v -e '/1 "%02x"') || return 1
+  [[ $tracing == "310a" ]] || return 1
+  pg_order || return 1
+  for token in resume.device resume.offset resume.devnum; do
+    [[ -f $pg_dir/$token && ! -L $pg_dir/$token ]] || return 1
+  done
+  read -r device < "$pg_dir/resume.device" || return 1
+  read -r offset < "$pg_dir/resume.offset" || return 1
+  read -r devnum < "$pg_dir/resume.devnum" || return 1
+  [[ $device == "/dev/mapper/root" && $offset == "1923214" && $devnum == "253:0" ]] || return 1
+  read -r actual < "$pg_root/sys/power/resume_offset" || return 1
+  [[ $actual == "$offset" ]] || return 1
+  read -r commandline < "$pg_root/proc/cmdline" || return 1
+  for token in $commandline; do
+    case $token in
+      resume=*) [[ ${token#resume=} == "$device" ]] || return 1; count=$((count + 1)) ;;
+      resume_offset=*) [[ ${token#resume_offset=} == "$offset" ]] || return 1; offsets=$((offsets + 1)) ;;
+      noresume|noresume=*|hibernate=noresume|hibernate=no|disablehooks=*) return 1 ;;
+    esac
+  done
+  [[ $count == "1" && $offsets == "1" && -x $pg_dir/header-reader ]] || return 1
+  pg_hash header-reader || return 1
+  pg_header=$("$pg_dir/header-reader" "$device" "$offset" "253" "0") || return 1
+  case $pg_header in NORMAL|PENDING) return 0 ;; *) return 1 ;; esac
+}
+
+pg_conflicts() {
+  local module
+  for module in mba_hibernate_cold_pre_cpu mba_hibernate_cold_pre_syscore mba_hibernate_cold_pre_relocate t2bce_core t2bce_audio t2bce_vhci t2bce_ave; do
+    [[ ! -e $pg_root/sys/module/$module && ! -L $pg_root/sys/module/$module ]] || return 1
+  done
+}
+
+pg_pci() {
+  local function id vendor device driver expected path
+  for function in 0 1 2 3; do
+    path=$pg_root/sys/bus/pci/devices/0000:74:00.$function
+    case $function in 0) id=0x2005; expected=nvme ;; 1) id=0x1801; expected=$1 ;; 2) id=0x1802; expected= ;; 3) id=0x1803; expected= ;; esac
+    read -r vendor < "$path/vendor" || return 1
+    read -r device < "$path/device" || return 1
+    [[ $vendor == "0x106b" && $device == "$id" ]] || return 1
+    if [[ -n "$expected" ]]; then
+      [[ -L $path/driver ]] || return 1
+      driver=$(readlink "$path/driver") || return 1
+      [[ ${driver##*/} == "$expected" ]] || return 1
+      if [[ $function == "1" ]]; then
+        driver=$(readlink "$path/driver/module") || return 1
+        [[ ${driver##*/} == "mba_hibernate_cold_pci_guard" ]] || return 1
+      fi
+    else
+      [[ ! -e $path/driver && ! -L $path/driver ]] || return 1
+    fi
+  done
+}
+
+pg_identity() {
+  local name sys expected actual
+  for name in abort guard; do
+    if [[ $name == "abort" ]]; then sys=$pg_abort; else sys=$pg_guard; fi
+    pg_hash "$name.ko" || return 1
+    [[ -f $pg_dir/$name.srcversion && ! -L $pg_dir/$name.srcversion ]] || return 1
+    read -r expected < "$pg_dir/$name.srcversion" || return 1
+    read -r actual < "$sys/srcversion" || return 1
+    [[ -n "$expected" && $actual == "$expected" ]] || return 1
+  done
+  pg_conflicts && pg_pci mba_hibernate_cold_pci_guard
+}
+
+pg_params() {
+  local sys=$1 armed consumed interceptions prefix irq online valid gates active failed
+  read -r armed < "$sys/parameters/arm_prefix" || return 1
+  read -r consumed < "$sys/parameters/arm_consumed" || return 1
+  read -r prefix < "$sys/parameters/vector_prefix" || return 1
+  if [[ $2 == "initial" ]]; then
+    [[ $armed == "0" && $consumed == "N" && -z "$prefix" ]] || return 1
+  elif [[ $2 == "before" ]]; then
+    [[ $armed == "1" && $consumed == "Y" && $prefix == "$pg_prefix" ]] || return 1
+  else
+    [[ $armed == "0" && $consumed == "Y" && $prefix == "$pg_prefix" ]] || return 1
+  fi
+  if [[ $sys == "$pg_abort" ]]; then
+    read -r interceptions < "$sys/parameters/interceptions" || return 1
+    read -r irq < "$sys/parameters/observed_irqs_disabled" || return 1
+    read -r online < "$sys/parameters/observed_online_cpus" || return 1
+    read -r valid < "$sys/parameters/observed_boundary_valid" || return 1
+    if [[ $2 == "returned" ]]; then
+      [[ $interceptions == "1" && $irq == "Y" && $online == "1" && $valid == "Y" ]]
+    else
+      [[ $interceptions == "0" && $irq == "N" && $online == "0" && $valid == "N" ]]
+    fi
+  else
+    read -r gates < "$sys/parameters/gates" || return 1
+    read -r active < "$sys/parameters/gate_active" || return 1
+    read -r failed < "$sys/parameters/gate_failed" || return 1
+    [[ $active == "N" && $failed == "N" ]] || return 1
+    if [[ $2 == "returned" ]]; then [[ $gates == "1" ]]; else [[ $gates == "0" ]]; fi
+  fi
+}
+
+pg_marker_prefix() {
+  local bytes
+  [[ -f $pg_marker && ! -L $pg_marker ]] || return 1
+  bytes=$(hexdump -v -e '/1 "%02x"' "$pg_marker") || return 1
+  [[ ${#bytes} == "42" && ${bytes:0:16} == "070000004d425253" && ${bytes:40:2} == "$1" ]] || return 1
+  pg_prefix=${bytes:16:24}
+}
+
+pg_witnesses_absent() {
+  local name
+  for name in OmarchyT2ColdPciPreArchReturned OmarchyT2ColdPreArchReturned OmarchyT2ColdPreSyscoreReturned OmarchyT2ColdPreCpuReturned; do
+    [[ ! -e $pg_vars/${name}${pg_prefix}-$pg_guid && ! -L $pg_vars/${name}${pg_prefix}-$pg_guid ]] || return 1
+  done
+}
+
+pg_hook_witnesses() {
+  local kind stage file actual expected
+  for kind in Entered Armed; do
+    if [[ $kind == "Entered" ]]; then stage=1; else stage=2; fi
+    file=$pg_vars/OmarchyT2RestoreHook${kind}${pg_prefix}-$pg_guid
+    [[ -f $file && ! -L $file ]] || return 1
+    actual=$(hexdump -v -e '/1 "%02x"' "$file") || return 1
+    expected=$(printf '\007\000\000\000MBRH%s' "$pg_prefix" | hexdump -v -e '/1 "%02x"') || return 1
+    [[ $actual == "${expected}0${stage}" ]] || return 1
+  done
+}
+
+pg_write_arm() {
+  printf '%s\n' "$pg_prefix" > "$1/parameters/arm_prefix"
+}
+
+pg_ordinary() {
+  [[ $pg_header == "NORMAL" && ! -e $pg_intent && ! -L $pg_intent && ! -e $pg_marker && ! -L $pg_marker ]] || return 1
+  [[ ! -e $pg_abort && ! -L $pg_abort && ! -e $pg_guard && ! -L $pg_guard ]] || return 1
+  pg_conflicts && pg_pci ""
+}
+
+pg_prepare() {
+  pg_paths && pg_header_gate || return 1
+  pg_failure=ordinary-or-pending
+  if [[ ! -e $pg_marker && ! -L $pg_marker ]]; then
+    pg_ordinary
+    return $?
+  fi
+  [[ $pg_header == "PENDING" && ! -e $pg_intent && ! -L $pg_intent && ! -e $pg_abort && ! -L $pg_abort && ! -e $pg_guard && ! -L $pg_guard ]] || return 1
+  pg_marker_prefix 00 && pg_witnesses_absent && pg_conflicts && pg_pci "" || return 1
+  pg_hash abort.ko && pg_hash guard.ko && pg_hash stock-resume || return 1
+  pg_failure=intent
+  (umask 077; set -C; printf '%s\n' "$pg_prefix" > "$pg_intent") || return 1
+  pg_failure=guard-insertion-binding
+  insmod "$pg_dir/guard.ko" || return 1
+  pg_pci mba_hibernate_cold_pci_guard && pg_params "$pg_guard" initial || return 1
+  pg_failure=abort-insertion
+  insmod "$pg_dir/abort.ko" || return 1
+  pg_identity && pg_params "$pg_abort" initial || return 1
+  pg_failure=guard-arm
+  pg_write_arm "$pg_guard" || return 1
+  pg_params "$pg_guard" before || return 1
+  pg_failure=abort-arm
+  pg_write_arm "$pg_abort" || return 1
+  pg_params "$pg_abort" before || return 1
+}
+
+pg_before_resume() {
+  local prefix armed stage
+  pg_paths && pg_header_gate || return 1
+  [[ ! -x $pg_root/usr/lib/systemd/systemd-hibernate-resume ]] || return 1
+  if [[ ! -e $pg_intent && ! -L $pg_intent ]]; then
+    pg_ordinary && pg_hash stock-resume
+    return $?
+  fi
+  [[ $pg_header == "PENDING" && -f $pg_intent && ! -L $pg_intent ]] || return 1
+  read -r prefix < "$pg_intent" || return 1
+  pg_marker_prefix 00 && [[ $prefix == "$pg_prefix" ]] || return 1
+  pg_witnesses_absent && pg_hook_witnesses && pg_identity && pg_hash stock-resume || return 1
+  pg_params "$pg_guard" before && pg_params "$pg_abort" before || return 1
+  read -r armed < "$pg_root/sys/module/mba_hibernate_efi_restore_marker/parameters/arm_prefix" || return 1
+  read -r stage < "$pg_root/sys/module/mba_hibernate_efi_restore_marker/parameters/stage" || return 1
+  [[ $armed == "1" && $stage == "0" ]]
+}
+
+pg_capture_return() {
+  local prefix witness expected actual
+  pg_paths && pg_header_gate || return 1
+  if [[ ! -e $pg_intent && ! -L $pg_intent ]]; then
+    pg_ordinary
+    return $?
+  fi
+  [[ -f $pg_intent && ! -L $pg_intent && $pg_header == "NORMAL" ]] || return 1
+  read -r prefix < "$pg_intent" || return 1
+  pg_marker_prefix 07 && [[ $prefix == "$pg_prefix" ]] || return 1
+  pg_identity && pg_params "$pg_abort" returned && pg_params "$pg_guard" returned && pg_witnesses_absent && pg_hook_witnesses || return 1
+  witness=$pg_vars/OmarchyT2ColdPciPreArchReturned${pg_prefix}-$pg_guid
+  expected=$(printf '\007\000\000\000MBPG%s\001' "$pg_prefix" | hexdump -v -e '/1 "%02x"') || return 1
+  (umask 077; set -C; printf '\007\000\000\000MBPG%s\001' "$pg_prefix" > "$witness") || return 1
+  actual=$(hexdump -v -e '/1 "%02x"' "$witness") || return 1
+  [[ $actual == "$expected" ]]
+}
+
+pg_recovery() {
+  if command -v plymouth >/dev/null 2>&1; then plymouth quit >/dev/null 2>&1 || :; fi
+  err "omarchy-t2-cold-pci-pre-arch: $*; diagnostic stops before normal boot"
+  launch_interactive_shell --exec
+  # mkinitcpio ignores hook return codes. A failed console/shell exec must
+  # terminate init rather than advance into resume, root mount or latehooks.
+  exit 1
+}

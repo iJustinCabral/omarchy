@@ -1,0 +1,6 @@
+build() {
+  add_runscript
+}
+help() {
+  echo "Exact synchronous stock resume behind the combined pending-image gate."
+}

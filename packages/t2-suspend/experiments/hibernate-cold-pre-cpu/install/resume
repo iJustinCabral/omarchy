@@ -1,0 +1,8 @@
+build() {
+  # Direct sysfs resume only: do not add the EFI-location systemd helper.
+  map add_module 'crypto-lzo' 'crypto-lz4'
+  add_runscript
+}
+help() {
+  echo "Resume through a pinned stock hook after the exact cold diagnostic gate."
+}

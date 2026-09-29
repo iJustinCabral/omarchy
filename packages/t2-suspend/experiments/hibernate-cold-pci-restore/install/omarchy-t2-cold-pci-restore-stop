@@ -1,0 +1,6 @@
+build() {
+  add_runscript
+}
+help() {
+  echo "Refuse restore initramfs continuation after any pending restore attempt."
+}

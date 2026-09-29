@@ -1,0 +1,48 @@
+#!/bin/bash
+
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+module=/home/jjc/.local/state/codex-mba-autonomous/efi-ftrace-entry-build.GpkgJK/mba_hibernate_efi_ftrace_marker.ko
+kernel=/usr/lib/modules/7.2.6-arch2-Watanare-T2-2-t2/vmlinuz
+ovmf_code=/usr/share/edk2/x64/OVMF_CODE.4m.fd
+ovmf_vars=/usr/share/edk2/x64/OVMF_VARS.4m.fd
+work=$(mktemp -d /tmp/mba-efi-ftrace-vm.XXXXXX)
+root=$work/root
+
+if [[ $(sha256sum "$module" | cut -d ' ' -f1) != "28e13ee2a660c590d0d66988c0af9d768aa5a37e2e2ed52624215f624b149f32" ]]; then
+  printf 'Refusing changed module\n' >&2
+  exit 1
+fi
+if [[ ! -r $kernel || ! -r $ovmf_code || ! -r $ovmf_vars ]]; then
+  printf 'Missing pinned production kernel or OVMF firmware\n' >&2
+  exit 1
+fi
+if [[ $(sha256sum "$kernel" | cut -d ' ' -f1) != "b6b9d3e9572089c973334fa5faa811328e5efe33e4c00e3d6a69d6c1cf9cc64c" ||
+      $(sha256sum "$ovmf_code" | cut -d ' ' -f1) != "2febd26c0b4cf95a636a941afa37d64a552723443ed9ac72f763f6840da98cb4" ||
+      $(sha256sum "$ovmf_vars" | cut -d ' ' -f1) != "5d2ac383371b408398accee7ec27c8c09ea5b74a0de0ceea6513388b15be5d1e" ]]; then
+  printf 'Refusing changed production kernel or OVMF firmware\n' >&2
+  exit 1
+fi
+
+mkdir -p "$root"/{dev,proc,sys}
+cc -std=c11 -Wall -Wextra -Werror -static -O2 -o "$root/init" "$script_dir/vm-init.c"
+cp "$module" "$root/module.ko"
+cp "$ovmf_vars" "$work/OVMF_VARS.4m.fd"
+
+(cd "$root" && find . -print0 | cpio --null -o --format=newc 2>/dev/null) | gzip -1 >"$work/initrd.img"
+printf 'Disposable guest files: %s\n' "$work"
+set +e
+timeout --signal=TERM --kill-after=5s 120s qemu-system-x86_64 \
+  -machine q35,accel=kvm -cpu host -smp 2 -m 1024 \
+  -display none -serial stdio -monitor none -no-reboot \
+  -drive if=pflash,format=raw,readonly=on,file="$ovmf_code" \
+  -drive if=pflash,format=raw,file="$work/OVMF_VARS.4m.fd" \
+  -kernel "$kernel" -initrd "$work/initrd.img" \
+  -append 'console=ttyS0 loglevel=5 rdinit=/init mba_vm_ftrace=1' 2>&1 | tee "$work/console.log"
+vm_status=${PIPESTATUS[0]}
+set -e
+if (( vm_status != 0 )) || ! rg -q '^MBA_VM_RESULT=pass\r?$' "$work/console.log"; then
+  printf 'VM EFI ftrace entry test failed; console retained at %s\n' "$work/console.log" >&2
+  exit 1
+fi

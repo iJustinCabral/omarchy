@@ -1,0 +1,13 @@
+build_pci_restore_bundle() {
+  local bundle=${OMARCHY_T2_COLD_PCI_RESTORE_BUNDLE:-} name destination=/usr/lib/omarchy-t2-cold-pci-restore
+  [[ -d $bundle && ! -L $bundle ]] || return 1
+  for name in functions guard.ko guard.sha256 guard.srcversion restore.variable header-reader header-reader.sha256 resume.device resume.offset resume.devnum stock-resume stock-resume.sha256; do
+    [[ -f $bundle/$name && ! -L $bundle/$name ]] || return 1
+  done
+  # Abort modules are never inputs to this protocol.
+  [[ ! -e $bundle/abort.ko && ! -L $bundle/abort.ko ]] || return 1
+  add_binary "$bundle/header-reader" "$destination/header-reader" 700 || return 1
+  for name in functions guard.ko guard.sha256 guard.srcversion restore.variable header-reader.sha256 resume.device resume.offset resume.devnum stock-resume stock-resume.sha256; do
+    add_file "$bundle/$name" "$destination/$name" 600 || return 1
+  done
+}

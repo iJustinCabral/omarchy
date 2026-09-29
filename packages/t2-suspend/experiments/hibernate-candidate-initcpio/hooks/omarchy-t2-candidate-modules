@@ -1,0 +1,61 @@
+# This file is sourced by mkinitcpio's ash runtime, not executed directly.
+
+run_latehook() (
+  candidate_root=${OMARCHY_T2_CANDIDATE_ROOT:-}
+  candidate_source=$candidate_root/usr/lib/omarchy-t2-hibernation-candidate
+  candidate_payload=$candidate_source/payload
+  candidate_state=$candidate_root/run/omarchy-t2-hibernation-candidate
+  candidate_systemd=$candidate_root/run/systemd
+  candidate_system=$candidate_systemd/system
+  candidate_wants=$candidate_system/sysinit.target.wants
+  candidate_dropin=$candidate_system/bluetooth-after-wifi.service.d
+  if [ ! -f "$candidate_payload/manifest.json" ] || \
+      [ ! -f "$candidate_source/load-modules.py" ] || \
+      [ ! -f "$candidate_source/bluetooth-after-wifi.py" ]; then
+    echo "omarchy-t2-candidate: post-switch-root payload is incomplete" >&2
+    return 1
+  fi
+  if [ -e "$candidate_state" ]; then
+    echo "omarchy-t2-candidate: refusing to overwrite candidate runtime state" >&2
+    return 1
+  fi
+
+  umask 077
+  mkdir -p "$candidate_state" "$candidate_wants" "$candidate_dropin" || return 1
+  chmod 755 "$candidate_systemd" "$candidate_system" "$candidate_wants" "$candidate_dropin" || return 1
+  cp "$candidate_payload"/* "$candidate_state/" || return 1
+  cp "$candidate_source/load-modules.py" "$candidate_state/load-modules.py" || return 1
+  cp "$candidate_source/bluetooth-after-wifi.py" "$candidate_state/bluetooth-after-wifi.py" || return 1
+  chmod 600 "$candidate_state"/*.ko "$candidate_state/manifest.json" "$candidate_state/hci_bcm4377.sha256" || return 1
+  chmod 700 "$candidate_state/load-modules.py" "$candidate_state/bluetooth-after-wifi.py" || return 1
+
+  cat > "$candidate_system/omarchy-t2-hibernation-candidate-modules.service" <<'EOF' || return 1
+[Unit]
+Description=Load private T2 candidate modules after switch_root
+DefaultDependencies=no
+Before=systemd-modules-load.service systemd-udev-trigger.service network-pre.target NetworkManager.service bluetooth-after-wifi.service systemd-user-sessions.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=45
+ExecStart=/usr/bin/python3 /run/omarchy-t2-hibernation-candidate/load-modules.py
+StandardOutput=journal
+StandardError=journal
+EOF
+  chmod 644 "$candidate_system/omarchy-t2-hibernation-candidate-modules.service" || return 1
+  ln -s ../omarchy-t2-hibernation-candidate-modules.service \
+    "$candidate_wants/omarchy-t2-hibernation-candidate-modules.service" || return 1
+
+  cat > "$candidate_dropin/50-hibernation-candidate.conf" <<'EOF' || return 1
+[Unit]
+Requires=omarchy-t2-hibernation-candidate-modules.service
+After=omarchy-t2-hibernation-candidate-modules.service
+
+[Service]
+ExecStart=
+ExecStart=/usr/bin/python3 /run/omarchy-t2-hibernation-candidate/bluetooth-after-wifi.py
+EOF
+  chmod 644 "$candidate_dropin/50-hibernation-candidate.conf" || return 1
+  echo "omarchy-t2-candidate: private modules staged for post-switch-root loading"
+)

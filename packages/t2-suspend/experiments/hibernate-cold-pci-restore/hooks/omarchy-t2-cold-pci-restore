@@ -1,0 +1,12 @@
+run_hook() {
+  local file=${OMARCHY_T2_COLD_PCI_RESTORE_ROOT:-}/usr/lib/omarchy-t2-cold-pci-restore/functions
+  if [[ ! -f $file || -L $file ]]; then
+    err "omarchy-t2-cold-pci-restore: missing full-restore functions"
+    launch_interactive_shell --exec
+    exit 1
+  fi
+  . "$file"
+  if ! fr_prepare; then
+    fr_recovery "arming failed (${fr_failure:-unknown})"
+  fi
+}

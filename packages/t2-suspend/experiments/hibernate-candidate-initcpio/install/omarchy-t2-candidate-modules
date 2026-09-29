@@ -1,0 +1,31 @@
+#!/bin/bash
+
+build() {
+  local payload=${OMARCHY_T2_CANDIDATE_PAYLOAD:-}
+  local module_helper=${OMARCHY_T2_CANDIDATE_MODULE_HELPER:-}
+  local bluetooth_helper=${OMARCHY_T2_CANDIDATE_BLUETOOTH_HELPER:-}
+  local candidate_file
+  if [[ -z $payload || ! -d $payload ]]; then
+    error "Missing candidate module payload"
+    exit 1
+  fi
+  if [[ -z $module_helper || ! -f $module_helper ]]; then
+    error "Missing candidate post-switch-root module loader"
+    exit 1
+  fi
+  if [[ -z $bluetooth_helper || ! -f $bluetooth_helper ]]; then
+    error "Missing candidate Bluetooth userspace gate"
+    exit 1
+  fi
+  add_runscript || exit 1
+  add_file "$module_helper" /usr/lib/omarchy-t2-hibernation-candidate/load-modules.py 700 || exit 1
+  add_file "$bluetooth_helper" /usr/lib/omarchy-t2-hibernation-candidate/bluetooth-after-wifi.py 700 || exit 1
+  for candidate_file in "$payload"/*; do
+    [[ -f $candidate_file ]] || continue
+    add_file "$candidate_file" "/usr/lib/omarchy-t2-hibernation-candidate/payload/${candidate_file##*/}" 600 || exit 1
+  done
+}
+
+help() {
+  echo "Keep private T2 modules out of the resume kernel and stage them for an ordinary post-switch-root boot."
+}
