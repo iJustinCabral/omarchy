@@ -297,7 +297,7 @@ sudo sha256sum "$S/runtime-deployment-review.json" "$S/runtime-deployment-bootst
 # expect: new_review, new_bootstrap, and 2f66daf8...16aa4f23 (config unchanged)
 sudo ls "$S" | grep -E 'retained|completed|consumed|pending'
 # expect present: runtime-retained-e489bab70e13-before-cf9075424e20, runtime-review-retained-...json, runtime-bootstrap-retained-...py, config-retained-...json,
-#   runtime-upgrade-completed-cf9075424e20.json, runtime-upgrade-approval-consumed-<this approval_id>.json, and the earlier 4125726a consumed file
+#   runtime-upgrade-completed-cf9075424e20.json, runtime-upgrade-approval-consumed-<this approval_id>.json (there is no consumed file for the earlier e489bab7 upgrade; see H0)
 # expect ABSENT: runtime-upgrade.pending, source-default-activation.pending, package-maintenance.pending, .runtime-pending
 sudo jq -r '.reviewed_commit' "$S/runtime-deployment-review.json"       # cf9075424e2069ff1cf6513e6eb6f3e5ee4a9cdc
 sudo jq -r '.reviewed_commit' "$S/runtime/snapshot.json"                # same
