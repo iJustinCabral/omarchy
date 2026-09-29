@@ -1,5 +1,6 @@
 """Disposable filesystem/lock fixtures only; no live root or power calls."""
 import fcntl
+import hashlib
 import importlib.util
 import json
 import os
@@ -485,46 +486,112 @@ class NativeMaintenance(unittest.TestCase):
     self.assertEqual(self.tree(), before)
     self.assertEqual(self.phases, [])
 
-  def test_idempotent_rerun_refuses_rewrite_and_reentry_is_read_only(self):
+  REAL = hasattr(T.G, "_maintenance")
+
+  def reenter(self):
+    return T._verify_existing_maintenance(self.root, guard=lambda: None, gate=self.gate)
+
+  def test_reentry_wiring_runs_guard_validator_under_locks_then_retained_gate(self):
     self.run_maintenance()
     marker = (self.root / T.MAINTENANCE).read_bytes()
+    settled, events = self.tree(), []
+    def validator(root):
+      events.append("validator")
+      self.assertTrue((root / T.DB_LOCK).is_file())
+      held = os.open(root / T.PHYSICAL_LOCK, os.O_RDONLY)
+      try:
+        with self.assertRaises(BlockingIOError): fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+      finally: os.close(held)
+      return {"transition_id": json.loads(marker)["transition_id"]}
+    self.phases.clear()
+    with patch.object(T.G, "_maintenance", validator, create=True):
+      result = self.reenter()
+    self.assertEqual((events, self.phases), (["validator"], ["retained"]))
+    self.assertTrue(result["already_inactive"])
+    self.assertEqual(result["maintenance_intent_sha256"], T.P.digest(marker))
+    self.assertEqual(self.tree(), settled)
+    self.assertFalse((self.root / T.DB_LOCK).exists())
+    # Validator or retained-gate failure propagates, never touching the marker.
+    with patch.object(T.G, "_maintenance", side_effect=ValueError("guard refuses"), create=True):
+      with self.assertRaisesRegex(ValueError, "guard refuses"): self.reenter()
+    self.fail_gate = True
+    self.fail["retained"] = True
+    with patch.object(T.G, "_maintenance", validator, create=True):
+      with self.assertRaisesRegex(ValueError, "injected retained"): self.reenter()
+    self.assertEqual(self.tree(), settled)
+    self.assertFalse((self.root / T.DB_LOCK).exists())
+
+  def test_reentry_refuses_without_guard_validator_or_marker(self):
+    with patch.object(T.G, "_maintenance", None, create=True):
+      with self.assertRaisesRegex(ValueError, "lacks the exact maintenance validator"): self.reenter()
+    with patch.object(T.G, "_maintenance", lambda root: {}, create=True):
+      with self.assertRaises(FileNotFoundError): self.reenter()
+    self.assertFalse((self.root / T.MAINTENANCE).exists())
+    self.assertFalse((self.root / T.DB_LOCK).exists())
+
+  def test_idempotent_rerun_refuses_rewrite(self):
+    self.run_maintenance()
     settled = self.tree()
     with self.assertRaisesRegex(ValueError, "maintenance intent"): self.run_maintenance()
     self.assertEqual(self.tree(), settled)
+
+  def coherent_update(self):
+    """Simulate an OS/kernel update: new production UKI and its matching stock entry hash."""
+    old = (self.root / T.PRODUCTION).read_bytes()
+    new = b"updated production image"
+    limine = (self.root / T.P.LIMINE).read_bytes()
+    (self.root / T.PRODUCTION).write_bytes(new)
+    (self.root / T.P.LIMINE).write_bytes(limine.replace(hashlib.blake2b(old).hexdigest().encode(), hashlib.blake2b(new).hexdigest().encode()))
+
+  @unittest.skipUnless(REAL, "requires the update guard's exact maintenance validator")
+  def test_reentry_reuses_guard_validator_and_accepts_coherent_new_stock(self):
+    self.run_maintenance()
+    settled = self.tree()
     self.phases.clear()
-    result = T._verify_existing_maintenance(self.root, guard=lambda: None, gate=self.gate)
-    self.assertTrue(result["already_inactive"])
-    self.assertEqual(result["maintenance_intent_sha256"], T.P.digest(marker))
-    self.assertEqual(self.phases, ["retained"])
-    self.assertEqual(self.tree(), settled)
+    self.assertTrue(self.reenter()["already_inactive"])
+    self.assertEqual((self.phases, self.tree()), (["retained"], settled))
+    self.coherent_update()
+    updated = self.tree()
+    self.assertTrue(self.reenter()["already_inactive"])
+    self.assertEqual(self.tree(), updated)
     self.assertFalse((self.root / T.DB_LOCK).exists())
 
-  def test_reentry_fails_closed_on_drift_and_preserves_marker(self):
+  @unittest.skipUnless(REAL, "requires the update guard's exact maintenance validator")
+  def test_reentry_refuses_incoherent_or_drifted_state_and_preserves_marker(self):
     self.run_maintenance()
     marker = (self.root / T.MAINTENANCE).read_bytes()
-    def attempt(): return T._verify_existing_maintenance(self.root, guard=lambda: None, gate=self.gate)
+    production = (self.root / T.PRODUCTION).read_bytes()
+    (self.root / T.PRODUCTION).write_bytes(b"kernel updated but stock entry not")
+    with self.assertRaises(ValueError): self.reenter()
+    (self.root / T.PRODUCTION).write_bytes(production)
     self.image = True
-    with self.assertRaisesRegex(ValueError, "saved image"): attempt()
+    with self.assertRaisesRegex(ValueError, "saved image"): self.reenter()
     self.image = False
-    (self.root / T.PRODUCTION).write_bytes(b"drift")
-    with self.assertRaisesRegex(ValueError, "does not bind"): attempt()
-    (self.root / T.PRODUCTION).write_bytes(b"production")
     self.f.write(T.OPT_IN, b"").chmod(0o644)
-    with self.assertRaisesRegex(ValueError, "active/incomplete"): attempt()
+    with self.assertRaises(ValueError): self.reenter()
     (self.root / T.OPT_IN).unlink()
     self.f.write(T.PENDINGS["activation"], b"partial")
-    with self.assertRaisesRegex(ValueError, "active/incomplete"): attempt()
+    with self.assertRaises(ValueError): self.reenter()
     self.fixture.pending("activation").unlink()
     (self.root / T.MAINTENANCE).write_bytes(marker + b" ")
-    with self.assertRaises(ValueError): attempt()
+    with self.assertRaises(ValueError): self.reenter()
     (self.root / T.MAINTENANCE).write_bytes(marker)
-    self.assertEqual(attempt()["transition_id"], json.loads(marker)["transition_id"])
+    self.assertTrue(self.reenter()["already_inactive"])
     self.assertFalse((self.root / T.DB_LOCK).exists())
 
-  def test_reentry_without_marker_writes_nothing(self):
-    with self.assertRaises(FileNotFoundError): T._verify_existing_maintenance(self.root, guard=lambda: None, gate=self.gate)
-    self.assertFalse((self.root / T.MAINTENANCE).exists())
-    self.assertFalse((self.root / T.DB_LOCK).exists())
+  def test_runtime_pending_markers_refuse_maintenance_with_no_writes(self):
+    for relative in T.RUNTIME_PENDINGS:
+      with self.subTest(marker=str(relative)):
+        other = self.new()
+        other.f.write(relative, b"interrupted")
+        before = other.tree()
+        with self.assertRaisesRegex(ValueError, "Runtime deployment/upgrade pending"): other.run_maintenance()
+        self.assertEqual(other.tree(), before)
+        self.assertEqual(other.phases, [])
+        self.assertFalse((other.root / T.MAINTENANCE).exists())
+        self.assertFalse(any(other.pending_names()))
+        self.assertFalse((other.root / T.DB_LOCK).exists())
+    self.assertEqual(T.RUNTIME_PENDINGS, (T.P.STATE / "runtime-upgrade.pending", T.P.STATE / ".runtime-pending"))
 
   def test_live_roots_and_arbitrary_callbacks_are_never_accepted(self):
     alias = self.root.parent / "live-alias"

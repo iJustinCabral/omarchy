@@ -45,6 +45,7 @@ HISTORY = P.STATE / "boot-policy-transitions"
 PENDINGS = {action: P.STATE / ("source-default-" + action + ".pending") for action in ("activation", "deactivation")}
 MAINTENANCE = P.STATE / "package-maintenance.pending"
 MAINTENANCE_SCHEMA = "omarchy-t2-package-maintenance-intent-v1"
+RUNTIME_PENDINGS = (P.STATE / D.UPGRADE_PENDING, P.STATE / D.PENDING)
 PRODUCTION = Path("boot/EFI/Linux/omarchy_linux-t2.efi")
 MAX_UKI = 256 * 1024 * 1024
 # Internal capability for the reviewed native adapter only. It is not security
@@ -279,6 +280,8 @@ def _replace(root, expected, replacement, transition_id, *, guard=lambda: None):
   guard()
   os.replace(temporary, target)
   _sync(target.parent)
+  # This readback may come from the page cache; durability rests on the file
+  # fsync in _new plus this directory fsync, not on the readback itself.
   if _read(root, P.LIMINE, private=False) != replacement: raise ValueError("Configuration replacement readback failed")
 
 
@@ -291,6 +294,14 @@ def transition(root, action, *, precheck, maintenance_continuation=None, guard=N
   if recover is not None and (action != "maintenance" or not callable(recover)):
     raise ValueError("Explicit fixture maintenance recovery required")
   return _transition(root, action, precheck=precheck, guard=(lambda: None) if guard is None else guard, maintenance_continuation=maintenance_continuation, recover=recover)
+
+
+def _runtime_pending(root, action):
+  """Maintenance never starts over an interrupted runtime deployment or upgrade."""
+  if action != "maintenance": return
+  for path in RUNTIME_PENDINGS:
+    G._ancestors(root, root / path, _owner(root))
+    if _present(root / path): raise ValueError("Runtime deployment/upgrade pending refuses maintenance")
 
 
 def _live_maintenance(root, gate, native):
@@ -322,12 +333,14 @@ def _transition(root, action, *, precheck, guard, maintenance_continuation=None,
   guard()
   G._ancestors(root, root / MAINTENANCE, os.geteuid())
   if _present(root / MAINTENANCE): raise ValueError("Existing package maintenance intent refuses new transition")
+  _runtime_pending(root, action)
   for path in PENDINGS.values():
     G._ancestors(root, root / path, os.geteuid())
     if _present(root / path): raise ValueError("Incomplete transition preserved; no automatic retry")
   with _locks(root) as release_db:
     if _present(root / MAINTENANCE) or any(_present(root / path) for path in PENDINGS.values()):
       raise ValueError("Incomplete transition or maintenance intent preserved")
+    _runtime_pending(root, action)
     runtime_review = _runtime(root)
     _idle(root)
     opt_in = _opt_in(root)
@@ -472,48 +485,30 @@ def _transition(root, action, *, precheck, guard, maintenance_continuation=None,
 
 
 def _verify_existing_maintenance(root, *, guard, gate, native=None):
-  """Read-only idempotent re-entry: validate an already durable inactive state.
+  """Read-only idempotent re-entry accepting exactly what the update guard accepts.
 
-  Holds the same DB and physical locks; never writes, repairs or removes the
-  marker. Any deviation raises with the marker (a sleep veto) untouched.
+  Reuses the guard's exact inactive-maintenance validator (which reuses
+  package_maintenance's fallback check, so coherent NEW stock bytes after an OS
+  or kernel update are accepted and incoherent ones refused), under the same DB
+  and physical locks, then the caller's retained gate. Never writes, repairs or
+  removes the marker; any deviation raises with the marker untouched.
   """
   root = Path(root)
   if not root.is_absolute() or root.resolve() != root or not root.is_dir(): raise ValueError("Canonical root required")
   _live_maintenance(root, gate, native)
   if not callable(guard) or not callable(gate): raise ValueError("Explicit guard and gate required")
+  validator = getattr(G, "_maintenance", None)
+  if not callable(validator): raise ValueError("Reviewed update guard lacks the exact maintenance validator")
   guard()
   G._ancestors(root, root / MAINTENANCE, _owner(root))
   with _locks(root) as release_db:
     guard()
     marker = _read(root, MAINTENANCE)
-    intent = P._json(marker)
-    keys = {"protocol", "transition_id", "old_policy_sha256", "runtime_review_sha256", "staged_receipt_sha256",
-            "fallback_limine_sha256", "deactivation_completion_sha256"}
-    if set(intent) != keys or intent["protocol"] != MAINTENANCE_SCHEMA or _encoded(intent) != marker:
-      raise ValueError("Exact canonical maintenance intent required")
-    PRODUCT.TX.uuid_value(intent["transition_id"])
-    archive = HISTORY / intent["transition_id"]
-    if _read(root, archive / "maintenance-intent.json") != marker: raise ValueError("Archived maintenance intent differs")
-    for name, expected in (("policy.json", intent["old_policy_sha256"]), ("completion.json", intent["deactivation_completion_sha256"])):
-      if P.digest(_read(root, archive / name)) != expected: raise ValueError("Retained maintenance authority changed")
-    completion = P._json(_read(root, archive / "completion.json"))
-    if (completion.get("action") != "deactivation" or completion.get("transition_id") != intent["transition_id"] or
-        completion.get("configuration_sha256") != intent["fallback_limine_sha256"] or
-        completion.get("intent_sha256") != P.digest(_read(root, archive / "intent.json"))):
-      raise ValueError("Maintenance deactivation completion chain differs")
-    if _read(root, archive / "opt-in", private=False) != b"": raise ValueError("Retained maintenance opt-in changed")
-    if P.digest(_read(root, P.RECEIPT)) != intent["staged_receipt_sha256"] or _runtime(root) != intent["runtime_review_sha256"]:
-      raise ValueError("Maintenance receipt/runtime review changed")
-    for name in (*PENDINGS.values(), P.POLICY, OPT_IN):
-      G._ancestors(root, root / name, _owner(root))
-      if _present(root / name): raise ValueError("Maintenance retains active/incomplete source state")
-    if P.digest(_read(root, P.LIMINE, private=False)) != intent["fallback_limine_sha256"]:
-      raise ValueError("Boot configuration differs from maintenance fallback")
-    _idle(root)
+    result = validator(root)
     gate(root, "retained")
     guard()
     release_db(verify_only=True)
     if _read(root, MAINTENANCE) != marker: raise ValueError("Maintenance marker changed during verification")
-  return {"protocol": "omarchy-t2-package-maintenance-verified-v1", "transition_id": intent["transition_id"],
+  return {"protocol": "omarchy-t2-package-maintenance-verified-v1", "transition_id": result["transition_id"],
           "maintenance_intent_sha256": P.digest(marker), "already_inactive": True,
           "live_execution": False, "qualification_issued": False}

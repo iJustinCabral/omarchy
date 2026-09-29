@@ -41,6 +41,8 @@ REVIEWED_DROPIN = RUNTIME_HIBERNATE / "systemd-hibernate.conf"
 DROPIN = Path("/etc/systemd/system/systemd-hibernate.service.d/omarchy-t2.conf")
 VENDOR_UNIT = "/usr/lib/systemd/system/systemd-hibernate.service"
 MAINTENANCE_NAME = "package-maintenance.pending"
+PROBE_BASE = Path("/run/omarchy-t2-maintenance-probe")
+EXEC_EXTRAS = ("ExecStartPre", "ExecStartPost", "ExecStop", "ExecStopPost", "ExecCondition")
 ACTIONS = ("activation", "deactivation", "maintenance")
 WHO = "omarchy-t2-source-default"
 WHY = "reviewed-boot-policy-transition"
@@ -333,14 +335,18 @@ def _hibernate_route():
   if _dropin_bytes() != _reviewed_identity("systemd-hibernate.conf"):
     raise ValueError("Installed hibernate drop-in differs from reviewed bytes")
   _reviewed_identity("sleep_entry.py")
-  raw = _command(("/usr/bin/systemctl", "show", "--no-pager", "--property=LoadState,FragmentPath,DropInPaths,ExecStart", "systemd-hibernate.service"))
+  raw = _command(("/usr/bin/systemctl", "show", "--no-pager", "--all", "--property=LoadState,FragmentPath,DropInPaths,ExecStart," + ",".join(EXEC_EXTRAS), "systemd-hibernate.service"))
   fields = {}
   for line in raw.splitlines():
     key, separator, value = line.partition("=")
     if not separator or key in fields: raise ValueError("Ambiguous systemd-hibernate.service properties")
     fields[key] = value
-  if set(fields) != {"LoadState", "FragmentPath", "DropInPaths", "ExecStart"} or fields["LoadState"] != "loaded":
+  required = {"LoadState", "FragmentPath", "DropInPaths", "ExecStart"}
+  if not required <= set(fields) or set(fields) - required - set(EXEC_EXTRAS) or fields["LoadState"] != "loaded":
     raise ValueError("Exact systemd-hibernate.service property inventory required")
+  # Empty properties may be omitted or printed empty; any other hook is unreviewed.
+  if any(fields.get(name, "") for name in EXEC_EXTRAS):
+    raise ValueError("Unreviewed pre/post/stop/condition commands on systemd-hibernate.service")
   if fields["FragmentPath"] != VENDOR_UNIT or fields["DropInPaths"] != str(DROPIN):
     raise ValueError("Unexpected systemd-hibernate.service fragment or drop-in set")
   execution = fields["ExecStart"]
@@ -349,6 +355,8 @@ def _hibernate_route():
   parts = execution[2:-2].split(" ; ")
   if parts[0] != "path=/usr/bin/python3" or parts[1] != "argv[]=/usr/bin/python3 -B " + str(SLEEP_ENTRY):
     raise ValueError("Effective ExecStart is not the reviewed sleep entry")
+  if "ignore_errors=no" not in parts or any(part.startswith("ignore_errors=") and part != "ignore_errors=no" for part in parts):
+    raise ValueError("Effective ExecStart must not ignore errors")
 
 
 def _load_reviewed(name, path):
@@ -358,15 +366,31 @@ def _load_reviewed(name, path):
   return module
 
 
+def _probe_base():
+  """Fixed private base for synthetic probe roots; ownership and mode are verified."""
+  try: PROBE_BASE.mkdir(mode=0o700)
+  except FileExistsError: pass
+  info = PROBE_BASE.lstat()
+  if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+    raise ValueError("Owned private probe directory required")
+  return PROBE_BASE
+
+
 def _maintenance_vetoes(engine):
   """Behavioral proof that reviewed sleep, product and activation code honor the marker.
 
-  Uses only a private temporary synthetic root; a control without the marker
-  must pass so a vacuous or always-refusing probe cannot be mistaken for policy.
+  Uses only a private temporary synthetic root under the fixed root-private
+  PROBE_BASE (never TMPDIR); a control without the marker must pass so a vacuous
+  or always-refusing probe cannot be mistaken for policy.
+
+  Limit: this proves the reviewed veto FUNCTIONS reject the marker. That the real
+  callers use them (sleep_entry main -> reject_pending; product admission ->
+  verify_deployment) rests on the inventory byte pins and the effective
+  ExecStart check in _hibernate_route, not on this probe.
   """
   sleep_entry = _load_reviewed("native_reviewed_sleep_entry", SLEEP_ENTRY)
   if MAINTENANCE_NAME not in sleep_entry.PENDING: raise ValueError("Reviewed sleep entry lacks maintenance veto")
-  with tempfile.TemporaryDirectory() as directory:
+  with tempfile.TemporaryDirectory(dir=_probe_base()) as directory:
     root = Path(directory).resolve()
     state = root / engine.P.STATE
     state.mkdir(parents=True, mode=0o700)
@@ -415,7 +439,7 @@ def native(action):
     if action == "maintenance":
       gate = lambda root, phase: _maintenance_gate(engine, root, phase)
       if engine._present(ROOT / engine.MAINTENANCE):
-        # Idempotent re-entry validates the retained inactive state, never rewrites it.
+        # Idempotent re-entry reuses the guard's exact inactive validator, never rewrites.
         result = engine._verify_existing_maintenance(ROOT, guard=guard, gate=gate, native=engine._NATIVE_MAINTENANCE)
       else:
         result = engine._transition(ROOT, action, precheck=lambda root, requested, phase: _precheck(engine, requested, phase),

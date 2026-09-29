@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import os
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -472,7 +473,11 @@ class Maintenance(unittest.TestCase):
     variants = {
       "ExecStart": [self.EXEC.replace("-B ", "-I "), self.EXEC.replace(str(N.SLEEP_ENTRY), "/tmp/sleep_entry.py"),
                     self.EXEC.replace("path=/usr/bin/python3", "path=/usr/bin/python"), "", self.EXEC + " " + self.EXEC,
-                    self.EXEC.replace("{ path", "{ ignore ; path")],
+                    self.EXEC.replace("{ path", "{ ignore ; path"), self.EXEC.replace("ignore_errors=no", "ignore_errors=yes"),
+                    self.EXEC.replace(" ; ignore_errors=no", "")],
+      "ExecStartPre": ["{ path=/usr/bin/true ; argv[]=/usr/bin/true ; ignore_errors=no }"],
+      "ExecStartPost": ["{ path=/usr/bin/true }"], "ExecStop": ["{ path=/usr/bin/true }"],
+      "ExecStopPost": ["{ path=/usr/bin/true }"], "ExecCondition": ["{ path=/usr/bin/true }"],
       "DropInPaths": ["", str(N.DROPIN) + " /etc/systemd/system/systemd-hibernate.service.d/other.conf"],
       "FragmentPath": ["/etc/systemd/system/systemd-hibernate.service", ""],
       "LoadState": ["masked", "not-found"]}
@@ -481,6 +486,10 @@ class Maintenance(unittest.TestCase):
         with self.subTest(key=key, value=value):
           self.properties = {**original, key: value}
           with self.assertRaises(ValueError): self.route()
+    for name in N.EXEC_EXTRAS:
+      # Empty (printed by --all) or omitted extras are fine.
+      self.properties = {**original, name: ""}
+      self.route()
     self.properties = {**original, "Extra": "x"}
     with self.assertRaises(ValueError): self.route()
     self.properties = {key: value for key, value in original.items() if key != "ExecStart"}
@@ -513,7 +522,8 @@ class Maintenance(unittest.TestCase):
 
   def test_vetoes_are_proven_behaviorally_against_reviewed_code(self):
     _, engine = self.engine()
-    with patch.object(N, "SLEEP_ENTRY", HERE / "hibernate/sleep_entry.py"):
+    base = Path(self.enterContext(__import__("tempfile").TemporaryDirectory())) / "probe"
+    with patch.object(N, "PROBE_BASE", base), patch.object(N, "SLEEP_ENTRY", HERE / "hibernate/sleep_entry.py"):
       N._maintenance_vetoes(engine)
       # An old sleep entry that ignores the marker name is refused.
       old = HERE / "hibernate/sleep_entry.py"
@@ -526,6 +536,28 @@ class Maintenance(unittest.TestCase):
       engine.PRODUCT = F.T.PRODUCT
       engine._transition = lambda *args, **kwargs: None
       with self.assertRaisesRegex(ValueError, "does not veto"): N._maintenance_vetoes(engine)
+
+  def test_probe_base_is_fixed_private_and_ignores_tmpdir(self):
+    parent = Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+    base = parent / "probe"
+    _, engine = self.engine()
+    seen = []
+    original = N.tempfile.TemporaryDirectory
+    def record(*args, **kwargs):
+      seen.append(kwargs.get("dir"))
+      return original(*args, **kwargs)
+    with patch.dict(os.environ, {"TMPDIR": str(parent / "hostile")}), patch.object(N, "PROBE_BASE", base), \
+         patch.object(N, "SLEEP_ENTRY", HERE / "hibernate/sleep_entry.py"), patch.object(N.tempfile, "TemporaryDirectory", side_effect=record):
+      N._maintenance_vetoes(engine)
+    self.assertEqual(seen, [base])
+    self.assertEqual(stat.S_IMODE(base.stat().st_mode), 0o700)
+    for prepare in (lambda: base.chmod(0o755), lambda: (base.rmdir(), base.symlink_to(parent))):
+      prepare()
+      with patch.object(N, "PROBE_BASE", base), self.assertRaisesRegex(ValueError, "private probe directory"): N._probe_base()
+      if base.is_symlink(): base.unlink()
+      else: base.chmod(0o700)
+    with patch.object(N.os, "geteuid", return_value=os.geteuid() + 1), patch.object(N, "PROBE_BASE", parent / "other"):
+      with self.assertRaisesRegex(ValueError, "private probe directory"): N._probe_base()
 
   def test_gate_phases_bind_backup_then_live_fallback_and_final_no_image(self):
     fixture, engine = self.engine()
