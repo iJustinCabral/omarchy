@@ -312,6 +312,86 @@ class Selection(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, 'must use stock radio drivers'): self.select()
 
 
+class DkmsArchive(unittest.TestCase):
+  """After `dkms install` the stock radio modules live in DKMS's original_module archive."""
+  def setUp(self):
+    self.temp = tempfile.TemporaryDirectory()
+    self.addCleanup(self.temp.cleanup)
+    self.root = Path(self.temp.name)
+    self.f = Fixture(self.root)
+
+  def archive_dir(self):
+    return self.root / f'var/lib/dkms/{m.NAME}/original_module/{RELEASE}/x86_64'
+
+  def dkms_install(self):
+    """Emulate dkms install: move each stock module into the archive with an .origin note, add the replacement."""
+    archive = self.archive_dir()
+    archive.mkdir(parents=True, exist_ok=True)
+    for name in QUALIFIED:
+      stock = self.root / f'usr/lib/modules/{RELEASE}/kernel/{RADIO_DIRS[name]}/{name}.ko'
+      (archive / stock.name).write_bytes(stock.read_bytes())
+      (archive / (stock.name + '.origin')).write_text(f'/usr/lib/modules/{RELEASE}/kernel/{RADIO_DIRS[name]}/{name}.ko\n')
+      stock.unlink()
+    self.f.package_all()
+
+  def runner(self, args, **kwargs):
+    """Real gate, fake kmod over the fixture root; module paths are reported root-relative like the live system."""
+    root = str(self.root)
+    if args[0] == 'modinfo':
+      args = ['modinfo', '-b', root] + args[1:]
+      args = [root + a if a.startswith('/usr/') else a for a in args]
+    out = subprocess.run(['bash', '-c', FAKE_MODINFO + '\n"$@"\n', 'x', *args], text=True,
+                         capture_output=True, timeout=60)
+    if out.returncode and args[0] != 'bash':
+      raise subprocess.CalledProcessError(out.returncode, args, out.stdout, out.stderr)
+    return subprocess.CompletedProcess(args, out.returncode, out.stdout.replace(root, ''), out.stderr)
+
+  def test_gate_qualifies_from_the_archive_after_dkms_install(self):
+    self.dkms_install()
+    result = self.f.gate(RELEASE, str(self.root))
+    self.assertEqual(result.returncode, 0, result.stderr)
+
+  def test_check_selection_and_verify_path_accept_the_package_set(self):
+    self.dkms_install()
+    m.check_selection([RELEASE], self.runner, self.root, [RELEASE])  # install: recorded decision
+    m.check_selection([RELEASE], self.runner, self.root)             # verify: archive-aware gate
+
+  def test_hook_accepts_package_set_after_dkms_install(self):
+    self.dkms_install()
+    result = self.f.hook()
+    self.assertEqual(result.returncode, 0, result.stderr)
+    self.assertIn('BUILD COMPLETE', result.stdout)
+
+  def test_missing_stock_and_missing_archive_is_unqualified(self):
+    self.dkms_install()
+    (self.archive_dir() / 'hci_bcm4377.ko').unlink()
+    self.assertEqual(self.f.gate(RELEASE, str(self.root)).returncode, 1)
+
+  def test_archive_srcversion_mismatch_is_unqualified(self):
+    self.dkms_install()
+    (self.archive_dir() / 'brcmfmac.ko').write_text('srcversion=NOTQUALIFIED\nvermagic=x\n')
+    self.assertEqual(self.f.gate(RELEASE, str(self.root)).returncode, 1)
+
+  def test_archive_entry_not_taken_from_the_stock_directory_is_ignored(self):
+    self.dkms_install()
+    (self.archive_dir() / 'brcmfmac.ko.origin').write_text(f'/usr/lib/modules/{RELEASE}/updates/dkms/brcmfmac.ko\n')
+    self.assertEqual(self.f.gate(RELEASE, str(self.root)).returncode, 1)
+    (self.archive_dir() / 'brcmfmac.ko.origin').unlink()
+    self.assertEqual(self.f.gate(RELEASE, str(self.root)).returncode, 1)
+
+  def test_replacements_in_updates_never_qualify(self):
+    Fixture(self.root, qualified=False)
+    shutil.rmtree(self.root / f'usr/lib/modules/{RELEASE}/kernel/drivers/net')
+    shutil.rmtree(self.root / f'usr/lib/modules/{RELEASE}/kernel/drivers/bluetooth')
+    self.f.package_all()
+    self.assertEqual(self.f.gate(RELEASE, str(self.root)).returncode, 1)
+
+  def test_unqualified_decision_still_demands_stock_radio(self):
+    self.dkms_install()
+    with self.assertRaisesRegex(ValueError, 'must use stock radio drivers'):
+      m.check_selection([RELEASE], self.runner, self.root, [])
+
+
 class Upgrade(base.Installer):
   """Upgrade from an installed 1.5 that replaced BCE, on a root whose only kernel is not the running one."""
   OLD = '1.5'

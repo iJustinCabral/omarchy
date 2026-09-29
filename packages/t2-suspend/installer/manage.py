@@ -156,10 +156,18 @@ def check_bce_family(release, runner=run):
       raise ValueError('Mixed or foreign T2 BCE module family: ' + name + ' resolves to ' +
                        selected + '; every t2bce_* module must come from the stock kernel tree')
 
-def check_selection(releases, runner=run, root=Path('/')):
+def check_selection(releases, runner=run, root=Path('/'), decided=None):
+  """Check the radio and BCE selection for every kernel.
+
+  DKMS moves each stock radio module it replaces into its original_module archive, so after
+  an install the stock tree no longer shows the stock fingerprint. Install therefore passes
+  `decided`, the kernels it judged qualified BEFORE building; those are trusted for the kernels
+  it just built. Later verification passes nothing and asks the gate, which reads the archive.
+  """
   for release in releases:
     check_bce_family(release, runner)
-    if not qualified(root, release, runner):
+    is_qualified = release in decided if decided is not None else qualified(root, release, runner)
+    if not is_qualified:
       # DKMS skipped the package: the whole radio set must be stock, with no package build.
       build = root / f'var/lib/dkms/{NAME}/{VERSION}/{release}/x86_64/module'
       for name in MODULES:
@@ -328,7 +336,7 @@ def install(root, runner=run, selection=check_selection, fetch=fetcher.fetch):
         runner(['dkms', 'install', '--force', '-m', NAME, '-v', VERSION, '-k', release])
       for release in releases:
         runner(['depmod', '-a', release])
-      selection(releases, runner, root)
+      selection(releases, runner, root, buildable)
       runner(['limine-mkinitcpio', 'linux-t2'])
       check_images(root, runner)
       receipt['state'] = 'installed'
