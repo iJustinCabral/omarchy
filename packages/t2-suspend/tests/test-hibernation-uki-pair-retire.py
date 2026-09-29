@@ -20,7 +20,7 @@ def load(name, path):
 
 PAIR = load("retire_pair", HERE / "experiments/stage-hibernation-uki-pair.py")
 MACHINE = "0123456789abcdef0123456789abcdef"
-STEPS = ("archive", "journal", "limine", "image-source", "image-restore", "backup", "receipt", "record")
+STEPS = ("archive", "journal", "custody", "limine", "image-source", "image-restore", "backup", "receipt", "record")
 
 
 def sha(data):
@@ -138,8 +138,132 @@ class Retire(unittest.TestCase):
       self.assertFalse(self.path(PAIR.IMAGES[role]).exists())
     self.assertFalse(self.path(PAIR.RECEIPT).exists())
     self.assertFalse(self.path(PAIR.BACKUP).exists())
+    self.assert_custody()
     self.assertEqual((self.path(PAIR.STATE / "s4-vectors") / "guard").read_text(), "consumed")
     self.assertFalse(self.path(PAIR.DB_LOCK).exists())
+
+  def custody_paths(self):
+    shared = PAIR.custody()
+    return self.path(PAIR.PRODUCT_STATE / shared.RETIREMENT_NAME), self.path(PAIR.PRODUCT_STATE / shared.RETIRED_RECEIPT_NAME)
+
+  def assert_custody(self):
+    """The exact custody contract: retained receipt bytes and a strict record chaining to them, mode 0600."""
+    shared = PAIR.custody()
+    record, copy = self.custody_paths()
+    self.assertEqual(copy.read_bytes(), self.receipt_raw)
+    value = json.loads(record.read_bytes())
+    self.assertEqual(set(value), shared.RETIREMENT_KEYS)
+    self.assertEqual(value, {"protocol": "omarchy-t2-pair-retirement-v1", "retired_receipt_sha256": sha(self.receipt_raw),
+                             "source_sha256": self.images["source"]["sha256"], "restore_sha256": self.images["restore"]["sha256"]})
+    shared.check(value, copy.read_bytes())
+    for path in (record, copy): self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+  def chain_holds(self):
+    """The maintenance chain can always resolve the receipt: the live one, or the custody copy that a valid record binds."""
+    live = self.path(PAIR.RECEIPT)
+    if live.exists() and live.read_bytes() == self.receipt_raw: return True
+    record, copy = self.custody_paths()
+    try: PAIR.custody().check(json.loads(record.read_bytes()), copy.read_bytes())
+    except (OSError, ValueError): return False
+    return copy.read_bytes() == self.receipt_raw
+
+  def test_custody_uses_the_shared_contract_and_is_written_before_the_receipt_is_removed(self):
+    self.kernel_update()
+    seen = []
+    def hook(name):
+      seen.append((name, self.chain_holds(), self.path(PAIR.RECEIPT).exists(), all(path.exists() for path in self.custody_paths())))
+    self.retire(step_hook=hook)
+    self.assertTrue(all(item[1] for item in seen), seen)  # never a moment the marker's receipt is unresolvable
+    self.assertEqual([item[0] for item in seen], list(STEPS))
+    by = {item[0]: item for item in seen}
+    self.assertFalse(by["journal"][3])  # nothing before the custody step
+    self.assertTrue(by["custody"][2] and by["custody"][3])  # both custody files exist while the live receipt still does
+    self.assertFalse(by["receipt"][2])
+    self.assert_custody()
+    consumer = importlib.util.spec_from_file_location("custody_consumer", HERE / "hibernate/boot_policy_transition.py")
+    transition = importlib.util.module_from_spec(consumer)
+    consumer.loader.exec_module(transition)
+    self.assertEqual((transition.RETIREMENT.name, transition.RETIRED_RECEIPT.name), (PAIR.custody().RETIREMENT_NAME, PAIR.custody().RETIRED_RECEIPT_NAME))
+    self.assertEqual(transition.RETIREMENT_KEYS, PAIR.custody().RETIREMENT_KEYS)
+
+  def test_stale_custody_of_a_previous_generation_is_replaced_atomically(self):
+    self.kernel_update()
+    record, copy = self.custody_paths()
+    self.write(PAIR.PRODUCT_STATE / PAIR.custody().RETIRED_RECEIPT_NAME, b'{"images": "an older receipt"}')
+    self.write(PAIR.PRODUCT_STATE / PAIR.custody().RETIREMENT_NAME, b'{"protocol": "stale"}')
+    calls = []
+    real = PAIR.atomic_write
+    def watch(path, data, mode):
+      calls.append(path.name)
+      real(path, data, mode)
+    PAIR.atomic_write = watch
+    try: self.retire()
+    finally: PAIR.atomic_write = real
+    self.assertIn(record.name, calls)
+    self.assertIn(copy.name, calls)
+    self.assertLess(calls.index(copy.name), calls.index(record.name))  # copy first, the record commits it
+    self.assert_custody()
+    self.assertEqual([name for name in os.listdir(record.parent) if name.startswith(".pair-")], [])
+
+  def test_custody_paths_must_be_regular_files(self):
+    self.kernel_update()
+    record, copy = self.custody_paths()
+    record.symlink_to(self.path("etc-target"))
+    with self.assertRaises(ValueError): self.retire()
+    self.assertTrue(self.path(PAIR.RECEIPT).exists())  # the live receipt survived the refusal
+    record.unlink()
+    copy.mkdir()
+    with self.assertRaises(ValueError): self.retire()
+    self.assertTrue(self.path(PAIR.RECEIPT).exists())
+    copy.rmdir()
+    self.assertEqual(self.retire()["state"], "retired")
+    self.assert_retired()
+
+  def test_a_crash_around_the_custody_write_reruns_to_the_same_bytes(self):
+    for step in ("journal", "custody", "limine", "receipt"):
+      with self.subTest(step=step):
+        self.tearDown_fixture()
+        self.setUp()
+        self.kernel_update()
+        def hook(name, step=step):
+          if name == step: raise RuntimeError("crash")
+        with self.assertRaises(RuntimeError): self.retire(step_hook=hook)
+        self.assertTrue(self.chain_holds())
+        self.assertEqual(self.retire()["state"], "retired")
+        self.assert_retired()
+
+  def test_rollback_removes_the_custody_it_wrote_and_survives_a_crash_between_the_two_files(self):
+    for crash in (None, "custody-record-removed", "custody-removed"):
+      with self.subTest(crash=crash):
+        self.tearDown_fixture()
+        self.setUp()
+        self.kernel_update()
+        def stop(name):
+          if name == "receipt": raise RuntimeError("interrupted")
+        with self.assertRaises(RuntimeError): self.retire(step_hook=stop)
+        self.assertTrue(all(path.exists() for path in self.custody_paths()))
+        def hook(name, crash=crash):
+          self.assertTrue(self.chain_holds(), name)
+          if name == crash: raise RuntimeError("rollback crash")
+        if crash:
+          with self.assertRaises(RuntimeError): PAIR.retire_rollback(self.root, step_hook=hook)
+          self.assertTrue(self.chain_holds())
+        self.assertEqual(PAIR.retire_rollback(self.root, step_hook=hook if not crash else None)["state"], "retirement-rolled-back")
+        self.assertFalse(any(path.exists() for path in self.custody_paths()))
+        self.assertEqual(self.path(PAIR.RECEIPT).read_bytes(), self.receipt_raw)
+        self.assertEqual(self.retire()["state"], "retired")
+        self.assert_retired()
+
+  def test_rollback_leaves_custody_that_does_not_chain_to_this_receipt(self):
+    self.kernel_update()
+    def stop(name):
+      if name == "receipt": raise RuntimeError("interrupted")
+    with self.assertRaises(RuntimeError): self.retire(step_hook=stop)
+    record, copy = self.custody_paths()
+    record.write_bytes(json.dumps({"retired_receipt_sha256": "1" * 64}).encode())
+    copy.write_bytes(b"another generation's receipt")
+    PAIR.retire_rollback(self.root)
+    self.assertTrue(record.exists() and copy.exists())
 
   def test_happy_path_archives_then_removes_only_our_entries(self):
     self.kernel_update()
@@ -514,6 +638,7 @@ class Retire(unittest.TestCase):
   def test_rolled_back_receipt_with_changed_production_retires_without_images(self):
     self.assertEqual(PAIR.rollback(self.root)["state"], "rolled-back")
     self.assertEqual(self.path(PAIR.SINGLE.LIMINE).read_bytes(), self.original)
+    self.receipt_raw = self.path(PAIR.RECEIPT).read_bytes()  # rollback rewrote the receipt state
     self.write("boot/EFI/Linux/omarchy_linux-t2.efi", self.new_production)
     self.updated_limine = limine_text(self.new_production, 4, "c").encode()
     self.write(PAIR.SINGLE.LIMINE, self.updated_limine)
