@@ -439,6 +439,21 @@ class NativeAdmission(unittest.TestCase):
 
   def snapshot(self): return {str(path): path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
 
+  def test_admit_and_native_route_never_pass_ignore(self):
+    real = guard._maintenance
+    seen = []
+    def spy(*args, **kwargs):
+      seen.append(kwargs)
+      return real(*args, **kwargs)
+    with patch.object(guard, "_maintenance", spy):
+      self.admit()
+    self.assertEqual(seen, [{}])
+    seen.clear()
+    with patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "_marker_present", return_value=True), \
+         patch.object(guard, "_admit", side_effect=lambda *a, **k: seen.append(k) or {}):
+      with patch.object(guard, "SCRIPT", Path(guard.__file__).absolute()): guard.main([])
+    self.assertNotIn("ignore", seen[0])
+
   def test_valid_inactive_evidence_admits_repeatedly_and_retains_marker(self):
     before = self.snapshot()
     for _ in range(3):
@@ -559,6 +574,58 @@ class NativeAdmission(unittest.TestCase):
       for root in ("/", "/tmp/..", alias, "relative"):
         with self.assertRaises(ValueError): guard.check_inactive_maintenance(root)
       self.assertEqual(guard.check_inactive_maintenance(self.root)["classification"], "fixture-inactive-maintenance-verified")
+
+  def test_ignore_is_strict_and_only_relaxes_the_named_known_pending(self):
+    deactivation = self.T.PENDINGS["deactivation"]
+    self.assertEqual(guard._maintenance(self.root, ignore=())["transition_id"], self.intent["transition_id"])
+    for bad in (self.T.MAINTENANCE, Path("etc/passwd"), self.T.PENDINGS["deactivation"].parent, str(deactivation), [deactivation], (str(deactivation),), (deactivation, self.T.MAINTENANCE), deactivation):
+      with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "Ignore must name"): guard._maintenance(self.root, ignore=bad)
+    before = guard.ACTIVE
+    pending = self.f.write(deactivation, b"pending")
+    with self.assertRaisesRegex(ValueError, "Active or incomplete"): guard._maintenance(self.root)
+    with self.assertRaisesRegex(ValueError, "Active or incomplete"): guard._maintenance(self.root, ignore=())
+    self.assertEqual(guard._maintenance(self.root, ignore=(deactivation,))["transition_id"], self.intent["transition_id"])
+    self.assertIs(guard.ACTIVE, before)
+    for other, mode in ((self.T.PENDINGS["activation"], 0o600), (self.T.RUNTIME_PENDINGS[0], 0o600), (self.T.RUNTIME_PENDINGS[1], 0o600), (self.T.P.POLICY, 0o600), (self.T.OPT_IN, 0o644)):
+      with self.subTest(other=other.name):
+        extra = self.f.write(other, b"x")
+        extra.chmod(mode)
+        with self.assertRaisesRegex(ValueError, "Active or incomplete"): guard._maintenance(self.root, ignore=(deactivation,))
+        # ignoring one path never excuses a different one
+        with self.assertRaisesRegex(ValueError, "Active or incomplete"): guard._maintenance(self.root, ignore=(other,))
+        extra.unlink()
+    pending.unlink()
+    self.assertEqual(guard._maintenance(self.root)["transition_id"], self.intent["transition_id"])
+
+  def test_ignore_also_relaxes_the_final_appeared_during_verification_scan(self):
+    deactivation = self.T.PENDINGS["deactivation"]
+    self.f.write(deactivation, b"pending")
+    other = self.T.PENDINGS["activation"]
+    real = self.T._idle
+    calls = []  # counts _idle calls made by the validator itself
+    def appear(root):
+      real(root)
+      calls.append(1)
+      if len(calls) == 2 and not (root / other).exists(): self.f.write(other, b"late")
+    loader = guard._load
+    def load(*args):
+      module = loader(*args)
+      module.T._idle = appear  # the module instance _maintenance actually validates with
+      return module
+    with patch.object(guard, "_load", load), self.assertRaisesRegex(ValueError, "appeared during"):
+      guard._maintenance(self.root, ignore=(deactivation,))
+    self.assertTrue((self.root / other).exists())
+
+  def test_public_wrapper_and_admission_paths_never_pass_ignore(self):
+    import ast, inspect
+    self.assertEqual(list(inspect.signature(guard.check_inactive_maintenance).parameters), ["root"])
+    with self.assertRaises(TypeError): guard.check_inactive_maintenance(self.root, ignore=(self.T.PENDINGS["deactivation"],))
+    tree = ast.parse(Path(guard.__file__).read_text())
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_maintenance"]
+    self.assertTrue(calls)
+    for node in calls: self.assertFalse([keyword for keyword in node.keywords if keyword.arg == "ignore" or keyword.arg is None], ast.dump(node))
+    self.f.write(self.T.PENDINGS["deactivation"], b"pending")
+    with self.assertRaises(ValueError): guard.check_inactive_maintenance(self.root)
 
   def test_cli_routes_marker_to_native_and_absent_marker_to_blanket_check(self):
     with patch.object(guard.os, "geteuid", return_value=0):

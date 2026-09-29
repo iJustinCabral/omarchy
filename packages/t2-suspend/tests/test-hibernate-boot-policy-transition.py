@@ -617,7 +617,12 @@ class NativeMaintenance(unittest.TestCase):
     self.assertFalse((self.root / T.DB_LOCK).exists())
 
   def complete(self, pinned=None):
-    return T._complete_interrupted_maintenance(self.root, guard=lambda: None, gate=self.gate, pinned=pinned)
+    active = T.G.ACTIVE
+    value = tuple(active)
+    try: return T._complete_interrupted_maintenance(self.root, guard=lambda: None, gate=self.gate, pinned=pinned)
+    finally:  # the guard's source-state list is never mutated, on success or refusal
+      self.assertIs(T.G.ACTIVE, active)
+      self.assertEqual(tuple(T.G.ACTIVE), value)
 
   def interrupt(self, how="gate"):
     """Publish maintenance, then leave marker + deactivation pending exactly as a crash would."""
@@ -751,6 +756,14 @@ class NativeMaintenance(unittest.TestCase):
     self.assertEqual(tuple(T.G.ACTIVE), active)
     self.complete()
     self.assertEqual(tuple(T.G.ACTIVE), active)  # the relaxation never leaks past the call
+
+  @unittest.skipUnless(REAL, "requires the update guard's exact maintenance validator")
+  def test_completion_passes_only_the_deactivation_pending_as_ignore_then_verifies_unrelaxed(self):
+    self.interrupt()
+    seen, real = [], T.G._maintenance
+    with patch.object(T.G, "_maintenance", lambda root, *a, **k: seen.append(k) or real(root, *a, **k)):
+      self.complete()
+    self.assertEqual(seen, [{"ignore": (T.PENDINGS["deactivation"],)}, {}])
 
   def test_interrupted_maintenance_completion_needs_native_capability_on_live_root(self):
     noop = lambda *a: None

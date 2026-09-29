@@ -545,8 +545,8 @@ def _complete_interrupted_maintenance(root, *, guard, gate, native=None, pinned=
   Only the step the interrupted publisher would have done next: marker and
   deactivation pending both present, nothing else active, and the pending
   byte-identical to the archived intent the marker chains to. Runs the guard's
-  exact maintenance validator (its only relaxation is ignoring that one proven
-  pending), the caller's "final" gate with the archived resume tuple pinned,
+  exact maintenance validator (its only relaxation is its explicit ignore of that one
+  proven pending), the caller's "final" gate with the archived resume tuple pinned,
   retires the pending as _transition does, then re-verifies as inactive
   maintenance ("retained"). Any mismatch raises with every file untouched; the
   marker is never written or removed. A failure after retirement reinstates the
@@ -558,7 +558,7 @@ def _complete_interrupted_maintenance(root, *, guard, gate, native=None, pinned=
   if not callable(guard) or not callable(gate): raise ValueError("Explicit guard and gate required")
   if pinned is not None and type(pinned) is not dict: raise ValueError("Pinned evidence dictionary required")
   validator = getattr(G, "_maintenance", None)
-  if not callable(validator) or not hasattr(G, "ACTIVE"): raise ValueError("Reviewed update guard lacks the exact maintenance validator")
+  if not callable(validator): raise ValueError("Reviewed update guard lacks the exact maintenance validator")
   pending_path = PENDINGS["deactivation"]
   pending = root / pending_path
   guard()
@@ -582,10 +582,7 @@ def _complete_interrupted_maintenance(root, *, guard, gate, native=None, pinned=
     return marker
   def evaluate():
     """The guard's exact validator, relaxed only for the one proven pending."""
-    original = G.ACTIVE
-    G.ACTIVE = tuple(path for path in original if path != pending_path)
-    try: return validator(root)
-    finally: G.ACTIVE = original
+    return validator(root, ignore=(pending_path,))
   with _locks(root) as release_db:
     guard()
     marker = expected_state()

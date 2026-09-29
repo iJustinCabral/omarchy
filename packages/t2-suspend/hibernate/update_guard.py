@@ -210,14 +210,21 @@ def _execute(name, path, raw):
   return module
 
 
-def _maintenance(root, inventory=None):
-  """Exact inactive-maintenance validation; callers authenticate and lock first."""
+def _maintenance(root, inventory=None, *, ignore=()):
+  """Exact inactive-maintenance validation; callers authenticate and lock first.
+
+  `ignore` names known ACTIVE paths (never the marker) skipped by both source-state
+  scans. Only the reviewed interrupted-publication completion passes it, after
+  proving the exact bytes; every admission path uses the empty default.
+  """
+  if type(ignore) is not tuple or any(not isinstance(path, Path) or path not in ACTIVE or path == MAINTENANCE for path in ignore):
+    raise ValueError("Ignore must name known active source paths other than the maintenance marker")
   # Lazy reuse avoids import-time cycles (the transition itself imports us).
   sibling = Path(__file__).with_name("package_maintenance.py")
   maintenance = _load("guard_maintenance_evidence", sibling, None if inventory is None else inventory["packages/t2-suspend/hibernate/package_maintenance.py"])
   transition, policy = maintenance.T, maintenance.T.P
   for relative in ACTIVE:
-    if relative == transition.MAINTENANCE: continue
+    if relative == transition.MAINTENANCE or relative in ignore: continue
     _ancestors(root, root / relative, os.geteuid())
     if transition._present(root / relative):
       raise ValueError("Active or incomplete source state prevents maintenance evidence")
@@ -280,7 +287,7 @@ def _maintenance(root, inventory=None):
   if stat.S_IMODE((root / archive / "opt-in").lstat().st_mode) != 0o644:
     raise ValueError("Historical routine opt-in metadata changed")
   for relative in ACTIVE:
-    if relative != transition.MAINTENANCE and transition._present(root / relative):
+    if relative != transition.MAINTENANCE and relative not in ignore and transition._present(root / relative):
       raise ValueError("Source state appeared during maintenance verification")
   return {"classification": "fixture-inactive-maintenance-verified", "transition_id": identifier,
     "maintenance_intent_sha256": policy.digest(raw), "fallback": fallback, "resume": resume,
