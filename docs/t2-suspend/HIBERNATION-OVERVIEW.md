@@ -72,7 +72,7 @@ On a MacBookAir9,1 with the product installed, `omarchy update` runs `omarchy-up
 - Before: if hibernation is on, it explains that hibernation must pause and asks. Yes runs the reviewed `maintenance` action. No cancels the update with nothing changed and prints the manual command. `-y` never pauses on its own and stops instead. An unreadable state (no sudo), a loader override or any unfinished transition also stops the update before anything changes and points at the runbook.
 - After: while paused, it runs the read-only `assess`. If nothing qualified changed it offers to turn hibernation back on (`reactivate`). If the kernel or drivers changed it says hibernation stays off until requalified and that suspend still works. It never requalifies and never fails the update.
 
-The integration landed in `7eaefa2a` and `8c2b0976`. It is covered by the shell tests (`test/shell.d/update-t2-hibernation-test.sh`). It has not yet been exercised by a real `omarchy update` on the laptop: the 7.2.6 to 7.2.7 update on 2026-09-29 was run by hand under maintenance before the hook existed, so the interactive prompts are unproven on hardware.
+The integration is in this branch (on the working branch `fix-t2-vintage-mac-support` it landed as `7eaefa2a` and `8c2b0976`). It is covered by the shell tests (`test/shell.d/update-t2-hibernation-test.sh`). It has not yet been exercised by a real `omarchy update` on the laptop: the 7.2.6 to 7.2.7 update on 2026-09-29 was run by hand under maintenance before the hook existed, so the interactive prompts are unproven on hardware.
 
 ## Path to upstream
 
