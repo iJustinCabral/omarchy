@@ -52,8 +52,9 @@ After the runtime is deployed, `omarchy setup t2-hibernate maintenance|assess|re
 | H3 | maintenance publisher: deactivates hibernation, restores stock `limine.conf`, writes marker | sudo, real inhibitor | operator |
 | H4 | first package update through the native guard, then `omarchy update` | sudo / update flow | operator |
 | H5 (optional, later) | `reactivate`: re-applies the retained source default without requalification, only when `assess` reports `unchanged` | sudo, real inhibitor | operator |
+| H6a to H6i (after a kernel update, hardware campaign) | requalify and `rebind` a new generation: runtime upgrade under maintenance, retire, build, stage, attended vectors, issue authority, generation trial, `rebind`, one routine S4 | sudo, real inhibitor, attended hardware | operator, per sub-gate |
 
-Stop and ask for review if any check differs from its expected output. Unknown means stop. Never retry a failed gate by repeating it: recovery for H2 and H3 is read-only diagnosis first (see the failure section). Never reboot, power-cycle, suspend or hibernate the machine at any point of this procedure.
+Stop and ask for review if any check differs from its expected output. Unknown means stop. Never retry a failed gate by repeating it: recovery for H2 and H3 is read-only diagnosis first (see the failure section). Never reboot, power-cycle, suspend or hibernate the machine at any point of gates H0 to H5. Gate H6 is different: its attended hardware steps (H6e to H6g and H6i) reboot into the staged entries as described there, one at a time; every other H6 step (H6a, H6b, H6d, H6h) must not be interrupted by a reboot or power action.
 
 ### Do not create snapshots before H3
 
@@ -420,6 +421,174 @@ Interrupted or failed run: re-run `reactivate`. It authenticates its own pending
 
 Residual gap: userspace packages outside the UKI (systemd, logind and others) are not assessed items. Only the effective `systemd-hibernate.service` route is checked, so an update to them that the assessment does not see is not covered by `unchanged`.
 
+## Gate H6: requalify and rebind a new generation
+
+Operator approval required, separately for each sub-gate; a prior approval, a green fixture test or an automatic goal continuation is not approval. Precondition: the machine is in inactive package maintenance and `assess` reports `requalification-required` after a kernel update (RESUME.md, 7.2.7 incident). Rationale and state machine: [REBIND-DESIGN.md](REBIND-DESIGN.md); stuck states: [MAINTENANCE-RUNBOOK.md section 9](MAINTENANCE-RUNBOOK.md) (retire) and [section 10](MAINTENANCE-RUNBOOK.md) (rebind). Nothing here is hardware evidence. H6d to H6f and H6h to H6i are attended hardware actions; follow AGENTS.md hardware safety: never restage a replacement `.linux`, never reuse a consumed guard, never repeat a failed vector, keep production `.linux` and `.cmdline` byte-for-byte in every private UKI, and serialise every boot, EFI, module-load and power step. Updates stay allowed for the whole sequence.
+
+The order matters. The runtime upgrade comes FIRST because the installed runtime's guard validates the maintenance chain from the receipt file at its fixed path, and retiring the old pair removes that file; the runtime deployed at H6a resolves it from the custody files the retire step leaves (`pair-retired-receipt.json` plus `pair-retirement.json`, shared contract `hibernate/pair_custody.py`). Live-state note: the machine's current assessment (`recovery-7.2.7-*/assess-7.2.7.json`) is `requalification-required` with `kernel`, `production_uki` and `control_inventory` changed and `driver_modules`/`firmware` unknown; `rebind` accepts that overall class (changed items take precedence over unknown ones) and only refuses a class of `unknown` or `unchanged`.
+
+Common variables used below:
+
+```bash
+S=/var/lib/omarchy/t2-hibernate-product
+NATIVE=$S/runtime/packages/t2-suspend/hibernate/boot_policy_native.py
+EXP=$S/runtime/packages/t2-suspend/experiments        # root-owned, review-pinned copy installed by H6a; never run privileged Python from the workspace
+REL=7.2.7-arch1-Watanare-T2-2-t2
+CAND=<output of verify-hibernation-candidate.py for the target kernel>
+WORK=<new private build tree, outside the ESP>
+```
+
+| Step | Action |
+| --- | --- |
+| H6a | Maintenance runtime upgrade |
+| H6b | Retire the old pair |
+| H6c | Build the new pair (sudo builders) and audit it |
+| H6d | Stage it |
+| H6e | Attended ordinary boots, `test_resume`, S4 vector |
+| H6f | Boot the new source entry; generation trial (`trial.py --generation`) |
+| H6g | Issue the qualification (bound to the trial's record), config and boot policy review |
+| H6h | `rebind` |
+| H6i | One routine S4 |
+
+### H6a: maintenance runtime upgrade
+
+Stage and run exactly as H1 and H2 do, with these differences. The approval protocol is `omarchy-t2-runtime-upgrade-maintenance-approval-v1`. The seven `expected` pins and a fresh UUID4 `approval_id` are as for v2 (`old_config` equals `new_config`, because the configuration is untouched). `unchanged` is exactly `{qualification, hook, marker}`: the SHA-256 of `qualification.json`, of the installed pacman hook and of the exact `package-maintenance.pending` bytes. Limine, boot policy and opt-in are not pinned (boot policy and opt-in must be absent). The new runtime must contain commit `1d1528fb` (volatile state out of the baseline), the rebind engine, `pair_custody.py` and the custody-aware guard. Adapter command (no arguments):
+
+```bash
+sudo -n /usr/bin/python3 -I -B "$S/runtime-upgrade-native.py"
+```
+
+Verify: `runtime-rebind-<new12>.json` and the two `*.before-runtime-<new12>.json` copies exist in `$S/boot-policy-transitions/<maintenance id>/`, `jq -r .runtime_review_sha256 "$S/package-maintenance.pending"` equals the new review digest, the guard exits 0 (`sudo /usr/bin/python3 -I -B $S/runtime/packages/t2-suspend/hibernate/update_guard.py`) and `sudo /usr/bin/python3 -I -B "$NATIVE" assess | jq '{class, changed_items, unknown_items}'` still reports `requalification-required`. After the volatile-state fix `control_inventory` differs only by real control files; `driver_modules` and `firmware` stay `unknown` until rebind (the qualified 7.2.6 module directory is gone). Failures: MAINTENANCE-RUNBOOK.md section 10, "After a runtime upgrade under maintenance that failed".
+
+### H6b: retire the old pair
+
+```bash
+P=$EXP/stage-hibernation-uki-pair.py
+sudo /usr/bin/python3 -I -B "$P" retire-after-production-change --dry-run     # read-only plan
+sudo /usr/bin/python3 -I -B "$P" retire-after-production-change               # attended; re-run if interrupted
+```
+
+Preconditions and recovery: MAINTENANCE-RUNBOOK.md section 9. Journal order: archive, journal, custody, Limine, images, backup, receipt, record. The custody files are written before the live receipt is removed, so the guard keeps validating at every instant. Verify: `sudo jq . $S/pair-retirement.json` (exactly `protocol`, `retired_receipt_sha256`, `source_sha256`, `restore_sha256`), `sudo sha256sum $S/pair-retired-receipt.json` equals both `retired_receipt_sha256` and `jq -r .staged_receipt_sha256 $S/package-maintenance.pending`, the guard exits 0, `assess` still `requalification-required`. Undo only an interrupted retirement with `retire-rollback` (it removes the custody it wrote after restoring the receipt).
+
+### H6c: build the new pair and audit it
+
+Kernel-bound helper modules must be rebuilt for `$REL` and re-pinned before any image is built; a module built for 7.2.6 has the wrong vermagic and the wrong hash. Build each out of tree against `/usr/lib/modules/$REL/build` from its directory under `$EXP` (each has a `Kbuild` and README), record `sha256sum` and `modinfo -F srcversion` and `modinfo -F vermagic`, and have the pins independently reviewed:
+
+| Helper (source directory under `$EXP`) | Where its pin lives |
+| --- | --- |
+| Cold PCI guard, `hibernate-cold-pci-guard` (`mba_hibernate_cold_pci_guard`) | In the tree: `GUARD_SHA256` and `GUARD_SRCVERSION` in `cold-pci-restore-protocol.py` (lines 13 and 14), enforced by `build-hibernation-candidate-uki.py` and the pair audit. srcversion normally does not change without a source change; the sha256 does with the kernel. Update both in a reviewed commit BEFORE building; also the pre-arch guard flags below |
+| Restore marker v2, `hibernate-efi-restore-marker` (`mba_hibernate_efi_restore_marker`) | Not in the tree: passed as `--expected-restore-marker-sha256` and `--expected-restore-marker-srcversion` to the candidate builder (with `--restore-marker-version v2`) and as `--expected-restore-efi-marker-sha256`, `--expected-restore-efi-marker-srcversion`, `--restore-efi-marker-version v2` to the S4 runner; recorded in the built images' `provenance.json` |
+| Postwrite marker v3, `hibernate-efi-postwrite-marker` (`mba_hibernate_efi_postwrite_marker`) | The product config's `marker_pin` `{sha256, srcversion, vermagic, variable_version: "v3"}` (vermagic's first token must be `$REL`, checked by `host_backend.validate_static_inputs`), the trial authorization's `marker_pin`, and `--postwrite-efi-marker-module`, `--postwrite-source-marker-version v3`, `--expected-postwrite-efi-marker-sha256/-srcversion` on the S4 runner |
+| Cold pre-cpu, pre-syscore, pre-arch and pci-pre-arch modules and their header helpers | Only if the pair profile uses them: their `--expected-cold-*` flags (builder `--help` lists all); hard-coded historical pins such as `SOURCE_MODULE_SHA256` in `audit-cold-pre-cpu-return.py` are for the specific old binaries and are not valid for 7.2.7 |
+
+The candidate `$CAND` (patches 0005 to 0017, `candidate-7.2.7-h1`, `provenance.json` records `hardware_qualified: false`) supplies the t2bce modules. Its module file hashes are not reproducible; identify a rebuild by srcversion (core `E6502516231074FB1ADB781`, dma `D8292CC3FFC947C39023071`, vhci `D6A4F0C4742C9FD289568DF`, audio `5D7F99F76022CA6E84DFB8C`, ave `3B8513911A86C7A1E4FEE5A`). The builders run as root so mkinitcpio can embed the unlock key. Build source and restore images into a NEW private directory each, outside the ESP; the production `.linux` and `.cmdline` are read from the current production UKI and preserved byte-for-byte:
+
+```bash
+sudo /usr/bin/python3 -I -B "$EXP/build-hibernation-source-uki.py" --candidate-source "$CAND" \
+  --production-uki /boot/EFI/Linux/omarchy_linux-t2.efi --kernel-release "$REL" --output "$WORK/pair-source" --experiment-id gen-7.2.7-source
+sudo /usr/bin/python3 -I -B "$EXP/build-hibernation-candidate-uki.py" --candidate-source "$CAND" \
+  --production-uki /boot/EFI/Linux/omarchy_linux-t2.efi --kernel-release "$REL" --output "$WORK/pair-restore" --experiment-id cold-pci-guard-fullrestore-v1 --minimal-restore-devices \
+  --restore-marker-module "$WORK/mba_hibernate_efi_restore_marker.ko" --restore-marker-version v2 \
+  --expected-restore-marker-sha256 <sha256> --expected-restore-marker-srcversion <srcversion> \
+  --cold-pci-restore-guard-module "$WORK/mba_hibernate_cold_pci_guard.ko" \
+  --expected-cold-pci-restore-guard-sha256 <GUARD_SHA256> --expected-cold-pci-restore-guard-srcversion <GUARD_SRCVERSION> \
+  <the remaining pair-profile --cold-pci-* flags from the previous generation's provenance.json>
+sudo /usr/bin/python3 -I -B "$EXP/audit-hibernation-uki-pair.py" --source "$WORK/pair-source" --restore "$WORK/pair-restore"
+```
+
+The restore builder enforces `--experiment-id cold-pci-guard-fullrestore-v1` and requires `--minimal-restore-devices` with the cold-PCI flags. Pair outputs go to `$WORK/pair-source` and `$WORK/pair-restore` because `$WORK/source` holds the H6a runtime export. Take the exact restore-side flag set from the qualified 7.2.6 pair's `provenance.json` (unchanged flags stay unchanged; only kernel-bound module paths and pins change). Independent audit of the pair before staging. This is a structural audit, not proof that the pair boots.
+
+### H6d: stage the new pair
+
+```bash
+sudo /usr/bin/python3 -I -B "$P" stage --source "$WORK/pair-source" --restore "$WORK/pair-restore"
+sudo /usr/bin/python3 -I -B "$P" verify
+```
+
+`stage` refuses while an old receipt or image exists (H6b removed them) and writes the new receipt, backup and Limine block.
+
+### H6e: attended ordinary boots, `test_resume` and S4 vector
+
+Owner attended, serialised, one at a time. The stock `Omarchy.linux-t2` entry stays the default; the staged one-shots are armed and consumed by the runners.
+
+```bash
+sudo /usr/bin/python3 -I -B "$P" arm-source                                    # then reboot into the source entry (attended)
+sudo /usr/bin/python3 -I -B "$EXP/verify-hibernation-uki-pair-source.py" --source "$WORK/pair-source" --restore "$WORK/pair-restore" --role source
+sudo /usr/bin/python3 -I -B "$EXP/run-hibernation-uki-pair-test-resume.py" --source "$WORK/pair-source" --restore "$WORK/pair-restore" \
+  --physical-input-evidence <evidence> --validate-only --operator-attended
+sudo /usr/bin/python3 -I -B "$EXP/run-hibernation-uki-pair-test-resume.py" --source "$WORK/pair-source" --restore "$WORK/pair-restore" \
+  --physical-input-evidence <evidence> --execute --operator-attended --expected-source-sha256 <source sha256>
+sudo /usr/bin/python3 -I -B "$EXP/run-hibernation-uki-pair-s4.py" --source "$WORK/pair-source" --restore "$WORK/pair-restore" \
+  --test-resume-proof-source <proof> --disk-mode platform --marker-backend postwrite-efi --operator-attended --validate-only \
+  --postwrite-efi-marker-module "$WORK/mba_hibernate_efi_postwrite_marker.ko" --postwrite-source-marker-version v3 \
+  --expected-postwrite-efi-marker-sha256 <sha256> --expected-postwrite-efi-marker-srcversion <srcversion> \
+  --restore-efi-marker-module "$WORK/mba_hibernate_efi_restore_marker.ko" --restore-efi-marker-version v2 \
+  --expected-restore-efi-marker-sha256 <sha256> --expected-restore-efi-marker-srcversion <srcversion>
+# the same command with --execute --expected-pair-vector <vector> consumes the durable pair guard: run only with separate explicit approval
+sudo /usr/bin/python3 -I -B "$P" disarm-restore                                # only when the runner says an owned restore one-shot remains
+```
+
+Each `--execute` is a one-time hardware vector: a failed or ambiguous attempt is terminal, is preserved as evidence and is never repeated. Ordinary boot success does not establish S4 safety. Use the runners' own `--help` for the exact evidence arguments.
+
+### H6f: boot the new source entry, then the generation trial
+
+The generation trial is a one-use, unqualified hardware run whose durable terminal record is what the qualification must later point at. Its readiness check requires the current boot to be the staged source entry: `LoaderEntrySelected` must be `MBA-T2-hibernation-source-<first 16 hex of the source sha256>` (`trial.verify_readiness`), AC power online, the source marker module not loaded and no EFI stage or override variables. So first, attended, boot into the source entry (the one-shot armed by `arm-source` in H6e is consumed by that boot; re-arm it if this is a later session) and confirm:
+
+```bash
+sudo /usr/bin/python3 -I -B "$P" arm-source && systemctl reboot    # attended; select nothing manually: the one-shot picks the source entry
+sudo /usr/bin/python3 -I -B "$EXP/verify-hibernation-uki-pair-source.py" --source "$WORK/pair-source" --restore "$WORK/pair-restore" --role source
+```
+
+The trial's two inputs are written by the operator or orchestrator as root, never by this code, from audited evidence, root-owned 0600:
+
+- `config.json` (schema `omarchy-t2-explicit-trial-config-v1`, exact keys `source_directory restore_directory production_uki source_tree marker_file marker_pin manifest audited_details_sha256 staged_receipt_sha256 retire_slots`). Provenance: the artifact paths are the private build outputs of H6c; `manifest` and `audited_details_sha256` are what the audit derives (`trial.py inspect` prints `manifest_sha256`; a mismatch refuses); `staged_receipt_sha256` is the live NEW receipt's hash; `marker_file`/`marker_pin` are the postwrite marker v3 built and pinned for this kernel in H6c. `retire_slots` MUST be `true`: only a retiring trial reaches the terminal `reconciled` cycle that H6g and `rebind` require.
+- `authorization.json` (protocol `omarchy-t2-product-one-use-trial-v1`, `qualified: false`). Provenance: written by the operator after reviewing the audit, with `manifest_sha256` and `audited_details_sha256` of this pair, `original_boot_id` equal to the CURRENT boot id (`/proc/sys/kernel/random/boot_id`), a fresh `authorization_id`, the same `marker_pin`, and `physical_acceptance` `{boot_id, authorization_id, accepted: true, method: "operator-attended-cold-power"}` recording the operator's explicit attended acceptance. It is permission for one run, not qualification.
+
+Provision the fresh root named by the first 12 hex digits of the manifest digest (`TX.digest(manifest)`) with real `0700` directories; the original trial root and its consumed guard are never reused:
+
+```bash
+G=/var/lib/omarchy/t2-hibernate-trial/generations/<manifest12>
+sudo install -d -m 0700 -o root -g root "$G" "$G/guards" "$G/ledger" "$G/archives"
+sudo install -m 0600 -o root -g root -T -- <reviewed>/trial-config.json "$G/config.json"
+sudo install -m 0600 -o root -g root -T -- <reviewed>/trial-authorization.json "$G/authorization.json"
+T=$S/runtime/packages/t2-suspend/hibernate/trial.py
+sudo /usr/bin/python3 -I -B "$T" --generation <manifest12> inspect
+sudo /usr/bin/python3 -I -B "$T" --generation <manifest12> execute            # one use; separate explicit approval
+```
+
+It refuses if the audited manifest is not the directory's, if the manifest is the original trial's, or if this generation's guard is already consumed. `repair-constructor` never applies to a generation. After a successful run the durable terminal record is `$G/ledger/cycle-<cycle id>.json` in state `reconciled` (plus the consumed `$G/guards/trial-consumed.json` naming the same cycle and an unblocked `$G/ledger/state.json`). A failed or ambiguous trial is terminal for that generation: never repeat its vector.
+
+### H6g: issue the qualification, config and boot policy review
+
+Externally, after independent review of the trial record. The qualification is still written by the operator or orchestrator, but it can only point at a real successful trial: `rebind` requires `evidence_sha256` to equal the SHA-256 of the exact bytes of `$G/ledger/cycle-<cycle id>.json`:
+
+```bash
+sudo sha256sum "$G"/ledger/cycle-*.json          # the value for evidence_sha256
+```
+
+Qualification: `{"protocol": "omarchy-t2-product-cycle-v1", "manifest_sha256": <digest of the new manifest>, "evidence_sha256": <that sha256>, "qualified": true}`. Product config: schema v2 for the new pair (`staged_receipt_sha256` is the live NEW receipt's hash, the v3 `marker_pin`, `power_policy` present). Boot policy review: `boot_policy.prepare` output for the new receipt with `approved: true`. Stage all three root-owned 0600, under distinct names:
+
+```bash
+for f in rebind-config.json rebind-qualification.json rebind-boot-policy-review.json; do
+  sudo install -m 0600 -o root -g root -T -- "<reviewed dir>/$f" "$S/$f"
+done
+sudo sync
+```
+
+### H6h: `rebind`
+
+Read-only checks first (MAINTENANCE-RUNBOOK.md section 10), then:
+
+```bash
+sudo /usr/bin/python3 -I -B "$NATIVE" rebind
+```
+
+Do not reboot, power-cycle, suspend or hibernate while it runs. `rebind` reads and validates the generation trial record (private real directories, no symlinks, reconciled cycle for this manifest, consumed guard naming it, evidence digest) before any write. SIGHUP, SIGTERM and SIGINT (a dropped ssh session, Ctrl-C) are converted to an exit that releases `db.lck`; the pending veto stays and re-running recovers. SIGKILL or power loss can leak `db.lck`: confirm with `pgrep -ax pacman` that no pacman runs, then follow MAINTENANCE-RUNBOOK.md section 4 and re-run `rebind`. Success prints canonical JSON with `"rebound": true`, `"requalification_required": false`, `"live_execution": true`, `"power_operation": false`. Afterwards `config.json`, `qualification.json`, `boot-policy-review.json`, `limine.conf.before-source-default` and `boot-policy.json` are the new generation's, the opt-in exists, the marker and pending are gone and the old set is archived under `boot-policy-transitions/<id>`. Interrupted: re-run it. While the machine is ACTIVE after `rebind`, pacman is blocked by the guard (`boot-policy.json` and the opt-in exist) until the next `maintenance` publish, exactly as before H3; run `maintenance` before any package update.
+
+### H6i: one routine S4
+
+Attended, separately approved: the first `product.py hibernate` cycle under the new manifest (via `omarchy-t2-hibernate-product.service` or `sudo /usr/bin/python3 -B $S/runtime/packages/t2-suspend/hibernate/product.py check` first, then `hibernate`). The product ledger chains it to the previous terminal cycle. Until it passes, treat the generation as bound but unproven.
+
 ## Failure and rollback handling
 
 General rules: fail closed. There is no automatic retry, no replay and no rollback command. The retained `*-retained-<OLD12>-before-<NEW12>*` files preserve the old runtime, review, bootstrap and config as evidence, but restoring them is a separately reviewed operation, not part of this procedure. Do not run the adapter or publisher a second time to "finish" a run. Never replay a consumed deployment or any approval whose consumed file exists: a replay is refused before any lock because the installed review no longer matches `old_review` (`runtime_upgrade_native.py:198`, in `_verified_engines` before `_locks`; the consumed-approval file is checked again at `runtime_deployment.py:378-380`), and even if it were not, replaying is forbidden.
@@ -435,6 +604,9 @@ General rules: fail closed. There is no automatic retry, no replay and no rollba
 | H3 | Marker written or not | MAINTENANCE-RUNBOOK.md sections 1 to 3 and 5 |
 | H4 | Update aborted by the guard before mutation | Read the guard message; runbook sections 2 and 3; never bypass the hook |
 | H5 | Refused with zero writes, or interrupted with an activation pending | Refusal: read the message above, nothing changed. Interrupted: do not reboot; re-run `reactivate` (MAINTENANCE-RUNBOOK.md section 6) |
+| H6a | Refused before the barrier, or barrier retained | As H2; the maintenance recovery also settles the marker binding (MAINTENANCE-RUNBOOK.md section 10) |
+| H6b | Refused, or interrupted retirement | MAINTENANCE-RUNBOOK.md section 9: re-run, or `retire-rollback` |
+| H6h | Refused with zero writes, or interrupted with a rebind pending | Refusal: read the message. Interrupted: do not reboot; re-run `rebind` (MAINTENANCE-RUNBOOK.md section 10) |
 
 If the machine loses power, hangs or reboots at any gate, do not assume state: on the next boot, reconcile with your own record of this machine, `git`, and the read-only inventory in the runbook before any further action, and do not try to complete the gate.
 

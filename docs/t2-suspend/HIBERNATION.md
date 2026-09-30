@@ -36,6 +36,7 @@ omarchy setup t2-hibernate status        # read-only summary, no privilege
 omarchy setup t2-hibernate assess        # classify the current generation against the qualified baseline
 omarchy setup t2-hibernate maintenance   # hold hibernation off before an update
 omarchy setup t2-hibernate reactivate    # re-apply the source default when assess says "unchanged"
+omarchy setup t2-hibernate rebind        # leave maintenance on a requalified, staged generation (gate H6)
 omarchy setup t2-hibernate activation    # reviewed source-default activation
 omarchy setup t2-hibernate deactivation  # restore the exact stock boot policy
 ```
@@ -49,14 +50,14 @@ The prototype guard blocks every package transaction while hibernation is active
 3. **Assess.** `assess` recomputes the baseline items read-only and reports `unchanged`, `requalification-required` or `unknown`. Snapshot churn in `limine.conf` does not count as a change.
 4. **Reactivate or requalify.** If nothing the qualification depends on changed, `reactivate` re-applies the retained source default without requalification. Otherwise hibernation stays off until the pair is rebuilt and requalified. Interrupted transitions recover by re-running the same action; the [runbook](MAINTENANCE-RUNBOOK.md) covers the stuck states.
 
-A `linux-t2` kernel update therefore correctly ends in `requalification-required`, which is what happened to the reference machine on 7.2.6 to 7.2.7. After a production kernel change the stale staged pair can be removed with the reviewed `stage-hibernation-uki-pair.py retire-after-production-change` mode ([runbook section 9](MAINTENANCE-RUNBOOK.md)). A generation-rebind path (maintenance to a new qualified generation) is in development on the working branch and will be added to this pull request after its audit.
+A `linux-t2` kernel update therefore correctly ends in `requalification-required`, which is what happened to the reference machine on 7.2.6 to 7.2.7. After a production kernel change the stale staged pair can be removed with the reviewed `stage-hibernation-uki-pair.py retire-after-production-change` mode ([runbook section 9](MAINTENANCE-RUNBOOK.md)). A `rebind` action leaves maintenance on a newly requalified generation (per-generation one-use trial state, pair custody records, and a maintenance-aware runtime upgrade); see [REBIND-DESIGN.md](REBIND-DESIGN.md), gate H6 of [DEPLOYMENT.md](DEPLOYMENT.md) and [HELPERS-7.2.7.md](HELPERS-7.2.7.md). It is audited and synthetic-tested but has not been exercised on hardware.
 
 ## Limits
 
 - Qualified only on one MacBookAir9,1 with kernel 7.2.6; the rebased 7.2.7 candidate is offline-verified only and its requalification is pending an attended test. Other models and kernels need their own qualification.
 - Not automatic: no migration, installer or default enables it, and there is no unattended rollout.
 - The 30 percent reserve check is a provisional engineering guard, not a measured battery or endurance policy.
-- A marker rebind after requalification is not implemented.
+- The marker rebind after requalification is implemented but has not been exercised on hardware.
 - Distribution of the private UKI build (who builds, signs and stages it on a user machine) is an open question; today it is an operator procedure.
 - The runtime carries some reference-machine constants that were part of the tested bytes (for example a fixed repair unit name in `trial.py`); they are deliberately left as tested.
 

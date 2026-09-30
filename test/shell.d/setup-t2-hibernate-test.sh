@@ -66,7 +66,7 @@ try {
   assert(unreadable.stdout.includes('root-private'), 'status says the runtime needs root to inspect')
 
   // every action reaches the fixed native adapter with the right privilege route
-  for (const action of ['assess', 'maintenance', 'reactivate', 'activation', 'deactivation']) {
+  for (const action of ['assess', 'maintenance', 'reactivate', 'rebind', 'activation', 'deactivation']) {
     assertDeepEqual(run({args: [action], role: 'root'}).calls, [native(action)], `${action} as root runs the native transition directly`)
     assertDeepEqual(run({args: [action], terminal: true}).calls, [`sudo ${native(action).replace('native ', path.join(commands, 'native') + ' ')}`, native(action)], `${action} from a terminal uses sudo`)
     assertDeepEqual(run({args: [action]}).calls, [`pkexec ${native(action).replace('native ', path.join(commands, 'native') + ' ')}`, native(action)], `${action} without a terminal uses pkexec`)

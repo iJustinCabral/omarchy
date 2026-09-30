@@ -341,7 +341,7 @@ Preconditions (all checked, all read-only until they pass; any failure changes n
 
 Limine drift is judged with `boot_policy.limine_canonical`, imported and not reimplemented. The exact pair block rebuilt from the receipt is removed from the current bytes; both that remainder and the pre-staging backup are canonicalised (snapshot region removed) and the production path line hash is masked. The two must then be byte-equal, so only the production hash and the `limine-snapper-sync` snapshots may differ. The new hash must equal the BLAKE2b of the current production UKI, which proves the kernel update finished. Foreign entries, `default_entry`, cmdline, unrecognised snapshot text or edited pair text refuse. Do not edit `limine.conf` by hand to make it pass (section 7).
 
-Steps: archive to `/var/lib/omarchy-t2-hibernation-pair-retired/<receipt-sha16>-<n>/` (0700: images, receipt, backup, current `limine.conf`, `manifest.json` of hashes), fsync, write `journal.json`, remove only the pair block from the current Limine bytes (the new production hash and snapshots are kept; the old backup is never restored over them), remove the two ESP images, the backup and the receipt, then write `retirement.json` chaining to the old receipt SHA-256. Each step is detected from disk, so an interrupted run is finished by running it again; `retire-rollback` instead restores the archived images, backup, block and receipt of an interrupted (not completed) retirement. A second run after success only reports `already-retired`. `stage` may then run for the new generation.
+Steps: archive to `/var/lib/omarchy-t2-hibernation-pair-retired/<receipt-sha16>-<n>/` (0700: images, receipt, backup, current `limine.conf`, `manifest.json` of hashes), fsync, write `journal.json`, remove only the pair block from the current Limine bytes (the new production hash and snapshots are kept; the old backup is never restored over them), remove the two ESP images, the backup and the receipt, then write `retirement.json` (in the archive) chaining to the old receipt SHA-256. Before the live receipt is removed it also leaves the receipt custody files `pair-retired-receipt.json` and `pair-retirement.json` in `/var/lib/omarchy/t2-hibernate-product` (contract in `hibernate/pair_custody.py`), so the maintenance chain keeps validating; a stale record of an earlier generation is replaced atomically and `retire-rollback` removes only custody that chains to the receipt it restores. Rebinding onto the new pair is [section 10](#10-requalify-and-rebind-a-new-generation). Each step is detected from disk, so an interrupted run is finished by running it again; `retire-rollback` instead restores the archived images, backup, block and receipt of an interrupted (not completed) retirement. A second run after success only reports `already-retired`. `stage` may then run for the new generation.
 
 Prerequisites and recovery for retirement: the fixed physical-cycle lock `/var/lib/omarchy/t2-hibernate-trial/physical-cycle.lock` (0600) must already exist, since maintenance entry needs it too; retire refuses if it is missing and never creates it. SIGTERM, SIGHUP and SIGINT are handled so an interrupted run releases the `db.lck` it created and only that one. If a `SIGKILL` or power loss leaves a stale `/var/lib/pacman/db.lck` (the next run refuses with `db.lck is held`), confirm no pacman is running (`pgrep -ax pacman`), remove the stale `db.lck`, then rerun `retire-after-production-change`. Limine is re-read immediately before it is written, so a concurrent `limine-snapper-sync` rewrite is re-judged and preserved, not reverted. After `retire-rollback` the aborted archive keeps `journal.aborted.json` and the next retirement uses a fresh archive index.
 
@@ -352,8 +352,76 @@ sudo /usr/bin/python3 -I -B "$P" retire-after-production-change             # at
 sudo /usr/bin/python3 -I -B "$P" retire-rollback                            # only to undo an interrupted retirement
 ```
 
+## 10. Requalify and rebind a new generation
+
+Use this when `assess` reports `requalification-required` (a kernel update changed the production UKI, kernel, control files or the stock Limine projection) and you want ACTIVE source-default hibernation again on the new kernel. Design rationale: [REBIND-DESIGN.md](REBIND-DESIGN.md). The whole sequence is an operator gate list in [DEPLOYMENT.md, gate H6](DEPLOYMENT.md); this section is the reference for the states you can meet. `rebind` issues no qualification and is not power permission; hibernation is not proven until the attended qualification evidence exists and one routine S4 has been run afterwards.
+
+### Sequence at a glance
+
+1. Runtime upgrade UNDER MAINTENANCE, first, while the old pair and its receipt are still intact (the installed guard reads the fixed receipt path). It deploys a runtime that contains the rebind engine, the receipt custody resolver and the volatile-state baseline fix. It uses the maintenance approval protocol (DEPLOYMENT.md, gate H6a).
+2. Retire the old pair with the stager `retire-after-production-change` mode (section 9). It deletes the old receipt, images and Limine entries and leaves `pair-retired-receipt.json` and `pair-retirement.json` in the product state directory. Updates stay allowed and `assess` keeps reporting `requalification-required`.
+3. Build and audit the new pair from the new production UKI (private candidate stack; never restage a replacement `.linux`), stage it, and run the attended ordinary boots, `test_resume` and S4 qualification. A one-use trial for the new manifest uses `trial.py --generation <manifest12>`; the original trial root and its consumed guard are never reused or reset.
+4. Run the one-use generation trial (`trial.py --generation <manifest12>`, with `retire_slots: true`), then externally issue the qualification, the product config (schema v2, battery policy) and the boot policy review for the new receipt. The qualification's `evidence_sha256` must be the SHA-256 of the trial's reconciled `generations/<manifest12>/ledger/cycle-<id>.json`. Stage them, root-owned mode 0600, as `rebind-qualification.json`, `rebind-config.json` and `rebind-boot-policy-review.json` in the product state directory.
+5. `sudo /usr/bin/python3 -I -B "$NATIVE" rebind`.
+6. One routine S4 with the product dispatcher, attended.
+
+### Read-only check before `rebind`
+
+```bash
+S=/var/lib/omarchy/t2-hibernate-product
+NATIVE=$S/runtime/packages/t2-suspend/hibernate/boot_policy_native.py
+sudo /usr/bin/python3 -I -B "$NATIVE" assess | jq '{class, changed_items, unknown_items}'   # expect requalification-required
+sudo jq . "$S/pair-retirement.json"                                                             # protocol omarchy-t2-pair-retirement-v1
+sudo sha256sum "$S/pair-retired-receipt.json" /var/lib/omarchy-t2-hibernation-pair/receipt.json
+sudo jq -r .staged_receipt_sha256 "$S/package-maintenance.pending"                              # equals retired_receipt_sha256 and the retained receipt's hash
+sudo sha256sum "$S/rebind-config.json" "$S/rebind-qualification.json" "$S/rebind-boot-policy-review.json"
+sudo jq -r .staged_receipt_sha256 "$S/rebind-config.json"                                       # equals the LIVE (new) receipt hash
+```
+
+### Refusals (all with zero writes; the marker stays and updates stay allowed)
+
+| Message | Meaning |
+| --- | --- |
+| `generation unchanged: use reactivate` | Nothing changed; this is class (a). |
+| `compatibility unknown: ...` | The baseline is missing or invalid, or an item could not be read. `rebind` needs a definite `requalification-required`; there is no override. |
+| `Reviewed runtime differs from the maintenance intent; upgrade the runtime under maintenance first` | Step 1 was skipped. |
+| `The old pair is still staged` | Step 2 was skipped. |
+| `Pair retirement record required` / `does not chain` / `Retained retired receipt` | The stager's custody files are missing, foreign or for another receipt. The guard refuses updates in the same way. |
+| `Staged replacement authority required` / `does not bind the staged pair receipt` / `not bound to this product manifest` | A staged file is missing or does not bind the new pair and manifest. |
+| `Unrelated Limine drift: ... staged pair bytes` | `/boot/limine.conf` differs from the staged pair by more than the snapshot region (for example another update ran after staging); restage the pair. |
+| a product validation, resume, deployment or saved-image refusal | The staged generation is not qualified as staged. |
+| `Qualification evidence does not bind the generation trial's reconciled cycle`, `Generation trial state required`, `Consumed generation trial guard required`, `Generation trial cycle is not reconciled`, `Exactly one generation trial cycle required`, `Private real generation trial directory required` | The qualification does not point at a real, successful, consumed trial of this manifest under `/var/lib/omarchy/t2-hibernate-trial/generations/<manifest12>/`; a record of the original trial root never counts. |
+| `A retired ... image is still on the ESP` | The guard's retirement check: an ESP image still has a retired image's hash; re-run the stager retire. |
+
+### Interrupted or failed `rebind`
+
+A dropped ssh session, Ctrl-C or SIGTERM is converted to an exit that releases `/var/lib/pacman/db.lck`, leaving the pending in place (sleep and updates stay vetoed): re-run `rebind`. SIGKILL or power loss cannot be caught and can leak `db.lck` (the next run then refuses with a `db.lck` error): confirm no pacman is running, remove it only after the section 4 checks, and re-run.
+
+`source-default-activation.pending` exists and `jq -r .protocol` prints `omarchy-t2-package-rebind-intent-v1` (anything else is the runtime upgrade barrier or a reactivation: do not run `rebind`; use section 6 or the DEPLOYMENT.md failure table). Sleep and updates are refused; `maintenance` and `reactivate` name `rebind`. Do not reboot while it exists: the boot line may already be changed.
+
+Re-run the same command; never delete the pending, an archive file or a staged file by hand:
+
+```bash
+sudo /usr/bin/python3 -I -B "$NATIVE" rebind
+```
+
+| State found | What re-running does |
+| --- | --- |
+| Pending only, or archive partly written | Writes `rollback.json` and removes the pending; a torn archive directory is left as noise |
+| Some authority files installed, boot config untouched | Restores each installed file from the archived old bytes, writes `rollback.json`, removes the pending |
+| Boot-config line changed, with or without the opt-in, or the post-checks failed | Reverses that one line on the current bytes, removes the opt-in and `boot-policy.json`, restores the old authority, re-verifies inactive maintenance, writes `rollback.json`, removes the pending |
+| `completion.json` present, marker present | Re-runs the ACTIVE checks; if they pass it removes the marker and the pending, otherwise it rolls back |
+| Marker gone, completion present | Verifies ACTIVE and removes the pending |
+
+After `"rolled_back": true` the machine is in ordinary inactive maintenance again, byte-identical to before, with the retired-pair evidence and the new pair still in place, and a new `rebind` may be attempted. A refusal on re-run (`... is neither the old nor the new bytes`, `Archived ... differs`, `Unrelated Limine drift`) changes nothing and means a foreign write happened: stop and ask for review.
+
+### After a runtime upgrade under maintenance that failed
+
+The adapter keeps `source-default-activation.pending` and `runtime-upgrade.pending` (protocol `omarchy-t2-runtime-upgrade-maintenance-intent-v1`) and refuses updates. Its recovery restores the durable veto and then settles the marker binding: marker, `boot-policy-transitions/<id>/maintenance-intent.json` and `generation-baseline.json` all become exactly the new form when the new runtime review is installed, or exactly the old bytes when the old one is. The old bytes are always retained first as `maintenance-intent.before-runtime-<new12>.json` and `generation-baseline.before-runtime-<new12>.json` next to `runtime-rebind-<new12>.json`. A process killed mid-rewrite cannot run that recovery; compare the three files with those copies (the marker's only difference is `runtime_review_sha256`; the baseline's is `maintenance_intent_sha256`) and escalate rather than editing by hand.
+
 ## Summary of gaps
 
-- No code path re-publishes a new resume tuple, or retires maintenance, when the swapfile or cmdline changed; only restoring the original topology is supported today.
+- No code path re-publishes a new resume tuple, or retires maintenance, when the swapfile or cmdline changed; only restoring the original topology is supported today. `rebind` requires the derived resume target to equal the archived one.
+- `rebind` needs the stager `retire` mode's custody files (section 9) and an externally authored boot policy review; neither is produced by this repository's runtime code.
 - Regenerating the production UKI with `limine-mkinitcpio` is the repo's normal tool, but this configuration's preservation of `default_entry: 2` and the entry hash was not confirmed from code.
 - Journal identifiers for the publisher and guard are unconfirmed.
