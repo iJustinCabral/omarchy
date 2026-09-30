@@ -151,7 +151,8 @@ def platform(root, receipt, boot, attempt):
   loaded = {line.split()[0] for line in V16.read(root, Path("proc/modules")).decode().splitlines() if line.split()}
   loaded |= {item.name for item in V16.path(root, Path("sys/module")).iterdir()}
   if any(name.startswith("mba_hibernate_") or "abort" in name.lower() for name in loaded): raise ValueError("Marker/cold/abort writer loaded")
-  mounts = [line.split() for line in V16.read(root, Path("proc/self/mounts")).decode().splitlines() if len(line.split()) >= 4 and line.split()[1] == "/"]
+  # /proc/self is a native symlink, so resolve it with the v16 confined runtime resolver
+  mounts = [line.split() for line in HOST.HOST._raw(V16.runtime_path(root, Path("proc/self/mounts"))).decode().splitlines() if len(line.split()) >= 4 and line.split()[1] == "/"]
   if len(mounts) != 1 or mounts[0][0:3] != ["/dev/mapper/root", "/", "btrfs"] or "subvol=/@" not in mounts[0][3].split(","):
     raise ValueError("Primary encrypted root changed")
   for role, relative in {**PAIR.IMAGES, "production": Path("boot/EFI/Linux/omarchy_linux-t2.efi")}.items():

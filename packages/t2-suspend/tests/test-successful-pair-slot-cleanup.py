@@ -32,7 +32,8 @@ class Cleanup(unittest.TestCase):
     self.write("proc/sys/kernel/osrelease", KERNEL)
     self.write("proc/modules", "t2bce_core 0 0 - Live 0")
     (self.root / "sys/module").mkdir(parents=True)
-    self.write("proc/self/mounts", "/dev/mapper/root / btrfs rw,subvol=/@ 0 0")
+    self.write("proc/4242/mounts", "/dev/mapper/root / btrfs rw,subvol=/@ 0 0")
+    (self.root / "proc/self").symlink_to("4242")  # native /proc/self is a symlink
     images, receipt = {}, {"images": {}, "runtime_stack_sha256": "c" * 64}
     for role, relative in {**PAIR.IMAGES, "production": Path("boot/EFI/Linux/omarchy_linux-t2.efi")}.items():
       raw = ("synthetic " + role).encode()
