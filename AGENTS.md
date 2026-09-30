@@ -10,6 +10,7 @@ matching guide before starting:
 - [`agents/skills/acceptance-tests.md`](agents/skills/acceptance-tests.md) - writing or running graphical acceptance tests under `test/acceptance.d/`
 - [`agents/skills/visual-verification.md`](agents/skills/visual-verification.md) - verifying any change with a visual effect in the running UI
 - [`agents/skills/migrations.md`](agents/skills/migrations.md) - creating or changing migrations under `migrations/`
+- [`agents/skills/t2-hibernation.md`](agents/skills/t2-hibernation.md) - working on T2 hibernation (`packages/t2-suspend/`, the MacBookAir9,1 boot images, `docs/t2-suspend/`)
 
 # T2 Hibernation Hardware Safety
 
