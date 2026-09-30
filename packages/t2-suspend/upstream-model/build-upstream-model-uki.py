@@ -8,7 +8,9 @@ MODULES (D1, so the whole t2bce family is the candidate) and an initramfs-only m
 blacklist keeps brcmfmac, brcmfmac-bca, brcmfmac-cyw and brcmfmac-wcc out of the restore
 kernel (D2, variant U1b). No marker hook, cold PCI guard or minimal-restore initramfs is
 present. The builder changes no installed boot image, module or power setting and creates
-no boot entry. Run it as root from root-owned inputs; the output directory must not exist.
+no boot entry. Run it as root from a root-owned export of the reviewed commit (the builder itself,
+common.py and the install hook must be root-owned and not group/world writable, like every other
+input); the output directory must not exist.
 """
 
 import argparse
@@ -76,6 +78,40 @@ def require_root_tree(path, *, directory=None, owner=0):
     metadata = item.lstat()
     if metadata.st_uid != owner or metadata.st_mode & 0o022:
       raise ValueError("Build input must be root-owned and not group/world writable: " + str(item))
+
+
+def shell_arrays(config):
+  """HOOKS, FILES, BINARIES and MODULES as bash sees them after sourcing a config in a subshell."""
+  script = ('source "$1"; for name in HOOKS FILES BINARIES MODULES; do declare -n array=$name; '
+            'printf "%s\\0" "@$name" "${array[@]}"; done')
+  output = subprocess.run(("bash", "-c", script, "bash", str(config)), check=True, capture_output=True).stdout
+  result, current = {}, None
+  for token in output.split(b"\0")[:-1]:
+    text = token.decode()
+    if text.startswith("@") and text[1:] in ("HOOKS", "FILES", "BINARIES", "MODULES"):
+      current = text[1:]
+      result[current] = []
+    else:
+      result[current].append(text)
+  return result
+
+
+def audit_config(private, stock):
+  """Build-time arrays equal stock plus exactly the declared deltas."""
+  before, after = shell_arrays(stock), shell_arrays(private)
+  if after["HOOKS"] != before["HOOKS"] + [C.HOOK]:
+    raise ValueError("Build HOOKS differ from stock plus the blacklist hook")
+  for name in ("FILES", "BINARIES"):
+    if after[name] != before[name]:
+      raise ValueError("Build " + name + " differ from stock")
+  expected = before["MODULES"] + ([] if "t2bce_audio" in before["MODULES"] else ["t2bce_audio"])
+  if after["MODULES"] != expected:
+    raise ValueError("Build MODULES differ from stock plus t2bce_audio")
+  return {"hooks": after["HOOKS"], "modules": after["MODULES"], "files": after["FILES"], "binaries": after["BINARIES"]}
+
+
+def stock_config_text():
+  return private_config().split("\n# D1:")[0] + "\n"
 
 
 def require_stock_config(conf=HOST_CONF, directory=HOST_CONF_DIRECTORY):
@@ -194,10 +230,19 @@ def manifest_diff(production, candidate, release, *, dependencies=(), production
   removed = sorted(set(production) - set(candidate))
   changed = sorted(path for path in set(production) & set(candidate) if production[path] != candidate[path])
   allowed_changed, allowed_added, disallowed = [], [], []
+  # The stock t2bce_{dma,core,vhci} ship as .ko.zst; the substituted copies are plain .ko. Exactly
+  # that swap is allowed, per module, and nothing else may be removed.
+  swapped = {}
+  for name in ("t2bce_dma", "t2bce_core", "t2bce_vhci"):
+    stem = tree + "kernel/drivers/staging/t2bce/" + name + "/" + name
+    swapped[stem + ".ko.zst"] = stem + ".ko"
   for path in removed:
+    if path in swapped and swapped[path] in added:
+      continue
     disallowed.append("removed: " + path)
   for path in added:
-    if path == C.BLACKLIST_DESTINATION or path in audio_paths:
+    if path == C.BLACKLIST_DESTINATION or path in audio_paths or path in swapped.values() and any(
+        old in removed for old, new in swapped.items() if new == path):
       allowed_added.append(path)
     else:
       disallowed.append("added: " + path)
@@ -260,7 +305,22 @@ def audio_dependencies(extracted, release):
   output = BASE.run(("modprobe", "--config", extracted / "etc/modprobe.d", "--dirname", extracted,
                      "--set-version", release, "--show-depends", "t2bce_audio"), capture=True).stdout
   paths = [line.split()[1] for line in output.splitlines() if line.startswith("insmod ")]
-  return [path[len(str(extracted)):] if path.startswith(str(extracted)) else path for path in paths]
+  return normalize_dependencies(paths, extracted)
+
+
+def normalize_dependencies(paths, extracted):
+  """modprobe --dirname prints <extracted>/lib/modules/... (lib is a symlink to usr/lib); return usr/lib paths."""
+  result = []
+  for path in paths:
+    for prefix in (str(extracted), str(Path(extracted).resolve())):
+      if path.startswith(prefix + "/"):
+        path = path[len(prefix):]
+        break
+    path = "/" + path.lstrip("/")
+    if path.startswith("/lib/"):
+      path = "/usr" + path
+    result.append(path)
+  return result
 
 
 def build_initrd(work, module_root, release, expected, production_initrd):
@@ -270,6 +330,10 @@ def build_initrd(work, module_root, release, expected, production_initrd):
   config = work / "upstream-model-mkinitcpio.conf"
   config.write_text(private_config())
   config.chmod(0o600)
+  stock = work / "stock-mkinitcpio.conf"
+  stock.write_text(stock_config_text())
+  stock.chmod(0o600)
+  config_audit = audit_config(config, stock)
   initrd = work / "upstream-model.initrd"
   BASE.run((
     "env",
@@ -302,6 +366,7 @@ def build_initrd(work, module_root, release, expected, production_initrd):
     production_config=(production_tree / "config").read_text(),
     candidate_config=(extracted / "config").read_text(),
   )
+  blacklist_report["config_arrays"] = config_audit
   return initrd, selected, blacklist_report, diff, production_manifest, candidate_manifest
 
 
@@ -327,6 +392,8 @@ def main():
   require_root_tree(candidate_source, directory=True)
   require_root_tree(production, directory=False)
   require_stock_config()
+  require_root_tree(INSTALL_HOOKS, directory=True)
+  require_root_tree(HERE / "common.py", directory=False)
   output.parent.mkdir(parents=True, exist_ok=True)
   os.umask(0o077)
 

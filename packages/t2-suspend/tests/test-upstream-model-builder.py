@@ -102,25 +102,26 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-builder-") as temporary:
 # Manifest diff: only the declared deltas pass.
 release = "7.2.7-test-t2"
 tree_path = "usr/lib/modules/" + release + "/"
+stem = tree_path + "kernel/drivers/staging/t2bce/"
 production = {
   "init": "file:aa:755",
   "config": "x",
   tree_path + "modules.dep.bin": "file:01:644",
-  tree_path + "kernel/drivers/staging/t2bce/t2bce_core/t2bce_core.ko": "file:old1:644",
-  tree_path + "kernel/drivers/staging/t2bce/t2bce_dma/t2bce_dma.ko": "file:old2:644",
-  tree_path + "kernel/drivers/staging/t2bce/t2bce_vhci/t2bce_vhci.ko": "file:old3:644",
+  stem + "t2bce_core/t2bce_core.ko.zst": "file:old1:644",
+  stem + "t2bce_dma/t2bce_dma.ko.zst": "file:old2:644",
+  stem + "t2bce_vhci/t2bce_vhci.ko.zst": "file:old3:644",
   "etc/modprobe.d/brcmfmac.conf": "file:bb:644",
 }
 prod_config = 'MODULES="t2bce_vhci hid_apple"\nHOOKS="udev encrypt resume"\nEARLYHOOKS="udev"\nLATEHOOKS="plymouth"\nCLEANUPHOOKS="udev"\nEMERGENCYHOOKS="plymouth"\n'
 cand_config = prod_config.replace('MODULES="t2bce_vhci hid_apple"', 'MODULES="t2bce_vhci hid_apple t2bce_audio"')
-audio = tree_path + "kernel/drivers/staging/t2bce/t2bce_audio/t2bce_audio.ko"
+audio = stem + "t2bce_audio/t2bce_audio.ko"
 snd = tree_path + "kernel/sound/core/snd-pcm.ko"
-candidate = dict(production)
+candidate = {key: value for key, value in production.items() if not key.endswith(".ko.zst")}
 candidate.update({
   tree_path + "modules.dep.bin": "file:02:644",
-  tree_path + "kernel/drivers/staging/t2bce/t2bce_core/t2bce_core.ko": "file:new1:644",
-  tree_path + "kernel/drivers/staging/t2bce/t2bce_dma/t2bce_dma.ko": "file:new2:644",
-  tree_path + "kernel/drivers/staging/t2bce/t2bce_vhci/t2bce_vhci.ko": "file:new3:644",
+  stem + "t2bce_core/t2bce_core.ko": "file:new1:644",
+  stem + "t2bce_dma/t2bce_dma.ko": "file:new2:644",
+  stem + "t2bce_vhci/t2bce_vhci.ko": "file:new3:644",
   audio: "file:new4:644", snd: "file:snd:644", C.BLACKLIST_DESTINATION: "file:cc:644",
   "config": "y", "buildconfig": "z",
 })
@@ -136,8 +137,8 @@ def diff(candidate_manifest=candidate_with_buildconfig, production_manifest=prod
 
 
 report = diff()
-assert report["removed"] == [] and audio in report["added"] and C.BLACKLIST_DESTINATION in report["added"]
-assert tree_path + "kernel/drivers/staging/t2bce/t2bce_core/t2bce_core.ko" in report["changed"]
+assert len(report["removed"]) == 3 and audio in report["added"] and C.BLACKLIST_DESTINATION in report["added"]
+assert stem + "t2bce_core/t2bce_core.ko" in report["added"] and stem + "t2bce_core/t2bce_core.ko.zst" in report["removed"]
 
 def mutated(**changes):
   value = dict(candidate_with_buildconfig)
@@ -154,6 +155,27 @@ rejects(lambda: diff(candidate_config=cand_config.replace("t2bce_audio", "brcmfm
 rejects(lambda: diff(candidate_config=cand_config.replace('MODULES="t2bce_vhci hid_apple t2bce_audio"', 'MODULES="t2bce_vhci"')), "MODULES differs")
 rejects(lambda: diff(candidate_manifest={**candidate_with_buildconfig, "usr/lib/omarchy-t2-restore-marker/marker.ko": "file:dd:600"}, dependencies=["/usr/lib/omarchy-t2-restore-marker/marker.ko"]), "marker/guard-like")
 rejects(lambda: diff(dependencies=["/" + audio]), "added: " + snd)
+
+# modprobe --dirname reports /lib/modules paths below the extracted tree; they normalise to usr/lib.
+extracted = Path("/tmp/x/initrd-root")
+lib = str(extracted) + "/lib/modules/" + release + "/"
+assert build.normalize_dependencies([lib + "kernel/sound/core/snd-pcm.ko"], extracted) == ["/" + snd]
+assert diff(dependencies=build.normalize_dependencies([lib + "kernel/sound/core/snd-pcm.ko", lib + "kernel/drivers/staging/t2bce/t2bce_audio/t2bce_audio.ko"], extracted))
+# A stray .ko.zst removal, or a removal without its matching .ko, is refused.
+rejects(lambda: diff(production_manifest={**production_with_buildconfig, tree_path + "kernel/fs/x.ko.zst": "file:q:644"}), "removed: " + tree_path + "kernel/fs/x.ko.zst")
+rejects(lambda: diff(production_manifest={**production_with_buildconfig, stem + "t2bce_ave/t2bce_ave.ko.zst": "file:a:644"}), "t2bce_ave.ko.zst")
+rejects(lambda: diff(candidate_manifest={key: value for key, value in candidate_with_buildconfig.items() if key != stem + "t2bce_dma/t2bce_dma.ko"}), "removed: " + stem + "t2bce_dma/t2bce_dma.ko.zst")
+
+# Build arrays equal stock plus exactly the declared deltas.
+with tempfile.TemporaryDirectory(prefix="t2-upstream-arrays-") as temporary:
+  stock_file, private_file = Path(temporary) / "stock.conf", Path(temporary) / "private.conf"
+  stock_file.write_text("HOOKS=(base udev)\nFILES=(/a)\nBINARIES=()\nMODULES=(m1)\n")
+  good = stock_file.read_text() + "MODULES+=(t2bce_audio)\nHOOKS+=(" + C.HOOK + ")\n"
+  private_file.write_text(good)
+  assert build.audit_config(private_file, stock_file)["modules"] == ["m1", "t2bce_audio"]
+  for extra, expected in (("FILES+=(/b)\n", "FILES"), ("BINARIES+=(x)\n", "BINARIES"), ("HOOKS+=(evil)\n", "HOOKS"), ("MODULES+=(brcmfmac)\n", "MODULES")):
+    private_file.write_text(good + extra)
+    rejects(lambda: build.audit_config(private_file, stock_file), expected)
 
 # Build configuration values parse the runtime `config` file only.
 assert build.config_values(cand_config)["MODULES"] == ["t2bce_vhci", "hid_apple", "t2bce_audio"]
