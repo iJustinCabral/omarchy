@@ -103,7 +103,8 @@ class Session:
       raise ValueError("Maintenance deactivation completion chain differs")
     if T._read(self.root, (self.archive / "opt-in").relative_to(self.root), private=False) != b"":
       raise ValueError("Retained maintenance opt-in changed")
-    if T.P.digest(T._read(self.root, T.P.RECEIPT)) != intent["staged_receipt_sha256"] or T._runtime(self.root) != intent["runtime_review_sha256"]:
+    T.marker_receipt(self.root, intent)  # raises unless the live or retired-pair receipt is exactly the pinned one
+    if T._runtime(self.root) != intent["runtime_review_sha256"]:
       raise ValueError("Maintenance receipt/runtime review changed")
     if T.PRODUCT.TX.uuid_value(T._read(self.root, BOOT, private=False).decode().strip()) != self.start["original_boot_id"]:
       raise ValueError("Maintenance original boot changed")

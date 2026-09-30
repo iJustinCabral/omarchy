@@ -581,6 +581,11 @@ def boot_policy():
   return import_path("pair_retire_boot_policy", HERE.parent / "hibernate/boot_policy.py")
 
 
+def custody():
+  """Shared receipt-custody names and validator (also imported by boot_policy_transition)."""
+  return import_path("pair_retire_custody", HERE.parent / "hibernate/pair_custody.py")
+
+
 def bytes_digest(data):
   return hashlib.sha256(data).hexdigest()
 
@@ -747,7 +752,7 @@ def plan_retirement(root, receipt, receipt_raw, backup, *, fresh):
     "limine_block_present": block_present,
     "limine_before_sha256": bytes_digest(current),
     "limine_after_sha256": bytes_digest(remainder),
-    "steps": ["archive", "journal", "limine", "image-source", "image-restore", "backup", "receipt", "record"],
+    "steps": ["archive", "journal", "custody", "limine", "image-source", "image-restore", "backup", "receipt", "record"],
   }, remainder
 
 
@@ -819,6 +824,51 @@ def write_archive(root, plan, receipt_raw, backup, current):
   for path in (directory / "images", directory, base):
     SINGLE.fsync_directory(path)
   return directory
+
+
+def write_custody(root, receipt_raw, receipt):
+  """Leave the retired receipt's exact bytes and a strict chaining record in the product state directory.
+
+  Written BEFORE the live receipt is removed, so the maintenance chain (update guard, assess) never sees the marker's
+  receipt vanish. The copy goes first and the record last: the record is what commits the custody. A stale record or
+  copy of a previous generation is replaced atomically (its own generation's evidence lives in that rebind's archive).
+  """
+  shared = custody()
+  state = rooted(root, PRODUCT_STATE)
+  if state.is_symlink() or not state.is_dir():
+    raise ValueError("Product state directory is missing")
+  wanted = shared.record_bytes(receipt_raw, receipt)
+  items = ((shared.RETIRED_RECEIPT_NAME, receipt_raw), (shared.RETIREMENT_NAME, wanted))
+  for name, _data in items:  # every path is judged before any is written
+    path = state / name
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+      raise ValueError("Custody path is not a regular file: " + name)
+  for name, data in items:
+    path = state / name
+    if not path.exists() or path.read_bytes() != data:
+      atomic_write(path, data, 0o600)
+  SINGLE.fsync_directory(state)
+
+
+def remove_custody(root, receipt_raw, hook=lambda _name: None):
+  """Rollback counterpart: remove the record, then the copy, but only what chains to this receipt."""
+  shared = custody()
+  state = rooted(root, PRODUCT_STATE)
+  record, copy = state / shared.RETIREMENT_NAME, state / shared.RETIRED_RECEIPT_NAME
+  sha = bytes_digest(receipt_raw)
+  if record.exists() and not record.is_symlink():
+    try:
+      chained = json.loads(record.read_bytes()).get("retired_receipt_sha256") == sha
+    except (ValueError, AttributeError):
+      chained = False
+    if chained:
+      record.unlink()
+      SINGLE.fsync_directory(state)
+  hook("custody-record-removed")
+  if copy.exists() and not copy.is_symlink() and copy.read_bytes() == receipt_raw and not record.exists():
+    copy.unlink()
+    SINGLE.fsync_directory(state)
+  hook("custody-removed")
 
 
 def write_journal(directory, plan):
@@ -918,6 +968,8 @@ def retire(root, *, dry_run=False, step_hook=None):
     for role, relative in IMAGES.items():
       if rooted(root, relative).exists() and not archived_image_matches(directory, manifest, role, receipt["images"][role]["sha256"]):
         raise ValueError("Refusing to retire: the " + role + " image has no matching archived copy")
+    write_custody(root, receipt_raw, receipt)
+    hook("custody")
     if plan["limine_block_present"]:
       atomic_write(limine, fresh_limine(limine, root, receipt, backup_bytes(), plan["limine_before_sha256"], remainder), 0o600)
     hook("limine")
@@ -966,7 +1018,7 @@ def retire(root, *, dry_run=False, step_hook=None):
   return {"state": "retired", "retirement": record}
 
 
-def retire_rollback(root):
+def retire_rollback(root, *, step_hook=None):
   """Undo an interrupted (not completed) retirement from its archive."""
   pending = incomplete_journals(root)
   if len(pending) != 1:
@@ -1013,6 +1065,7 @@ def retire_rollback(root):
         atomic_write(limine, current + receipt_block(receipt), 0o600)
     if not rooted(root, RECEIPT).exists():
       atomic_write(rooted(root, RECEIPT), receipt_raw, 0o600)
+    remove_custody(root, receipt_raw, step_hook or (lambda _name: None))  # after the live receipt is back, so the chain never breaks
     (directory / "journal.json").replace(directory / "journal.aborted.json")
     SINGLE.fsync_directory(directory)
   return {"state": "retirement-rolled-back", "receipt_sha256": sha}

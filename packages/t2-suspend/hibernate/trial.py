@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import sys
 import time
@@ -34,6 +35,11 @@ HOST = _module("trial_observation", "host_observation.py")
 WORKFLOW = _module("trial_workflow", "workflow.py")
 RETIREMENT = _module("trial_retirement", "slot_retirement.py")
 STATE = Path("/var/lib/omarchy/t2-hibernate-trial")
+# Each requalified generation gets its own one-use state root beside the original one. The original root, its
+# consumed guard and its ledger are never read for, moved to or reset for a generation; the physical-cycle lock
+# stays the single global lock in STATE. A generation root is named by the first 12 hex of its manifest digest.
+GENERATIONS = STATE / "generations"
+GENERATION = re.compile(r"[0-9a-f]{12}\Z")
 CONFIG_SCHEMA = "omarchy-t2-explicit-trial-config-v1"
 REPAIR_SCHEMA = "omarchy-t2-known-constructor-repair-v1"
 REPAIR_BOOT = "b795a460-bf57-4ff6-84b7-4ebc415a9350"
@@ -310,32 +316,71 @@ def _global_lock():
     os.close(fd)
 
 
+def _refuse_original_manifest(manifest):
+  """A generation root may never re-run the original one-use trial, under any name.
+
+  The original root's manifest is known from its consumed guard record and its config; both are read fail-closed.
+  """
+  known = set()
+  guard = STATE / "guards/trial-consumed.json"
+  if guard.exists() or guard.is_symlink():
+    record = _private_json(guard)
+    cycle = record.get("cycle") if type(record) is dict else None
+    if type(cycle) is not dict or type(cycle.get("manifest")) is not dict: raise ValueError("Original consumed guard is unreadable; no generation trial")
+    known.add(TX.digest(cycle["manifest"]))
+  config = STATE / "config.json"
+  if config.exists() or config.is_symlink():
+    value = _private_json(config)
+    if type(value) is dict and type(value.get("manifest")) is dict: known.add(TX.digest(value["manifest"]))
+  if TX.digest(manifest) in known: raise ValueError("The original one-use trial manifest cannot be re-run through a generation root")
+
+
+def generation_root(manifest_or_id):
+  """Fixed one-use state root of one requalified generation, from its manifest (or its 12-hex digest prefix)."""
+  identity = manifest_or_id if type(manifest_or_id) is str else TX.digest(TX.manifest_value(manifest_or_id))[:12]
+  if type(identity) is not str or not GENERATION.fullmatch(identity): raise ValueError("Generation is 12 lowercase hex digits of the manifest digest")
+  return GENERATIONS / identity
+
+
+def _private_directory(directory):
+  info = directory.lstat()
+  if directory.is_symlink() or not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
+    raise ValueError("Fixed existing root-private trial state directories required")
+
+
 def main(argv=None):
   parser = argparse.ArgumentParser(description="Explicit one-use T2 trial; no usable qualification or stock hibernate")
   parser.add_argument("action", nargs="?", choices=("inspect", "check", "execute", "repair-constructor"), default="inspect")
+  parser.add_argument("--generation", metavar="MANIFEST12", help="use the one-use state root of a requalified generation (12 hex of its manifest digest) instead of the original root")
   args = parser.parse_args(argv)
+  if args.generation is not None and (not GENERATION.fullmatch(args.generation) or args.action == "repair-constructor"):
+    parser.error("--generation takes 12 lowercase hex digits and never applies to the historical constructor repair")
   if args.action in ("execute", "repair-constructor") and os.geteuid() != 0:
     parser.error("Explicit root invocation required; use sudo. No automatic escalation is performed.")
   with _global_lock():
-    return _dispatch(args.action)
+    if args.generation is None: return _dispatch(args.action)  # the original root: exactly the historical call
+    return _dispatch(args.action, generation=args.generation)
 
 
-def _dispatch(action):
-  config = _private_json(STATE / "config.json")
-  authorization = _private_json(STATE / "authorization.json")
+def _dispatch(action, generation=None):
+  state = STATE if generation is None else generation_root(generation)
+  if generation is not None:
+    for directory in (GENERATIONS, state): _private_directory(directory)
+  config = _private_json(state / "config.json")
+  authorization = _private_json(state / "authorization.json")
   report = ARTIFACTS.derive_artifacts(config["source_directory"], config["restore_directory"], config["production_uki"])
+  if generation is not None:
+    HOST.CT.exact(TX.digest(report["manifest"])[:12], generation, "Generation state root binds the audited manifest")
+    _refuse_original_manifest(report["manifest"])
   validate(config, authorization, report, HOST._raw(Path("/proc/sys/kernel/random/boot_id")).decode().strip())
   verify_deployment(Path("/"), config, report)
   verify_readiness(Path("/"), config, authorization, report)
-  for directory in (STATE, STATE / "guards", STATE / "ledger", STATE / "archives"):
-    info = directory.lstat()
-    if directory.is_symlink() or not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
-      raise ValueError("Fixed existing root-private trial state directories required")
-  guard = STATE / "guards/trial-consumed.json"
+  for directory in (state, state / "guards", state / "ledger", state / "archives"): _private_directory(directory)
+  guard = state / "guards/trial-consumed.json"
   if action == "repair-constructor":
     backend = _module("trial_live_backend", "host_backend.py")
-    result = repair_constructor(config, authorization, report, ledger=TX.Ledger(STATE / "ledger"), guard_directory=STATE / "guards",
-                                archive_directory=STATE / "archives", root=Path("/"), repair_directory=STATE,
+    result = repair_constructor(config, authorization, report, ledger=TX.Ledger(state / "ledger"), guard_directory=state / "guards",
+                                archive_directory=state / "archives", root=Path("/"), repair_directory=state,
                                 backend_factory=backend.HostBackend, sleeper=time.sleep)
     print(json.dumps({"classification": result["classification"], "cycle_id": result["cycle"]["cycle_id"], "state": result["cycle"]["state"]}))
     return 0
@@ -345,8 +390,8 @@ def _dispatch(action):
     print(json.dumps({"classification": "audited-one-use-trial-not-qualified", "execute": False, "manifest_sha256": TX.digest(report["manifest"])}))
     return 0
   backend = _module("trial_live_backend", "host_backend.py")
-  result = execute(config, authorization, report, ledger=TX.Ledger(STATE / "ledger"), guard_directory=STATE / "guards",
-                   archive_directory=STATE / "archives", root=Path("/"), backend_factory=backend.HostBackend, sleeper=time.sleep)
+  result = execute(config, authorization, report, ledger=TX.Ledger(state / "ledger"), guard_directory=state / "guards",
+                   archive_directory=state / "archives", root=Path("/"), backend_factory=backend.HostBackend, sleeper=time.sleep)
   print(json.dumps({"classification": result["classification"], "cycle_id": result["cycle"]["cycle_id"], "state": result["cycle"]["state"]}))
   return 0
 
