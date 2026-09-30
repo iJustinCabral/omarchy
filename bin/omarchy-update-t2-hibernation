@@ -1,0 +1,190 @@
+#!/bin/bash
+
+# omarchy:summary=Pause T2 hibernation for a package update and offer to turn it back on afterwards
+# omarchy:args=pre|post
+# omarchy:hidden=true
+# omarchy:requires-sudo=true
+
+# Only meaningful on a MacBookAir9,1 with the opt-in T2 hibernation product
+# installed; everywhere else this exits 0 without output. The product's pacman
+# guard aborts every transaction while hibernation is active, so `pre` pauses it
+# (the reviewed `maintenance` action) and `post` asks whether to resume it (the
+# reviewed `reactivate` action, offered only when the read-only `assess` says
+# nothing qualified has changed). Neither ever requalifies hibernation.
+#
+# Exit status: 0 continue the update, 1 stop it (`pre` only; `post` never fails).
+
+STATE="/var/lib/omarchy/t2-hibernate-product"
+OPT_IN="/etc/omarchy/t2-hibernate-product.enabled"
+MODEL="/sys/class/dmi/id/product_name"
+NATIVE="$STATE/runtime/packages/t2-suspend/hibernate/boot_policy_native.py"
+RUNBOOK="docs/t2-suspend/MAINTENANCE-RUNBOOK.md"
+
+MAINTENANCE_COMMAND="sudo /usr/bin/python3 -I -B $NATIVE maintenance"
+
+say() { echo -e "\e[32m$*\e[0m"; }
+warn() { echo -e "\e[33m$*\e[0m" >&2; }
+fail() { echo -e "\e[31m$*\e[0m" >&2; }
+
+# The state directory is root-only, so every look inside it goes through sudo.
+present() { sudo test -e "$1" || sudo test -L "$1"; }
+native() { sudo /usr/bin/python3 -I -B "$NATIVE" "$@"; }
+
+# Sets $t2_state to one of: none, active, maintenance, incomplete.
+classify() {
+  local pending marker=0 policy=0 opt_in=0 incomplete=0
+
+  for pending in source-default-activation.pending source-default-deactivation.pending \
+    runtime-upgrade.pending .runtime-pending; do
+    ! present "$STATE/$pending" || incomplete=1
+  done
+  ! present "$STATE/package-maintenance.pending" || marker=1
+  ! present "$STATE/boot-policy.json" || policy=1
+  ! present "$OPT_IN" || opt_in=1
+
+  if (( incomplete )); then
+    t2_state=incomplete
+  elif (( marker )); then
+    # Maintenance retires the policy and the opt-in; finding either beside the
+    # marker is a half-finished transition, not a paused product.
+    if (( policy || opt_in )); then t2_state=incomplete; else t2_state=maintenance; fi
+  elif (( policy && opt_in )); then
+    t2_state=active
+  elif (( policy || opt_in )); then
+    t2_state=incomplete
+  else
+    t2_state=none
+  fi
+}
+
+stop_incomplete() {
+  fail "T2 hibernation is in an unfinished or unexpected state, so it cannot be paused or resumed automatically."
+  fail "Nothing was changed. Do not delete anything under $STATE."
+  fail "Follow $RUNBOOK (State inventory, then the matching section) in the Omarchy source."
+}
+
+# The product exists only on this hardware, and the state directory's presence
+# is visible without privilege. Anything else is a machine this is not for.
+applicable() {
+  [[ -r $MODEL && $(<"$MODEL") == "MacBookAir9,1" ]] || return 1
+  omarchy-hw-t2 || return 1
+  [[ -d $STATE ]]
+}
+
+pre() {
+  local status
+
+  classify
+  case $t2_state in
+    none) return 0 ;;
+    incomplete)
+      stop_incomplete
+      return 1
+      ;;
+    maintenance)
+      say "T2 hibernation is already paused for package updates. Continuing."
+      return 0
+      ;;
+  esac
+
+  echo
+  gum style --border normal --padding "1 2" \
+    "T2 hibernation is on." \
+    "" \
+    "Hibernation must pause while packages update, because a kernel or driver" \
+    "update can leave the saved hibernation setup unusable." \
+    "Suspend (S3) keeps working while it is paused." \
+    "" \
+    "After the update, Omarchy checks whether anything hibernation depends on" \
+    "changed and offers to turn it back on."
+  echo
+
+  if [[ ${OMARCHY_UPDATE_UNATTENDED:-} == 1 ]]; then
+    warn "T2 hibernation is on and -y cannot ask to pause it. Nothing was changed."
+    warn "Run 'omarchy update' without -y, or pause it first with:"
+    warn "  $MAINTENANCE_COMMAND"
+    return 1
+  fi
+
+  if ! gum confirm "Pause T2 hibernation for this update?"; then
+    echo "Update cancelled. T2 hibernation is unchanged."
+    echo "To pause it yourself before updating, run:"
+    echo "  $MAINTENANCE_COMMAND"
+    return 1
+  fi
+
+  if native maintenance >/dev/null; then
+    say "T2 hibernation paused. Suspend (S3) still works."
+    return 0
+  else
+    status=$?
+  fi
+
+  fail "Pausing T2 hibernation failed (exit $status), so the update was not started."
+  fail "See $RUNBOOK in the Omarchy source before trying again."
+  return 1
+}
+
+post() {
+  local report class
+
+  classify
+  case $t2_state in
+    none | active) return 0 ;;
+    incomplete)
+      stop_incomplete
+      return 0
+      ;;
+  esac
+
+  echo
+  say "T2 hibernation is paused. Checking whether it can be turned back on..."
+
+  if ! report=$(native assess) || ! class=$(jq -r '.class // empty' <<<"$report" 2>/dev/null) || [[ -z $class ]]; then
+    warn "Could not check whether T2 hibernation can be turned back on. It stays off; suspend (S3) still works."
+    warn "See $RUNBOOK in the Omarchy source."
+    return 0
+  fi
+
+  case $class in
+    unchanged)
+      if [[ ${OMARCHY_UPDATE_UNATTENDED:-} == 1 ]]; then
+        echo "Nothing hibernation depends on changed. It stays off until you run:"
+        echo "  sudo /usr/bin/python3 -I -B $NATIVE reactivate"
+      elif gum confirm "Turn hibernation back on?"; then
+        if native reactivate >/dev/null; then
+          say "T2 hibernation is on again."
+        else
+          fail "Turning hibernation back on failed. Do not reboot or suspend until it is sorted out."
+          fail "See $RUNBOOK (section 6, interrupted or failed reactivate) in the Omarchy source."
+        fi
+      else
+        echo "T2 hibernation stays off. To turn it on later, run:"
+        echo "  sudo /usr/bin/python3 -I -B $NATIVE reactivate"
+      fi
+      ;;
+    requalification-required)
+      warn "The kernel or drivers changed. Hibernation stays off until it is requalified for this kernel."
+      warn "Suspend (S3) still works. See $RUNBOOK (section 10) in the Omarchy source."
+      ;;
+    *)
+      warn "Omarchy could not tell whether the update changed what hibernation depends on ($class)."
+      warn "Hibernation stays off; suspend (S3) still works. See $RUNBOOK in the Omarchy source."
+      ;;
+  esac
+
+  return 0
+}
+
+if (( $# != 1 )) || [[ $1 != "pre" && $1 != "post" ]]; then
+  echo "Usage: omarchy-update-t2-hibernation pre|post" >&2
+  exit 2
+fi
+
+applicable || exit 0
+
+if [[ $1 == "pre" ]]; then
+  pre
+else
+  post
+fi

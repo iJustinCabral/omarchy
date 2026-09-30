@@ -16,6 +16,7 @@ steps=(
   omarchy-update-lock
   omarchy-update-requires-free-space
   omarchy-update-confirm
+  omarchy-update-t2-hibernation
   omarchy-update-pkg-prune
   omarchy-snapshot
   omarchy-update-stay-awake
@@ -63,6 +64,7 @@ expected_steps() {
     omarchy-update-lock \
     omarchy-update-requires-free-space \
     ${1:+omarchy-update-confirm} \
+    omarchy-update-t2-hibernation \
     omarchy-update-pkg-prune \
     omarchy-snapshot \
     omarchy-update-stay-awake \
@@ -76,6 +78,7 @@ expected_steps() {
     omarchy-update-orphan-pkgs \
     omarchy-update-analyze-logs \
     omarchy-update-status \
+    omarchy-update-t2-hibernation \
     omarchy-update-stay-awake \
     omarchy-update-restart
 }
@@ -106,3 +109,29 @@ for step in omarchy-migrate omarchy-hook omarchy-update-aur-pkgs omarchy-update-
   fi
 done
 pass "a blocked package upgrade stops the update before it migrates"
+
+# A T2 hibernation that is not paused stops the update before anything changes;
+# one that cannot be resumed afterwards never fails an update that succeeded.
+# The stub cannot tell the two phases apart, so it takes them from its argument.
+cat >"$stub_bin/omarchy-update-t2-hibernation" <<'STUB'
+#!/bin/bash
+printf '%s %s unattended=%s\n' "${0##*/}" "$1" "${OMARCHY_UPDATE_UNATTENDED:-}" >>"$STEP_LOG"
+[[ $1 != "${T2_FAILING_PHASE:-}" ]] || exit 1
+STUB
+chmod +x "$stub_bin/omarchy-update-t2-hibernation"
+
+if T2_FAILING_PHASE=pre run_update -y; then
+  fail "an update whose T2 hibernation was not paused passes for a whole one"
+fi
+for step in omarchy-update-pkg-prune omarchy-snapshot omarchy-update-system-pkgs omarchy-migrate; do
+  if grep -q "^$step " "$test_tmp/steps"; then
+    fail "a declined T2 hibernation pause still runs $step"
+  fi
+done
+grep -q '^omarchy-update-t2-hibernation pre ' "$test_tmp/steps" ||
+  fail "the T2 hibernation pause does not run first"
+pass "an unpaused T2 hibernation stops the update before it changes anything"
+
+T2_FAILING_PHASE=post run_update -y || fail "a T2 hibernation that stays off fails the update"
+grep -q '^omarchy-update-restart' "$test_tmp/steps" || fail "the update stopped after the T2 hibernation check"
+pass "a T2 hibernation check never fails a finished update"

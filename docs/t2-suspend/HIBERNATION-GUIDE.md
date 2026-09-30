@@ -60,6 +60,8 @@ The installed [ALPM hook](../../packages/t2-suspend/hibernate/00-omarchy-t2-hibe
 
 Why it exists: an update can change the production kernel, modules, firmware, initramfs or boot configuration while the default still points to an older private source image. Rejecting hibernation after the update would not protect that next ordinary boot. The temporary solution freezes package transactions while the reviewed pair is active. “Safe deactivation” means verifying restoration of the stock boot default and disabling the prototype route before allowing updates—not deleting the hook or assuming any new image is compatible.
 
+`omarchy update` now handles the pause for the user: it asks before pausing hibernation, runs the reviewed `maintenance` action, and after the update runs the read-only `assess` and offers to turn hibernation back on only when nothing qualified changed (otherwise it says hibernation stays off until requalified and suspend still works). See [the maintenance runbook](MAINTENANCE-RUNBOOK.md#normal-path-omarchy-update-does-this-for-you).
+
 That is not the requested final behavior. Normal updates need a maintained, transactional artifact/boot lifecycle and safe handling of any outstanding hibernation image. The [production plan](HIBERNATION-PRODUCTION-PLAN.md) specifies the unfinished design and evidence needed. This documentation turn does not remove either guard or change the live boot policy.
 
 ## Evidence register

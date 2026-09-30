@@ -26,6 +26,11 @@ omarchy-update-requires-free-space
 [[ ${1:-} != "-y" ]] || export OMARCHY_UPDATE_UNATTENDED=1
 
 if [[ ${1:-} == "-y" ]] || omarchy-update-confirm; then
+  # An active T2 hibernation makes pacman refuse every transaction, so it is
+  # paused first. It says why when it stops the update, and a stop here changes
+  # nothing yet, so this is not "something went wrong".
+  omarchy-update-t2-hibernation pre || exit 1
+
   # Before the snapshot: the cache is on the snapshotted subvolume, so pruning
   # after it frees nothing until that snapshot ages out.
   omarchy-update-pkg-prune
@@ -53,6 +58,9 @@ if [[ ${1:-} == "-y" ]] || omarchy-update-confirm; then
 
   omarchy-update-analyze-logs
   omarchy-update-status
+
+  # Never fails the update: a machine left paused is asked again next time.
+  omarchy-update-t2-hibernation post || true
 
   # Release update-owned inhibitors before offering a reboot. A confirmed
   # reboot can terminate this process before its EXIT trap gets a chance to

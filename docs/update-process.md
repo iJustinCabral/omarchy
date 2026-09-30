@@ -118,6 +118,10 @@ omarchy-update
   ├─ omarchy-update-requires-free-space
   │    └─ abort below the configured free-space threshold on /
   ├─ confirm unless -y
+  ├─ omarchy-update-t2-hibernation pre
+  │    └─ MacBookAir9,1 with opt-in T2 hibernation active only: asks to pause it
+  │       (its pacman guard refuses every transaction otherwise); declining or
+  │       an unfinished state stops the update before anything changes
   ├─ omarchy-update-pkg-prune
   │    └─ trim the pacman cache to two versions per package, deliberately
   │       before the snapshot since the cache lives on the snapshotted subvolume
@@ -128,6 +132,9 @@ omarchy-update
   ├─ run package updates, migrations, hooks, and log analysis
   ├─ omarchy-update-status
   │    └─ refresh or clear the shell update indicator
+  ├─ omarchy-update-t2-hibernation post
+  │    └─ when T2 hibernation is paused: read-only assess, then offer to turn it
+  │       back on only if nothing it depends on changed; never fails the update
   ├─ omarchy-update-stay-awake stop
   │    └─ release the sleep inhibitor and restore shell idle state, if changed
   └─ omarchy-update-restart
