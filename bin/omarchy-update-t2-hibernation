@@ -17,6 +17,8 @@
 STATE="/var/lib/omarchy/t2-hibernate-product"
 OPT_IN="/etc/omarchy/t2-hibernate-product.enabled"
 MODEL="/sys/class/dmi/id/product_name"
+EFI_VARS="/sys/firmware/efi/efivars"
+LOADER_GUID="4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
 NATIVE="$STATE/runtime/packages/t2-suspend/hibernate/boot_policy_native.py"
 RUNBOOK="docs/t2-suspend/MAINTENANCE-RUNBOOK.md"
 
@@ -27,22 +29,53 @@ warn() { echo -e "\e[33m$*\e[0m" >&2; }
 fail() { echo -e "\e[31m$*\e[0m" >&2; }
 
 # The state directory is root-only, so every look inside it goes through sudo.
-present() { sudo test -e "$1" || sudo test -L "$1"; }
+# Status 0 present, 1 absent, anything else (an expired credential, no terminal
+# for a password prompt) means the answer is unknown, never "absent".
+present() { sudo test -e "$1" -o -L "$1"; }
 native() { sudo /usr/bin/python3 -I -B "$NATIVE" "$@"; }
 
 # Sets $t2_state to one of: none, active, maintenance, incomplete.
 classify() {
-  local pending marker=0 policy=0 opt_in=0 incomplete=0
+  local pending marker=0 policy=0 opt_in=0 incomplete=0 override=0 status
+
+  # Refresh the credential so a long update does not expire it mid-check; with
+  # no way to authenticate, nothing below can be trusted.
+  if ! sudo -v; then
+    t2_state=unreadable
+    return
+  fi
+
+  # Sets $found to 1 when the path exists; returns 1 when that is unknowable.
+  probe() {
+    found=0
+    if present "$1"; then
+      found=1
+      return 0
+    else
+      status=$?
+    fi
+    (( status == 1 ))
+  }
 
   for pending in source-default-activation.pending source-default-deactivation.pending \
     runtime-upgrade.pending .runtime-pending; do
-    ! present "$STATE/$pending" || incomplete=1
+    probe "$STATE/$pending" || { t2_state=unreadable; return; }
+    (( found )) && incomplete=1
   done
-  ! present "$STATE/package-maintenance.pending" || marker=1
-  ! present "$STATE/boot-policy.json" || policy=1
-  ! present "$OPT_IN" || opt_in=1
+  probe "$STATE/package-maintenance.pending" || { t2_state=unreadable; return; }
+  marker=$found
+  probe "$STATE/boot-policy.json" || { t2_state=unreadable; return; }
+  policy=$found
+  probe "$OPT_IN" || { t2_state=unreadable; return; }
+  opt_in=$found
+  for pending in LoaderEntryOneShot LoaderEntryDefault; do
+    probe "$EFI_VARS/$pending-$LOADER_GUID" || { t2_state=unreadable; return; }
+    (( found )) && override=1
+  done
 
-  if (( incomplete )); then
+  if (( override )); then
+    t2_state=override
+  elif (( incomplete )); then
     t2_state=incomplete
   elif (( marker )); then
     # Maintenance retires the policy and the opt-in; finding either beside the
@@ -63,6 +96,16 @@ stop_incomplete() {
   fail "Follow $RUNBOOK (State inventory, then the matching section) in the Omarchy source."
 }
 
+stop_unreadable() {
+  fail "Could not check the T2 hibernation state (no sudo access), so the update was not started."
+  fail "Nothing was changed. Run 'omarchy update' again from a terminal where sudo can ask for a password."
+}
+
+stop_override() {
+  fail "A boot loader entry override (LoaderEntryOneShot or LoaderEntryDefault) is set, which blocks package updates."
+  fail "Nothing was changed. Do not delete EFI variables by hand; see $RUNBOOK in the Omarchy source."
+}
+
 # The product exists only on this hardware, and the state directory's presence
 # is visible without privilege. Anything else is a machine this is not for.
 applicable() {
@@ -77,6 +120,14 @@ pre() {
   classify
   case $t2_state in
     none) return 0 ;;
+    unreadable)
+      stop_unreadable
+      return 1
+      ;;
+    override)
+      stop_override
+      return 1
+      ;;
     incomplete)
       stop_incomplete
       return 1
@@ -131,6 +182,15 @@ post() {
   classify
   case $t2_state in
     none | active) return 0 ;;
+    unreadable)
+      warn "Could not check T2 hibernation (no sudo access). If it was paused for this update it is still off;"
+      warn "run 'omarchy update' again, or see $RUNBOOK in the Omarchy source."
+      return 0
+      ;;
+    override)
+      warn "A boot loader entry override is set; T2 hibernation stays off. See $RUNBOOK in the Omarchy source."
+      return 0
+      ;;
     incomplete)
       stop_incomplete
       return 0

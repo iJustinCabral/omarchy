@@ -11,6 +11,7 @@ stub_bin="$test_tmp/bin"
 state="$test_tmp/state"
 opt_in="$test_tmp/enabled"
 model="$test_tmp/product_name"
+efi="$test_tmp/efivars"
 calls="$test_tmp/calls"
 mkdir -p "$stub_bin"
 
@@ -19,11 +20,17 @@ mkdir -p "$stub_bin"
 sed -e "s|^STATE=.*|STATE=\"$state\"|" \
   -e "s|^OPT_IN=.*|OPT_IN=\"$opt_in\"|" \
   -e "s|^MODEL=.*|MODEL=\"$model\"|" \
+  -e "s|^EFI_VARS=.*|EFI_VARS=\"$efi\"|" \
   "$ROOT/bin/omarchy-update-t2-hibernation" >"$test_tmp/hook"
 
 cat >"$stub_bin/sudo" <<'STUB'
 #!/bin/bash
 # Run read-only `test` for real; script the product's native actions.
+if [[ $1 == "-v" ]]; then
+  printf 'sudo -v\n' >>"$CALLS"
+  exit "${SUDO_V_STATUS:-0}"
+fi
+if [[ $1 == "test" && -n ${SUDO_TEST_STATUS:-} ]]; then exit "$SUDO_TEST_STATUS"; fi
 if [[ $1 == "/usr/bin/python3" ]]; then
   action=${*: -1}
   printf 'native %s\n' "$action" >>"$CALLS"
@@ -58,11 +65,11 @@ STUB
 chmod +x "$stub_bin"/*
 
 reset() {
-  rm -rf "$state" "$opt_in"
-  mkdir -p "$state"
+  rm -rf "$state" "$opt_in" "$efi"
+  mkdir -p "$state" "$efi"
   printf 'MacBookAir9,1\n' >"$model"
   : >"$calls"
-  unset GUM_ANSWER MAINTENANCE_STATUS REACTIVATE_STATUS ASSESS_STATUS ASSESS_OUTPUT T2_STATUS OMARCHY_UPDATE_UNATTENDED
+  unset GUM_ANSWER MAINTENANCE_STATUS REACTIVATE_STATUS ASSESS_STATUS ASSESS_OUTPUT T2_STATUS SUDO_V_STATUS SUDO_TEST_STATUS OMARCHY_UPDATE_UNATTENDED
 }
 
 set_active() {
@@ -78,7 +85,7 @@ run_hook() {
 
 called() { grep -qxF "$1" "$calls"; }
 said() { grep -q "$1" "$test_tmp/out" "$test_tmp/err"; }
-untouched() { [[ ! -s $calls && ! -s $test_tmp/out && ! -s $test_tmp/err ]]; }
+untouched() { ! grep -qvx 'sudo -v' "$calls" && [[ ! -s $test_tmp/out && ! -s $test_tmp/err ]]; }
 
 # Not installed, or not this hardware: silent no-op, nothing asked or run.
 reset
@@ -182,7 +189,7 @@ pass "an incomplete state stops pre with the runbook and never fails post"
 reset
 set_active
 run_hook post
-[[ ! -s $calls ]] || fail "post on an active product did something"
+! grep -qvx 'sudo -v' "$calls" || fail "post on an active product did something"
 pass "post leaves an unpaused product alone"
 
 reset
@@ -250,3 +257,48 @@ ASSESS_OUTPUT='not json' run_hook post
 (( status == 0 )) || fail "unparseable assess fails the update"
 ! called "native reactivate" || fail "unparseable assess attempted reactivation"
 pass "an unparseable assess is tolerated"
+
+# An unknown answer is never "absent": expired credentials or no terminal.
+reset
+set_active
+SUDO_TEST_STATUS=2 run_hook pre
+(( status == 1 )) || fail "unreadable state does not stop pre"
+said "no sudo access" || fail "unreadable state in pre is not explained"
+! grep -qE 'native|confirm' "$calls" || fail "unreadable state in pre ran the product"
+reset
+set_active
+SUDO_V_STATUS=1 OMARCHY_UPDATE_UNATTENDED=1 run_hook pre
+(( status == 1 )) || fail "-y without sudo does not stop pre"
+said "no sudo access" || fail "-y without sudo is not explained"
+! grep -qE 'native|confirm' "$calls" || fail "-y without sudo ran the product"
+reset
+set_active
+run_hook pre
+called "sudo -v" || fail "pre does not refresh the sudo credential"
+pass "pre stops on an unreadable state and on -y without sudo"
+
+reset
+set_maintenance
+SUDO_TEST_STATUS=2 run_hook post
+(( status == 0 )) || fail "unreadable state fails the update in post"
+said "Could not check T2 hibernation" || fail "unreadable state in post is not explained"
+said "omarchy update" || fail "unreadable state in post does not say what to do"
+! grep -qE 'native|confirm' "$calls" || fail "unreadable state in post ran the product"
+reset
+set_maintenance
+SUDO_V_STATUS=1 run_hook post
+(( status == 0 )) || fail "failed sudo fails the update in post"
+said "Could not check T2 hibernation" || fail "failed sudo in post is not explained"
+pass "post warns on an unreadable state and never fails"
+
+# A stray loader override blocks pacman's guard, so pre must stop for it.
+for variable in LoaderEntryOneShot LoaderEntryDefault; do
+  reset
+  set_active
+  : >"$efi/$variable-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
+  run_hook pre
+  (( status == 1 )) || fail "$variable does not stop pre"
+  said "MAINTENANCE-RUNBOOK" || fail "$variable does not point at the runbook"
+  ! grep -qE 'native|confirm' "$calls" || fail "$variable ran the product"
+done
+pass "a loader entry override stops pre with the runbook"
