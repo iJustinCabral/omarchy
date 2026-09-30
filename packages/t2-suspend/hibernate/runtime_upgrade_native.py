@@ -12,6 +12,12 @@ bytes (Limine legitimately churns; the boot policy and the opt-in must be ABSENT
 guard's: the old reviewed guard validates the maintenance chain and the pinned resume page before the barrier,
 the NEW reviewed guard validates it (barrier ignored) after the runtime and the marker's runtime binding were
 replaced, and again with the barrier retired. The ordinary v2 protocol still refuses under a marker.
+
+Under maintenance the guard admits exactly this approval's own barrier and upgrade-pending bytes (the core writes them
+before it calls the guard), and the marker either as pinned or with only runtime_review_sha256 moved to the new review
+(the core rebinds it under the barrier). An optional `leftover` approval field names one earlier, never-consumed
+maintenance intent (approval id and intent SHA-256); the adapter then proves nothing moved, consumes that earlier
+approval and archives its barrier before the core runs (see _adopt_leftover).
 """
 import hashlib
 from contextlib import contextmanager
@@ -60,8 +66,20 @@ UNCHANGED_MAINTENANCE = {
   "marker": (MARKER, 0o600),
 }
 # Present only in ACTIVE source-default state; their presence during maintenance is not this upgrade's business.
+# source-default-activation.pending is deliberately not listed: the upgrade core itself writes its durable barrier at that
+# name (and runtime-upgrade.pending beside it), so _maintenance_barrier() admits exactly this approval's own intent bytes.
 ABSENT_IN_MAINTENANCE = (STATE / "boot-policy.json", Path("/etc/omarchy/t2-hibernate-product.enabled"),
-                         STATE / "source-default-activation.pending", STATE / "source-default-deactivation.pending")
+                         STATE / "source-default-deactivation.pending")
+BARRIER = STATE / "source-default-activation.pending"
+UPGRADE_PENDING = STATE / "runtime-upgrade.pending"
+INTENT_MAINTENANCE = "omarchy-t2-runtime-upgrade-maintenance-intent-v1"
+MARKER_SCHEMA = "omarchy-t2-package-maintenance-intent-v1"
+MARKER_FIELDS = {"protocol", "transition_id", "old_policy_sha256", "runtime_review_sha256", "staged_receipt_sha256",
+                 "fallback_limine_sha256", "deactivation_completion_sha256"}
+INTENT_FIELDS = {"protocol", "transaction_id", "approval_id", "old_review_sha256", "new_review_sha256", "old_config_sha256",
+                 "new_config_sha256", "marker_sha256"}
+OWNERS = (0,)  # file owners accepted for root-private inputs; a test fixture appends its own uid
+UUID4 = r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}"
 UNCHANGED = {
   "qualification": (STATE / "qualification.json", 0o600),
   "boot_policy": (STATE / "boot-policy.json", 0o600),
@@ -86,7 +104,7 @@ def _private_bytes(path, mode=0o600):
   fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
   try:
     info = os.fstat(fd)
-    if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1 or info.st_mode & 0o022 or
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid not in OWNERS or info.st_nlink != 1 or info.st_mode & 0o022 or
         (mode is not None and stat.S_IMODE(info.st_mode) != mode) or info.st_size > 2 * 1024 * 1024):
       raise ValueError("Bounded regular owned upgrade input required: " + str(path))
     raw = os.read(fd, 2 * 1024 * 1024 + 1)
@@ -103,11 +121,20 @@ def _pin(value):
 
 def _parse_approval(raw, adapter_raw):
   approval = json.loads(raw, object_pairs_hook=_pairs)
-  if (type(approval) is not dict or set(approval) != {"protocol", "approved", "current_boot_id", "source_directory",
-      "reviewed_commit", "adapter_sha256", "expected", "unchanged", "approval_id"} or
+  required = {"protocol", "approved", "current_boot_id", "source_directory", "reviewed_commit", "adapter_sha256", "expected",
+              "unchanged", "approval_id"}
+  if (type(approval) is not dict or not required <= set(approval) <= required | {"leftover"} or
       approval["protocol"] not in (ORDINARY_PROTOCOL, MAINTENANCE_PROTOCOL) or approval["approved"] is not True):
     raise ValueError("Exact external runtime upgrade approval required")
   maintenance = approval["protocol"] == MAINTENANCE_PROTOCOL
+  if "leftover" in approval:
+    # Only a maintenance approval may name the one unconsumed earlier attempt whose intent it adopts; both identities are pinned.
+    leftover = approval["leftover"]
+    if (not maintenance or type(leftover) is not dict or set(leftover) != {"approval_id", "intent_sha256"} or
+        type(leftover["approval_id"]) is not str or not re.fullmatch(UUID4, leftover["approval_id"]) or
+        uuid.UUID(leftover["approval_id"]).version != 4 or leftover["approval_id"] == approval["approval_id"]):
+      raise ValueError("Exact earlier approval to adopt required")
+    _pin(leftover["intent_sha256"])
   identity = approval["approval_id"]
   if type(identity) is not str or not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", identity) or uuid.UUID(identity).version != 4:
     raise ValueError("Fresh canonical UUID4 runtime upgrade approval required")
@@ -153,15 +180,83 @@ def _unchanged(approval):
   if maintenance:
     for path in ABSENT_IN_MAINTENANCE:
       if os.path.lexists(path): raise ValueError("Active source-default state is present under a maintenance upgrade: " + path.name)
+    _maintenance_barrier(approval)
   for name, (path, mode) in (UNCHANGED_MAINTENANCE if maintenance else UNCHANGED).items():
-    for ancestor in path.parents:
-      info = ancestor.lstat()
-      if not stat.S_ISDIR(info.st_mode) or ancestor.is_symlink() or info.st_uid != 0 or info.st_mode & 0o022:
-        raise ValueError("Owned nonsymlink host artifact ancestry required: " + name)
+    _ancestry(path, name)
     raw = _private_bytes(path, mode)
     if name == "opt_in" and raw: raise ValueError("Source-default opt-in is not empty")
     if _digest(raw) != approval["unchanged"][name]:
+      # The core moves the marker's runtime binding under the barrier, so afterwards the marker is its pinned bytes with only
+      # runtime_review_sha256 changed to the new review; nothing else about it may differ.
+      if name == "marker" and maintenance and _rebound_marker(raw, approval): continue
       raise ValueError("Unchanged host artifact differs: " + name)
+
+
+def _ancestry(path, name):
+  for ancestor in path.parents:
+    info = ancestor.lstat()
+    if not stat.S_ISDIR(info.st_mode) or ancestor.is_symlink() or info.st_uid != 0 or info.st_mode & 0o022:
+      raise ValueError("Owned nonsymlink host artifact ancestry required: " + name)
+
+
+def _encoded(value):
+  return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+
+def _rebound_marker(raw, approval):
+  """True only for the pinned old marker with exactly runtime_review_sha256 moved to the approved new review."""
+  try: marker = json.loads(raw, object_pairs_hook=_pairs)
+  except ValueError: return False
+  expected = approval["expected"]
+  return (type(marker) is dict and set(marker) == MARKER_FIELDS and marker["protocol"] == MARKER_SCHEMA and _encoded(marker) == raw and
+          marker["runtime_review_sha256"] == expected["new_review"] and
+          _digest(_encoded({**marker, "runtime_review_sha256": expected["old_review"]})) == approval["unchanged"]["marker"])
+
+
+def _maintenance_intent(raw, approval, *, own):
+  """Validate barrier bytes: this approval's own intent (own=True) or the pinned leftover of one earlier unconsumed approval."""
+  record = json.loads(raw, object_pairs_hook=_pairs)
+  expected = approval["expected"]
+  if (type(record) is not dict or set(record) != INTENT_FIELDS or _encoded(record) != raw or record["protocol"] != INTENT_MAINTENANCE or
+      type(record["transaction_id"]) is not str or not re.fullmatch(UUID4, record["transaction_id"]) or uuid.UUID(record["transaction_id"]).version != 4 or
+      record["old_review_sha256"] != expected["old_review"] or record["old_config_sha256"] != expected["old_config"] or
+      record["new_config_sha256"] != expected["new_config"] or record["marker_sha256"] != approval["unchanged"]["marker"]):
+    raise ValueError("Compatible barrier is not an exact maintenance upgrade intent")
+  if own:
+    if record["approval_id"] != approval["approval_id"] or record["new_review_sha256"] != expected["new_review"]:
+      raise ValueError("Compatible barrier belongs to another approval")
+  else:
+    leftover = approval.get("leftover")
+    if (leftover is None or record["approval_id"] != leftover["approval_id"] or _digest(raw) != leftover["intent_sha256"] or
+        type(record["new_review_sha256"]) is not str or not re.fullmatch(r"[0-9a-f]{64}", record["new_review_sha256"]) or
+        record["new_review_sha256"] == expected["new_review"]):
+      raise ValueError("Compatible barrier is not the approved earlier intent")
+  return record
+
+
+def _maintenance_barrier(approval):
+  """Admit no source-default state under maintenance except the durable barrier this very upgrade (or its approved leftover) owns.
+
+  The core writes the barrier, then runtime-upgrade.pending with identical bytes, and calls the guard between every write, so
+  the barrier alone or both together are legitimate. Any other bytes, an upgrade pending without the barrier, or differing
+  copies stay refused.
+  """
+  barrier, pending = os.path.lexists(BARRIER), os.path.lexists(UPGRADE_PENDING)
+  if not barrier:
+    if pending: raise ValueError("Upgrade pending without its compatible barrier under a maintenance upgrade")
+    return
+  refusal = "Active source-default state is present under a maintenance upgrade: " + BARRIER.name
+  try:
+    raw = _private_bytes(BARRIER, 0o600)
+    try: _maintenance_intent(raw, approval, own=True)
+    except ValueError:
+      if approval.get("leftover") is None: raise
+      _maintenance_intent(raw, approval, own=False)
+      if pending: raise ValueError("Earlier maintenance intent must not have an upgrade pending")
+      return
+    if pending and _private_bytes(UPGRADE_PENDING, 0o600) != raw: raise ValueError("Upgrade pending differs from the compatible barrier")
+  except ValueError as error:
+    raise ValueError(refusal + " (" + str(error) + ")") from error
 
 
 def _review(raw, expected_sha, commit=None):
@@ -390,8 +485,13 @@ def _restore_veto(core, approval):
           record["config_sha256"] != approval["expected"]["new_config"] or consumed not in evidence):
         raise ValueError("Cannot restore veto from foreign completion")
       intents.append(_intent(core, approval, core._encoded(record["intent"])))
+    leftover = None
     for name in (consumed, core.UPGRADE_PENDING, core.COMPATIBLE_BARRIER):
-      if name in evidence: intents.append(_intent(core, approval, evidence[name]))
+      if name not in evidence: continue
+      if name == core.COMPATIBLE_BARRIER and approval.get("leftover") is not None and _is_leftover(evidence[name], approval):
+        leftover = evidence[name]  # the approved earlier intent, still in place: it is the veto; nothing of this upgrade exists yet
+        continue
+      intents.append(_intent(core, approval, evidence[name]))
     if intents:
       if any(raw != intents[0] for raw in intents): raise ValueError("Recovery intents differ; foreign evidence preserved")
       _durable_veto(core, state_fd, intents[0])
@@ -400,6 +500,7 @@ def _restore_veto(core, approval):
         # review is installed, back to the old bytes when it is not. Foreign bytes raise and stay preserved.
         core.settle_maintenance_binding(STATE, json.loads(intents[0], object_pairs_hook=_pairs), _digest(_private_bytes(STATE / "runtime-deployment-review.json")))
     else:
+      if leftover is not None: _durable_veto(core, state_fd, leftover)
       # No completion is not proof of safety. Require all old authority bytes
       # and the entire tree, with no partial staging or retained publication.
       for name, pin in ((core.REVIEW.name, "old_review"), (core.BOOTSTRAP, "old_bootstrap"), (core.CONFIG, "old_config")):
@@ -410,6 +511,110 @@ def _restore_veto(core, approval):
       if any(name == core.PENDING or name.startswith(("runtime-retained-", "runtime-review-retained-", "runtime-bootstrap-retained-", "config-retained-")) and suffix in name for name in os.listdir(state_fd)):
         raise ValueError("Partial publication cannot release without durable veto")
       core._verify_tree(STATE / "runtime", review["files"])
+  finally: os.close(state_fd)
+
+
+def _is_leftover(raw, approval):
+  try: _maintenance_intent(raw, approval, own=False)
+  except ValueError: return False
+  return True
+
+
+def _prove_unmoved(core, state_fd, approval, record):
+  """Strict proof that an earlier, never-consumed attempt changed nothing that matters: the old runtime, authority, config,
+  marker binding, archive and review are exactly the pinned old ones and no publication evidence exists beside them.
+
+  Recovery of that earlier attempt (the old adapter's own) legitimately left retained copies of the OLD marker and baseline
+  plus a rebind record under the earlier review's tag; those are accepted only when byte-exact to the current old bytes.
+  """
+  expected = approval["expected"]
+  for name, pin in ((core.REVIEW.name, "old_review"), (core.BOOTSTRAP, "old_bootstrap"), (core.CONFIG, "old_config")):
+    if _digest(core._private_read(state_fd, name)) != expected[pin]: raise ValueError("Earlier attempt moved authority: " + name)
+  review = _review(core._private_read(state_fd, core.REVIEW.name), expected["old_review"])
+  core._verify_tree(STATE / "runtime", review["files"])
+  receipt = json.loads(core._private_file(STATE / "runtime" / core.MANIFEST), object_pairs_hook=_pairs)
+  if (receipt.get("review_sha256") != expected["old_review"] or receipt.get("files") != review["files"] or
+      receipt.get("reviewed_commit") != review["reviewed_commit"]):
+    raise ValueError("Earlier attempt moved the runtime receipt")
+  old_prefix = review["reviewed_commit"][:12]
+  own_consumed = "runtime-upgrade-approval-consumed-" + approval["approval_id"] + ".json"
+  for name in os.listdir(state_fd):
+    if name in (core.PENDING, core.UPGRADE_PENDING, own_consumed, "runtime-upgrade-completed-" + approval["reviewed_commit"][:12] + ".json"):
+      raise ValueError("Publication evidence exists; earlier attempt is not unmoved: " + name)
+    if (name.startswith(("runtime-retained-", "runtime-review-retained-", "runtime-bootstrap-retained-", "config-retained-")) and
+        "-retained-" + old_prefix + "-before-" in name):
+      raise ValueError("Retained publication evidence exists; earlier attempt is not unmoved: " + name)
+    if name.startswith("runtime-upgrade-completed-"):
+      try: completed = json.loads(core._private_read(state_fd, name), object_pairs_hook=_pairs)
+      except ValueError: raise ValueError("Unreadable upgrade completion evidence preserved: " + name) from None
+      if type(completed) is not dict or completed.get("review_sha256") in (record["new_review_sha256"], expected["new_review"]):
+        raise ValueError("Completion evidence exists; earlier attempt is not unmoved: " + name)
+  marker = core._private_read(state_fd, core.MAINTENANCE_PENDING)
+  if _digest(marker) != approval["unchanged"]["marker"] or _digest(marker) != record["marker_sha256"]:
+    raise ValueError("Maintenance marker is not the pinned old marker")
+  identifier = core._canonical_uuid(json.loads(marker, object_pairs_hook=_pairs).get("transition_id"))
+  archive = STATE / core.HISTORY / identifier
+  for directory in (STATE / core.HISTORY, archive): core._private_directory(directory)
+  if core._private_file(archive / "maintenance-intent.json") != marker: raise ValueError("Maintenance marker differs from its archived intent")
+  baseline = core._private_file(archive / core.BASELINE_NAME)
+  new_marker, new_baseline = core._maintenance_binding(marker, baseline, expected["old_review"], record["new_review_sha256"])
+  for stray in (archive / (core.BASELINE_NAME + ".runtime-rebind-tmp"), archive / "maintenance-intent.json.runtime-rebind-tmp",
+                STATE / (core.MAINTENANCE_PENDING + ".runtime-rebind-tmp")):
+    if os.path.lexists(stray): raise ValueError("Rebind temporary exists; earlier attempt is not unmoved: " + stray.name)
+  if any(os.path.lexists(archive / name) for name in core._binding_names(expected["new_review"])):
+    raise ValueError("Rebind evidence for this approval's review already exists")
+  old_marker_name, old_baseline_name, record_name = core._binding_names(record["new_review_sha256"])
+  for name, raw in ((old_marker_name, marker), (old_baseline_name, baseline)):
+    if os.path.lexists(archive / name) and core._private_file(archive / name) != raw:
+      raise ValueError("Retained old evidence differs from the current bytes: " + name)
+  if os.path.lexists(archive / record_name):
+    wanted = core._encoded({"protocol": core.REBIND_RECORD_SCHEMA, "approval_id": record["approval_id"],
+      "old_review_sha256": expected["old_review"], "new_review_sha256": record["new_review_sha256"],
+      "old_marker_sha256": _digest(marker), "new_marker_sha256": _digest(new_marker),
+      "old_baseline_sha256": _digest(baseline), "new_baseline_sha256": _digest(new_baseline)})
+    if (core._private_file(archive / record_name) != wanted or not os.path.lexists(archive / old_marker_name) or
+        not os.path.lexists(archive / old_baseline_name)):
+      raise ValueError("Earlier rebind record is not the old-form record; the marker may have moved")
+
+
+def _adopt_leftover(core, approval, guard):
+  """Archive one earlier, never-consumed maintenance intent named by the approval, so this approval can proceed.
+
+  The earlier attempt's adapter had a defect and stopped at its own barrier; that barrier is now the only thing vetoing
+  updates. Adoption needs the exact intent bytes pinned by the approval and proof that nothing moved. It then (1) writes the
+  earlier approval's consumed record, so it can never be replayed, and (2) renames the barrier to an archive name; nothing is
+  ever deleted. Both steps are idempotent and each is preceded by the guard.
+  """
+  leftover = approval.get("leftover")
+  if leftover is None: return False
+  old_id = leftover["approval_id"]
+  consumed_name = "runtime-upgrade-approval-consumed-" + old_id + ".json"
+  abandoned_name = "runtime-upgrade-abandoned-intent-" + old_id + ".json"
+  state_fd = core._open_directory(STATE)
+  try:
+    core._private(state_fd, directory=True)
+    def read(name):
+      try: return core._private_read(state_fd, name)
+      except FileNotFoundError: return None
+    barrier, consumed, abandoned = read(core.COMPATIBLE_BARRIER), read(consumed_name), read(abandoned_name)
+    if barrier is None:
+      # Adoption finished earlier (and possibly stopped before this upgrade's own barrier): the archive must be exact.
+      if consumed is None or consumed != abandoned or _digest(consumed) != leftover["intent_sha256"]:
+        raise ValueError("The approved earlier intent is neither in place nor archived")
+      _prove_unmoved(core, state_fd, approval, _maintenance_intent(consumed, approval, own=False))
+      return True
+    record = _maintenance_intent(barrier, approval, own=False)
+    if abandoned is not None or (consumed is not None and consumed != barrier) or read(core.UPGRADE_PENDING) is not None:
+      raise ValueError("Earlier attempt evidence is inconsistent; preserved")
+    _prove_unmoved(core, state_fd, approval, record)
+    guard()
+    if consumed is None: core._new_private(state_fd, consumed_name, barrier)
+    guard()
+    if read(core.COMPATIBLE_BARRIER) != barrier or read(consumed_name) != barrier: raise ValueError("Earlier attempt evidence changed during adoption")
+    os.rename(core.COMPATIBLE_BARRIER, abandoned_name, src_dir_fd=state_fd, dst_dir_fd=state_fd)
+    os.fsync(state_fd)
+    guard()
+    return True
   finally: os.close(state_fd)
 
 
@@ -635,6 +840,7 @@ def native():
       release_db.check_physical()
       try:
         guard()
+        _adopt_leftover(core, approval, guard)
         old_product = engine.PRODUCT
         maintenance = approval.get("maintenance", False)
         def before():
