@@ -417,7 +417,37 @@ After `"rolled_back": true` the machine is in ordinary inactive maintenance agai
 
 ### After a runtime upgrade under maintenance that failed
 
-The adapter keeps `source-default-activation.pending` and `runtime-upgrade.pending` (protocol `omarchy-t2-runtime-upgrade-maintenance-intent-v1`) and refuses updates. Its recovery restores the durable veto and then settles the marker binding: marker, `boot-policy-transitions/<id>/maintenance-intent.json` and `generation-baseline.json` all become exactly the new form when the new runtime review is installed, or exactly the old bytes when the old one is. The old bytes are always retained first as `maintenance-intent.before-runtime-<new12>.json` and `generation-baseline.before-runtime-<new12>.json` next to `runtime-rebind-<new12>.json`. A process killed mid-rewrite cannot run that recovery; compare the three files with those copies (the marker's only difference is `runtime_review_sha256`; the baseline's is `maintenance_intent_sha256`) and escalate rather than editing by hand.
+What is left depends on where the adapter stopped. The core writes, in this order and each after a guard check: `source-default-activation.pending` (the barrier, protocol `omarchy-t2-runtime-upgrade-maintenance-intent-v1`), `runtime-upgrade.pending` (same bytes), `runtime-upgrade-approval-consumed-<approval>.json` (same bytes), the retained old runtime files, the new runtime, and only then the marker rebind. A stop before the barrier leaves nothing. A stop right after the barrier (the guard refusing) leaves ONLY the barrier: no `runtime-upgrade.pending`, no consumed file, the old runtime, config, review and marker untouched. A later stop leaves the barrier and `runtime-upgrade.pending` (and the consumed file from the third write on). The barrier alone is never sufficient evidence that nothing moved; the proof below is.
+
+The adapter's recovery restores the durable veto and then settles the marker binding: marker, `boot-policy-transitions/<id>/maintenance-intent.json` and `generation-baseline.json` all become exactly the new form when the new runtime review is installed, or exactly the old bytes when the old one is. The old bytes are always retained first as `maintenance-intent.before-runtime-<new12>.json` and `generation-baseline.before-runtime-<new12>.json` next to `runtime-rebind-<new12>.json`, even when nothing moved (the retained copies then equal the current files: that is old-form evidence, not proof of a rebind). A process killed mid-rewrite cannot run that recovery; compare the three files with those copies (the marker's only difference is `runtime_review_sha256`; the baseline's is `maintenance_intent_sha256`) and escalate rather than editing by hand.
+
+Updates stay refused by the installed guard (`Active or incomplete source state prevents maintenance evidence`) until the barrier is retired. Never delete it by hand and never re-run the failed approval: its adapter bytes are pinned and it is dead once a defect is found.
+
+#### Adopting the barrier of an earlier, unconsumed approval
+
+A maintenance approval may carry an optional `leftover` object, `{"approval_id": "<earlier UUID4>", "intent_sha256": "<SHA-256 of the exact barrier bytes>"}`. Its reviewed adapter then, under the same locks and inhibitor, before it calls the core:
+
+1. proves nothing moved: the barrier is byte-exact the pinned intent, canonical, for THIS approval's old review, config and marker digest, from the named earlier approval and a different new review; no `runtime-upgrade.pending`, no `.runtime-pending`, no consumed file for either approval, no completion or retained-runtime evidence for either review; the installed review, bootstrap and config are exactly the old pins and the whole runtime tree verifies against the old review; the marker equals the pinned bytes, the archived intent equals the marker and the baseline is bound to it in the old form; the retained old copies and the rebind record under the earlier review's tag, if present, are byte-exact old-form evidence; no rebind evidence exists for this approval's review;
+2. writes `runtime-upgrade-approval-consumed-<earlier approval>.json` with the barrier's bytes, so the earlier approval can never be replayed (the core and the adapter refuse a consumed approval);
+3. renames the barrier to `runtime-upgrade-abandoned-intent-<earlier approval>.json` (archived, never deleted);
+4. continues with this approval's own upgrade.
+
+Each step is preceded by the guard and is idempotent: a crash after step 2 or 3 is resumed by re-running the same approval; any other bytes or any moved state refuses with zero writes and the barrier stays. If the upgrade then stops before writing its own barrier (a precheck refusal), the machine is back in ordinary inactive maintenance on the old runtime.
+
+#### The 2026-09-29 leftover (approval `c6051717-6c93-4183-9d5f-eba64bd6182e`, reviewed commit `0807b7d7`)
+
+The first live maintenance upgrade stopped at its first guard after writing the barrier (`Active source-default state is present under a maintenance upgrade: source-default-activation.pending`), because the adapter's own guard refused the core's own barrier. A second defect would have followed: after the marker rebind the guard compared the marker with its pinned OLD bytes. Both are fixed by the reviewed replacement adapter, which also adopts the leftover. The state to expect (read-only):
+
+```bash
+S=/var/lib/omarchy/t2-hibernate-product
+A=$S/boot-policy-transitions/f5be4683-011d-40ca-85b2-815508a9bdb1
+sudo sha256sum "$S/source-default-activation.pending"    # 248927bfdce50c394d955c85c15ce1d483aa703b696188e3058d46a0dd2d022b (the exact intent, 603 bytes)
+sudo ls "$S"/runtime-upgrade.pending "$S"/.runtime-pending "$S"/runtime-upgrade-approval-consumed-c6051717-* 2>&1   # all absent
+sudo sha256sum "$S/runtime-deployment-review.json" "$S/package-maintenance.pending"   # c31e1a43... (old review) and 6d6ccc4a... (old marker)
+sudo ls "$A"        # includes the two *.before-runtime-14107eedf06a.json copies and runtime-rebind-14107eedf06a.json: old-form evidence left by the failed run's recovery
+```
+
+Operator steps: build and review the fixed source commit; author the new approval (new adapter pin and new review, same old pins, a fresh `approval_id`, `unchanged` = qualification, hook and the marker digest 6d6ccc4a...) with `"leftover": {"approval_id": "c6051717-6c93-4183-9d5f-eba64bd6182e", "intent_sha256": "248927bfdce50c394d955c85c15ce1d483aa703b696188e3058d46a0dd2d022b"}`. Archive the earlier staged set beside the new one (the stage script's `prior-<commit12>.` copies, prefix `0807b7d7`) before installing the new one, and make the pre-run checks expect exactly this one leftover in place of "markers absent". Run the adapter once, as in H6a. On success the leftover is archived as `runtime-upgrade-abandoned-intent-c6051717-....json` and consumed as `runtime-upgrade-approval-consumed-c6051717-....json`. On a refusal nothing has been written: diagnose read-only; do not edit state.
 
 ## Summary of gaps
 
