@@ -559,4 +559,24 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-stage-audit-") as temporary
   set_boot(root, receipt["entry_id"], BOOT_B)
   assert stage.mark_booted(root)["state"] == "booted"
 
+  # R1: a pair receipt change while armed must not stop disarm or mark_booted; arming still refuses.
+  root, build, limine, original, production = fixture(base / "r1")
+  receipt = stage.stage(root, build)
+  advertise(root, receipt)
+  stage.arm(root, runner=bootctl_for(root))
+  (root / stage.PAIR_STATE / "receipt.json").write_text(json.dumps({"state": "rolled-back"}))
+  assert stage.disarm(root, runner=bootctl_for(root))["state"] == "disarmed"
+  assert not (root / stage.ONESHOT).exists()
+  rejects(lambda: stage.arm(root, runner=bootctl_for(root)), "pair receipt changed")
+  rejects(lambda: stage.verify_staged(root, receipt), "pair receipt changed")
+  stage.verify_staged(root, receipt, pair=False)
+  root, build, limine, original, production = fixture(base / "r1-booted")
+  receipt = stage.stage(root, build)
+  advertise(root, receipt)
+  stage.arm(root, runner=bootctl_for(root))
+  (root / stage.ONESHOT).unlink()
+  set_boot(root, receipt["entry_id"], BOOT_B)
+  (root / stage.PAIR_STATE / "receipt.json").write_text(json.dumps({"state": "rolled-back"}))
+  assert stage.mark_booted(root)["state"] == "booted"
+
 print("PASS: upstream-model stager locks, re-reads Limine before writing and enforces arm ordering")

@@ -394,6 +394,7 @@ def main():
   require_stock_config()
   require_root_tree(INSTALL_HOOKS, directory=True)
   require_root_tree(HERE / "common.py", directory=False)
+  require_root_tree(Path(__file__).resolve(), directory=False)
   output.parent.mkdir(parents=True, exist_ok=True)
   os.umask(0o077)
 

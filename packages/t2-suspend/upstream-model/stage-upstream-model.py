@@ -394,7 +394,7 @@ def load_receipt(root):
   return data
 
 
-def verify_staged(root, receipt):
+def verify_staged(root, receipt, pair=True):
   image = rooted(root, ESP_IMAGE)
   if not image.is_file() or SINGLE.digest(image) != receipt["image_sha256"] or SINGLE.blake2(image) != receipt["image_blake2"]:
     raise ValueError("Staged upstream-model image changed")
@@ -412,7 +412,7 @@ def verify_staged(root, receipt):
     raise ValueError("Upstream-model Limine hash is stale or ambiguous")
   if present(root, DEFAULT):
     raise ValueError("Persistent EFI default would weaken stock fallback")
-  if receipt.get("pair_receipt_sha256") != pair_receipt_sha256(root):
+  if pair and receipt.get("pair_receipt_sha256") != pair_receipt_sha256(root):
     raise ValueError("The pair receipt changed since staging; roll back the upstream model before any pair retire, rollback or rebind")
 
 
@@ -654,7 +654,7 @@ def mark_booted(root):
     state = "armed" if (receipt.get("arming") or {}).get("purpose") == "boot" else "s4-armed"
   if state not in ARMED:
     raise ValueError("No armed upstream-model boot to confirm")
-  verify_staged(root, receipt)
+  verify_staged(root, receipt, pair=False)
   if present(root, ONESHOT) or present(root, DEFAULT):
     raise ValueError("LoaderEntryOneShot was not consumed")
   if selected_entry(root) != receipt["entry_id"]:
@@ -678,7 +678,7 @@ def disarm(root, runner=subprocess.run):
     return receipt
   if receipt.get("state") not in ARMED + ("arming",):
     raise ValueError("No upstream-model one-shot is armed")
-  verify_staged(root, receipt)
+  verify_staged(root, receipt, pair=False)
   purpose = (receipt.get("arming") or {}).get("purpose")
   if purpose == "s4":
     if selected_entry(root) != receipt["entry_id"] or current_boot_id(root) != receipt.get("test_boot_id"):

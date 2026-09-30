@@ -93,6 +93,9 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-builder-") as temporary:
   sys.argv = ["build", "--candidate-source", str(tree), "--output", str(output), "--experiment-id", "upstream-test"]
   try:
     rejects(build.main, "Output already exists")
+    sys.argv = ["build", "--candidate-source", str(tree), "--output", str(base / "fresh"), "--experiment-id", "upstream-test"]
+    rejects(build.main, "root-owned")
+    assert not (base / "fresh").exists()
     sys.argv = ["build", "--candidate-source", str(tree), "--output", "/boot/EFI/Linux/new-output", "--experiment-id", "upstream-test"]
     rejects(build.main, "EFI or boot filesystem")
   finally:
