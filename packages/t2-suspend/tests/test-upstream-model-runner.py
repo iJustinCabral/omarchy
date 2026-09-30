@@ -53,9 +53,11 @@ class Env:
     self.inhibit = "Xwayland 1000 jjc 99 Xwayland sleep:idle Xwayland delay\n"
     self.map_offset = str(OFFSET)
     self.lock_hook = None
+    self.dmesg = ""
+    self.bootctl_log = []
     self._sysfs()
     self.host = run.Host(self.root, run=self.command, ask=self.ask, now=lambda: self.clock, sleep=self.sleep, euid=lambda: 0,
-                         sync=lambda: self.calls.append("sync"), stager_runner=bootctl_for(self.root), lock=self.lock)
+                         sync=lambda: self.calls.append("sync"), stager_runner=bootctl_for(self.root, self.bootctl_log), lock=self.lock)
 
   # -- fake sysfs ---------------------------------------------------------------
   def write(self, relative, text):
@@ -130,6 +132,12 @@ class Env:
       return done(self.map_offset + "\n")
     if arguments[0] == "systemd-inhibit":
       return done(self.inhibit)
+    if arguments[0] == "dmesg":
+      return done(self.dmesg)
+    if arguments[0] == "journalctl" and "-k" in arguments:
+      after = [item for item in arguments if item.startswith("--after-cursor=s=")]
+      text = self.journal[int(after[0].split("=")[-1]):] if after else self.journal
+      return done("".join(line + "\n" for line in text.splitlines() if "kernel:" in line))
     if arguments[0] == "journalctl":
       if "--show-cursor" in arguments:
         return done("-- cursor: s=" + str(len(self.journal)) + "\n")
@@ -478,7 +486,10 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-") as temporary:
     pass
   else:
     raise AssertionError("interrupt swallowed")
-  assert case.terminal() and case.guard(1).exists() and not case.dropin_present() and not (case.root / stage.ONESHOT).exists()
+  # An abort inside the power call unwinds nothing: the transition may be in flight.
+  assert case.terminal() and case.guard(1).exists() and case.dropin_present() and (case.root / stage.ONESHOT).exists()
+  assert case.attempt(1)["state"] == "failed-terminal" and case.attempt(1)["unwound"] is False and "noresume" in case.attempt(1)["stale_image_warning"]
+  assert "" not in case.bootctl_log
 
   def swap_changed(e):
     e.hibernate_hook = lambda: e.write("sys/power/resume_offset", "8\n")
@@ -642,19 +653,26 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-signals-") as tempor
   case.lock_hook = None
   assert run.s4_cycle(case.host, 1)["state"] == "returned-and-cleaned"
 
-  for number in (signal.SIGHUP, signal.SIGINT):
+  # After the guard, terminating signals are ignored through the power call and post-return: nothing is
+  # disarmed or unwound while a transition may be in flight.
+  for number in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
     case = Env(base / ("signal-after-guard-" + str(int(number))))
     case.to_s3_passed()
-    case.hibernate_hook = lambda number=number: os.kill(os.getpid(), number)
+    seen = {}
+
+    def hook(number=number, case=case, seen=seen):
+      os.kill(os.getpid(), number)
+      seen["dropin"] = case.dropin_present()
+      seen["oneshot"] = (case.root / stage.ONESHOT).exists()
+      seen["disarms"] = list(case.bootctl_log)
+
+    case.hibernate_hook = hook
     with run.terminating_signals():
-      try:
-        run.s4_cycle(case.host, 1)
-      except SystemExit as error:
-        assert error.code == 128 + int(number)
-      else:
-        raise AssertionError("signal ignored")
-    assert case.terminal() and case.guard(1).exists() and not case.dropin_present() and not (case.root / stage.ONESHOT).exists()
-    assert case.attempt(1)["state"] == "failed-terminal"
+      installed = signal.getsignal(number)
+      assert run.s4_cycle(case.host, 1)["state"] == "returned-and-cleaned"
+      assert signal.getsignal(number) == installed
+    assert seen["dropin"] is True and seen["oneshot"] is True and "" not in seen["disarms"]
+    assert "" not in case.bootctl_log and case.guard(1).exists() and not case.terminal()
 
   # recover: a dead runner on the test boot.
   case = Env(base / "recover-same-boot")
@@ -704,3 +722,75 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-signals-") as tempor
   rejects(lambda: run.recover(case.host), "from the stock boot use cleanup")
 
 print("PASS: upstream-model runner cleans up on signals, recovers a dead runner and retries non-transitions")
+
+
+with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-evidence-") as temporary:
+  base = Path(temporary)
+  import fcntl
+
+  # Refusal evidence: every source must agree that no transition began.
+  def refusal(name, prepare, retryable):
+    case = Env(base / name)
+    case.to_s3_passed()
+    prepare(case)
+    rejects(lambda: run.s4_cycle(case.host, 1), "returned 1")
+    assert case.terminal() is (not retryable), name
+    assert case.attempt(1)["state"] == ("refused-before-transition" if retryable else "failed-terminal"), name
+    return case
+
+  def set_rc(e):
+    e.hibernate_rc = 1
+
+  pre_failure_text = "[  50.0] host systemd[1]: systemd-hibernate.service: Control process exited, code=exited, status=1/FAILURE\n[  50.1] host systemd[1]: Failed to start System Hibernate.\n"
+  refusal("pre-refusal", lambda e: (set_rc(e), setattr(e, "hibernate_hook", lambda: setattr(e, "journal", e.journal + pre_failure_text))), True)
+  refusal("dmesg-freeze", lambda e: (set_rc(e), setattr(e, "hibernate_hook", lambda: setattr(e, "dmesg", e.dmesg + "[   60.0] PM: Freezing user space processes failed\n"))), False)
+  for text in ("Syncing filesystems ... done.", "PM: Preparing system for sleep (hibernation)", "swsusp: Basic memory bitmaps created", "Image not found"):
+    refusal("dmesg-" + text[:6], lambda e, text=text: (set_rc(e), setattr(e, "hibernate_hook", lambda: setattr(e, "dmesg", e.dmesg + "[   61.0] " + text + "\n"))), False)
+  refusal("kernel-journal", lambda e: (set_rc(e), setattr(e, "hibernate_hook", lambda: setattr(e, "journal", e.journal + "[ 62.0] host kernel: PM: Preparing system for sleep (hibernation)\n"))), False)
+  refusal("sleep-journal", lambda e: (set_rc(e), setattr(e, "hibernate_hook", lambda: setattr(e, "journal", e.journal + "[ 63.0] host systemd-sleep[99]: Performing sleep operation 'hibernate'...\n"))), False)
+  refusal("hibernate-location", lambda e: (set_rc(e), setattr(e, "hibernate_hook", lambda: e.write(HIBERNATE_LOCATION, "x"))), False)
+  # Unreadable sources are terminal, never retryable.
+  class Unreadable(Env):
+    def command(self, arguments, timeout=None):
+      if tuple(arguments)[:2] == ("journalctl", "--sync") and getattr(self, "broken", None) == "sync":
+        return subprocess.CompletedProcess(arguments, 1, "", "no journal")
+      if tuple(arguments)[0] == "dmesg" and getattr(self, "broken", None) == "dmesg" and self.armed_broken:
+        return subprocess.CompletedProcess(arguments, 1, "", "dmesg: read kernel buffer failed")
+      return super().command(arguments, timeout)
+
+  for broken in ("sync", "dmesg"):
+    case = Unreadable(base / ("unreadable-" + broken))
+    case.to_s3_passed()
+    case.hibernate_rc = 1
+    case.broken, case.armed_broken = broken, False
+    case.hibernate_hook = lambda case=case: setattr(case, "armed_broken", True)
+    rejects(lambda: run.s4_cycle(case.host, 1), "returned 1")
+    assert case.terminal() and case.attempt(1)["state"] == "failed-terminal"
+  # A dmesg baseline taken at the cursor hides earlier, unrelated kernel lines.
+  case = Env(base / "baseline")
+  case.to_s3_passed()
+  case.dmesg = "[ 5.0] PM: Freezing user space processes (from an earlier cycle)\n"
+  case.hibernate_rc = 1
+  rejects(lambda: run.s4_cycle(case.host, 1), "returned 1")
+  assert not case.terminal() and case.attempt(1)["state"] == "refused-before-transition"
+  assert ("journalctl", "--sync") in case.calls
+
+  # Runner lock: a held lock refuses every mutating phase; read-only phases are not gated.
+  case = Env(base / "lock")
+  case.to_s3_passed()
+  descriptor = os.open(case.root / C.STATE / "runner.lock", os.O_RDWR | os.O_CREAT, 0o600)
+  fcntl.flock(descriptor, fcntl.LOCK_EX)
+  for action in (lambda: run.verify_boot(case.host), lambda: run.s3(case.host), lambda: run.s4_cycle(case.host, 1),
+                 lambda: run.cleanup(case.host), lambda: run.recover(case.host)):
+    rejects(action, "runner lock")
+  assert not case.dropin_present() and not case.guard(1).exists() and len(case.called("systemctl", "suspend")) == 1
+  fcntl.flock(descriptor, fcntl.LOCK_UN)
+  os.close(descriptor)
+  assert run.cleanup(case.host)["state"] == "cleaned"
+  # The lock file does not block the stager's state validation or clear.
+  set_boot(case.root, C.STOCK_ENTRY, BOOT_C)
+  stage.rollback(case.root)
+  assert stage.clear_rolled_back(case.root)["state"] == "cleared"
+  assert (case.root / C.STATE / "runner.lock").exists()
+
+print("PASS: upstream-model runner ignores signals in flight, weighs all refusal evidence and serialises runners")

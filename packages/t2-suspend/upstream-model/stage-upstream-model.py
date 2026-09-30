@@ -53,7 +53,7 @@ PHYSICAL_LOCK = Path("var/lib/omarchy/t2-hibernate-trial/physical-cycle.lock")
 DB_LOCK = Path("var/lib/pacman/db.lck")
 PAIR_PENDING_STATES = ("preparing", "restore-arming", "rolling-back", "stage-failed-recovered")
 ESP_HEADROOM = 16 * 1024 * 1024
-STATE_FILES = ("receipt.json", "limine.conf.before")
+STATE_FILES = ("receipt.json", "limine.conf.before", "runner.lock")
 SCHEMA = "omarchy-t2-upstream-model-stage-v1"
 MAX_PROVENANCE = 4 * 1024 * 1024
 ARMED = ("armed", "s4-armed")
@@ -684,6 +684,12 @@ def adopt_boot(root):
 
   Used by the runner's recover step on the test boot itself: the current boot becomes the test boot and
   the receipt moves to "booted" (verify-boot must then pass on it). Evidence and guards are untouched.
+
+  This deliberately skips the boot-id checks that mark_booted makes (armed_from_boot_id / test_boot_id),
+  because the boot being adopted is by definition not the one the receipt expected. It stays safe because
+  every attempt that owned a guard was already made terminal by the runner's reconcile step before adopt,
+  arming refuses terminal images, and verify-boot (selected entry, cmdline, srcversions, health, typed
+  confirmation) must be re-run on the adopted boot before any S3 or S4 step will proceed.
   """
   receipt = load_receipt(root)
   if receipt.get("state") not in ARMED + ("arming",):

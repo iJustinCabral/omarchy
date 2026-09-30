@@ -19,6 +19,8 @@ Any failure after a guard is consumed makes the image hash terminal. Typed phras
 
 import argparse
 from contextlib import contextmanager
+import fcntl
+import functools
 import hashlib
 import importlib.util
 import json
@@ -68,6 +70,9 @@ EVIDENCE_COMMANDS = {
   "btrfs-device-stats": ("btrfs", "device", "stats", "/"),
   "inhibitors": ("systemd-inhibit", "--list", "--no-pager", "--no-legend"),
 }
+STALE_WARNING = ("The power call did not return cleanly: the drop-in and any one-shot were left in place. NEXT BOOT: use the noresume "
+                 "edit (Limine menu, E on the stock entry, append noresume, F10) and read the swap header before any normal boot; "
+                 "then run recover (test boot) or cleanup (stock boot).")
 CHECKLIST = """\
 Recovery checklist (nothing here repeats a hibernation attempt):
  1. Write down what the screen showed, how long it took, and whether the machine powered down by itself.
@@ -147,6 +152,46 @@ class Host:
 
   def exists(self, relative):
     return os.path.lexists(self.root / relative)
+
+
+def ignore_signals():
+  """SIG_IGN for the terminating signals; returns the previous handlers (empty if not the main thread)."""
+  previous = {}
+  for name in ("SIGHUP", "SIGTERM", "SIGINT"):
+    try:
+      previous[getattr(signal, name)] = signal.signal(getattr(signal, name), signal.SIG_IGN)
+    except ValueError:
+      break
+  return previous
+
+
+def restore_signals(previous):
+  for number, handler in previous.items():
+    signal.signal(number, handler)
+
+
+@contextmanager
+def runner_lock(host):
+  """Non-blocking exclusive flock so two runner invocations never mutate state concurrently."""
+  path = host.root / C.STATE / "runner.lock"
+  path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+  descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+  try:
+    try:
+      fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+      raise ValueError("Another upstream-model runner holds the runner lock") from None
+    yield
+  finally:
+    os.close(descriptor)
+
+
+def locked(function):
+  @functools.wraps(function)
+  def wrapper(host, *arguments, **options):
+    with runner_lock(host):
+      return function(host, *arguments, **options)
+  return wrapper
 
 
 def selected_value(text):
@@ -401,6 +446,7 @@ def load(host):
   return receipt
 
 
+@locked
 def verify_boot(host):
   """G1: ordinary boot of the staged image."""
   receipt = load(host)
@@ -440,6 +486,7 @@ def require_g1(host, receipt):
   return boot_id
 
 
+@locked
 def s3(host):
   """G2: plain S3 suspend on the image."""
   receipt = load(host)
@@ -600,6 +647,7 @@ def install_dropin(host):
     if show_units(host) != expected_units(host):
       raise ValueError("systemd-hibernate.service does not show the expected stock ExecStart and prepare steps")
   except BaseException:
+    ignore_signals()
     remove_dropin(host)
     raise
   return pins
@@ -660,14 +708,31 @@ def terminating_signals():
       signal.signal(number, handler)
 
 
-def no_transition_evidence(host, target, mark):
-  """True only if the swap header is still SWAPSPACE2 and the journal since the guard lacks the entry line."""
+TRANSITION_KERNEL = re.compile(r"hibernation entry|Freezing|Syncing filesystems|swsusp|Image|PM: Preparing")
+TRANSITION_SLEEP = re.compile(r"Performing sleep operation|Entering sleep state|hibernat", re.I)
+
+
+def no_transition_evidence(host, target, mark, dmesg_before=""):
+  """True only if every source agrees that no transition began; any hit or unreadable source means False.
+
+  Sources: SWAPSPACE2 header, no HibernateLocation variable, the kernel log since the cursor (journal -k
+  and dmesg beyond the pre-write baseline) free of freeze/swsusp/entry lines, and the full journal since
+  the cursor free of systemd-sleep's own sleep lines (systemd[1] failure text for our own pre step is fine).
+  """
   try:
+    host.output(("journalctl", "--sync"))
     require_clean_header(host, target)
-    lines, _full = journal_slice(host, mark)
+    if host.exists(HIBERNATE_LOCATION):
+      return False
+    kernel = host.output(("journalctl", "-k", "-b", "-o", "short-monotonic", "--no-pager", "--after-cursor=" + mark))
+    dmesg = host.output(("dmesg",))
+    _filtered, full = journal_slice(host, mark)
   except (ValueError, OSError):
     return False
-  return not any("hibernation entry" in line for line in lines)
+  new_dmesg = dmesg[len(dmesg_before):] if dmesg.startswith(dmesg_before) else dmesg
+  if TRANSITION_KERNEL.search(kernel) or TRANSITION_KERNEL.search(new_dmesg):
+    return False
+  return not any("systemd-sleep" in line and TRANSITION_SLEEP.search(line) for line in full.splitlines())
 
 
 def archive_prior_attempt(host, directory):
@@ -683,6 +748,7 @@ def archive_prior_attempt(host, directory):
       item.rename(archive / item.name)
 
 
+@locked
 def s4_cycle(host, cycle):
   receipt = load(host)
   boot_id = require_g1(host, receipt)
@@ -700,7 +766,7 @@ def s4_cycle(host, cycle):
               "swap_target": facts["swap_target"]}
   attempt = {**identity, "state": "preparing", "hibernate_attempted": False}
   save(host, attempt_path, attempt)
-  consumed, armed, installed = False, False, False
+  consumed, armed, installed, in_flight, saved = False, False, False, False, {}
   try:
     capture(host, receipt, directory, "pre", facts["swap_target"])
     issue_acceptance(host, receipt, cycle, boot_id, power["label"], directory)
@@ -730,6 +796,10 @@ def s4_cycle(host, cycle):
     if host.exists(HIBERNATE_LOCATION):
       raise ValueError("HibernateLocation EFI variable is already set")
     mark = cursor(host)
+    dmesg_before = host.output(("dmesg",))
+    # From here a signal must not abort the cycle: once the guard exists the hibernate job can continue in
+    # pid 1 even if this client dies, so nothing may be unwound while a transition could be in flight.
+    saved = ignore_signals()
     create_guard(host, receipt, cycle, {**identity, "created": host.now()})
     consumed = True
     attempt["state"] = "guard-consumed"
@@ -738,19 +808,31 @@ def s4_cycle(host, cycle):
     save(host, attempt_path, attempt)
     host.sync()
     print("omarchy-t2-upstream-model: starting attended S4 cycle " + str(cycle) + " boot=" + boot_id + " image=" + receipt["image_sha256"][:12], flush=True)
+    in_flight = True
     result = host.run(("systemctl", "hibernate"))
+    in_flight = False
     attempt["hibernate_returncode"] = result.returncode
     if result.returncode != 0:
       message = "systemctl hibernate returned " + str(result.returncode) + ": " + result.stderr.strip()[:200]
-      if no_transition_evidence(host, facts["swap_target"], mark):
+      if no_transition_evidence(host, facts["swap_target"], mark, dmesg_before):
         raise RefusedBeforeTransition(message)
       raise RuntimeError(message)
     attempt["state"] = "returned"
     save(host, attempt_path, attempt)
     post_return(host, receipt, cycle, attempt, directory, mark, boot_id)
   except BaseException as error:
+    ignore_signals()  # first statement: cleanup itself must not be interrupted
     attempt["error"] = str(error)
     cleanup_errors = []
+    if in_flight:
+      # The power call did not return: a transition may be running. Unwinding now (removing the drop-in,
+      # daemon-reload, disarming) could break a live hibernate or its one-shot. Leave everything in place.
+      attempt.update(state="failed-terminal", unwound=False, stale_image_warning=STALE_WARNING)
+      terminal(host, receipt, "S4 cycle " + str(cycle) + " aborted during the power call: " + str(error))
+      save(host, attempt_path, attempt)
+      print(STALE_WARNING, file=sys.stderr)
+      print(CHECKLIST, file=sys.stderr)
+      raise
     if installed:
       cleanup_errors += remove_dropin(host)
     if armed and host.exists(STAGE.ONESHOT):
@@ -779,6 +861,8 @@ def s4_cycle(host, cycle):
     save(host, attempt_path, attempt)
     print(CHECKLIST, file=sys.stderr)
     raise
+  finally:
+    restore_signals(saved)
   return attempt
 
 
@@ -839,6 +923,7 @@ def reconcile_attempts(host, receipt):
   return settled
 
 
+@locked
 def cleanup(host):
   """Standalone G4 cleanup: drop-in and helpers gone, owned one-shot disarmed; never touches guards."""
   errors = remove_dropin(host)
@@ -854,6 +939,7 @@ def cleanup(host):
   return {"state": "cleaned", "image_sha256": receipt["image_sha256"], "settled_attempts": settled}
 
 
+@locked
 def recover(host):
   """Repair after a runner died on the test boot: drop-in gone, one-shot disarmed, attempts settled.
 
