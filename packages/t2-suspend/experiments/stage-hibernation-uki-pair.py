@@ -605,12 +605,55 @@ def tree_has_pending(path):
   return False
 
 
+KERNEL_RELEASE = rb"[0-9A-Za-z][0-9A-Za-z._+~-]{0,127}"
+KERNEL_COMMENT = re.compile(rb"^([ \t]*comment: Kernel version: )(" + KERNEL_RELEASE + rb")$", re.M)
+ENTRY_HEADER = re.compile(rb"^[ \t]*/[^\n]*$", re.M)
+
+
 def mask_production_hash(canonical):
-  """(canonical Limine bytes with the production hash blanked, that BLAKE2b hash)."""
+  """(canonical Limine bytes with the production hash and kernel-version comment blanked, that BLAKE2b hash, that release or None).
+
+  The kernel-version comment is masked only when it is the single `comment: Kernel version:` line
+  of the entry that owns the production path line (limine-entry-tool writes it there); a line in
+  any other entry, a second line, or a differently formatted line stays unmasked and so must match.
+  """
   matches = PRODUCTION_PATH.findall(canonical)
   if len(matches) != 1:
     raise ValueError("Limine must have exactly one production UKI path line")
-  return PRODUCTION_PATH.sub(lambda match: match.group(1) + b"#<production-blake2>", canonical), matches[0][1].decode()
+  path_start = PRODUCTION_PATH.search(canonical).start()
+  headers = [header.end() for header in ENTRY_HEADER.finditer(canonical, 0, path_start)]
+  entry_start = headers[-1] if headers else 0
+  comments = list(KERNEL_COMMENT.finditer(canonical, entry_start, path_start))
+  release = None
+  if len(comments) == 1:
+    release = comments[0].group(2).decode()
+    canonical = canonical[:comments[0].start(2)] + b"<kernel-release>" + canonical[comments[0].end(2):]
+  masked = PRODUCTION_PATH.sub(lambda match: match.group(1) + b"#<production-blake2>", canonical)
+  return masked, matches[0][1].decode(), release
+
+
+def uki_kernel_release(path):
+  """The kernel release in the .uname section of a UKI (a PE file), or raise."""
+  data = read_file(path)
+  try:
+    pe = int.from_bytes(data[0x3c:0x40], "little")
+    if data[:2] != b"MZ" or data[pe:pe + 4] != b"PE\0\0":
+      raise ValueError("not a PE image")
+    sections = int.from_bytes(data[pe + 6:pe + 8], "little")
+    table = pe + 24 + int.from_bytes(data[pe + 20:pe + 22], "little")
+    for index in range(sections):
+      entry = data[table + 40 * index:table + 40 * (index + 1)]
+      if len(entry) == 40 and entry[:8].rstrip(b"\0") == b".uname":
+        virtual = int.from_bytes(entry[8:12], "little")
+        size = int.from_bytes(entry[16:20], "little")
+        offset = int.from_bytes(entry[20:24], "little")
+        raw = data[offset:offset + (min(virtual, size) if virtual else size)].rstrip(b"\0")
+        if re.fullmatch(KERNEL_RELEASE, raw):
+          return raw.decode()
+        break
+  except (IndexError, ValueError):
+    pass
+  raise ValueError("Cannot read a kernel release from the production UKI .uname section")
 
 
 def receipt_block(receipt):
@@ -626,8 +669,10 @@ def judge_limine(root, receipt, current, backup):
 
   The only drift accepted is what a production kernel update legitimately causes:
   the hash on the production path line (which must be coherent with the current
-  production UKI) and the limine-snapper-sync snapshot region (removed from both
-  sides by boot_policy.limine_canonical). Everything else, including default_entry,
+  production UKI), the single `comment: Kernel version:` line of that same entry
+  (which, when it changed, must equal the release in the production UKI's .uname
+  section) and the limine-snapper-sync snapshot region (removed from both sides by
+  boot_policy.limine_canonical). Everything else, including default_entry,
   /+Omarchy and //linux-t2, the EFI fallback and foreign entries, must equal the
   pre-staging backup byte for byte. Unrecognised snapshot text refuses.
   """
@@ -642,13 +687,15 @@ def judge_limine(root, receipt, current, backup):
   for marker in (BEGIN, END, SINGLE.BEGIN, SINGLE.END, "/MBA-T2-hibernation-"):
     if marker.encode() in remainder:
       raise ValueError("Limine holds unowned or modified pair text: " + marker)
-  expected, _old_hash = mask_production_hash(policy.limine_canonical(backup))
-  actual, new_hash = mask_production_hash(policy.limine_canonical(remainder))
-  if actual != expected:
-    raise ValueError("Limine changed beyond the production UKI hash and snapshot region")
+  expected, _old_hash, old_release = mask_production_hash(policy.limine_canonical(backup))
+  actual, new_hash, new_release = mask_production_hash(policy.limine_canonical(remainder))
+  if actual != expected or (old_release is None) != (new_release is None):
+    raise ValueError("Limine changed beyond the production UKI hash, kernel release comment and snapshot region")
   production = rooted(root, Path("boot/EFI/Linux") / SINGLE.PRODUCTION_IMAGE)
   if not production.is_file() or SINGLE.blake2(production) != new_hash:
     raise ValueError("Production Limine hash is not coherent with the current production UKI; finish the kernel update first")
+  if new_release != old_release and new_release != uki_kernel_release(production):
+    raise ValueError("Production kernel release comment does not match the release embedded in the production UKI")
   return remainder, new_hash, bool(present)
 
 
