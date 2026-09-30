@@ -443,8 +443,19 @@ def main(argv=None):
   return 0
 
 
+def refusal(error):
+  """Operator-facing refusal text; wording only, never consulted for admission."""
+  native = "/" + str(RUNTIME / "packages/t2-suspend/hibernate/boot_policy_native.py")
+  return ("T2 hibernation update guard: " + str(error) + "\n"
+          "Package updates are paused while T2 hibernation is active. To update, run:\n"
+          "  omarchy update\n"
+          "which pauses hibernation for you and offers to turn it back on afterwards. Without omarchy update, run:\n"
+          "  sudo /usr/bin/python3 -I -B " + native + " maintenance\n"
+          "If this message persists, see docs/t2-suspend/MAINTENANCE-RUNBOOK.md.")
+
+
 if __name__ == "__main__":
   try: raise SystemExit(main())
   except (OSError, ValueError) as error:
-    print("T2 hibernation update guard: " + str(error), file=sys.stderr)
+    print(refusal(error), file=sys.stderr)
     raise SystemExit(1)

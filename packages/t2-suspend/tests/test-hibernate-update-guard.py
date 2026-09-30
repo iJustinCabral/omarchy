@@ -129,6 +129,13 @@ class Updates(unittest.TestCase):
     omarchy.symlink_to(omarchy.with_name("missing"))
     with self.assertRaises(ValueError): guard.check(self.root)
 
+  def test_refusal_text_names_the_update_command_and_the_fixed_maintenance_command(self):
+    text = guard.refusal(ValueError("fixture active policy"))
+    self.assertTrue(text.startswith("T2 hibernation update guard: fixture active policy\n"))
+    self.assertIn("  omarchy update\n", text)
+    self.assertIn("sudo /usr/bin/python3 -I -B /var/lib/omarchy/t2-hibernate-product/runtime/packages/t2-suspend/hibernate/boot_policy_native.py maintenance", text)
+    self.assertIn("MAINTENANCE-RUNBOOK.md", text)
+
   def test_unavailable_efi_view_cannot_prove_absent_overrides(self):
     (self.root / guard.EFI).rmdir()
     with self.assertRaises(FileNotFoundError): guard.check(self.root)
