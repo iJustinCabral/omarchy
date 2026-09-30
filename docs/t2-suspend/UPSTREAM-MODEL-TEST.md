@@ -43,7 +43,7 @@ Kernel, DKMS radio, firmware and `/etc` must not change during the test window, 
 
 One hash-bound one-shot entry of the same image, re-armed before each S4. Limine consumes `LoaderEntryOneShot` at the next boot whatever happens after, so power-on after S4 picks the test entry and the restore happens in that boot. If it fails or hangs, the operator power-cycles and the default (stock `Omarchy.linux-t2`, `default_entry: 2`) boots. A persistent default is never set (`LoaderEntryDefault` must be absent at all times; a temporary default would loop a failing image).
 
-History says a failed restore usually consumes the image (`swsusp_check()` resets the swap signature as soon as it reads the header; every earlier failed vector ended with stock reporting `PM: Image not found (code -22)`). The dangerous residual case is a hang before `swsusp_check`: the image is intact and the stock UKI's own `resume` hook would restore it with an unpatched BCE and no 0005 gate, a never-run vector. The recovery checklist (printed by the runner on every failure and by `run-upstream-model.py recovery`) therefore tells the operator to record observations first, power-cycle, read `journalctl -b` for `Image not found`, read the swap header, never retry, and treat the image hash as terminal. An Arch live-USB header repair (copy `orig_sig` over `sig`) writes the owner's swap file and is not authorised here.
+History says a failed restore usually consumes the image (`swsusp_check()` resets the swap signature as soon as it reads the header; every earlier failed vector ended with stock reporting `PM: Image not found (code -22)`). The dangerous residual case is a hang before `swsusp_check`: the image is intact and the stock UKI's own `resume` hook would restore it with an unpatched BCE and no 0005 gate, a never-run vector. The recovery checklist (printed by the runner on every failure and by `run-upstream-model.py recovery`) therefore tells the operator to record observations first, power-cycle, read `journalctl -b` for `Image not found`, read the swap header, never retry, and treat the image hash as terminal. **Stale-image mitigation (do this first after any failed S4).** On the first boot after a failed S4 the stock resume hook could still restore an intact image with an unpatched BCE. Power on, and at the Limine menu highlight the stock `Omarchy` entry, press `E`, move to the `cmdline:` line, press `End`, type a space followed by `noresume`, then press `F10` to boot once. `noresume` is not persistent (nothing is written). Read the swap header from that boot (`sudo python3 packages/t2-suspend/experiments/audit-hibernation-swap-header.py --device /dev/mapper/root --page-offset <resume_offset>`) and only then boot normally. An Arch live-USB header repair (copy `orig_sig` over `sig`) writes the owner's swap file and is not authorised here.
 
 ## 3. Tooling (all under `packages/t2-suspend/upstream-model/`)
 
@@ -55,6 +55,10 @@ History says a failed restore usually consumes the image (`swsusp_check()` reset
 | `prepare.py` | The transient pre/post steps run by the drop-in. Copied to `/run` by the runner; stdlib only. |
 | `common.py` | Shared names and pure helpers (phrases, drop-in text, rejected hashes). |
 | `initcpio/install/omarchy-t2-upstream-model-blacklist` | Build-time-only mkinitcpio hook for the blacklist file. |
+
+The builder, `common.py` and the install hook must be root-owned and not group/world writable, like every other builder input, so run the builder from a root-owned export of the reviewed commit (step 1 below), never from the working tree. The stager and runner likewise run from the export, and the stager takes `db.lck` and the physical cycle lock around `stage`, `arm`, `arm-s4` and `rollback`, re-reading `limine.conf` immediately before each write.
+
+**Pair interplay.** The pair receipt's steady `source-arming` state (ACTIVE product) is normal and allowed; the stager refuses while a pair transaction is in a transient state (`preparing`, `restore-arming`, `rolling-back`, `stage-failed-recovered`). It records the pair receipt hash at staging and refuses to arm if it changes. Our rollback must therefore precede any pair retire, rollback or rebind step; `reactivate` and the maintenance runbook steps come after `rollback` and `clear`.
 
 Tests: `packages/t2-suspend/tests/test-upstream-model-{builder,stage,prepare,runner}.py` with the shared fixture `upstream_model_fixture.py`; registered in `test/shell.d/t2-suspend-installer-test.sh`.
 
@@ -140,7 +144,7 @@ BUILD=$TOOLS_ROOT/build-$(date +%Y%m%d)
    sudo python3 "$TOOLS/run-upstream-model.py" s4 --cycle 3
    ```
 
-   The runner needs the desktop user via `sudo` (it reads `SUDO_UID` and `SUDO_USER` to run `omarchy-system-sleep-lock`). Stay at the machine with the power button reachable; the display goes dark, the machine powers off, and after you press the power button the restore boot selects the test entry and the same terminal session returns. On any failure follow the printed checklist and stop: the image is terminal.
+   The runner needs the desktop user via `sudo` (it reads `SUDO_UID` and `SUDO_USER` to run `omarchy-system-sleep-lock`). A failure of the drop-in's `ExecStartPre` (Wi-Fi detach, Bluetooth or bolt) happens after the guard was created, so it consumes the cycle: the image hash becomes terminal and a repeat needs a new image hash and a new design review. Stay at the machine with the power button reachable; the display goes dark, the machine powers off, and after you press the power button the restore boot selects the test entry and the same terminal session returns. On any failure follow the printed checklist and stop: the image is terminal.
 
 9. **Return to stock and undo.** Reboot to stock (the default), then:
 
@@ -151,7 +155,7 @@ BUILD=$TOOLS_ROOT/build-$(date +%Y%m%d)
    sudo /usr/bin/python3 -I -B "$NATIVE" assess
    ```
 
-   Only if `assess` reports `unchanged`: `sudo /usr/bin/python3 -I -B "$NATIVE" reactivate`. Anything else keeps hibernation off (fail-closed; nothing to repair by hand; see the maintenance runbook and [REQUALIFICATION.md](REQUALIFICATION.md)). After reactivation run `omarchy-update-t2-hibernation post` if the update hook is in use. The product's routine ledger chain is not advanced by test cycles; its next cycle goes from a fresh boot, as after any reboot.
+   Then `sudo python3 "$TOOLS/run-upstream-model.py" pre-reactivate-check`, which refuses while the `/run` drop-in, `/run/omarchy-t2-upstream-model`, a one-shot, the receipt or an unsettled attempt remains (a reboot also clears `/run`, but run `cleanup` anyway so attempts are settled). Only if both `assess` reports `unchanged` and the check passes: `sudo /usr/bin/python3 -I -B "$NATIVE" reactivate`. Anything else keeps hibernation off (fail-closed; nothing to repair by hand; see the maintenance runbook and [REQUALIFICATION.md](REQUALIFICATION.md)). After reactivation run `omarchy-update-t2-hibernation post` if the update hook is in use. The product's routine ledger chain is not advanced by test cycles; its next cycle goes from a fresh boot, as after any reboot.
 
 10. **Record the outcome** in `RESUME.md` and `EVIDENCE-7.2.7.md` with the evidence directory path and the image SHA-256 before doing anything else.
 
