@@ -143,8 +143,8 @@ class Deployment(unittest.TestCase):
     result = subprocess.run(("/usr/bin/python3", "-B", "-c", script), capture_output=True, text=True, timeout=30)
     self.assertEqual(result.returncode, 0, result.stderr)
     self.assertEqual(result.stdout.strip(), "transitive-imports-pass")
-    # A sanity floor, not a pin. The working branch ships 229 files in the two runtime trees (floor 180);
-    # this branch omits the maintenance broker modules, lab probes and cleanup tools and ships 158.
+    # A sanity floor, not a pin. The working branch ships 230 files in the two runtime trees (floor 180);
+    # this branch omits the maintenance broker modules, lab probes and cleanup tools and ships 159.
     self.assertGreater(len(receipt["files"]), 130)
     self.assertTrue(D.UPDATE_GUARD_HOOK in receipt["files"], "Actual reviewed inventory must include the exact update guard hook")
     self.assertEqual((runtime / D.UPDATE_GUARD_HOOK).read_bytes(), (REPO / D.UPDATE_GUARD_HOOK).read_bytes())
