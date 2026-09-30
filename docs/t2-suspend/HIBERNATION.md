@@ -1,6 +1,6 @@
 # T2 hibernation (S4) for MacBookAir9,1
 
-Opt-in hibernation for the MacBookAir9,1 (T2, BCM4377 radios) on `linux-t2`. It is not enabled by default, by install or by any migration: nothing here changes what `systemctl hibernate` does until an operator deliberately deploys and opts in. This page is the overview; [DEPLOYMENT.md](DEPLOYMENT.md) and [MAINTENANCE-RUNBOOK.md](MAINTENANCE-RUNBOOK.md) are the operator procedures and [EVIDENCE.md](EVIDENCE.md) says what was actually demonstrated.
+Opt-in hibernation for the MacBookAir9,1 (T2, BCM4377 radios) on `linux-t2`. It is not enabled by default, by install or by any migration: nothing here changes what `systemctl hibernate` does until an operator deliberately deploys and opts in. This page is the overview; [DEPLOYMENT.md](DEPLOYMENT.md) and [MAINTENANCE-RUNBOOK.md](MAINTENANCE-RUNBOOK.md) are the operator procedures [EVIDENCE.md](EVIDENCE.md) and [EVIDENCE-7.2.7.md](EVIDENCE-7.2.7.md) say what was actually demonstrated, [HIBERNATION-OVERVIEW.md](HIBERNATION-OVERVIEW.md) is the plain-language narrative, and [REQUALIFICATION.md](REQUALIFICATION.md) is the new-kernel procedure.
 
 ## What it is
 
@@ -13,7 +13,7 @@ Two private unified kernel images (UKIs) are built and staged next to the produc
 - **Source image** boots the session that will be saved. It carries the candidate module stack (patched T2 BCE, `brcmfmac`, `hci_bcm4377`) and the marker and guard modules that record and gate the S4 sequence.
 - **Restore image** is booted cold by the one-shot loader entry, reads the image and hands back to the source session. Its early initramfs holds the cold-restore guards.
 
-The stock `Omarchy linux-t2` entry and its production UKI stay untouched as the fallback. The pair is built and audited offline by `packages/t2-suspend/experiments/` (`build-hibernation-candidate-uki.py`, `build-hibernation-source-uki.py`, `audit-hibernation-uki-pair.py`, `stage-hibernation-uki-pair.py`); the kernel changes it depends on are the `experiments/00*.patch` series plus `patches/bce/` and `patches/wifi/0006`, applied by the `hibernation` source profile of `prepare-source.py`. The candidate stack now targets `linux-t2` 7.2.7: t2bce is pinned to `6780d522` in `packages/t2-suspend/t2bce-source.json` and the patch series includes 0016 and 0017 (see [T2BCE-7.2.7-REBASE.md](T2BCE-7.2.7-REBASE.md)). Hardware S4 evidence exists only for the 7.2.6 generation.
+The stock `Omarchy linux-t2` entry and its production UKI stay untouched as the fallback. The pair is built and audited offline by `packages/t2-suspend/experiments/` (`build-hibernation-candidate-uki.py`, `build-hibernation-source-uki.py`, `audit-hibernation-uki-pair.py`, `stage-hibernation-uki-pair.py`); the kernel changes it depends on are the `experiments/00*.patch` series plus `patches/bce/` and `patches/wifi/0006`, applied by the `hibernation` source profile of `prepare-source.py`. The candidate stack now targets `linux-t2` 7.2.7: t2bce is pinned to `6780d522` in `packages/t2-suspend/t2bce-source.json` and the patch series includes 0016 and 0017 (see [T2BCE-7.2.7-REBASE.md](T2BCE-7.2.7-REBASE.md)). Hardware S4 evidence exists for both the 7.2.6 and the 7.2.7 generations.
 
 The `experiments/` directory name and paths are kept on purpose: the deployed runtime snapshot and its inventory pin those paths, and the code shipped here is the code that ran on hardware. Only the parts the runtime and the pair build actually reach are included; lab probes and one-shot cleanup tools stay on the working branch.
 
@@ -50,14 +50,15 @@ The prototype guard blocks every package transaction while hibernation is active
 3. **Assess.** `assess` recomputes the baseline items read-only and reports `unchanged`, `requalification-required` or `unknown`. Snapshot churn in `limine.conf` does not count as a change.
 4. **Reactivate or requalify.** If nothing the qualification depends on changed, `reactivate` re-applies the retained source default without requalification. Otherwise hibernation stays off until the pair is rebuilt and requalified. Interrupted transitions recover by re-running the same action; the [runbook](MAINTENANCE-RUNBOOK.md) covers the stuck states.
 
-A `linux-t2` kernel update therefore correctly ends in `requalification-required`, which is what happened to the reference machine on 7.2.6 to 7.2.7. After a production kernel change the stale staged pair can be removed with the reviewed `stage-hibernation-uki-pair.py retire-after-production-change` mode ([runbook section 9](MAINTENANCE-RUNBOOK.md)). A `rebind` action leaves maintenance on a newly requalified generation (per-generation one-use trial state, pair custody records, and a maintenance-aware runtime upgrade); see [REBIND-DESIGN.md](REBIND-DESIGN.md), gate H6 of [DEPLOYMENT.md](DEPLOYMENT.md) and [HELPERS-7.2.7.md](HELPERS-7.2.7.md). It is audited and synthetic-tested but has not been exercised on hardware.
+A `linux-t2` kernel update therefore correctly ends in `requalification-required`, which is what happened to the reference machine on 7.2.6 to 7.2.7. After a production kernel change the stale staged pair can be removed with the reviewed `stage-hibernation-uki-pair.py retire-after-production-change` mode ([runbook section 9](MAINTENANCE-RUNBOOK.md)). A `rebind` action leaves maintenance on a newly requalified generation (per-generation one-use trial state, pair custody records, and a maintenance-aware runtime upgrade); see [REBIND-DESIGN.md](REBIND-DESIGN.md), gate H6 of [DEPLOYMENT.md](DEPLOYMENT.md) and [HELPERS-7.2.7.md](HELPERS-7.2.7.md). It was exercised on hardware on 2026-09-30 after the 7.2.7 requalification.
 
 ## Limits
 
-- Qualified only on one MacBookAir9,1 with kernel 7.2.6; the rebased 7.2.7 candidate is offline-verified only and its requalification is pending an attended test. Other models and kernels need their own qualification.
+- Qualified only on one MacBookAir9,1, on kernel 7.2.6 and, after a full requalification on 2026-09-29/30, on 7.2.7 ([EVIDENCE-7.2.7.md](EVIDENCE-7.2.7.md)). Other models and kernels need their own qualification, and so does the next kernel update.
 - Not automatic: no migration, installer or default enables it, and there is no unattended rollout.
 - The 30 percent reserve check is a provisional engineering guard, not a measured battery or endurance policy.
-- The marker rebind after requalification is implemented but has not been exercised on hardware.
+- Requalification is a tested but manual, attended procedure ([REQUALIFICATION.md](REQUALIFICATION.md)); it is not automated.
+- The interactive `omarchy update` pause and resume prompts have shell-test coverage only, and no deliberate battery-only cycle has been run on 7.2.7.
 - Distribution of the private UKI build (who builds, signs and stages it on a user machine) is an open question; today it is an operator procedure.
 - The runtime carries some reference-machine constants that were part of the tested bytes (for example a fixed repair unit name in `trial.py`); they are deliberately left as tested.
 

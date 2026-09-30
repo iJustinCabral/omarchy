@@ -1,6 +1,6 @@
 # New-generation rebind: design rationale
 
-Status: source and synthetic tests only. Nothing here has run on the live MacBookAir9,1, and nothing here is hardware evidence, qualification or permission to hibernate. Operator procedure: [MAINTENANCE-RUNBOOK.md, "Requalify and rebind a new generation"](MAINTENANCE-RUNBOOK.md) and [DEPLOYMENT.md gate H6](DEPLOYMENT.md). Companion evidence: [RESUME.md](RESUME.md).
+Status when written: source and synthetic tests only. The rebind has since run on the reference MacBookAir9,1 (see [EVIDENCE-7.2.7.md](EVIDENCE-7.2.7.md), gate H6h); this document is design, not hardware evidence, qualification or permission to hibernate. Operator procedure: [MAINTENANCE-RUNBOOK.md, "Requalify and rebind a new generation"](MAINTENANCE-RUNBOOK.md) and [DEPLOYMENT.md gate H6](DEPLOYMENT.md). Companion evidence: RESUME.md (on branch `fix-t2-vintage-mac-support`).
 
 ## The gap
 

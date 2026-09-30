@@ -64,7 +64,7 @@ The radio package above never builds, installs or verifies the BCE family (`t2bc
 
 The exact HTTPS source-fetch path and DKMS build were exercised in temporary directories against the installed T2 headers. Real DKMS installation into a temporary module tree exercised original-module archival and replacement. Transaction fixtures cover idempotence, build/install/image failures, boot/configuration restoration, administrator conflicts, source drift, missing headers, early Bluetooth and exclusion of power/radio commands. Shell fixtures cover fresh setup, migration, CLI verification/rollback and error propagation. The corrected installer has also been deployed on the test machine: a normal boot and a short actual S3 cycle passed with the installed drivers. See the [validation record](VALIDATION.md) for the deployment defects, corrections and observed results. A clean OS installation remains untested.
 
-The earlier hardware suspend results remain the evidence for the driver behavior. This integration makes automatic delivery concrete, but neither fixes the unresolved hibernation/S4 issue nor expands qualification to other Mac models.
+The earlier hardware suspend results remain the evidence for the driver behavior. This integration makes automatic delivery concrete, but does not itself enable hibernation (the separate opt-in product, see [README.md](README.md)) and does not expand qualification to other Mac models.
 
 ```mermaid
 flowchart TD

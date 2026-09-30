@@ -1,4 +1,29 @@
-# T2 suspend: issue, implementation and evidence
+# T2 suspend and hibernation on the MacBookAir9,1: map
+
+This directory documents how suspend (S3) and hibernation (S4) were made to work on the tested MacBookAir9,1 (T2, BCM4377), how that was tested, and how to operate it. This page is the entry point. The S3 driver investigation follows the map unchanged, from [section 1](#1-why-the-old-sleep-workaround-was-removed) on. Documents that live only on the working branch `fix-t2-vintage-mac-support` (lab journal, resume notes, agent guides, evidence archives) are not part of this pull request; `docs/t2-suspend/` there has them.
+
+## What works
+
+| Capability | State on the MacBookAir9,1 | Scope |
+| --- | --- | --- |
+| Suspend (S3) with Wi-Fi and Bluetooth recovery | Works with the DKMS radio package, installed by `omarchy setup t2-suspend` | MacBookAir9,1 with BCM4377 |
+| Hibernation (S4) | Works as an opt-in product: ACTIVE on linux-t2 7.2.7 (generation `f4025add13d1`) on the tested machine, source image as the Limine default and the stock entry as fallback. Routine S4 cycle `53ac1f92` reconciled on 2026-09-30 | This exact machine and kernel. Other T2 models are not qualified |
+| `omarchy update` with hibernation on | Asks to pause hibernation, runs the update, then offers to resume it or says requalification is needed | MacBookAir9,1 with the opt-in product only; prompts not yet exercised on hardware |
+| Requalification after a kernel update | A tested operator procedure, not automated: [REQUALIFICATION.md](REQUALIFICATION.md) | Attended, needs the owner at the machine |
+
+Not proven: other T2 models, a battery-only cycle on 7.2.7, long-term soak, and hibernation on a stock kernel without the private image pair. See [EVIDENCE-7.2.7.md](EVIDENCE-7.2.7.md).
+
+## Reading order
+
+1. [manual/t2-suspend.md](../../manual/t2-suspend.md) if you only want to use it.
+2. [HIBERNATION-OVERVIEW.md](HIBERNATION-OVERVIEW.md): the problem, the design, the safety model and the path to upstream. [HIBERNATION.md](HIBERNATION.md) is the short technical summary of this pull request.
+3. [EVIDENCE-7.2.7.md](EVIDENCE-7.2.7.md) and [EVIDENCE.md](EVIDENCE.md): what was run on the hardware and what is not proven.
+4. [DEPLOYMENT.md](DEPLOYMENT.md), [REQUALIFICATION.md](REQUALIFICATION.md), [MAINTENANCE-RUNBOOK.md](MAINTENANCE-RUNBOOK.md) and [REBIND-DESIGN.md](REBIND-DESIGN.md): operating it.
+5. [T2BCE-7.2.7-REBASE.md](T2BCE-7.2.7-REBASE.md) and [HELPERS-7.2.7.md](HELPERS-7.2.7.md) if you want to review or upstream the driver patches.
+
+## Where evidence lives
+
+In the repository: this directory and [`evidence/`](evidence/README.md) (S3 and radio experiments). On the test laptop only: the operator state tree (`<state>`), `/var/lib/omarchy/t2-hibernate-product/`, `/var/lib/omarchy/t2-hibernate-trial/generations/<manifest12>/` and `/var/lib/omarchy-t2-hibernation-pair/`. The `/var/lib` trees are root-owned; read-only `sudo` is enough to inspect them.
 
 The driver series enabled real S3 suspend and working Wi-Fi/Bluetooth recovery on the tested MacBookAir9,1. Repeated automatic AirPods reconnection and audible stereo playback were confirmed. The latest Wi-Fi-off suspend/re-enable cycle also passed. Earlier Wi-Fi-off failures and one unexplained reboot remain part of the record. The automatic installer subsequently passed normal boot and a short S3 cycle with working Bluetooth/audio; see the [deployment validation](VALIDATION.md).
 
@@ -125,5 +150,3 @@ On the combined integration branch, the existing trackpad, T2 hardware, retired-
 On this branch alone: the T2 hardware, retired-sleep, Bluetooth startup installer/gate, suspend installer (14 installer and 5 source-preparation cases), brcmfmac suspend, sleep lock/monitor, sleep-ownership migration and Bluetooth shell suites passed, together with the CLI suite. Hash-pinned source was fetched; both profiles were prepared and matched the tested source; the extracted-C Bluetooth (including its restore and ring-creation harnesses), interface-open and FLR tests passed. These are offline checks, not a hardware boot, suspend or fresh installation.
 
 Eligibility now finds the BCM4377 Wi-Fi function by device ID and requires Bluetooth (`14e4:5fa0`) as function 1 of that same chip, instead of the fixed addresses `0000:73:00.0` and `0000:73:00.1`. Read-only eligibility checks against the live MacBookAir9,1 found the same pair at its usual address.
-
-Hibernation (S4) is a separate, opt-in feature; see the [hibernation overview](HIBERNATION.md), [deployment procedure](DEPLOYMENT.md), [maintenance runbook](MAINTENANCE-RUNBOOK.md) and [evidence summary](EVIDENCE.md).
