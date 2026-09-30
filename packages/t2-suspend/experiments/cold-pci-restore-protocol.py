@@ -10,7 +10,10 @@ spec = importlib.util.spec_from_file_location("restore_historical_pci", HERE / "
 BASE = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(BASE)
 KEY = "cold_pci_restore"
-GUARD_SHA256 = "f04c0d369b2538fd51676d584b6fd60566b3c966e7c43ee5d770de360ded9198"
+# The 7.2.6 artifact (f04c0d36...) is retired with the v16 pair; module bytes embed the build path, so this pins
+# the specific 7.2.7-arch1-Watanare-T2-2-t2 build in helpers-7.2.7/artifacts/guard (docs/t2-suspend/HELPERS-7.2.7.md).
+# The source and srcversion are unchanged from 7.2.6; the release binding comes from the image provenance.
+GUARD_SHA256 = "a2cb23c2fd2abb3e57156961ceee61d9884aaafcf6c034bd61f1d8678f393643"
 GUARD_SRCVERSION = "9D7B498FA4B5693DA3769B7"
 RESTORE_VARIABLE = "OmarchyT2RestoreStageV2-5e17d2ad-021f-4d45-a8e5-f4c191983e27"
 RESUME = {"device": "/dev/mapper/root", "offset": 1923214, "devnum": "253:0"}

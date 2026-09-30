@@ -28,8 +28,11 @@ GUID = "5e17d2ad-021f-4d45-a8e5-f4c191983e27"
 EFI = Path("sys/firmware/efi/efivars")
 SOURCE_VARIABLE = "OmarchyT2PostwriteStageV3-47a2fceb-87bc-4e58-8d83-23f62ffb3393"
 RESTORE_VARIABLE = "OmarchyT2RestoreStageV2-" + GUID
-SOURCE_MODULE_SHA256 = "4cbe981d7ad945d65057b286feb069d569aeaef93ac08d2a0fba4fcb220bcd28"
+# Current pin: the 7.2.7 build in helpers-7.2.7/artifacts/postwrite-v3 (docs/t2-suspend/HELPERS-7.2.7.md).
+SOURCE_MODULE_SHA256 = "aeac152708982fa0de528a05e7f6bd91d917af478dc625db26e517018a30af4d"
 SOURCE_MODULE_SRCVERSION = "1A72ABF3A3BFC778FC5A9C6"
+# Retired 7.2.6 build, kept only so consumed 7.2.6 attempt directories still audit as evidence; not accepted for new work.
+LEGACY_SOURCE_MODULES = {"4cbe981d7ad945d65057b286feb069d569aeaef93ac08d2a0fba4fcb220bcd28": "1A72ABF3A3BFC778FC5A9C6"}
 ATTRIBUTES = b"\x07\0\0\0"
 LOADER_ATTRIBUTES = b"\x06\0\0\0"
 ATTEMPT_STATES = {"preparing", "isolated", "guard-consumed", "postwrite-efi-marker-armed",
@@ -261,8 +264,13 @@ def inspect(root, source, restore, expected_pair_vector, pair_loader=PAIR.load_p
         expected = {"kind": kind + "-efi-s4-identity-v1", "vector": vector,
                     "source_boot_id": source_boot, "source_efi_variable": SOURCE_VARIABLE}
         if kind == "postwrite":
-          expected.update(module_sha256=SOURCE_MODULE_SHA256, module_srcversion=SOURCE_MODULE_SRCVERSION,
-                          recovery="operator-attended-cold-power")
+          module = identity.get("module_sha256") if isinstance(identity, dict) else None
+          if module in LEGACY_SOURCE_MODULES:
+            expected.update(module_sha256=module, module_srcversion=LEGACY_SOURCE_MODULES[module],
+                            recovery="operator-attended-cold-power")
+          else:
+            expected.update(module_sha256=SOURCE_MODULE_SHA256, module_srcversion=SOURCE_MODULE_SRCVERSION,
+                            recovery="operator-attended-cold-power")
         else:
           expected.update(module_sha256=restore_marker["sha256"], module_srcversion=restore_marker["srcversion"],
                           efi_variable=RESTORE_VARIABLE)

@@ -92,6 +92,11 @@ class RestoreToolingTests(unittest.TestCase):
       with mock.patch.object(R, "sha256", side_effect=self.hash), mock.patch.object(R.subprocess, "run", side_effect=self.metadata):
         builder.verify_cold_pre_cpu_tree(tree, report[R.KEY], self.release, self.marker, R.KEY)
 
+  def test_guard_pin_is_the_7_2_7_build_not_the_retired_7_2_6_build(self):
+    self.assertEqual(R.GUARD_SHA256, "a2cb23c2fd2abb3e57156961ceee61d9884aaafcf6c034bd61f1d8678f393643")
+    self.assertEqual(R.GUARD_SRCVERSION, "9D7B498FA4B5693DA3769B7")
+    self.assertNotEqual(R.GUARD_SHA256, "f04c0d369b2538fd51676d584b6fd60566b3c966e7c43ee5d770de360ded9198")
+
   def test_partial_wrong_guard_and_marker_fail(self):
     for field in ("guard", "guard_sha256", "guard_srcversion", "helper", "helper_sha256", "restore_marker"):
       with self.subTest(field=field), self.assertRaisesRegex(ValueError, "together"):

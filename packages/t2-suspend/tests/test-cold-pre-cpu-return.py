@@ -214,6 +214,20 @@ class ReturnAuditTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "differs from archived"):
       self.inspect()
 
+  def test_postwrite_pin_is_current_build_and_legacy_needs_exact_pair(self):
+    self.assertEqual(audit.SOURCE_MODULE_SHA256, "aeac152708982fa0de528a05e7f6bd91d917af478dc625db26e517018a30af4d")
+    self.assertNotIn(audit.SOURCE_MODULE_SHA256, audit.LEGACY_SOURCE_MODULES)
+    self.attempted()
+    path = self.attempt_directory / "postwrite-efi-identity.json"
+    legacy, srcversion = next(iter(audit.LEGACY_SOURCE_MODULES.items()))
+    self.write_json(path, {**self.identities["postwrite"], "module_sha256": legacy, "module_srcversion": srcversion})
+    self.assertEqual(self.inspect()["classification"], "controlled-abort-return")
+    for wrong in ({"module_srcversion": "0" * 23}, {"module_sha256": "f" * 64}):
+      with self.subTest(wrong=wrong):
+        self.write_json(path, {**self.identities["postwrite"], "module_sha256": legacy, "module_srcversion": srcversion, **wrong})
+        with self.assertRaisesRegex(ValueError, "prearm identity"):
+          self.inspect()
+
   def test_second_attempt_or_false_pm_flags_refused(self):
     self.attempted()
     self.write_json(self.directory / "attempts" / STOCK_BOOT / "attempt.json", self.attempt)
