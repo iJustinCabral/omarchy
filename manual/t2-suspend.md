@@ -21,7 +21,7 @@ The trackpad fix, Wi-Fi recovery service and Bluetooth startup setup remain avai
 
 ## Hibernation
 
-Hibernation saves your session to disk and powers the laptop off completely, so nothing is drawn from the battery while it sits. On the tested MacBookAir9,1 it now works as an opt-in extra, separate from suspend: hibernating from the menu (_System > Hibernate_) powers off, and pressing the power button later brings back your session with your apps exactly as you left them. It is tested on one machine and one kernel at a time. Other T2 Macs are not supported for hibernation, and `omarchy setup t2-suspend` does not turn it on; it is enabled by hand on the tested laptop.
+Hibernation saves your session to disk and powers the laptop off completely, so nothing is drawn from the battery while it sits. On the tested MacBookAir9,1 it now works as an opt-in extra, separate from suspend: hibernating from the menu (_System > Hibernate_, or `omarchy system hibernate` in a terminal) powers off, and pressing the power button later brings back your session with your apps exactly as you left them. The menu entry appears only when swap and resume are configured. It is tested on one machine and one kernel at a time. Other T2 Macs are not supported for hibernation, and `omarchy setup t2-suspend` does not turn it on; it is enabled by hand on the tested laptop.
 
 While hibernation is on, the laptop starts from a special hibernation-ready boot entry by default. The normal Omarchy entry is still in the boot menu if you ever need it: press a key during the short boot menu and choose _linux-t2_ under _Omarchy_.
 
@@ -36,24 +36,16 @@ When the update finishes, Omarchy checks whether anything hibernation depends on
 
 If the update stops with a message about an unfinished or unexpected hibernation state, do not delete anything; note the message and ask for help.
 
-### Turning hibernation off
+### Pausing or turning hibernation off
 
-Pausing hibernation returns the laptop to the normal boot entry and leaves suspend untouched. The update prompt does this for you. To do it yourself, at any time:
+When you update, answer yes at the `omarchy update` prompt and Omarchy pauses hibernation for you. To pause hibernation without updating, or to turn it off, see the maintainer documentation in the repository, under `docs/t2-suspend`.
 
-```bash
-sudo /usr/bin/python3 -I -B /var/lib/omarchy/t2-hibernate-product/runtime/packages/t2-suspend/hibernate/boot_policy_native.py maintenance
-```
+### If the lock screen does not accept input
 
-Hibernation stays off until it is turned back on after an update or requalified.
-
-### If the lock screen does not respond after waking
-
-If you wake from hibernation and the lock screen does not accept input, switch to a text console with `Ctrl + Alt + F2`, log in, and run:
+If the lock screen does not accept input, switch to a text console with `Ctrl + Alt + F2`, log in, and run:
 
 ```bash
 loginctl unlock-sessions
 ```
 
-Then switch back to your desktop with `Ctrl + Alt + F1` (try `F2` or `F3` if that is not where your session lives). This is a workaround for an open issue that has been seen once and is not yet explained.
-
-For how this works and how it was tested, see the [maintainer documentation](../docs/t2-suspend/README.md).
+Then switch back to your desktop with `Ctrl + Alt + F1` (try `F2` or `F3` if that is not where your session lives). This is a workaround for an open issue that has been seen once and is not yet explained; it has not been tried on a real occurrence yet.

@@ -40,6 +40,9 @@ WORK=~/.local/state/codex-mba-autonomous/gen-<kernel>   # private operator tree,
 - **Helper modules are kernel-bound.** The cold PCI guard, restore marker and postwrite marker must be rebuilt for each kernel, re-pinned with their `srcversion` and `vermagic`, and independently reviewed before any image is built. A module built for the previous kernel has the wrong vermagic and hash. See [HELPERS-7.2.7.md](HELPERS-7.2.7.md). The t2bce module file hashes are not reproducible, so identify a rebuild by `srcversion`.
 - **The trial needs a source-selected boot.** Trial readiness requires `LoaderEntrySelected` to be the source entry, a plain reboot with the one-shot consumed, AC online, no EFI stage slots and no marker module loaded.
 - **Routine S4 needs a source-default boot.** A first routine cycle under a new manifest is refused on the restore-selected session that the trial leaves you in. After `rebind`, reboot once normally so the source default boots, then run the routine cycle.
+- **Root-only state directories.** `$S` and the trial tree are root-only, so globs, `cd` and `readlink` fail as your user. Use `sudo sh -c '...'` or `sudo readlink`.
+- **The marker goes to a fresh path per kernel**, `/var/lib/omarchy-t2-postwrite-marker/v3-<kernel>/`, because the installed config still pins the old module in `v3/`.
+- **`source_tree` is built before the trial**, extracted the same way the audit extracts embedded modules (`lsinitcpio --early` plus `--cpio`); nothing else builds it.
 - **Tools print trace lines on stdout.** Builders and the audit print `+ command` trace lines on stdout ahead of their JSON. Parse the last JSON line only.
 - **Runners expect a source directory, not a proof file.** `--test-resume-proof-source` takes the source directory; the S4 runner also needs `--post-resume-input-evidence` and `--pre-s4-input-evidence`, and the marker modules must be absolute, root-owned, mode 0600 files. The runbook text in DEPLOYMENT H6e predates these corrections; prefer the corrected flow below.
 - **A stale recovery acceptance may sit at the fixed path.** The acceptance file from an earlier vector would be refused; the operator script replaces it after the typed phrase.
@@ -163,7 +166,7 @@ Expected JSON: `"rebound": true`, `"requalification_required": false`, `"live_ex
 
 ### H6i: one routine S4
 
-Reboot once normally so the source default boots, then `omarchy system hibernate` (phrase `ROUTINE-S4-<manifest12>` in the operator script). Expected: the newest ledger cycle under `$S/ledger` is `reconciled` with classification `qualified-product-cycle-reconciled`, chained to the previous terminal cycle. Until it passes, the generation is bound but unproven.
+Reboot once normally so the source default boots, then `omarchy system hibernate` (phrase `ROUTINE-S4-<manifest12>` in the operator script). Expected: the newest ledger cycle under `$S/ledger` is `reconciled` with ledger state `reconciled` (`qualified-product-cycle-reconciled` is the classification `product.py` prints, not a ledger state), chained to the previous terminal cycle. Until it passes, the generation is bound but unproven.
 
 ## Recommended future work
 

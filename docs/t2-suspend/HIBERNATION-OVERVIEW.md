@@ -19,7 +19,7 @@ The long record of failed vectors and what each taught is in the [journal](HIBER
 Two private boot images (UKIs) are staged next to the production image:
 
 - The source image boots the normal desktop with the patched T2 driver stack in its initramfs. It is the session that gets saved.
-- The restore image cold-boots, unlocks storage, loads the cold PCI guard, reads the saved image and transfers into the saved session. Its initramfs deliberately leaves BCE and the radio drivers out, so no new peripheral queue graph is built before the older memory image is applied. On an ordinary boot without a pending image it behaves like a normal boot and loads the candidate drivers late.
+- The restore image cold-boots, unlocks storage, loads the cold PCI guard, reads the saved image and transfers into the saved session. Per the builder design (`--minimal-restore-devices`; the pair's `provenance.json`), its initramfs deliberately leaves BCE and the radio drivers out, so no new peripheral queue graph is built before the older memory image is applied. On an ordinary boot without a pending image it behaves like a normal boot and loads the candidate drivers late.
 
 Both keep the production `.linux` (kernel) and `.cmdline` sections byte-for-byte. Earlier attempts that replaced the kernel repeatedly failed to mount the physical encrypted root (`/dev/mapper/root`) even when offline and VM checks passed, so a replacement kernel is excluded from the design and the pair stager enforces that policy. Only the initramfs differs. The consequence is that every production kernel update changes `.linux`, so the pair must be retired and rebuilt from the new production image and requalified.
 
