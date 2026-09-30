@@ -36,6 +36,19 @@ The optional client/coordinator/broker experiments remain useful evidence, but a
 
 Plain existing `deactivation` is insufficient: removing opt-in selects stock `systemd-sleep`, and direct product admission can still accept the old qualified artifacts. The durable maintenance marker is needed to veto both routes and reactivation after updates.
 
+## Requalification on linux-t2 7.2.7 (status September 29, 2026, late)
+
+All source work for a new generation is done, each piece independently audited and integrated. Nothing has been executed on the machine yet: it is still on stock 7.2.7 in inactive package maintenance with runtime `d64069bb`, the old 7.2.6 pair still staged, and `assess` reporting `requalification-required`.
+
+- **t2bce rebase** (`a2f5db3b`..`7ea330d7`): patches rebased onto t2linux t2bce `6780d522`, whose unpatched srcversions equal the installed stock modules; pins in `t2bce-source.json` (radio `manifest.json` untouched). See [T2BCE-7.2.7-REBASE.md](T2BCE-7.2.7-REBASE.md).
+- **Hardening** (`5469e1b2`, `b6babd8a`): patch 0016 (idempotent mailbox channel pause, refuse suspend after a skipped resume) and 0017 (bounded command-queue idle wait). The candidate is `candidate-7.2.7-h1`.
+- **Helpers** (`0807b7d7`): the cold-PCI guard, restore marker v2 and postwrite marker v3 were rebuilt for 7.2.7 with unchanged srcversions and re-pinned. See [HELPERS-7.2.7.md](HELPERS-7.2.7.md).
+- **Retire** (`8eea6ec3`, `bf3bb152`): the stager's `retire-after-production-change` removes the old pair after a production kernel change and leaves custody files.
+- **Rebind** (`7261f646`..`1500f105`): moves maintenance onto a new generation, with a runtime upgrade under maintenance, a per-generation trial root, and a qualification bound to the generation trial's reconciled cycle. See [REBIND-DESIGN.md](REBIND-DESIGN.md) and DEPLOYMENT gate H6.
+- **Operator inputs** for H6a (runtime `0807b7d7`, review `14107eed`) and H6c (pair build and audit) are prepared and audited in `~/.local/state/codex-mba-autonomous/gen-7.2.7/` (`README-gen-7.2.7.md`, `h6a-*.sh`, `h6c-*.sh`). The H6a approval pins the current boot id; after a reboot, regenerate it with `h6a-regen-approval.sh` and re-review it.
+- **Next:** H6a, then H6b retire, then H6c build and audit (no power actions), then H6d stage, then the attended H6e and H6f hardware steps, then H6g issue, H6h `rebind` and H6i a routine S4. Claude Code's permission classifier blocked the agent from running the root H6a stage, so the owner runs it or grants a rule.
+- **PR:** the curated hibernation product is draft andrew-boyd/omarchy#6 (`intel-mac/p10/t2-hibernation`), stacked on #5. Update it with the 7.2.7 hardware result.
+
 ## Exact next implementation tasks
 
 Status at `ddaca8da` (source only, each piece independently audited, then a whole-path integration audit that walked publish → update → kernel update → further updates → re-entry and found no step that blocks after a legitimate coherent update). **Deployment is NOT approved**, and installed `e489bab7` does not recognize any of it.
