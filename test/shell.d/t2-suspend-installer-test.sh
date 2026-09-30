@@ -65,6 +65,10 @@ python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-boot-policy.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-boot-policy-transition.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-boot-policy-native.py"
 python3 "$ROOT/packages/t2-suspend/tests/test-hibernate-update-guard.py"
+python3 "$ROOT/packages/t2-suspend/tests/test-upstream-model-builder.py"
+python3 "$ROOT/packages/t2-suspend/tests/test-upstream-model-stage.py"
+python3 "$ROOT/packages/t2-suspend/tests/test-upstream-model-prepare.py"
+python3 "$ROOT/packages/t2-suspend/tests/test-upstream-model-runner.py"
 pass "T2 suspend source and installer transactions"
 
 test_tmp=$(mktemp -d)
