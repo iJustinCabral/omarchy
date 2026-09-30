@@ -12,6 +12,19 @@ Applicability: this runbook applies only after a reviewed runtime containing `bo
 - Stop and ask for review when a check below fails in a way the section does not describe. Unknown means stop.
 - Commands here are read-only unless labelled REPAIR. Read-only does not mean unprivileged: the state directory is root-private (0700).
 
+## Normal path: `omarchy update` does this for you
+
+On a MacBookAir9,1 with opt-in T2 hibernation active, `omarchy update` (via the hidden helper `omarchy-update-t2-hibernation pre|post`, `bin/omarchy-update-t2-hibernation`) runs the fixed commands below itself; the sections that follow are for when it stops or something was done by hand. It has no effect on any other machine, and exits silently where the product is not installed.
+
+- Before the update, with hibernation active: it explains that hibernation must pause during package updates and asks `Pause T2 hibernation for this update?`. Yes runs `boot_policy_native.py maintenance`. No stops the update with nothing changed and prints the exact maintenance command to run later. `omarchy update -y` never pauses hibernation on its own: it stops and says so.
+- Already in maintenance (marker present, nothing pending): it says so and continues.
+- Any unfinished or unexpected state (an activation, deactivation or runtime-upgrade pending, a marker beside the policy or opt-in, or only one of policy and opt-in): it stops before changing anything and points here. Use the State inventory below; do not delete anything.
+- After the update, while in maintenance: it runs the read-only `boot_policy_native.py assess`. `unchanged` offers `Turn hibernation back on?` (yes runs `reactivate`; with `-y` it only prints the command). `requalification-required` says the kernel or drivers changed, hibernation stays off until requalified (section 10), and suspend (S3) still works; it never attempts requalification. `unknown`, or an `assess` that fails or prints something unreadable, points here. None of these ever fails the update.
+
+If a run is interrupted after the pause, the machine stays in maintenance: the next `omarchy update` reports that and offers to resume at the end. A failed `reactivate` is section 6.
+
+The pacman guard's own refusal text (`update_guard.refusal`) names `omarchy update` and the maintenance command for anyone running bare `pacman`. The guard is part of the byte-pinned runtime inventory, so that wording reaches an installed machine only with the next reviewed runtime upgrade; until then bare-pacman users see the older terse message.
+
 ## Reference: paths and messages
 
 All under `/` on the live system (sources use root-relative forms).
