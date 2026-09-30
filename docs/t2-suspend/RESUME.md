@@ -46,7 +46,19 @@ Plain existing `deactivation` is insufficient: removing opt-in selects stock `sy
 - The source `test_resume` returned and cleaned up on boot `442c90c5`.
 - The restore ordinary boot passed on boot `54ad1561`.
 - The real attended cold-power S4 vector `ef9f9683` succeeded on boot `10f1df5e`. The result was `returned-and-cleaned` with stages 4/7/2, a cold-PCI restored source witness, and physical input confirmed.
-- Remaining steps: H6e-clean (clear the V3/V2 stage slots with `cleanup-successful-pair-slots.py`, `6d569778`), H6f generation trial, H6g qualification, H6h `rebind`, and H6i one routine S4. The update guard refuses pacman until the slots are cleared.
+- **Completed, September 30, 2026.** Every gate after that also passed:
+  - H6e-clean cleared the V3/V2 stage slots with `cleanup-successful-pair-slots.py` (`6d569778`, fixed in `4c5842ba`). It ran from a root-owned export of the reviewed commit.
+  - H6f: the generation trial (cycle `3ab69461`) reconciled with a cold-power S4 on boot `37208ef7`.
+  - H6g: the qualification was issued with evidence `bdadff1b`, after an independent review.
+  - H6h: `rebind` made generation `f4025add13d1` ACTIVE and made the source entry the Limine default.
+  - H6i: one routine S4 through `omarchy-system-hibernate` completed, with result `qualified-product-cycle-reconciled` (cycle `53ac1f92`). The ledger chains it to the last 7.2.6 cycle `0b8fa4cf`.
+  - Permanent hibernation is qualified and active on linux-t2 7.2.7.
+- Next work:
+  - An `omarchy update` integration: prompt to publish maintenance before updating, then assess and reactivate, or explain that requalification is needed.
+  - A full documentation and evidence pass.
+  - Update PR #6 and take PRs #1–#6 out of draft.
+  - Upstream the t2bce hibernation patches to linux-t2.
+- Superseded list: remaining steps: H6e-clean (clear the V3/V2 stage slots with `cleanup-successful-pair-slots.py`, `6d569778`), H6f generation trial, H6g qualification, H6h `rebind`, and H6i one routine S4. The update guard refuses pacman until the slots are cleared.
 
 All source work for a new generation is done, each piece independently audited and integrated. Nothing has been executed on the machine yet: it is still on stock 7.2.7 in inactive package maintenance with runtime `d64069bb`, the old 7.2.6 pair still staged, and `assess` reporting `requalification-required`.
 
