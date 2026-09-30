@@ -98,7 +98,20 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-stage-refusals-") as tempor
 
   mutate_case("replaced-kernel", "replaces the production kernel", lambda r: r.update(modified_sections_sha256={".linux": "c" * 64}))
   mutate_case("wrong-deltas", "declared upstream-model deltas", lambda r: r["deltas"].update(D1_modules_added=[]))
-  mutate_case("removed-files", "removes production files", lambda r: r["initrd_manifest_diff"].update(removed=["init"]))
+  def diff_case(name, expected, change):
+    mutate_case(name, expected, lambda r: change(r["initrd_manifest_diff"]))
+
+  diff_case("stray-removal", "removed: init", lambda d: d["removed"].append("init"))
+  diff_case("stray-zst-removal", "removed: usr/lib/modules/" + RELEASE + "/kernel/fs/x.ko.zst", lambda d: d["removed"].append("usr/lib/modules/" + RELEASE + "/kernel/fs/x.ko.zst"))
+  diff_case("zst-without-ko", "removed: " + T2BCE_DIR + "t2bce_dma/t2bce_dma.ko.zst", lambda d: d["added"].remove(T2BCE_DIR + "t2bce_dma/t2bce_dma.ko"))
+  diff_case("ave-zst", "t2bce_ave.ko.zst", lambda d: d["removed"].append(T2BCE_DIR + "t2bce_ave/t2bce_ave.ko.zst"))
+  diff_case("stray-addition", "added: usr/bin/evil", lambda d: d["added"].append("usr/bin/evil"))
+  diff_case("ko-without-zst-removal", "added: " + T2BCE_DIR + "t2bce_core/t2bce_core.ko", lambda d: d["removed"].remove(T2BCE_DIR + "t2bce_core/t2bce_core.ko.zst"))
+  diff_case("marker-addition", "added: hooks/omarchy-t2-restore-marker", lambda d: d["added"].append("hooks/omarchy-t2-restore-marker"))
+  mutate_case("missing-release", "missing or malformed", lambda r: r.pop("kernel_release"))
+  diff_case("missing-deps", "missing or malformed", lambda d: d.pop("audio_dependencies"))
+  # The accepted real shape stages (the happy paths below use it), and the validator is shared with the builder.
+  assert C.delta_problems(**{"removed": real_diff()["removed"], "added": real_diff()["added"], "release": RELEASE, "dependencies": real_diff()["audio_dependencies"]}) == []
   mutate_case("missing-module", "exactly the four t2bce", lambda r: r["modules"].pop("t2bce_audio"))
   mutate_case("modified-flag", "offline-only", lambda r: r.update(installed=True))
   mutate_case("wrong-protocol", "Unexpected upstream-model provenance", lambda r: r.update(protocol="other"))

@@ -302,8 +302,13 @@ def load_build(root, directory):
       deltas.get("D2_initramfs_blacklist") != list(C.BLACKLISTED_MODULES) or deltas.get("build_hook") != C.HOOK):
     raise ValueError("Image does not carry exactly the declared upstream-model deltas")
   diff = provenance.get("initrd_manifest_diff")
-  if not isinstance(diff, dict) or diff.get("removed") != []:
-    raise ValueError("Image initramfs manifest diff is missing or removes production files")
+  if (not isinstance(diff, dict) or not isinstance(diff.get("removed"), list) or not isinstance(diff.get("added"), list)
+      or not isinstance(diff.get("audio_dependencies"), list)
+      or not isinstance(provenance.get("kernel_release"), str)):
+    raise ValueError("Image initramfs manifest diff is missing or malformed")
+  problems = C.delta_problems(diff["removed"], diff["added"], provenance["kernel_release"], diff["audio_dependencies"])
+  if problems:
+    raise ValueError("Image initramfs manifest diff removes or adds production files beyond the declared deltas: " + "; ".join(problems[:6]))
   modules = provenance.get("modules")
   if not isinstance(modules, dict) or set(modules) != set(C.T2BCE_MODULES):
     raise ValueError("Image does not pin exactly the four t2bce modules")

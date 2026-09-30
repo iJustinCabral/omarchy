@@ -126,3 +126,26 @@ def dropin_text(runtime_dir, prepare_sha256):
     "ExecStopPost=\n"
     "ExecStopPost=/usr/bin/python3 -I -B " + script + " post\n"
   )
+
+
+def delta_problems(removed, added, release, dependencies=()):
+  """Disallowed entries of an initramfs file delta against production (shared by builder and stager).
+
+  Removals: exactly t2bce_{dma,core,vhci}.ko.zst, each only together with its added plain .ko.
+  Additions: those swapped .ko files, the t2bce_audio .ko and its dependencies, and the blacklist file.
+  """
+  base = "usr/lib/modules/" + release + "/kernel/drivers/staging/t2bce/"
+  swapped = {}
+  for name in ("t2bce_dma", "t2bce_core", "t2bce_vhci"):
+    swapped[base + name + "/" + name + ".ko.zst"] = base + name + "/" + name + ".ko"
+  allowed = {item.lstrip("/") for item in dependencies}
+  allowed.add(base + "t2bce_audio/t2bce_audio.ko")
+  allowed.add(BLACKLIST_DESTINATION)
+  problems = []
+  for path in removed:
+    if not (path in swapped and swapped[path] in added):
+      problems.append("removed: " + path)
+  for path in added:
+    if path not in allowed and not any(new == path and old in removed for old, new in swapped.items()):
+      problems.append("added: " + path)
+  return problems

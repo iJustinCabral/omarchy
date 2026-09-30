@@ -230,22 +230,9 @@ def manifest_diff(production, candidate, release, *, dependencies=(), production
   removed = sorted(set(production) - set(candidate))
   changed = sorted(path for path in set(production) & set(candidate) if production[path] != candidate[path])
   allowed_changed, allowed_added, disallowed = [], [], []
-  # The stock t2bce_{dma,core,vhci} ship as .ko.zst; the substituted copies are plain .ko. Exactly
-  # that swap is allowed, per module, and nothing else may be removed.
-  swapped = {}
-  for name in ("t2bce_dma", "t2bce_core", "t2bce_vhci"):
-    stem = tree + "kernel/drivers/staging/t2bce/" + name + "/" + name
-    swapped[stem + ".ko.zst"] = stem + ".ko"
-  for path in removed:
-    if path in swapped and swapped[path] in added:
-      continue
-    disallowed.append("removed: " + path)
-  for path in added:
-    if path == C.BLACKLIST_DESTINATION or path in audio_paths or path in swapped.values() and any(
-        old in removed for old, new in swapped.items() if new == path):
-      allowed_added.append(path)
-    else:
-      disallowed.append("added: " + path)
+  # Removals and additions are judged by the validator the stager shares (common.delta_problems).
+  disallowed.extend(C.delta_problems(removed, added, release, audio_paths))
+  allowed_added = [path for path in added if "added: " + path not in disallowed]
   indexes = {path for path in changed if path.startswith(tree) and "/" not in path[len(tree):] and path[len(tree):].startswith("modules.")}
   t2bce = {path for path in candidate if path.startswith(tree) and Path(path).name in tuple(name + ".ko" for name in C.T2BCE_MODULES)}
   for path in changed:
@@ -274,7 +261,7 @@ def manifest_diff(production, candidate, release, *, dependencies=(), production
       disallowed.append("marker/guard-like path: " + path)
   if disallowed:
     raise ValueError("Initramfs differs from production beyond the upstream-model deltas: " + "; ".join(disallowed[:12]))
-  return {"added": added, "removed": removed, "changed": changed,
+  return {"added": added, "removed": removed, "changed": changed, "audio_dependencies": sorted(audio_paths),
           "allowed_changed_count": len(allowed_changed), "allowed_added_count": len(allowed_added)}
 
 

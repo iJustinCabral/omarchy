@@ -71,6 +71,21 @@ def limine_text(production_blake2, snapshots=1, tag="a", pair_block=True):
   return text
 
 
+RELEASE = "7.2.7-test-t2"
+T2BCE_DIR = "usr/lib/modules/" + RELEASE + "/kernel/drivers/staging/t2bce/"
+
+
+def real_diff():
+  """The shape of a real build: three .ko.zst swapped for .ko, the audio .ko and a dependency, the blacklist."""
+  swapped = ("t2bce_dma", "t2bce_core", "t2bce_vhci")
+  dependency = "usr/lib/modules/" + RELEASE + "/kernel/sound/core/snd-pcm.ko"
+  return {
+    "removed": [T2BCE_DIR + name + "/" + name + ".ko.zst" for name in swapped],
+    "added": [T2BCE_DIR + name + "/" + name + ".ko" for name in swapped] + [T2BCE_DIR + "t2bce_audio/t2bce_audio.ko", dependency, C.BLACKLIST_DESTINATION],
+    "changed": [], "audio_dependencies": ["/" + T2BCE_DIR + "t2bce_audio/t2bce_audio.ko", "/" + dependency],
+  }
+
+
 def make_build(directory, production, *, mutate=None):
   directory.mkdir(mode=0o700)
   initrd = directory / C.BUILD_INITRD
@@ -84,7 +99,8 @@ def make_build(directory, production, *, mutate=None):
     "unchanged_production_sections_sha256": {".linux": sha(b"k"), ".cmdline": sha(b"c")},
     "modified_sections_sha256": None,
     "deltas": {"D1_modules_added": ["t2bce_audio"], "D2_initramfs_blacklist": list(C.BLACKLISTED_MODULES), "build_hook": C.HOOK},
-    "initrd_manifest_diff": {"added": [], "removed": [], "changed": []},
+    "kernel_release": RELEASE,
+    "initrd_manifest_diff": real_diff(),
     "modules": {name: {"sha256": sha(name.encode()), "srcversion": "SRC" + name} for name in C.T2BCE_MODULES},
     "production_modified": False, "installed": False, "boot_entry_created": False, "hardware_qualified": False,
   }
