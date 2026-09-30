@@ -1,0 +1,174 @@
+# Upstream-model hibernation test (MacBookAir9,1, linux-t2 7.2.7)
+
+Attended hardware-test tooling. Nothing in this page has been built, staged or run on the machine; the tools exist in source with fixture tests only. Checkout reference: `packages/t2-suspend/upstream-model/` at the commit that added it. Status words follow [HIBERNATION-GUIDE.md](HIBERNATION-GUIDE.md): everything here is implemented and unit-tested, none of it is observed on hardware.
+
+Goal: one UKI with the production `.linux` and `.cmdline` byte-for-byte, the stock mkinitcpio configuration, the patched `t2bce_*` family (candidate-7.2.7-h1) substituted, no marker hook, no cold PCI guard and no minimal-restore initramfs. The same image boots, hibernates with plain `systemctl hibernate` and restores through the stock `resume` hook. This is the model an upstream kernel package would have, which is why it is tested separately from the private source/restore pair that the product uses today.
+
+A successful run would show that the patched drivers alone, without the cold guard machinery, survive a real S4 round trip. A failed run is evidence about the restore kernel with BCE alive and is not a regression of the product. No result here changes the product's qualification.
+
+## 0. Findings that shaped the design
+
+1. **The Wi-Fi detach helper is not in the rootfs.** `/usr/lib/omarchy/omarchy-t2-hibernate-wifi` does not exist (the 0008 README says it is not installed by package 1.5). Today Wi-Fi detach, Bluetooth power-off and bolt stop are done by the product's preparation adapter (`hibernate/preparation.py`), which this test bypasses. The test therefore carries its own transient preparation, `prepare.py`, which reuses the repo helper `experiments/0008-wifi-hibernate-isolation/omarchy-t2-hibernate-wifi` and the same bolt, Bluetooth and Wi-Fi order as the pair runner.
+2. **The stock initramfs already contains radios and a GPU.** The `omarchy-t2-suspend` mkinitcpio build hook unconditionally adds `brcmfmac`, `brcmfmac-wcc`, `brcmfmac-cyw` and `brcmfmac-bca` (plus the Apple Wi-Fi firmware), and the stock configuration adds `t2bce_vhci`, `thunderbolt` and `i915`. It does not contain `t2bce_audio` or `hci_bcm4377`. So "stock configuration" and "no Wi-Fi driver bound in the restore kernel" contradict each other unless an initramfs-only blacklist is added (decision D2).
+3. **`t2bce_audio` is loaded late from the rootfs**, and the rootfs copy is the unpatched module. A patched core/dma/vhci with unpatched audio is a mixed family: patch 0002 (audio hibernation callbacks) would be missing from the session that gets saved (decision D1).
+4. **The omarchy-t2-suspend hook needs support files in the module root.** It reads `usr/src/omarchy-t2-radio-1.6`, `var/lib/dkms/omarchy-t2-radio/1.6/<release>` and the Apple firmware relative to `--moduleroot`, and it refuses unless every `t2bce_*` resolves under `kernel/drivers/staging/t2bce/`. The builder copies those trees into its private module root and substitutes the four modules in place, so the hook runs unmodified (the source builder removes the hook instead; this builder keeps it so the hooks list stays equal to production).
+5. **mkinitcpio `FILES` cannot choose a destination** (`map add_file "${FILES[@]}"` passes one path), so the blacklist file cannot be added by `FILES+=()` without writing under `/etc` on the host. The builder uses a build-time-only install hook (`upstream-model/initcpio/install/omarchy-t2-upstream-model-blacklist`, no runtime script) that places the private file at `/etc/modprobe.d/zz-omarchy-t2-upstream-model.conf` inside the image only. The image's runtime `config` hook lists stay identical to production; the audit enforces that.
+6. **The current cmdline** carries `resume=/dev/mapper/root resume_offset=<n> cryptkey=rootfs:/etc/cryptsetup-keys.d/root.key`. The effective HOOKS come from the `/etc/mkinitcpio.conf.d/` drop-ins, not from `/etc/mkinitcpio.conf`, so the private configuration must source the stock file and every drop-in, exactly like the existing builders, and never write under `/etc`.
+
+### Decisions taken (orchestrator)
+
+- **D1, yes:** `t2bce_audio` (patched) is added to `MODULES` in the private configuration only, so the whole t2bce family in the image is the candidate.
+- **D2, variant U1b:** an initramfs-only `modprobe.d` blacklist of the brcmfmac family (`brcmfmac`, `brcmfmac-bca`, `brcmfmac-cyw`, `brcmfmac-wcc`). `.cmdline` is untouched. Wi-Fi and Bluetooth load after switch_root from the rootfs radio DKMS stack as usual. The harsher pure-stock variant (U1) is not implemented.
+- **D3:** the transient drop-in does Wi-Fi detach (required), Bluetooth off and bolt stop before `systemd-sleep`, and the reverse afterwards, matching `preparation.py`. Dropping Bluetooth or bolt is a separate later experiment.
+- **Routing:** `/run/systemd/system/systemd-hibernate.service.d/zz-upstream-model.conf` resets `ExecStart` to stock `/usr/lib/systemd/systemd-sleep hibernate` and adds the prepare steps; helpers are copied root-owned and hash-pinned under `/run/omarchy-t2-upstream-model/`.
+- **Machine state:** the product must be in inactive package maintenance (the tools refuse otherwise) and is reactivated after the campaign only if `assess` reports `unchanged`.
+
+## 1. Machine state and what the test changes
+
+The product goes into maintenance first. In ACTIVE, `/boot/limine.conf` must equal the staged bytes, so any extra block makes the product fail closed, and the update guard refuses transactions while a LoaderEntryOneShot/Default exists. In ACTIVE the `/etc` drop-in `omarchy-t2.conf` routes `systemd-hibernate.service` to `sleep_entry.py`, which vetoes while `package-maintenance.pending` exists; the `/run` drop-in sorts after it and overrides only `ExecStart` and the pre/post steps. The `/etc` drop-in is never edited, so `assess` sees no `control_inventory` drift. `systemctl suspend` (S3) is unaffected.
+
+| Item | Test change | Undo |
+| --- | --- | --- |
+| `/boot/limine.conf` | one appended owned block (`# BEGIN omarchy T2 upstream model` ... `# END ...`) | the stager removes exactly that block from the current bytes and requires `limine_canonical(current) == limine_canonical(backup)`, robust to snapper rewriting the snapshot region (the backup is never restored verbatim) |
+| ESP | new file `/boot/EFI/Linux/mba_t2_upstream_model.efi` | deleted by `rollback`, verified absent |
+| EFI variables | LoaderEntryOneShot (set by the stager, consumed by the resume boot); HibernateLocation (set and cleared by systemd-sleep) | both checked absent before and after every cycle |
+| Swap header | `S1SUSPEND` to `SWAPSPACE2` after a resume; the flags word changes | nothing; raw header captured before and after every cycle |
+| State | new directory `/var/lib/omarchy-t2-upstream-model/` (receipt, guards, attempts, terminal markers) | evidence is preserved; never deleted by the tools |
+| `/run` | transient drop-in and helpers | removed by the runner (post-return and on any failure) or by any reboot |
+| Product state, pair receipt and custody, ledger, qualification, production UKI, `/etc` drop-in | none | n/a |
+
+Kernel, DKMS radio, firmware and `/etc` must not change during the test window, and no `pacman` runs. An armed one-shot vetoes pacman through the update guard.
+
+## 2. Boot selection and failure handling
+
+One hash-bound one-shot entry of the same image, re-armed before each S4. Limine consumes `LoaderEntryOneShot` at the next boot whatever happens after, so power-on after S4 picks the test entry and the restore happens in that boot. If it fails or hangs, the operator power-cycles and the default (stock `Omarchy.linux-t2`, `default_entry: 2`) boots. A persistent default is never set (`LoaderEntryDefault` must be absent at all times; a temporary default would loop a failing image).
+
+History says a failed restore usually consumes the image (`swsusp_check()` resets the swap signature as soon as it reads the header; every earlier failed vector ended with stock reporting `PM: Image not found (code -22)`). The dangerous residual case is a hang before `swsusp_check`: the image is intact and the stock UKI's own `resume` hook would restore it with an unpatched BCE and no 0005 gate, a never-run vector. The recovery checklist (printed by the runner on every failure and by `run-upstream-model.py recovery`) therefore tells the operator to record observations first, power-cycle, read `journalctl -b` for `Image not found`, read the swap header, never retry, and treat the image hash as terminal. An Arch live-USB header repair (copy `orig_sig` over `sig`) writes the owner's swap file and is not authorised here.
+
+## 3. Tooling (all under `packages/t2-suspend/upstream-model/`)
+
+| File | Purpose |
+| --- | --- |
+| `build-upstream-model-uki.py` | Private UKI builder. Production `.linux`/`.cmdline` and every other non-`.initrd` section byte-for-byte; stock `/etc/mkinitcpio.conf` plus `/etc/mkinitcpio.conf.d/*.conf` with only the D1/D2 deltas; root-owned inputs required (candidate tree, production UKI, the sourced mkinitcpio files); output directory must not exist and is never on the ESP; the rejected-hash list (including `974246c0...`) refuses the result; the extracted initramfs file manifest is diffed against the production initramfs and recorded in provenance (`initrd-manifest-diff.json`). Allowed differences are only the four `t2bce_*` modules, the module-tree indexes, the `.ko` dependencies of `t2bce_audio`, the blacklist file and a `config` whose runtime hook lists are equal and whose `MODULES` gains at most `t2bce_audio`. Any other difference, removed file or marker/guard-like path refuses. The blacklist is proved effective by resolving the BCM4377 PCI alias with and without `--use-blacklist`. |
+| `stage-upstream-model.py` | Single-image stager: `stage`, `verify`, `arm`, `arm-s4`, `mark-booted`, `disarm`, `rollback`, `clear`, `status`. Own state directory, own receipt, entry prefix `MBA-T2-upstream-model-`, BLAKE2b path binding, canonical Limine handling through `boot_policy.limine_canonical`, refuses unless the product is in inactive maintenance, refuses rejected, pair-consumed or terminal hashes, checks the production-kernel policy on the actual PE sections. Never touches the pair receipt, pair custody or product state. |
+| `run-upstream-model.py` | Gates G0 to G4: `preflight`, `verify-boot`, `s3`, `s4 --cycle N`, `cleanup`, `recovery`. |
+| `prepare.py` | The transient pre/post steps run by the drop-in. Copied to `/run` by the runner; stdlib only. |
+| `common.py` | Shared names and pure helpers (phrases, drop-in text, rejected hashes). |
+| `initcpio/install/omarchy-t2-upstream-model-blacklist` | Build-time-only mkinitcpio hook for the blacklist file. |
+
+Tests: `packages/t2-suspend/tests/test-upstream-model-{builder,stage,prepare,runner}.py` with the shared fixture `upstream_model_fixture.py`; registered in `test/shell.d/t2-suspend-installer-test.sh`.
+
+### Gates
+
+- **G0 preconditions** (`preflight`, and the start of every phase): model MacBookAir9,1; product in inactive maintenance and the update guard exits 0; `assess` runnable; no other pending or active product file and no opt-in; no EFI default and (outside the armed window) no one-shot; production UKI, Limine and ESP image match the stager receipt; swap header `SWAPSPACE2`; `/sys/power/resume_offset` equals the cmdline value and Btrfs `map-swapfile`; `/proc/swaps` has exactly one non-zram candidate, `/swap/swapfile`; `disk` is `[platform]`; `pm_test` is `[none]`; `systemd-inhibit --list` shows only delay locks; the image hash is not rejected or terminal.
+- **G1 ordinary boot** (`verify-boot`): selected entry equals the test entry; `/proc/cmdline` equals the production UKI `.cmdline`; the four loaded `t2bce_*` srcversions equal the candidate pins (so the patched audio is what runs); the first brcmfmac kernel message comes after PID 1 starts on the real root (the blacklist worked); no failed units; the six PCI functions are bound; the internal keyboard and trackpad are registered; typed physical-input confirmation. The existing capture-physical-input monitor is not copied into the repo, so this gate uses the typed confirmation only.
+- **G2 S3** (`s3`): plain `systemctl suspend` with the same health checks before and after, the S3 entry and exit journal lines, no `HC died`, `t2bce` errors or call traces, and a typed confirmation. S3 must pass on the boot before any S4.
+- **G3 S4 cycle N** (`s4 --cycle N`): G0 again; cycle order 1 and 2 on AC, 3 on battery (charger unplugged before starting, `Discharging` and at least 70%); cycle N+1 requires N `returned-and-cleaned` on the same original boot id; a typed attendance phrase bound to the image prefix, boot id prefix, cycle number and power source (`I am at the MacBook with the power button reachable; image <12 hex> boot <8 hex> cycle <N> on <AC|battery>; stock is the recovery choice`), written to a root 0600 acceptance file that expires after 30 minutes and is re-verified immediately before the power write; the desktop is locked with `omarchy-system-sleep-lock`; the `/run` drop-in is installed and read back from `systemctl show`; the one-shot is armed through the stager and read back; power source, swap target, header, inhibitors and HibernateLocation are re-read; the durable guard `guards/<image>/cycle-N` is created `O_EXCL` and fsynced; only then `systemctl hibernate` runs.
+- **G4 post-return** (same process after the restore): boot id unchanged; drop-in and helpers removed and the product routing shown again by `systemctl show`; no one-shot or default; selected entry equals the test entry; swap target unchanged and header `SWAPSPACE2`; health with a 90 second settle window (Wi-Fi rebound on `0000:73:00.0`, input, units); the journal has the hibernation entry line and no `HC died`, `t2bce` error or call trace; `mark-booted`; typed confirmation; attempt state `returned-and-cleaned`.
+- **Terminal on failure:** any failure after the guard is created marks the image hash terminal (`terminal/<sha>.json`, exclusive create, never removed) and prints the recovery checklist. A failure before the guard (a mistyped phrase, a failed lock, an expired acceptance) unwinds the drop-in and the one-shot, leaves the cycle retryable and is not terminal. `cleanup` settles an interrupted runner the same way: no guard means retryable, a guard means terminal.
+
+### Evidence recorded per step
+
+Raw swap header (before, after), `journalctl -b` slice from a pre-write cursor filtered on `PM:`, `t2bce`, `bce`, `vhci`, `HC died`, `timeout`, `brcmfmac`, `hci_bcm4377`, `thunderbolt`, `i915`, `nvme`, `btrfs`, `Call Trace`, the hibernation entry line, the kernel taint flag, srcversions and PCI driver bindings for `74:00.0` to `74:00.3` and `73:00.0`, `lspci -k`, `lsmod`, input devices, `bluetoothctl show`, Wi-Fi link, `wpctl status` and `aplay -l`, `boltctl list`, `systemctl --failed`, `btrfs device stats`, battery and AC state, the EFI variable listing, the acceptance and guard records and the typed-phrase hashes. They land in `/var/lib/omarchy-t2-upstream-model/attempts/<image sha256>/<phase>/` as root 0600 files. The restore kernel's own messages are not recoverable (no markers, no persistent journal); that loss is the accepted cost of the test. Operator photos and notes of a failed screen are the substitute.
+
+## 4. Operator procedure
+
+Run everything in your own terminal (typed phrases are read from `/dev/tty`; the agent shell has none). Do not run privileged Python from the writable workspace: export a reviewed commit to a root-owned directory first. Reconcile state before starting: `docs/t2-suspend/RESUME.md`, `handoff.json`, `git log -5 --oneline`, `cat /proc/sys/kernel/random/boot_id`, no other autonomous agent.
+
+```bash
+REPO=/home/jjc/Projects/MBA_9_1
+COMMIT=$(git -C "$REPO" rev-parse HEAD)    # the reviewed commit that contains packages/t2-suspend/upstream-model
+TOOLS_ROOT=/var/lib/omarchy-t2-upstream-model-tools
+TOOLS=$TOOLS_ROOT/packages/t2-suspend/upstream-model
+CANDIDATE_SRC=/home/jjc/.local/state/codex-mba-autonomous/t2bce-7.2.7-hardening/candidate-7.2.7-h1
+BUILD=$TOOLS_ROOT/build-$(date +%Y%m%d)
+```
+
+1. **Export the tools and the candidate to root-owned locations.**
+
+   ```bash
+   sudo install -d -m 0755 "$TOOLS_ROOT"
+   git -C "$REPO" archive "$COMMIT" packages/t2-suspend | sudo tar -x -C "$TOOLS_ROOT"
+   sudo cp -a --reflink=auto "$CANDIDATE_SRC" "$TOOLS_ROOT/candidate-7.2.7-h1"
+   sudo chown -R root:root "$TOOLS_ROOT"
+   sudo chmod -R go-w "$TOOLS_ROOT"
+   ```
+
+2. **Run the offline tests from the export** (no hardware): `python3 "$TOOLS_ROOT/packages/t2-suspend/tests/test-upstream-model-runner.py"` and the stage, prepare and builder tests.
+
+3. **Build the image** (offline; changes no installed file):
+
+   ```bash
+   sudo python3 "$TOOLS/build-upstream-model-uki.py" --candidate-source "$TOOLS_ROOT/candidate-7.2.7-h1" --output "$BUILD" --experiment-id upstream-model-h1-$(date +%Y%m%d)
+   ```
+
+   The builder refuses unless the running kernel release equals the candidate's, the production cmdline equals the running one, and every input is root-owned. Read `$BUILD/provenance.json` and `$BUILD/initrd-manifest-diff.json` with `sudo`: the diff must list only the four `t2bce_*` modules, module-tree indexes, `snd*` dependencies of `t2bce_audio`, and the blacklist file. An independent audit of the build output is required before staging (AGENTS.md).
+
+4. **Pause the product** (maintenance) through the reviewed native path, see [MAINTENANCE-RUNBOOK.md](MAINTENANCE-RUNBOOK.md):
+
+   ```bash
+   NATIVE=/var/lib/omarchy/t2-hibernate-product/runtime/packages/t2-suspend/hibernate/boot_policy_native.py
+   sudo /usr/bin/python3 -I -B "$NATIVE" maintenance
+   sudo /usr/bin/python3 -I -B "$NATIVE" assess
+   ```
+
+5. **Stage, then refresh Limine with one stock boot.** Staging appends the block, writes the ESP image and arms nothing.
+
+   ```bash
+   sudo python3 "$TOOLS/stage-upstream-model.py" stage --build "$BUILD"
+   sudo python3 "$TOOLS/run-upstream-model.py" preflight
+   ```
+
+   Reboot into stock once so Limine advertises the entry. After the reboot, from stock:
+
+   ```bash
+   sudo python3 "$TOOLS/stage-upstream-model.py" arm
+   ```
+
+   Reboot. The one-shot boots the image once.
+
+6. **G1, on the test boot:** `sudo python3 "$TOOLS/run-upstream-model.py" verify-boot`. Type the printed confirmation only after checking keyboard, trackpad, Wi-Fi and audio.
+
+7. **G2:** `sudo python3 "$TOOLS/run-upstream-model.py" s3`. Press Enter, wake with a key, type the confirmation.
+
+8. **G3/G4, cycles 1 and 2 on AC, cycle 3 on battery:**
+
+   ```bash
+   sudo python3 "$TOOLS/run-upstream-model.py" s4 --cycle 1
+   sudo python3 "$TOOLS/run-upstream-model.py" s4 --cycle 2
+   # unplug the charger; wait for Discharging at 70% or more
+   sudo python3 "$TOOLS/run-upstream-model.py" s4 --cycle 3
+   ```
+
+   The runner needs the desktop user via `sudo` (it reads `SUDO_UID` and `SUDO_USER` to run `omarchy-system-sleep-lock`). Stay at the machine with the power button reachable; the display goes dark, the machine powers off, and after you press the power button the restore boot selects the test entry and the same terminal session returns. On any failure follow the printed checklist and stop: the image is terminal.
+
+9. **Return to stock and undo.** Reboot to stock (the default), then:
+
+   ```bash
+   sudo python3 "$TOOLS/run-upstream-model.py" cleanup
+   sudo python3 "$TOOLS/stage-upstream-model.py" rollback
+   sudo python3 "$TOOLS/stage-upstream-model.py" clear
+   sudo /usr/bin/python3 -I -B "$NATIVE" assess
+   ```
+
+   Only if `assess` reports `unchanged`: `sudo /usr/bin/python3 -I -B "$NATIVE" reactivate`. Anything else keeps hibernation off (fail-closed; nothing to repair by hand; see the maintenance runbook and [REQUALIFICATION.md](REQUALIFICATION.md)). After reactivation run `omarchy-update-t2-hibernation post` if the update hook is in use. The product's routine ledger chain is not advanced by test cycles; its next cycle goes from a fresh boot, as after any reboot.
+
+10. **Record the outcome** in `RESUME.md` and `EVIDENCE-7.2.7.md` with the evidence directory path and the image SHA-256 before doing anything else.
+
+## 5. Risks, ranked
+
+1. **BCE alive in the restore kernel, then frozen by the boot kernel's own patched callbacks.** The core of the model. v9 (BCE and Wi-Fi forced into the restore initramfs) failed real S4 before restored userspace, but v9 predates 0005 to 0017. A teardown stall in the restore kernel is a hang before the image copy: safe (image intact or consumed), costs a power cycle.
+2. **Wi-Fi bound during the atomic copy.** Removed by D2 (U1b). The G1 log-order check proves the blacklist took effect before the image is used.
+3. **Firmware state.** Every successful S4 so far restored with the T2 firmware cold and untouched by BCE. Here it sits nearer the S3 `test_resume` state. A failure would show as lost keyboard and trackpad after a session that otherwise returns; recoverable by reboot.
+4. **i915, Thunderbolt and Plymouth in the restore kernel.** All removed by `--minimal-restore-devices` in every image that restored successfully. Thunderbolt NHI freeze/restore on Titan Ridge is the less certain. Attach nothing to the USB-C ports; bolt is stopped by `prepare.py`.
+5. **Stale-image hazard after a failure before `swsusp_check`:** stock `resume` could restore with an unpatched BCE (section 2). Procedure only.
+6. **Loss of evidence on failure** (no markers, restore kernel messages not persisted): not a safety risk.
+7. **Harness risks:** a `/run` drop-in left after a failed cycle (cleared by any reboot and by `cleanup`), an armed one-shot (removed by `disarm`), snapper rewriting `limine.conf` (handled by the canonical compare and block-only removal).
+
+## 6. Open questions (unverified)
+
+- Whether `systemd-sleep hibernate` on this machine selects `/swap/swapfile` rather than zram (zram has priority 100, the swapfile 0). G0 requires exactly one non-zram swap candidate and verifies `/sys/power/resume(_offset)` against the cmdline and Btrfs before the write and again after the return, but systemd writes them inside the power transition, so a wrong pick can only be detected after the fact.
+- Whether `omarchy-system-sleep-lock` succeeds when invoked through `runuser` from a root runner (it needs the user's session bus); a failed lock refuses before any guard.
+- The exact `systemctl show` rendering of several `ExecStartPre`/`ExecStopPost` entries (the parser reads every `argv[]=` in each line).
+- Whether the installed DKMS radio modules equal the hardened `radio-h1` candidate (not compared; this test substitutes only `t2bce_*`).
+- Whether the current ordinary-boot `dmesg` records PID 1 messages early enough for the initramfs Wi-Fi log-order check; if not, G1 refuses rather than guessing.
