@@ -9,6 +9,7 @@ Phases, all run as root from the stager's receipt:
   s4           G3/G4 one S4 cycle (1, 2 or 3): attendance phrase, O_EXCL guard before the power
                write, one-shot armed, /run drop-in routing `systemctl hibernate` to stock
                systemd-sleep, evidence, post-return cleanup and confirmation.
+  recover      On the test boot after a dead runner: remove the drop-in, disarm, settle attempts, continue.
   pre-reactivate-check  Refuse while any drop-in, /run helper, one-shot, receipt or unsettled attempt remains.
   cleanup      Remove the /run drop-in and helpers and disarm an owned one-shot.
   recovery     Print the recovery checklist.
@@ -17,6 +18,7 @@ Any failure after a guard is consumed makes the image hash terminal. Typed phras
 """
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import importlib.util
 import json
@@ -24,6 +26,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -483,7 +486,7 @@ def require_sequence(host, receipt, cycle, boot_id):
   if cycle not in CYCLE_POWER:
     raise ValueError("Cycle must be 1, 2 or 3")
   existing = cycle_state(host, receipt, cycle)
-  if host.exists(C.GUARDS / receipt["image_sha256"] / ("cycle-" + str(cycle))) or (existing is not None and existing.get("state") != "refused-before-guard"):
+  if host.exists(C.GUARDS / receipt["image_sha256"] / ("cycle-" + str(cycle))) or (existing is not None and existing.get("state") not in ("refused-before-guard", "refused-before-transition")):
     raise ValueError("Cycle " + str(cycle) + " already has an attempt or guard; it is never repeated")
   for later in range(cycle + 1, 4):
     if cycle_state(host, receipt, later) is not None:
@@ -633,6 +636,53 @@ def terminal(host, receipt, reason):
   STAGE.mark_terminal(host.root, receipt["image_sha256"], reason)
 
 
+class RefusedBeforeTransition(RuntimeError):
+  """hibernate failed with no evidence that any transition began."""
+
+
+@contextmanager
+def terminating_signals():
+  """SIGHUP, SIGTERM and SIGINT become SystemExit so the cleanup in s4_cycle always runs."""
+  previous = {}
+
+  def terminate(signum, _frame):
+    raise SystemExit(128 + signum)
+
+  for name in ("SIGHUP", "SIGTERM", "SIGINT"):
+    try:
+      previous[getattr(signal, name)] = signal.signal(getattr(signal, name), terminate)
+    except ValueError:
+      break  # not the main thread
+  try:
+    yield
+  finally:
+    for number, handler in previous.items():
+      signal.signal(number, handler)
+
+
+def no_transition_evidence(host, target, mark):
+  """True only if the swap header is still SWAPSPACE2 and the journal since the guard lacks the entry line."""
+  try:
+    require_clean_header(host, target)
+    lines, _full = journal_slice(host, mark)
+  except (ValueError, OSError):
+    return False
+  return not any("hibernation entry" in line for line in lines)
+
+
+def archive_prior_attempt(host, directory):
+  """Move the files of a refused attempt into prior-<time>/ (evidence is kept, never deleted)."""
+  archive = directory / ("prior-" + str(int(host.now())))
+  n = 0
+  while archive.exists():
+    n += 1
+    archive = directory / ("prior-" + str(int(host.now())) + "-" + str(n))
+  archive.mkdir(mode=0o700)
+  for item in sorted(directory.iterdir()):
+    if item.is_file():
+      item.rename(archive / item.name)
+
+
 def s4_cycle(host, cycle):
   receipt = load(host)
   boot_id = require_g1(host, receipt)
@@ -644,7 +694,7 @@ def s4_cycle(host, cycle):
   directory = phase_dir(host, receipt, "cycle-" + str(cycle))
   attempt_path = directory / "attempt.json"
   if attempt_path.exists():
-    attempt_path.rename(directory / ("attempt-refused-" + str(int(host.now())) + ".json"))
+    archive_prior_attempt(host, directory)
   identity = {"image_sha256": receipt["image_sha256"], "entry_id": receipt["entry_id"], "boot_id": boot_id, "cycle": cycle,
               "power": power["label"], "transition_vector": vector(receipt, cycle, boot_id, power["label"]),
               "swap_target": facts["swap_target"]}
@@ -691,7 +741,10 @@ def s4_cycle(host, cycle):
     result = host.run(("systemctl", "hibernate"))
     attempt["hibernate_returncode"] = result.returncode
     if result.returncode != 0:
-      raise RuntimeError("systemctl hibernate returned " + str(result.returncode) + ": " + result.stderr.strip()[:200])
+      message = "systemctl hibernate returned " + str(result.returncode) + ": " + result.stderr.strip()[:200]
+      if no_transition_evidence(host, facts["swap_target"], mark):
+        raise RefusedBeforeTransition(message)
+      raise RuntimeError(message)
     attempt["state"] = "returned"
     save(host, attempt_path, attempt)
     post_return(host, receipt, cycle, attempt, directory, mark, boot_id)
@@ -707,7 +760,18 @@ def s4_cycle(host, cycle):
         cleanup_errors.append("disarm: " + str(disarm_error))
     if cleanup_errors:
       attempt["cleanup_errors"] = cleanup_errors
-    if consumed:
+    if consumed and isinstance(error, RefusedBeforeTransition):
+      # No evidence of a transition: keep the guard as evidence under a per-attempt name and allow a retry.
+      guard = host.root / C.GUARDS / receipt["image_sha256"] / ("cycle-" + str(cycle))
+      archived = guard.with_name(guard.name + ".refused-" + str(int(host.now())))
+      n = 0
+      while archived.exists():
+        n += 1
+        archived = guard.with_name(guard.name + ".refused-" + str(int(host.now())) + "-" + str(n))
+      guard.rename(archived)
+      attempt["guard_archived_as"] = archived.name
+      attempt.update(state="refused-before-transition", real_s4_attempted=False)
+    elif consumed:
       attempt["state"] = "failed-terminal"
       terminal(host, receipt, "S4 cycle " + str(cycle) + ": " + str(error))
     else:
@@ -790,6 +854,37 @@ def cleanup(host):
   return {"state": "cleaned", "image_sha256": receipt["image_sha256"], "settled_attempts": settled}
 
 
+def recover(host):
+  """Repair after a runner died on the test boot: drop-in gone, one-shot disarmed, attempts settled.
+
+  Runs only on the test-image boot. Leftover guards and evidence are never deleted; attempts with a guard
+  become terminal, those without become retryable, and the receipt moves to "booted" (or "disarmed") so
+  verify-boot and the later steps can continue. From the stock boot use cleanup instead.
+  """
+  receipt = load(host)
+  if STAGE.selected_entry(host.root) != receipt["entry_id"]:
+    raise ValueError("recover runs on the upstream-model test boot; from the stock boot use cleanup")
+  errors = remove_dropin(host)
+  if host.exists(STAGE.ONESHOT):
+    try:
+      STAGE.disarm(host.root, runner=host.stager_runner)
+    except ValueError as error:
+      errors.append("disarm: " + str(error))
+  settled = reconcile_attempts(host, receipt)
+  current = STAGE.load_receipt(host.root)
+  if current.get("state") in ("armed", "s4-armed", "arming") and not host.exists(STAGE.ONESHOT):
+    try:
+      STAGE.adopt_boot(host.root)
+    except ValueError as error:
+      errors.append("adopt: " + str(error))
+  if errors:
+    raise ValueError("Recovery incomplete: " + "; ".join(errors))
+  final = STAGE.load_receipt(host.root)
+  return {"state": "recovered", "receipt_state": final["state"], "test_boot_id": final.get("test_boot_id"),
+          "terminal": STAGE.is_terminal(host.root, receipt["image_sha256"]), "settled_attempts": settled,
+          "next": "run verify-boot again on this boot" if final["state"] == "booted" else "see receipt state"}
+
+
 def pre_reactivate_check(host):
   """Refuse while any test leftover exists; run before the product's reactivate (reads state only)."""
   directory, dropin = runtime_paths(host)
@@ -813,7 +908,7 @@ def pre_reactivate_check(host):
 
 def main():
   parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-  parser.add_argument("phase", choices=("preflight", "verify-boot", "s3", "s4", "cleanup", "pre-reactivate-check", "recovery"))
+  parser.add_argument("phase", choices=("preflight", "verify-boot", "s3", "s4", "cleanup", "recover", "pre-reactivate-check", "recovery"))
   parser.add_argument("--cycle", type=int)
   args = parser.parse_args()
   if args.phase == "recovery":
@@ -823,21 +918,24 @@ def main():
     raise SystemExit("Root required")
   host = Host()
   try:
-    if args.phase == "preflight":
-      receipt = load(host)
-      result = preconditions(host, receipt, efi_clear=receipt.get("state") not in ("armed", "s4-armed"))
-    elif args.phase == "verify-boot":
-      result = verify_boot(host)
-    elif args.phase == "s3":
-      result = s3(host)
-    elif args.phase == "s4":
-      if args.cycle is None:
-        parser.error("s4 requires --cycle")
-      result = s4_cycle(host, args.cycle)
-    elif args.phase == "pre-reactivate-check":
-      result = pre_reactivate_check(host)
-    else:
-      result = cleanup(host)
+    with terminating_signals():
+      if args.phase == "preflight":
+        receipt = load(host)
+        result = preconditions(host, receipt, efi_clear=receipt.get("state") not in ("armed", "s4-armed"))
+      elif args.phase == "verify-boot":
+        result = verify_boot(host)
+      elif args.phase == "s3":
+        result = s3(host)
+      elif args.phase == "s4":
+        if args.cycle is None:
+          parser.error("s4 requires --cycle")
+        result = s4_cycle(host, args.cycle)
+      elif args.phase == "pre-reactivate-check":
+        result = pre_reactivate_check(host)
+      elif args.phase == "recover":
+        result = recover(host)
+      else:
+        result = cleanup(host)
   except (OSError, RuntimeError, ValueError) as error:
     print(CHECKLIST, file=sys.stderr)
     raise SystemExit("Upstream-model runner refused: " + str(error)) from error

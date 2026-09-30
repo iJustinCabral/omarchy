@@ -679,6 +679,27 @@ def mark_booted(root):
   return receipt
 
 
+def adopt_boot(root):
+  """Recovery: a consumed one-shot booted the test image on a boot the receipt did not expect.
+
+  Used by the runner's recover step on the test boot itself: the current boot becomes the test boot and
+  the receipt moves to "booted" (verify-boot must then pass on it). Evidence and guards are untouched.
+  """
+  receipt = load_receipt(root)
+  if receipt.get("state") not in ARMED + ("arming",):
+    raise ValueError("No armed or interrupted upstream-model boot to adopt")
+  verify_staged(root, receipt, pair=False)
+  if present(root, ONESHOT) or present(root, DEFAULT):
+    raise ValueError("An EFI one-shot or default is still present; disarm it first")
+  if selected_entry(root) != receipt["entry_id"]:
+    raise ValueError("Running boot is not the exact upstream-model entry")
+  receipt["test_boot_id"] = current_boot_id(root)
+  receipt["state"] = "booted"
+  receipt.pop("arming", None)
+  save_receipt(root, receipt)
+  return receipt
+
+
 def disarm(root, runner=subprocess.run):
   receipt = load_receipt(root)
   if receipt.get("state") == "disarmed" and not present(root, ONESHOT):

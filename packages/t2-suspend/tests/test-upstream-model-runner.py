@@ -132,8 +132,9 @@ class Env:
       return done(self.inhibit)
     if arguments[0] == "journalctl":
       if "--show-cursor" in arguments:
-        return done("-- cursor: s=cursor1\n")
-      return done(self.journal)
+        return done("-- cursor: s=" + str(len(self.journal)) + "\n")
+      after = [item for item in arguments if item.startswith("--after-cursor=s=")]
+      return done(self.journal[int(after[0].split("=")[-1]):] if after else self.journal)
     if arguments[:2] == ("systemctl", "--failed"):
       return done(self.failed_units)
     if arguments[:2] == ("systemctl", "daemon-reload"):
@@ -441,7 +442,11 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-") as temporary:
     rejects(lambda: run.s4_cycle(case.host, 1), expected)
     return case
 
-  case = failed_cycle("hibernate-error", lambda e: setattr(e, "hibernate_rc", 1), "returned 1")
+  def nonzero_with_transition(e):
+    e.hibernate_rc = 1
+    e.hibernate_hook = lambda: setattr(e, "journal", e.journal + e.hibernate_lines)
+
+  case = failed_cycle("hibernate-error", nonzero_with_transition, "returned 1")
   assert case.guard(1).exists() and case.terminal() and case.attempt(1)["state"] == "failed-terminal"
   assert not case.dropin_present() and not (case.root / C.RUNTIME_DIR).exists() and not (case.root / stage.ONESHOT).exists()
   assert case.attempt(1)["hibernate_attempted"] is True
@@ -578,3 +583,124 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-audit-") as temporar
   assert "noresume" in run.CHECKLIST and "press E" in run.CHECKLIST
 
 print("PASS: upstream-model runner unwinds partial arms and gates product reactivation")
+
+with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-signals-") as temporary:
+  base = Path(temporary)
+  import signal
+
+  # Non-terminal refusal: hibernate fails, header still SWAPSPACE2, no entry line -> retry the same cycle.
+  case = Env(base / "refused")
+  case.to_s3_passed()
+  case.hibernate_rc = 1
+  rejects(lambda: run.s4_cycle(case.host, 1), "returned 1")
+  record = case.attempt(1)
+  assert record["state"] == "refused-before-transition" and record["real_s4_attempted"] is False
+  assert not case.terminal() and not case.guard(1).exists() and not case.dropin_present() and not (case.root / stage.ONESHOT).exists()
+  archived = sorted((case.root / C.GUARDS / case.receipt["image_sha256"]).glob("cycle-1.refused-*"))
+  assert len(archived) == 1 and json.loads(archived[0].read_text())["cycle"] == 1
+  assert record["guard_archived_as"] == archived[0].name
+  asked = len([call for call in case.calls if isinstance(call, tuple) and call[0] == "ask"])
+  case.hibernate_rc = 0
+  assert run.s4_cycle(case.host, 1)["state"] == "returned-and-cleaned"
+  assert len([call for call in case.calls if isinstance(call, tuple) and call[0] == "ask"]) > asked, "a fresh phrase is required"
+  prior = list((case.root / C.ATTEMPTS / case.receipt["image_sha256"] / "cycle-1").glob("prior-*/attempt.json"))
+  assert len(prior) == 1 and json.loads(prior[0].read_text())["state"] == "refused-before-transition"
+  assert case.guard(1).exists() and not case.terminal() and len(sorted((case.root / C.GUARDS / case.receipt["image_sha256"]).glob("cycle-1.refused-*"))) == 1
+  assert (prior[0].parent / "acceptance.json").exists()
+  # A second refusal archives a second guard; evidence accumulates.
+  case.hibernate_rc = 1
+  rejects(lambda: run.s4_cycle(case.host, 2), "returned 1")
+  assert case.attempt(2)["state"] == "refused-before-transition" and not case.terminal()
+
+  # Any evidence of a transition stays terminal: header changed, or the entry line is in the journal.
+  case = failed_cycle("rc-header", lambda e: (setattr(e, "hibernate_rc", 1), setattr(e, "hibernate_hook", lambda: e.header(b"S1SUSPEND"))), "returned 1")
+  assert case.terminal() and case.attempt(1)["state"] == "failed-terminal" and case.guard(1).exists()
+  case = failed_cycle("rc-journal", lambda e: (setattr(e, "hibernate_rc", 1), setattr(e, "hibernate_hook", lambda: setattr(e, "journal", e.journal + e.hibernate_lines))), "returned 1")
+  assert case.terminal()
+  case = failed_cycle("rc-unreadable", lambda e: (setattr(e, "hibernate_rc", 1), setattr(e, "hibernate_hook", lambda: e.header(b"GARBAGE"))), "returned 1")
+  assert case.terminal()
+
+  # Terminal death: signals become SystemExit and the cleanup runs.
+  previous = signal.getsignal(signal.SIGTERM)
+  case = Env(base / "sigterm-before-guard")
+  case.to_s3_passed()
+  case.lock_hook = lambda: os.kill(os.getpid(), signal.SIGTERM)
+  try:
+    with run.terminating_signals():
+      try:
+        run.s4_cycle(case.host, 1)
+      except SystemExit as error:
+        assert error.code == 128 + signal.SIGTERM
+      else:
+        raise AssertionError("SIGTERM ignored")
+  finally:
+    case.lock_hook = None
+  assert signal.getsignal(signal.SIGTERM) == previous
+  assert not case.dropin_present() and not (case.root / C.RUNTIME_DIR).exists() and not (case.root / stage.ONESHOT).exists()
+  assert case.attempt(1)["state"] == "refused-before-guard" and not case.terminal() and not case.guard(1).exists()
+  assert stage.load_receipt(case.root)["state"] == "booted"
+  case.lock_hook = None
+  assert run.s4_cycle(case.host, 1)["state"] == "returned-and-cleaned"
+
+  for number in (signal.SIGHUP, signal.SIGINT):
+    case = Env(base / ("signal-after-guard-" + str(int(number))))
+    case.to_s3_passed()
+    case.hibernate_hook = lambda number=number: os.kill(os.getpid(), number)
+    with run.terminating_signals():
+      try:
+        run.s4_cycle(case.host, 1)
+      except SystemExit as error:
+        assert error.code == 128 + int(number)
+      else:
+        raise AssertionError("signal ignored")
+    assert case.terminal() and case.guard(1).exists() and not case.dropin_present() and not (case.root / stage.ONESHOT).exists()
+    assert case.attempt(1)["state"] == "failed-terminal"
+
+  # recover: a dead runner on the test boot.
+  case = Env(base / "recover-same-boot")
+  case.to_s3_passed()
+  run.install_dropin(case.host)
+  stage.arm_s4(case.root, 1, runner=bootctl_for(case.root))
+  (case.root / stage.ONESHOT).unlink()
+  cycle_dir = case.root / C.ATTEMPTS / case.receipt["image_sha256"] / "cycle-1"
+  cycle_dir.mkdir(parents=True)
+  (cycle_dir / "attempt.json").write_text(json.dumps({"state": "armed"}))
+  (cycle_dir / "evidence.txt").write_text("keep")
+  assert stage.load_receipt(case.root)["state"] == "s4-armed"
+  result = run.recover(case.host)
+  assert result["receipt_state"] == "booted" and result["terminal"] is False and result["test_boot_id"] == BOOT_B
+  assert not case.dropin_present() and not (case.root / C.RUNTIME_DIR).exists()
+  assert case.attempt(1)["state"] == "refused-before-guard" and (cycle_dir / "evidence.txt").read_text() == "keep"
+  assert run.recover(case.host)["receipt_state"] == "booted"
+
+  case = Env(base / "recover-new-boot")
+  case.to_s3_passed()
+  stage.arm_s4(case.root, 1, runner=bootctl_for(case.root))
+  (case.root / stage.ONESHOT).unlink()
+  guard = run.create_guard(case.host, case.receipt, 1, {"cycle": 1})
+  cycle_dir = case.root / C.ATTEMPTS / case.receipt["image_sha256"] / "cycle-1"
+  cycle_dir.mkdir(parents=True)
+  (cycle_dir / "attempt.json").write_text(json.dumps({"state": "transition-started"}))
+  case.write("proc/sys/kernel/random/boot_id", BOOT_C + "\n")
+  set_boot(case.root, case.entry, BOOT_C)
+  run.install_dropin(case.host)
+  result = run.recover(case.host)
+  assert result["terminal"] is True and result["receipt_state"] == "booted" and result["test_boot_id"] == BOOT_C
+  assert guard.exists() and cycle_dir.exists() and case.terminal() and case.attempt(1)["state"] == "failed-terminal"
+  assert not case.dropin_present()
+  rejects(lambda: stage.arm_s4(case.root, 2, runner=bootctl_for(case.root)), "terminal")
+
+  # A still-armed one-shot on the test boot is disarmed, never left for the next boot.
+  case = Env(base / "recover-armed")
+  case.to_s3_passed()
+  stage.arm_s4(case.root, 1, runner=bootctl_for(case.root))
+  result = run.recover(case.host)
+  assert not (case.root / stage.ONESHOT).exists() and result["receipt_state"] == "disarmed"
+
+  # From stock, recover refuses.
+  case = Env(base / "recover-stock")
+  case.to_s3_passed()
+  set_boot(case.root, C.STOCK_ENTRY, BOOT_C)
+  rejects(lambda: run.recover(case.host), "from the stock boot use cleanup")
+
+print("PASS: upstream-model runner cleans up on signals, recovers a dead runner and retries non-transitions")

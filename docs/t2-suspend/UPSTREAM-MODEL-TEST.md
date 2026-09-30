@@ -137,14 +137,17 @@ BUILD=$TOOLS_ROOT/build-$(date +%Y%m%d)
 
 8. **G3/G4, cycles 1 and 2 on AC, cycle 3 on battery:**
 
+   Run the S4 runner as a transient systemd unit with a pty, so a dying terminal (SIGHUP) cannot kill it mid-cycle; it also converts SIGHUP, SIGTERM and SIGINT to a clean exit that removes the drop-in and disarms the one-shot:
+
    ```bash
-   sudo python3 "$TOOLS/run-upstream-model.py" s4 --cycle 1
-   sudo python3 "$TOOLS/run-upstream-model.py" s4 --cycle 2
+   S4="sudo systemd-run --pty --wait --collect --setenv=SUDO_UID --setenv=SUDO_USER python3 $TOOLS/run-upstream-model.py s4"
+   $S4 --cycle 1
+   $S4 --cycle 2
    # unplug the charger; wait for Discharging at 70% or more
-   sudo python3 "$TOOLS/run-upstream-model.py" s4 --cycle 3
+   $S4 --cycle 3
    ```
 
-   The runner needs the desktop user via `sudo` (it reads `SUDO_UID` and `SUDO_USER` to run `omarchy-system-sleep-lock`). A failure of the drop-in's `ExecStartPre` (Wi-Fi detach, Bluetooth or bolt) happens after the guard was created, so it consumes the cycle: the image hash becomes terminal and a repeat needs a new image hash and a new design review. Stay at the machine with the power button reachable; the display goes dark, the machine powers off, and after you press the power button the restore boot selects the test entry and the same terminal session returns. On any failure follow the printed checklist and stop: the image is terminal.
+   The runner needs the desktop user via `sudo` (it reads `SUDO_UID` and `SUDO_USER` to run `omarchy-system-sleep-lock`). If `systemctl hibernate` returns non-zero while the swap header is still `SWAPSPACE2` and the journal since the guard has no `PM: hibernation: hibernation entry` line (a `prepare.py` pre failure or a swap refusal), the attempt is recorded as `refused-before-transition`: not terminal, the guard is renamed to `cycle-N.refused-<time>` and kept as evidence, the prior attempt files move to `cycle-N/prior-<time>/`, and the same cycle can be retried after a fresh typed phrase. Any evidence of a transition (header changed, entry line present, unreadable header or journal) makes the image terminal; a repeat then needs a new image hash and a new design review. If the runner itself died on the test-image boot (terminal closed, killed), run `sudo python3 "$TOOLS/run-upstream-model.py" recover` there: it removes the drop-in, disarms a still-armed one-shot, settles attempts (with a guard: terminal; without: retryable), never deletes guards or evidence, and leaves the receipt `booted` (run `verify-boot` again on that boot) or `disarmed`. From the stock boot use `cleanup`. Stay at the machine with the power button reachable; the display goes dark, the machine powers off, and after you press the power button the restore boot selects the test entry and the same terminal session returns. On any failure follow the printed checklist and stop: the image is terminal.
 
 9. **Return to stock and undo.** Reboot to stock (the default), then:
 
