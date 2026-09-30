@@ -107,8 +107,11 @@ def post(directory=DIRECTORY, runner=run, owner=0, sleeper=time.sleep):
     except Exception as error:
       errors.append("bluetooth: " + str(error))
   if state.get("bolt_was_active"):
-    if runner(("systemctl", "start", "bolt.service")).returncode != 0:
-      errors.append("bolt.service did not start")
+    try:
+      if runner(("systemctl", "start", "bolt.service")).returncode != 0:
+        errors.append("bolt.service did not start")
+    except Exception as error:
+      errors.append("bolt: " + str(error))
   if not errors and state_path.exists():
     state_path.unlink()
   if errors:
@@ -121,7 +124,7 @@ def main(argv=None):
     raise SystemExit("usage (root): prepare.py pre|post")
   try:
     (pre if arguments[0] == "pre" else post)()
-  except (OSError, RuntimeError, ValueError) as error:
+  except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
     print("omarchy-t2-upstream-model prepare " + arguments[0] + ": " + str(error), file=sys.stderr)
     raise SystemExit(1) from error
 

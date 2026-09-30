@@ -138,8 +138,39 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-prepare-") as temporary:
   unreadable = lambda arguments, **_options: subprocess.CompletedProcess(arguments, 1, "", "")
   rejects(lambda: prepare.pre(directory, unreadable, owner=OWNER), "unavailable")
 
+# A raising bolt start and a timed-out command are reported, never propagated out of post unhandled.
+with tempfile.TemporaryDirectory(prefix="t2-upstream-prepare-") as temporary:
+  base = Path(temporary)
+  (base / "g").mkdir()
+  directory = directory_fixture(base / "g")
+  fake = Fake()
+  prepare.pre(directory, fake, owner=OWNER)
+  original_call = fake.__class__.__call__
+
+  def raising(self, arguments, **options):
+    if tuple(str(item) for item in arguments) == ("systemctl", "start", "bolt.service"):
+      raise subprocess.TimeoutExpired(arguments, 30)
+    return original_call(self, arguments, **options)
+
+  fake.__class__.__call__ = raising
+  try:
+    rejects(lambda: prepare.post(directory, fake, owner=OWNER, sleeper=lambda _seconds: None), "bolt")
+  finally:
+    fake.__class__.__call__ = original_call
+  assert fake.bluetooth is True and (directory / prepare.STATE_NAME).exists()
+  # The real entry point turns a timeout into a clean failure.
+  prepare.os.geteuid = lambda: 0
+  prepare.pre = lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired("x", 1))
+  try:
+    prepare.main(["pre"])
+  except SystemExit as error:
+    assert error.code == 1
+  else:
+    raise AssertionError("timeout not handled")
+
 # The entry point is root-only and takes exactly pre or post.
 for arguments in ([], ["both"], ["pre", "post"]):
+  prepare.os.geteuid = lambda: 0
   try:
     prepare.main(arguments)
   except SystemExit as error:

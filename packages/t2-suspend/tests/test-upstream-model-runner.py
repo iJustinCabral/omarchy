@@ -527,4 +527,54 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-") as temporary:
   assert not case.dropin_present() and not (case.root / stage.ONESHOT).exists() and case.terminal()
   assert run.cleanup(case.host)["state"] == "cleaned"
 
-print("PASS: upstream-model runner enforces gates G0-G4, guard consumption, phrase binding and terminal-on-failure")
+
+with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-audit-") as temporary:
+  base = Path(temporary)
+
+  # A partial arm (one-shot written, then the stager dies) is always disarmed and unwound.
+  case = Env(base / "partial-arm")
+  case.to_s3_passed()
+  real_arm = run.STAGE.arm_s4
+
+  def partial(root, cycle, runner=None, sync=None):
+    record = stage.load_receipt(root)
+    record.update(state="arming", arming={"purpose": "s4", "cycle": cycle, "boot_id": BOOT_B})
+    stage.save_receipt(root, record)
+    (root / stage.ONESHOT).write_bytes(efi_string(case.entry))
+    raise RuntimeError("stager died after setting the one-shot")
+
+  run.STAGE.arm_s4 = partial
+  try:
+    rejects(lambda: run.s4_cycle(case.host, 1), "stager died")
+  finally:
+    run.STAGE.arm_s4 = real_arm
+  assert not (case.root / stage.ONESHOT).exists() and not case.dropin_present() and not case.guard(1).exists() and not case.terminal()
+
+  # pre-reactivate-check refuses every kind of leftover and clears only when nothing remains.
+  case = Env(base / "reactivate")
+  case.to_s3_passed()
+  rejects(lambda: run.pre_reactivate_check(case.host), "receipt still exists")
+  run.s4_cycle(case.host, 1)
+  (case.root / C.RUNTIME_DIR).mkdir(parents=True)
+  rejects(lambda: run.pre_reactivate_check(case.host), "omarchy-t2-upstream-model exists")
+  (case.root / C.RUNTIME_DIR).rmdir()
+  (case.root / C.DROPIN).parent.mkdir(parents=True, exist_ok=True)
+  (case.root / C.DROPIN).write_text("[Service]\n")
+  rejects(lambda: run.pre_reactivate_check(case.host), "drop-in")
+  (case.root / C.DROPIN).unlink()
+  (case.root / stage.ONESHOT).write_bytes(efi_string(case.entry))
+  rejects(lambda: run.pre_reactivate_check(case.host), "one-shot")
+  (case.root / stage.ONESHOT).unlink()
+  rejects(lambda: run.pre_reactivate_check(case.host), "receipt still exists")
+  set_boot(case.root, C.STOCK_ENTRY, BOOT_C)
+  stage.rollback(case.root)
+  stage.clear_rolled_back(case.root)
+  path = case.root / C.ATTEMPTS / case.receipt["image_sha256"] / "cycle-2"
+  path.mkdir()
+  (path / "attempt.json").write_text(json.dumps({"state": "armed"}))
+  rejects(lambda: run.pre_reactivate_check(case.host), "unsettled attempt")
+  (path / "attempt.json").write_text(json.dumps({"state": "refused-before-guard"}))
+  assert run.pre_reactivate_check(case.host)["state"].startswith("clear")
+  assert "noresume" in run.CHECKLIST and "press E" in run.CHECKLIST
+
+print("PASS: upstream-model runner unwinds partial arms and gates product reactivation")

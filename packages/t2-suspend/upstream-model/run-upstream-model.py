@@ -9,6 +9,7 @@ Phases, all run as root from the stager's receipt:
   s4           G3/G4 one S4 cycle (1, 2 or 3): attendance phrase, O_EXCL guard before the power
                write, one-shot armed, /run drop-in routing `systemctl hibernate` to stock
                systemd-sleep, evidence, post-return cleanup and confirmation.
+  pre-reactivate-check  Refuse while any drop-in, /run helper, one-shot, receipt or unsettled attempt remains.
   cleanup      Remove the /run drop-in and helpers and disarm an owned one-shot.
   recovery     Print the recovery checklist.
 Any failure after a guard is consumed makes the image hash terminal. Typed phrases come from
@@ -68,6 +69,9 @@ CHECKLIST = """\
 Recovery checklist (nothing here repeats a hibernation attempt):
  1. Write down what the screen showed, how long it took, and whether the machine powered down by itself.
  2. Hold the power button until off, then power on. LoaderEntryOneShot was consumed, so Limine boots stock Omarchy.linux-t2.
+    STALE-IMAGE MITIGATION: if the failed S4 may have left the image intact, the stock resume hook could restore it with an
+    unpatched BCE. At the Limine menu highlight the stock entry (Omarchy), press E, move to the cmdline line, press End,
+    type a space and noresume, then press F10 to boot once. Read the swap header from that boot (step 4) before any normal boot.
  3. On the stock boot run: journalctl -b | head -200 | grep -iE 'Image not found|resume|hibernat'
     'Image not found' means the image was consumed and the session is lost (filesystem consistent).
     If stock resumed the image instead, record it as an unplanned vector and stop.
@@ -655,8 +659,8 @@ def s4_cycle(host, cycle):
     host.lock()
     install_dropin(host)
     installed = True
+    armed = True  # set first: a partial arm must always be disarmed on failure
     STAGE.arm_s4(host.root, cycle, runner=host.stager_runner, sync=host.sync)
-    armed = True
     attempt["state"] = "armed"
     save(host, attempt_path, attempt)
     # Final re-read immediately before the irreversible steps.
@@ -786,9 +790,30 @@ def cleanup(host):
   return {"state": "cleaned", "image_sha256": receipt["image_sha256"], "settled_attempts": settled}
 
 
+def pre_reactivate_check(host):
+  """Refuse while any test leftover exists; run before the product's reactivate (reads state only)."""
+  directory, dropin = runtime_paths(host)
+  problems = []
+  if dropin.exists() or dropin.is_symlink():
+    problems.append("the /run drop-in " + str(Path("/") / C.DROPIN) + " exists")
+  if directory.exists():
+    problems.append(str(Path("/") / C.RUNTIME_DIR) + " exists")
+  if host.exists(STAGE.ONESHOT) or host.exists(STAGE.DEFAULT):
+    problems.append("an EFI one-shot or default is present")
+  if host.exists(C.RECEIPT):
+    problems.append("the upstream-model receipt still exists; run the stager rollback and clear first")
+  if host.exists(C.ATTEMPTS):
+    for directory_ in sorted((host.root / C.ATTEMPTS).glob("*/cycle-*/attempt.json")):
+      if json.loads(directory_.read_text()).get("state") in ("preparing", "accepted", "armed", "guard-consumed", "transition-started", "returned"):
+        problems.append("an unsettled attempt remains: " + str(directory_.parent.name) + "; run cleanup")
+  if problems:
+    raise ValueError("Do not reactivate the product yet: " + "; ".join(problems))
+  return {"state": "clear-to-reactivate-check-assess-first"}
+
+
 def main():
   parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-  parser.add_argument("phase", choices=("preflight", "verify-boot", "s3", "s4", "cleanup", "recovery"))
+  parser.add_argument("phase", choices=("preflight", "verify-boot", "s3", "s4", "cleanup", "pre-reactivate-check", "recovery"))
   parser.add_argument("--cycle", type=int)
   args = parser.parse_args()
   if args.phase == "recovery":
@@ -809,6 +834,8 @@ def main():
       if args.cycle is None:
         parser.error("s4 requires --cycle")
       result = s4_cycle(host, args.cycle)
+    elif args.phase == "pre-reactivate-check":
+      result = pre_reactivate_check(host)
     else:
       result = cleanup(host)
   except (OSError, RuntimeError, ValueError) as error:
