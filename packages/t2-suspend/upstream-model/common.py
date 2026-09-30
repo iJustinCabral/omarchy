@@ -138,10 +138,16 @@ def delta_problems(removed, added, release, dependencies=()):
   swapped = {}
   for name in ("t2bce_dma", "t2bce_core", "t2bce_vhci"):
     swapped[base + name + "/" + name + ".ko.zst"] = base + name + "/" + name + ".ko"
-  allowed = {item.lstrip("/") for item in dependencies}
+  tree = "usr/lib/modules/" + release + "/"
+  allowed, problems = set(), []
+  for item in dependencies:
+    path = item.lstrip("/") if isinstance(item, str) else None
+    if path is None or not path.startswith(tree) or not path.endswith((".ko", ".ko.zst", ".ko.xz", ".ko.gz")):
+      problems.append("dependency: " + repr(item))
+    else:
+      allowed.add(path)
   allowed.add(base + "t2bce_audio/t2bce_audio.ko")
   allowed.add(BLACKLIST_DESTINATION)
-  problems = []
   for path in removed:
     if not (path in swapped and swapped[path] in added):
       problems.append("removed: " + path)

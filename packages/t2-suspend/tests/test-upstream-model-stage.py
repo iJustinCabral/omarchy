@@ -108,6 +108,12 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-stage-refusals-") as tempor
   diff_case("stray-addition", "added: usr/bin/evil", lambda d: d["added"].append("usr/bin/evil"))
   diff_case("ko-without-zst-removal", "added: " + T2BCE_DIR + "t2bce_core/t2bce_core.ko", lambda d: d["removed"].remove(T2BCE_DIR + "t2bce_core/t2bce_core.ko.zst"))
   diff_case("marker-addition", "added: hooks/omarchy-t2-restore-marker", lambda d: d["added"].append("hooks/omarchy-t2-restore-marker"))
+  for bad in ("etc/passwd", "/usr/lib/modules/other/kernel/x.ko", "/" + T2BCE_DIR + "t2bce_audio/t2bce_audio.txt", "usr/lib/modules/" + RELEASE + "/kernel/x.ko.bz2"):
+    diff_case("bad-dep-" + bad[-8:], "dependency", lambda d, bad=bad: d["audio_dependencies"].append(bad))
+  assert C.delta_problems([], [], RELEASE, ["/usr/lib/modules/" + RELEASE + "/kernel/x.ko.xz"]) == []
+  for key in ("removed", "added", "audio_dependencies"):
+    diff_case("non-string-" + key, "must all be strings", lambda d, key=key: d[key].append(7))
+    diff_case("null-" + key, "must all be strings", lambda d, key=key: d[key].append(None))
   mutate_case("missing-release", "missing or malformed", lambda r: r.pop("kernel_release"))
   diff_case("missing-deps", "missing or malformed", lambda d: d.pop("audio_dependencies"))
   # The accepted real shape stages (the happy paths below use it), and the validator is shared with the builder.

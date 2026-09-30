@@ -306,6 +306,8 @@ def load_build(root, directory):
       or not isinstance(diff.get("audio_dependencies"), list)
       or not isinstance(provenance.get("kernel_release"), str)):
     raise ValueError("Image initramfs manifest diff is missing or malformed")
+  if any(not isinstance(item, str) for key in ("removed", "added", "audio_dependencies") for item in diff[key]):
+    raise ValueError("Image initramfs manifest diff entries must all be strings")
   problems = C.delta_problems(diff["removed"], diff["added"], provenance["kernel_release"], diff["audio_dependencies"])
   if problems:
     raise ValueError("Image initramfs manifest diff removes or adds production files beyond the declared deltas: " + "; ".join(problems[:6]))
