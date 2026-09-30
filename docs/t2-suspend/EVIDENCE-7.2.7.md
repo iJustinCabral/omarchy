@@ -29,6 +29,9 @@ Paths are relative to `<state>/gen-7.2.7/` unless absolute. "Boot" is the first 
 | 09-30 06:52 | H6g qualification issued after independent review | `37208ef7` | `evidence_sha256` `bdadff1b2f1b1931ac2fecb293d6288b8f516a7f5d3c5aa2257969fd34ea64b4` (hash of the reconciled trial cycle file) | `qualified: true` for manifest `f4025add13d1` | `h6f/inputs/rebind/`; `$S/qualification.json` |
 | 09-30 07:04 to 07:05 | H6h `rebind` | `37208ef7` | transition `5d9ea39a-f18e-406e-b945-5f78f0ef64ef` from maintenance `f5be4683-011d-40ca-85b2-815508a9bdb1` | `rebound: true`, `requalification_required: false`, `power_operation: false`. Generation ACTIVE; source entry is the Limine default | `h6f/logs/rebind-20260930-070417.log` |
 | 09-30 12:28 | H6i routine S4 through `omarchy-system-hibernate` | `0e41e16a` (source default boot from 07:31; same boot id after resume) | cycle `53ac1f92-3f04-430c-b658-7644fb716fb5` | ledger state `reconciled` (`qualified-product-cycle-reconciled` is the classification `product.py` printed, not a ledger state); ledger chains to the last 7.2.6 cycle `0b8fa4cf` | `/var/lib/omarchy/t2-hibernate-product/ledger/cycle-53ac1f92-*.json` (SHA-256 `e17061e92a5404dbb4c6c0dd4a0b8ff3398f6674ccf2e71e043bd374fb65b0d5`) and the `allocation`, `preparation`, `workflow` and `slot-retirement` files beside it |
+| 09-30 13:41 | S3 (deep) from the hibernation source image | `f46e17c1` (source default boot) | — | kernel log `PM: suspend entry (deep)`, `Waking up from system sleep state S3`, `PM: suspend exit`; owner confirmed keyboard, trackpad, Wi-Fi and audio after wake | `journalctl -b` on that boot |
+| 09-30 ~13:43 | Routine S4, second cycle (the owner intended battery, but the charger was still online) | `f46e17c1` | cycle `c6b961cb-7a38-4024-a46f-4a5ee29b49c2` | ledger state `reconciled`; power admission recorded `source: mains` (ADP1 online, battery 73% charging), so it counts as an AC cycle, not the battery test | `ledger/cycle-c6b961cb-*.json` (SHA-256 `14651585af993ee1245b5848fb83804bc67b783887b96b0fd49b23e70b9491ca`) and `power-admission-c6b961cb-*.json` |
+| 09-30 ~13:45 | Routine S4 on battery | `f46e17c1` | cycle `edb3bf90-2f50-4029-8f7c-817cdbe5ab75` | ledger state `reconciled`; power admission and pre-write records show `source: battery`, BAT0 73% `Discharging` under the 30% policy; owner confirmed a working session after restore | `ledger/cycle-edb3bf90-*.json` (SHA-256 `21aa4843f4f405c3729bfceab318ee066f8f05552798b91905f1db24670ef21b`) and `power-admission-edb3bf90-*.json`, `power-prewrite-returned-edb3bf90-*.json`, `power-postreturn-edb3bf90-*.json` |
 
 The 7.2.6 generation's results, including the attended battery-only cycle `0b8fa4cf-7055-45a5-aa9f-99538a02564e`, are recorded in the guide's evidence register (on branch `fix-t2-vintage-mac-support`: docs/t2-suspend/HIBERNATION-GUIDE.md) and the journal (on branch `fix-t2-vintage-mac-support`: docs/t2-suspend/HIBERNATION.md, the lab journal). They are not evidence for 7.2.7.
 
@@ -38,11 +41,11 @@ Audited and tested in source, not hardware evidence: the t2bce rebase (`a2f5db3b
 
 ## What is not proven
 
+Battery-only S4 and S3 on the source image, both listed here earlier, were closed on 2026-09-30 by cycle `edb3bf90` and the 13:41 S3 row above.
+
 - **Other T2 models.** Only the MacBookAir9,1 (board `J230kAP`) was tested. The guard matches that model explicitly.
-- **Battery-only S4 on 7.2.7.** The 7.2.7 trial used the legacy AC-only policy, and whether the routine cycle ran on AC or battery was not checked for this record. The routine config carries the provisional 30% battery policy, but no deliberate battery-only cycle has been run on 7.2.7. The 7.2.6 battery cycle does not transfer.
-- **Low-reserve behaviour and long soak.** One successful routine cycle per generation is not a reliability measurement. No repeated-cycle, long-idle or power-loss-during-write soak exists.
+- **Low-reserve behaviour and long soak.** Three successful routine cycles on 7.2.7 (one on battery) are not a reliability measurement. No repeated-cycle, long-idle or power-loss-during-write soak exists.
 - **The interactive `omarchy update` prompts on hardware.** The 7.2.7 update was run by hand under maintenance; the pre and post hook has only shell-test coverage.
-- **S3 on the source image on 7.2.7.** Patch 0015 is in the candidate to keep S3 safe on the source image, and S3 on the stock entry passed on 7.2.7, but an S3 cycle on the source image was not located in the records reviewed.
 - **Unvetoed kernel routes.** Suspend-then-hibernate, hybrid-sleep and direct `/sys/power/state` writes are outside the marker vetoes; the guard's image check is the backstop (RESUME.md (on branch `fix-t2-vintage-mac-support`: docs/t2-suspend/RESUME.md), next tasks).
 - **Hibernation on a stock kernel with upstream drivers.** Not attempted; see the upstream path in [HIBERNATION-OVERVIEW.md](HIBERNATION-OVERVIEW.md).
 
