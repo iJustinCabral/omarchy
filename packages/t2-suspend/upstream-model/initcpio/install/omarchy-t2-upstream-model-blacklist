@@ -1,0 +1,18 @@
+#!/bin/bash
+
+# Build-time only hook: adds the private initramfs-only modprobe blacklist. mkinitcpio's FILES
+# array cannot choose a destination path, so this hook is the smallest mechanism that places
+# the file at /etc/modprobe.d/ without writing anything under /etc on the host. There is no
+# runtime script; the image's runtime hook list is identical to production.
+build() {
+  local blacklist=${OMARCHY_T2_UPSTREAM_MODEL_BLACKLIST:-}
+  if [[ -z $blacklist || ! -f $blacklist ]]; then
+    error "Missing upstream-model initramfs blacklist"
+    exit 1
+  fi
+  add_file "$blacklist" /etc/modprobe.d/zz-omarchy-t2-upstream-model.conf 644 || exit 1
+}
+
+help() {
+  echo "Keep the brcmfmac family out of the restore kernel of the upstream-model test image."
+}
