@@ -14,7 +14,7 @@ This is `fix-t2-vintage-mac-support`, the consolidated T2 support branch for Oma
 | Wi-Fi re-enable after Wi-Fi-off sleep | Firmware query timeout could falsely return interface-open success; Wi-Fi recovery coincided with Bluetooth loss | Transport-error propagation plus optional, narrowly scoped Wi-Fi function0 reset | Both patches installed on the supported model; latest functional cycle passed without executing Wi-Fi reset; one earlier unexpected reboot remains unexplained |
 | Retire old sleep workaround | Unloading Wi-Fi around sleep introduced Bluetooth failures | Remove unload helper/install path; guarded retirement migration | Integrated; remains removed |
 
-The latest Wi-Fi-off suspend/re-enable test passed with actual internet traffic and AirPods stereo playback. The earlier reboot remains recorded. This branch does not claim hibernation/S4 is fixed or that every T2 model is validated.
+The latest Wi-Fi-off suspend/re-enable test passed with actual internet traffic and AirPods stereo playback. The earlier reboot remains recorded. Hibernation (S4) is a separate opt-in product that is ACTIVE on the tested MacBookAir9,1 on linux-t2 7.2.7 (see the [T2 suspend and hibernation map](docs/t2-suspend/README.md)); this branch does not claim every T2 model is validated.
 
 ## Read the implementation and evidence
 

@@ -1,6 +1,6 @@
 # T2 hibernation: start here
 
-Status as of 2026-09-27: **working MacBookAir9,1 prototype; permanent fix unfinished**.
+Status as of 2026-09-30: **ACTIVE as an opt-in product on the MacBookAir9,1 on linux-t2 7.2.7 (generation `f4025add13d1`); single model, private image pair, upstreaming not started**. The map of all documents is [README.md](README.md), the plain-language explanation is [HIBERNATION-OVERVIEW.md](HIBERNATION-OVERVIEW.md) and the 7.2.7 hardware record is [EVIDENCE-7.2.7.md](EVIDENCE-7.2.7.md). The rest of this page is the evidence register and agent contract as of the 2026-09-27 prototype; sections that describe the AC-only gate, the blanket package block or a prototype-only status are historical and are corrected in place where noted.
 
 We have demonstrated real S4 power-off and restoration of the original Linux session through two AC-powered normal desktop/logind cycles, with an ordinary boot into the working source image between them, and one later attended battery-only cycle. Battery-aware runtime `e489bab7` returned the original session on battery with the same boot ID and reconciled the cycle without failed units. This is meaningful local hardware evidence, not a permanent fix: the provisional 30% reserve guard is not a measured low-battery policy, the prototype still blocks package transactions, and no other T2 model is qualified. The earlier declaration that the goal was complete was incorrect.
 
@@ -10,7 +10,10 @@ The target is normal, persistent hibernation on battery as well as AC, maintaine
 
 | Question | Document | Purpose |
 | --- | --- | --- |
-| What works, what does not, and where do I start? | This guide | Shared human/agent entry point and evidence index |
+| What works, what does not, and where do I start? | [README.md](README.md), then [Overview](HIBERNATION-OVERVIEW.md) | Entry point and plain-language explanation |
+| What happened on the hardware on 7.2.7? | [7.2.7 evidence](EVIDENCE-7.2.7.md) | Gate-by-gate hardware record |
+| How do I requalify after a kernel update? | [Requalification](REQUALIFICATION.md) | Attended operator procedure |
+| Evidence register for the 7.2.6 prototype | This guide | Evidence index and agent contract |
 | What failed, and what changes made restoration work? | [Mechanism and failure chain](HIBERNATION-MECHANISM.md) | Source-linked explanation, diagrams, and limits of causal claims |
 | How do we make this permanent and portable? | [Production and portability plan](HIBERNATION-PRODUCTION-PLAN.md) | Battery support, update lifecycle, model boundaries, and acceptance criteria |
 | What happened in a particular experiment? | [Investigation journal](HIBERNATION.md) | Historical checkpoints, hashes, failures, and successful cycles |
@@ -62,7 +65,7 @@ Why it exists: an update can change the production kernel, modules, firmware, in
 
 `omarchy update` now handles the pause for the user: it asks before pausing hibernation, runs the reviewed `maintenance` action, and after the update runs the read-only `assess` and offers to turn hibernation back on only when nothing qualified changed (otherwise it says hibernation stays off until requalified and suspend still works). See [the maintenance runbook](MAINTENANCE-RUNBOOK.md#normal-path-omarchy-update-does-this-for-you).
 
-That is not the requested final behavior. Normal updates need a maintained, transactional artifact/boot lifecycle and safe handling of any outstanding hibernation image. The [production plan](HIBERNATION-PRODUCTION-PLAN.md) specifies the unfinished design and evidence needed. This documentation turn does not remove either guard or change the live boot policy.
+After a kernel update the pair still has to be requalified, which is the maintained lifecycle ([REQUALIFICATION.md](REQUALIFICATION.md)); the true fix is upstream drivers ([overview](HIBERNATION-OVERVIEW.md#path-to-upstream)). The [production plan](HIBERNATION-PRODUCTION-PLAN.md) holds the remaining requirements. Neither guard is removed by documentation.
 
 ## Evidence register
 
@@ -94,7 +97,7 @@ For example, the board matrix maps MacBookAir9,1 to `J230kAP` and MacBookPro16,1
 
 ## Agent entry contract
 
-1. Treat **permanent fix unfinished** as the current status. Two AC successes and one attended battery-only success do not establish measured low-battery safety, normal updates or another model's qualification.
+1. Treat the current status as **ACTIVE on the MacBookAir9,1 on 7.2.7, not a permanent upstream fix**. The 7.2.6 evidence register below and the 7.2.7 record do not establish measured low-battery safety, long-term reliability, stock-kernel hibernation or another model's qualification.
 2. Read the mechanism and production plan, then inspect the actual source and evidence for the requirement being changed. Use the journal's named checkpoint rather than assuming every older “next” paragraph is current.
 3. Before touching hardware, reconcile `/home/jjc/.local/state/codex-mba-autonomous/handoff.json`, current boot ID, selected image, repository checkpoint, installed runtime and the ledger's actual terminal cycle. Local paths are references for this development laptop, not paths to ship in a general installer.
 4. Keep physical boot, EFI, module loading and power transitions serialized under the orchestrator. Documentation and design work do not authorize new physical tests. Preserve failed/consumed vectors and guards; do not replay them under new labels.

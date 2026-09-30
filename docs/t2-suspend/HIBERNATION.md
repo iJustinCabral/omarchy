@@ -2,7 +2,9 @@
 
 **Resuming after a break? Read [RESUME.md](RESUME.md) first** for the current checkpoint, exact next tasks and non-repeatable hardware constraints. Older entries below are historical.
 
-## Current status: prototype works; permanent fix is unfinished
+## Current status (superseded): see [README.md](README.md) and [RESUME.md](RESUME.md)
+
+As of 2026-09-30 hibernation is ACTIVE on linux-t2 7.2.7 on the MacBookAir9,1 ([evidence](EVIDENCE-7.2.7.md), [overview](HIBERNATION-OVERVIEW.md)). The paragraphs below record the state on 2026-09-27 and are kept as history.
 
 The earlier overall goal-complete declaration was incorrect. **The attended battery milestone is COMPLETE:** one battery-only normal-logind S4 restored the original session on this exact MacBookAir9,1, installed runtime `e489bab7`, tested source image and v16 restore image; its evidence is committed and pushed. Alongside two AC-powered normal-logind restores and a successful source-default boot, this demonstrates a working prototype, not low-battery, other-model or update qualification. Measured reserve policy, normal update compatibility without a blanket package block, and a maintained path to other T2 models remain required work. Existing evidence is preserved below; older “next” instructions and completion statements are historical, not current authorization.
 

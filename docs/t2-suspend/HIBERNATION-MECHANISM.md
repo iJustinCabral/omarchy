@@ -1,6 +1,6 @@
 # How the current T2 hibernation prototype works
 
-This explains the observed failures and the working experimental path on this MacBookAir9,1. Two AC-powered normal-logind S4 cycles and one attended battery-only cycle returned successfully; the second AC cycle followed an ordinary source-default reboot. That is evidence for the exact tested machine and image pair, not a permanent hibernation fix: measured low-reserve behavior, normal package-update compatibility, other T2 models and long-term reliability remain unfinished. The detailed observations and immutable attempt identities are in the [investigation record](HIBERNATION.md#first-attended-battery-only-s4-restored-the-original-session).
+This explains the observed failures and the working path on this MacBookAir9,1 (map: [README.md](README.md); plain-language summary: [HIBERNATION-OVERVIEW.md](HIBERNATION-OVERVIEW.md); current status: ACTIVE on 7.2.7, see [EVIDENCE-7.2.7.md](EVIDENCE-7.2.7.md)). The narrative below was written at the 7.2.6 prototype stage. Two AC-powered normal-logind S4 cycles and one attended battery-only cycle returned successfully; the second AC cycle followed an ordinary source-default reboot. That is evidence for the exact tested machine and image pair, not a permanent hibernation fix: measured low-reserve behavior, normal package-update compatibility, other T2 models and long-term reliability remain unfinished. The detailed observations and immutable attempt identities are in the [investigation record](HIBERNATION.md#first-attended-battery-only-s4-restored-the-original-session).
 
 ## Why suspend fixes were insufficient
 
@@ -75,7 +75,9 @@ The normal route uses logind and the vendor hibernation-service lifecycle, with 
 
 An earlier genuine return encountered a separate archive failure on Btrfs: a directory descriptor opened before files were created produced a stale empty listing. The [archive implementation](../../packages/t2-suspend/hibernate/evidence_archive.py) now opens a fresh `.` descriptor relative to the retained directory, verifies device/inode identity and enumerates that view. That fixes evidence publication after return; it does not explain the preceding hardware restoration failures.
 
-## What remains before permanent support
+## What remained before permanent support (as written at the 7.2.6 stage)
+
+Update, 2026-09-30: the update lifecycle described as missing below now exists (maintenance, assess, reactivate, requalify and rebind; `omarchy update` drives the first and third). The remaining gaps are measured battery policy, other models and upstream drivers.
 
 Installed runtime `e489bab7` permits attended battery operation with an explicit provisional 30% native-reserve threshold and fresh admission/pre-write checks; legacy v1 configuration remains AC-only. Battery-only cycle `0b8fa4cf-7055-45a5-aa9f-99538a02564e` restored the original session with AC offline before and after, and the operator confirmed usable return. This establishes one battery success, not a measured low-reserve limit or power-loss resilience. The [update guard](../../packages/t2-suspend/hibernate/update_guard.py) still intentionally blocks every package transaction while routine opt-in, active policy or unresolved transition state is present. Reviewed [native deactivation](../../packages/t2-suspend/hibernate/boot_policy_native.py) restores stock boot before updates. The source-only maintenance coordinator is not deployed and does not relax that live restriction. These measures protect pinned images but do not yet provide normal update-compatible hibernation.
 

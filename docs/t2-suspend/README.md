@@ -1,8 +1,56 @@
-# T2 suspend: issue, implementation and evidence
+# T2 suspend and hibernation on the MacBookAir9,1: map
+
+This directory documents how suspend (S3) and hibernation (S4) were made to work on the tested MacBookAir9,1 (T2, BCM4377), how that was tested, and how to operate it. This page is the entry point. The S3 driver investigation that used to be the whole of this page follows the map unchanged, from [section 1](#1-why-the-old-sleep-workaround-was-removed) on.
+
+## What works
+
+| Capability | State on the MacBookAir9,1 | Scope |
+| --- | --- | --- |
+| Suspend (S3) with Wi-Fi and Bluetooth recovery | Works with the DKMS radio package, installed by `omarchy setup t2-suspend` | MacBookAir9,1 with BCM4377 |
+| Hibernation (S4) | Works as an opt-in product: ACTIVE on linux-t2 7.2.7, generation `f4025add13d1`, the source image is the Limine default and the stock entry is the fallback. Routine S4 cycle `53ac1f92` reconciled on 2026-09-30 | This exact machine and kernel. Other T2 models are not qualified |
+| `omarchy update` with hibernation on | Asks to pause hibernation, runs the update, then offers to resume it or says requalification is needed | MacBookAir9,1 with the opt-in product only |
+| Requalification after a kernel update | A tested operator procedure, not yet automated: [REQUALIFICATION.md](REQUALIFICATION.md) | Attended, needs the owner at the machine |
+
+Not proven: other T2 models, a battery-only cycle on 7.2.7, long-term soak, and hibernation on a stock kernel without the private image pair. See [EVIDENCE-7.2.7.md](EVIDENCE-7.2.7.md) for the full list.
+
+## The pieces
+
+- **Drivers:** the S3 series under [`packages/t2-suspend`](../../packages/t2-suspend/README.md) (Wi-Fi mailbox, Bluetooth windows, radio DKMS package) and the hibernation experiment patches 0005 to 0017 on t2bce `6780d522` under `packages/t2-suspend/experiments`.
+- **Private boot pair:** a source image and a restore image (UKIs) that keep the production `.linux` and `.cmdline` byte-for-byte and differ only in initramfs contents. Built and staged by `stage-hibernation-uki-pair.py`.
+- **Product runtime:** the root-owned runtime under `/var/lib/omarchy/t2-hibernate-product/runtime`, from [`packages/t2-suspend/hibernate`](../../packages/t2-suspend/hibernate/README.md): ledger, pacman guard, and `boot_policy_native.py` with `maintenance`, `assess`, `reactivate` and `rebind`.
+- **Desktop integration:** `omarchy system hibernate`, the `omarchy-update-t2-hibernation pre|post` hook in `omarchy update`, and the menu entry.
+- **Operator procedures:** [REQUALIFICATION.md](REQUALIFICATION.md) for the new-kernel campaign and [MAINTENANCE-RUNBOOK.md](MAINTENANCE-RUNBOOK.md) for stuck states.
+
+## Reading order
+
+Humans (Omarchy users and maintainers, t2linux contributors):
+
+1. [manual/t2-suspend.md](../../manual/t2-suspend.md) if you only want to use it.
+2. [HIBERNATION-OVERVIEW.md](HIBERNATION-OVERVIEW.md): the problem, the design, the safety model and the path to upstream.
+3. [HIBERNATION-MECHANISM.md](HIBERNATION-MECHANISM.md): the failure chain and the cold PCI guard, with diagrams.
+4. [EVIDENCE-7.2.7.md](EVIDENCE-7.2.7.md): what was run on the hardware, when, with which identifiers.
+5. [T2BCE-7.2.7-REBASE.md](T2BCE-7.2.7-REBASE.md) and the experiments README if you want to review or upstream the driver patches.
+
+AI agents and anyone changing the code:
+
+1. [`AGENTS.md`](../../AGENTS.md) hardware safety rules, then [`agents/skills/t2-hibernation.md`](../../agents/skills/t2-hibernation.md).
+2. [RESUME.md](RESUME.md): current state (source of truth) and non-repeatable hardware constraints. Reconcile it against `/home/jjc/.local/state/codex-mba-autonomous/handoff.json` and the live boot before acting.
+3. [HIBERNATION-GUIDE.md](HIBERNATION-GUIDE.md) (evidence register), [HIBERNATION-PRODUCTION-PLAN.md](HIBERNATION-PRODUCTION-PLAN.md) (requirements), [DEPLOYMENT.md](DEPLOYMENT.md) (runtime gates H0 to H6), [REBIND-DESIGN.md](REBIND-DESIGN.md), [HELPERS-7.2.7.md](HELPERS-7.2.7.md), [AUTOMATION.md](AUTOMATION.md) (unattended reboot loop) and [VALIDATION.md](VALIDATION.md) (S3 installer record).
+4. [HIBERNATION.md](HIBERNATION.md) is the historical lab journal. Use it to verify a specific claim, never as a tutorial: older entries describe superseded states.
+
+## Where evidence lives
+
+- In the repository: this directory, [`evidence/`](evidence/README.md) (S3 and radio experiments), and commit messages on branch `fix-t2-vintage-mac-support`.
+- On the test laptop only (not in the repository): `~/.local/state/codex-mba-autonomous/` (handoff, per-generation operator scripts and logs; for 7.2.7 under `gen-7.2.7/`), `/var/lib/omarchy/t2-hibernate-product/` (runtime, ledger, archives, retained upgrade files), `/var/lib/omarchy/t2-hibernate-trial/generations/<manifest12>/` (generation trial ledger) and `/var/lib/omarchy-t2-hibernation-pair/` (test_resume and S4 vectors). The `/var/lib` trees are root-owned; read-only `sudo` is enough to inspect them. The private images embed unlock material, so never copy them or their contents into the repository or logs.
+
+## Current status
+
+ACTIVE on linux-t2 7.2.7, generation `f4025add13d1`. The `omarchy update` integration is merged (`8c2b0976`). Next: take draft PRs #1 to #6 out of draft, then upstream the t2bce hibernation patches to linux-t2. Details and the last-known boot are in [RESUME.md](RESUME.md).
+
 
 The driver series enabled real S3 suspend and working Wi-Fi/Bluetooth recovery on the tested MacBookAir9,1. Repeated automatic AirPods reconnection and audible stereo playback were confirmed. The latest Wi-Fi-off suspend/re-enable cycle also passed. Earlier Wi-Fi-off failures and one unexplained reboot remain part of the record. The automatic installer subsequently passed normal boot and a short S3 cycle with working Bluetooth/audio; see the [deployment validation](VALIDATION.md).
 
-The S3 work below is distinct from the subsequent S4 investigation. The MacBookAir9,1 hibernation prototype has now completed two normal-logind S4 restores, including one after a verified ordinary source-default boot. It is not a permanent fix: AC-only admission and a blanket package-update block remain temporary restrictions, and other T2 models are unqualified. Start with the [hibernation guide](HIBERNATION-GUIDE.md), [mechanism diagrams](HIBERNATION-MECHANISM.md), and [battery/update/portability plan](HIBERNATION-PRODUCTION-PLAN.md); use the [investigation journal](HIBERNATION.md) for historical details.
+The S3 work below is distinct from the subsequent S4 work. The MacBookAir9,1 hibernation product has completed repeated normal-logind S4 restores: on linux-t2 7.2.6 (including a battery-only cycle) and, after a full requalification, on 7.2.7. Start with the [hibernation overview](HIBERNATION-OVERVIEW.md) and the [7.2.7 evidence record](EVIDENCE-7.2.7.md). The prototype's AC-only admission and blanket package-update block are gone on the current runtime: `omarchy update` pauses hibernation around updates. Other T2 models remain unqualified, and the private image pair is a stopgap until the patches reach linux-t2 upstream.
 
 ## 1. Why the old sleep workaround was removed
 
