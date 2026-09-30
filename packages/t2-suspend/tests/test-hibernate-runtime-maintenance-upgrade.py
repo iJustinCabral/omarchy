@@ -467,4 +467,415 @@ class Adapter(unittest.TestCase):
         self.assertTrue((state / D.COMPATIBLE_BARRIER).exists())
 
 
+class LiveGuard(Fixture):
+  """The REAL adapter guard (`N._guard`, `N._unchanged`) driving the REAL core, in the live call order.
+
+  The earlier fixtures gave the core `guard=lambda: None` and tested `_unchanged` against mocked files, so nothing ever
+  called the real guard after the core had written its own barrier or rebound the marker. Only the fixed host paths, the
+  root-ownership requirement, the ancestry walk and the inhibitor-parent probe are redirected to the tempdir; the guard's
+  decisions are the installed ones.
+  """
+
+  def setUp(self):
+    super().setUp()
+    root = self.case.root
+    self.qualification = self.state / "qualification.json"
+    rewrite(self.qualification, b"qualification bytes")
+    self.hook = root / D.HOOK
+    self.barrier, self.pending = self.state / D.COMPATIBLE_BARRIER, self.state / D.UPGRADE_PENDING
+    marker = self.state / D.MAINTENANCE_PENDING
+    patches = {"STATE": self.state, "BARRIER": self.barrier, "UPGRADE_PENDING": self.pending, "OWNERS": (0, os.geteuid()),
+               # the adapter's own list, re-rooted: whatever it names as active state is what the fixture checks
+               "ABSENT_IN_MAINTENANCE": tuple(self.state / path.name if path.parent == N.STATE else root / path.relative_to("/") for path in N.ABSENT_IN_MAINTENANCE),
+               "UNCHANGED_MAINTENANCE": {"qualification": (self.qualification, 0o600), "hook": (self.hook, 0o644), "marker": (marker, 0o600)},
+               "_ancestry": lambda path, name: None, "_parent_identity": lambda pid: "identity"}
+    for name, value in patches.items():
+      patcher = patch.object(N, name, value)
+      patcher.start()
+      self.addCleanup(patcher.stop)
+    self.approval = self.make_approval()
+    self.guard_fd, self.check = N._guard(SimpleNamespace(_power_idle=lambda pid: None), self.approval)
+    self.addCleanup(os.close, self.guard_fd)
+
+  def make_approval(self, **changes):
+    boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    expected = {**self.expected, "new_image_state": "c" * 64}
+    approval = {"protocol": N.MAINTENANCE_PROTOCOL, "approved": True, "approval_id": self.case.approval_id, "current_boot_id": boot,
+                "source_directory": "/reviewed/source", "reviewed_commit": "b" * 40, "adapter_sha256": sha(b"adapter"), "expected": expected,
+                "unchanged": {"qualification": sha(self.qualification.read_bytes()), "hook": sha(self.hook.read_bytes()), "marker": sha(self.marker)}}
+    return N._parse_approval(json.dumps({**approval, **changes}).encode(), b"adapter")
+
+  def core_pins(self): return {name: self.approval["expected"][name] for name in N.CORE_HASHES}
+
+  def upgrade_live(self, **changes):
+    arguments = {"expected": self.core_pins(), "approval_id": self.case.approval_id, "guard": self.check,
+                 "precheck": lambda: self.events.append("precheck"), "postcheck": lambda: self.events.append("postcheck"), "maintenance": True}
+    return D.upgrade_snapshot(self.case.source, root=self.case.root, **{**arguments, **changes})
+
+  def own_intent(self, **changes):
+    record = {"protocol": N.INTENT_MAINTENANCE, "transaction_id": str(uuid.uuid4()), "approval_id": self.case.approval_id,
+              "old_review_sha256": self.expected["old_review"], "new_review_sha256": self.expected["new_review"],
+              "old_config_sha256": self.expected["old_config"], "new_config_sha256": self.expected["new_config"], "marker_sha256": sha(self.marker)}
+    return {**record, **changes}
+
+  def write_barrier(self, raw, path=None):
+    rewrite(path or self.barrier, raw)
+
+
+class LiveGuardCore(LiveGuard):
+  def test_the_maintenance_upgrade_completes_with_the_real_guard_after_the_barrier_and_the_marker_rebind(self):
+    # Live failure 2026-09-29 (approval c6051717): the first guard() after the core wrote its own source-default-activation.pending
+    # raised "Active source-default state is present under a maintenance upgrade". The guard after the marker rebind would have
+    # raised "Unchanged host artifact differs: marker" next.
+    result = self.upgrade_live()
+    self.assertEqual(result["review_sha256"], self.expected["new_review"])
+    self.assertEqual(self.events, ["precheck", "postcheck"])
+    self.assertEqual(self.triple(), self.new_triple())
+    self.assertFalse(self.barrier.exists() or self.pending.exists())
+    self.check()  # and the guard admits the finished state, marker in its new form
+
+  def test_the_guard_sees_the_barrier_the_pending_and_the_rebound_marker_at_the_right_moments(self):
+    seen = []
+    def watching():
+      seen.append((self.barrier.exists(), self.pending.exists(), (self.state / D.MAINTENANCE_PENDING).read_bytes() == self.new_marker))
+      self.check()
+    self.upgrade_live(guard=watching)
+    self.assertIn((True, False, False), seen)  # barrier alone: the very call that failed live
+    self.assertIn((True, True, False), seen)
+    self.assertIn((True, True, True), seen)   # marker rebound, both vetoes still held
+
+  def test_a_failure_after_the_barrier_keeps_the_veto_and_the_recovery_intent_is_what_the_guard_accepts(self):
+    def failing():
+      self.check()
+      if self.pending.exists(): raise ValueError("stop after both vetoes")
+    with self.assertRaisesRegex(ValueError, "stop after both vetoes"): self.upgrade_live(guard=failing)
+    self.assertTrue(self.barrier.exists() and self.pending.exists())
+    self.check()  # the retained veto is the approval's own exact intent, so the adapter's recovery guard still admits it
+    intent = json.loads(self.barrier.read_bytes())
+    self.assertEqual((intent["protocol"], intent["approval_id"], intent["marker_sha256"]), (N.INTENT_MAINTENANCE, self.case.approval_id, sha(self.marker)))
+
+
+class LiveGuardRefusals(LiveGuard):
+  def refuses(self, message="Active source-default state"):
+    with self.assertRaisesRegex((ValueError, OSError), message + "|symbolic links"): N._unchanged(self.approval)
+
+  def test_only_this_approvals_exact_private_intent_is_admitted(self):
+    N._unchanged(self.approval)  # nothing present
+    good = D._encoded(self.own_intent())
+    self.write_barrier(good)
+    N._unchanged(self.approval)
+    rewrite(self.pending, good)
+    N._unchanged(self.approval)
+    rewrite(self.pending, good + b" ")
+    self.refuses("differs from the compatible barrier")
+    self.pending.unlink()
+    for label, raw in {
+      "another approval": D._encoded(self.own_intent(approval_id="306521e4-998e-4477-b603-31b93144d999")),
+      "another marker": D._encoded(self.own_intent(marker_sha256="0" * 64)),
+      "another old review": D._encoded(self.own_intent(old_review_sha256="0" * 64)),
+      "another new review": D._encoded(self.own_intent(new_review_sha256="0" * 64)),
+      "another old config": D._encoded(self.own_intent(old_config_sha256="0" * 64)),
+      "another protocol": D._encoded(self.own_intent(protocol="omarchy-t2-runtime-upgrade-intent-v2")),
+      "a transaction that is not a uuid4": D._encoded(self.own_intent(transaction_id="not-a-uuid")),
+      "an extra field": D._encoded({**self.own_intent(), "extra": 1}),
+      "a missing field": D._encoded({key: value for key, value in self.own_intent().items() if key != "marker_sha256"}),
+      "not canonical": good + b"\n", "not json": b"policy", "empty": b"", "not an object": b"[]",
+      "the rebind intent": D._encoded({"protocol": "omarchy-t2-package-rebind-intent-v1"}),
+    }.items():
+      with self.subTest(label):
+        self.write_barrier(raw)
+        self.refuses()
+    self.write_barrier(good)
+    self.barrier.chmod(0o644)
+    with self.subTest("mode"): self.refuses()
+    self.barrier.chmod(0o600)
+    other = self.state / "other"
+    rewrite(other, good)
+    self.barrier.unlink()
+    os.link(other, self.barrier)
+    with self.subTest("hard link"): self.refuses()
+    self.barrier.unlink()
+    other.unlink()
+    rewrite(other, good)
+    os.symlink(other, self.barrier)
+    with self.subTest("symlink"): self.refuses()
+    self.barrier.unlink()
+    with self.subTest("pending without a barrier"):
+      rewrite(self.pending, good)
+      self.refuses("without its compatible barrier")
+
+  def test_the_other_active_state_stays_refused_and_a_barrier_never_excuses_it(self):
+    self.write_barrier(D._encoded(self.own_intent()))
+    for path in N.ABSENT_IN_MAINTENANCE:
+      with self.subTest(path.name):
+        rewrite(path, b"x")
+        self.refuses("Active source-default state")
+        path.unlink()
+
+  def test_the_rebound_marker_is_only_the_pinned_marker_with_the_review_moved(self):
+    marker = self.state / D.MAINTENANCE_PENDING
+    N._unchanged(self.approval)
+    rewrite(marker, self.new_marker)
+    N._unchanged(self.approval)
+    fields = json.loads(self.new_marker)
+    for label, raw in {
+      "another review": D._encoded({**fields, "runtime_review_sha256": "0" * 64}),
+      "another field": D._encoded({**fields, "old_policy_sha256": "0" * 64}),
+      "an extra field": D._encoded({**fields, "extra": 1}),
+      "not canonical": self.new_marker + b"\n",
+      "not json": b"x", "the old review is not restorable": D._encoded({**fields, "transition_id": str(uuid.uuid4())}),
+    }.items():
+      with self.subTest(label):
+        rewrite(marker, raw)
+        self.refuses("Unchanged host artifact differs: marker")
+
+  def test_the_ordinary_protocol_never_reaches_the_maintenance_barrier_check_and_cannot_adopt(self):
+    ordinary = {**self.make_approval(), "maintenance": False}
+    ordinary["unchanged"] = {name: "d" * 64 for name in N.UNCHANGED}
+    with patch.object(N, "_maintenance_barrier") as barrier, patch.object(N, "_private_bytes", return_value=(ordinary["current_boot_id"] + "\n").encode()), patch.object(N, "UNCHANGED", {}):
+      N._unchanged(ordinary)
+    barrier.assert_not_called()
+    body = {"protocol": N.ORDINARY_PROTOCOL, "approved": True, "approval_id": self.case.approval_id, "current_boot_id": "0f909934-0ecf-4407-863d-6822c81cb2df",
+            "source_directory": "/reviewed/source", "reviewed_commit": "b" * 40, "adapter_sha256": sha(b"adapter"),
+            "expected": {name: "c" * 64 for name in N.HASHES}, "unchanged": {name: "d" * 64 for name in N.UNCHANGED},
+            "leftover": {"approval_id": "306521e4-998e-4477-b603-31b93144d999", "intent_sha256": "e" * 64}}
+    with self.assertRaisesRegex(ValueError, "earlier approval"): N._parse_approval(json.dumps(body).encode(), b"adapter")
+
+  def test_the_leftover_pin_is_strict(self):
+    def parse(**leftover):
+      body = {"protocol": N.MAINTENANCE_PROTOCOL, "approved": True, "approval_id": self.case.approval_id, "current_boot_id": "0f909934-0ecf-4407-863d-6822c81cb2df",
+              "source_directory": "/reviewed/source", "reviewed_commit": "b" * 40, "adapter_sha256": sha(b"adapter"),
+              "expected": {name: "c" * 64 for name in N.HASHES}, "unchanged": {name: "d" * 64 for name in N.UNCHANGED_MAINTENANCE}, "leftover": leftover}
+      return N._parse_approval(json.dumps(body).encode(), b"adapter")
+    good = {"approval_id": "306521e4-998e-4477-b603-31b93144d999", "intent_sha256": "e" * 64}
+    self.assertEqual(parse(**good)["leftover"], good)
+    for label, bad in {"same id": {**good, "approval_id": self.case.approval_id}, "not a uuid4": {**good, "approval_id": "306521e4-998e-1477-b603-31b93144d999"},
+                       "short pin": {**good, "intent_sha256": "e" * 63}, "extra": {**good, "x": 1}, "missing": {"approval_id": good["approval_id"]}}.items():
+      with self.subTest(label), self.assertRaises(ValueError): parse(**bad)
+
+
+class Adoption(LiveGuard):
+  """A leftover from an earlier, unconsumed maintenance approval, adopted by this approval's adapter."""
+
+  OLD = "306521e4-998e-4477-b603-31b93144d999"
+
+  def setUp(self):
+    super().setUp()
+    self.old_new_review = "9" * 64
+    self.leftover = D._encoded({"protocol": N.INTENT_MAINTENANCE, "transaction_id": str(uuid.uuid4()), "approval_id": self.OLD,
+                                "old_review_sha256": self.expected["old_review"], "new_review_sha256": self.old_new_review,
+                                "old_config_sha256": self.expected["old_config"], "new_config_sha256": self.expected["new_config"], "marker_sha256": sha(self.marker)})
+    self.write_barrier(self.leftover)
+    rewrite(self.case.historical, D._encoded({"review_sha256": "7" * 64}))  # a real completion record of an older generation
+    self.settle_old()
+    self.approval = self.make_approval(leftover={"approval_id": self.OLD, "intent_sha256": sha(self.leftover)})
+    self.guard_fd2, self.check = N._guard(SimpleNamespace(_power_idle=lambda pid: None), self.approval)
+    self.addCleanup(os.close, self.guard_fd2)
+    self.consumed = self.state / ("runtime-upgrade-approval-consumed-" + self.OLD + ".json")
+    self.abandoned = self.state / ("runtime-upgrade-abandoned-intent-" + self.OLD + ".json")
+
+  def settle_old(self):
+    """What the earlier adapter's own recovery left: old-form retained copies and a rebind record under its review's tag."""
+    self.assertEqual(D.settle_maintenance_binding(self.state, json.loads(self.leftover), self.expected["old_review"]), "old")
+    self.assertTrue((self.archive / D._binding_names(self.old_new_review)[2]).exists())
+
+  def adopt(self, guard=None): return N._adopt_leftover(D, self.approval, guard or self.check)
+
+  def snapshot(self):
+    return {name: value for name, value in self.tree().items() if not name.endswith("runtime-deployment.lock")}
+
+  def refuses_unchanged(self, pattern, mutate):
+    mutate()
+    before = self.snapshot()
+    with self.assertRaisesRegex((ValueError, OSError), pattern): self.adopt()
+    self.assertEqual(self.snapshot(), before)  # nothing was written, archived or removed
+    self.assertTrue(self.barrier.exists() and not self.consumed.exists() and not self.abandoned.exists())
+
+  def test_the_guard_admits_the_pinned_leftover_only_with_the_approval_that_names_it(self):
+    N._unchanged(self.approval)
+    without = self.make_approval()
+    with self.assertRaisesRegex(ValueError, "Active source-default state"): N._unchanged(without)
+    wrong_pin = self.make_approval(leftover={"approval_id": self.OLD, "intent_sha256": "0" * 64})
+    with self.assertRaisesRegex(ValueError, "Active source-default state"): N._unchanged(wrong_pin)
+    wrong_id = self.make_approval(leftover={"approval_id": "306521e4-998e-4477-b603-31b93144d998", "intent_sha256": sha(self.leftover)})
+    with self.assertRaisesRegex(ValueError, "Active source-default state"): N._unchanged(wrong_id)
+    rewrite(self.pending, self.leftover)  # an earlier intent never coexists with an upgrade pending
+    with self.assertRaisesRegex(ValueError, "Active source-default state"): N._unchanged(self.approval)
+
+  def test_adoption_archives_the_intent_consumes_the_old_approval_and_returns_to_inactive_maintenance(self):
+    self.assertTrue(self.adopt())
+    self.assertFalse(self.barrier.exists())
+    self.assertEqual(self.consumed.read_bytes(), self.leftover)   # the old approval can never be replayed
+    self.assertEqual(self.abandoned.read_bytes(), self.leftover)  # evidence archived, not deleted
+    self.assertEqual(self.triple(), self.old_triple())
+    self.assertEqual(self.review_digest(), self.expected["old_review"])
+    for path in (self.consumed, self.abandoned): self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+    self.check()
+    self.assertTrue(self.adopt())  # idempotent
+
+  def test_adoption_without_the_earlier_recovery_evidence_is_equally_accepted(self):
+    for name in D._binding_names(self.old_new_review): (self.archive / name).unlink()
+    self.assertTrue(self.adopt())
+    self.assertFalse(self.barrier.exists())
+
+  def test_no_leftover_named_means_no_adoption(self):
+    approval = self.make_approval()
+    self.assertFalse(N._adopt_leftover(D, approval, self.check))
+    self.assertTrue(self.barrier.exists())
+
+  def test_adoption_then_the_new_upgrade_completes_and_keeps_both_generations_of_evidence(self):
+    self.adopt()
+    result = self.upgrade_live()
+    self.assertEqual(result["review_sha256"], self.expected["new_review"])
+    self.assertEqual(self.triple(), self.new_triple())
+    old_marker, old_baseline, record = D._binding_names(self.old_new_review)
+    for name in (old_marker, old_baseline, record): self.assertTrue((self.archive / name).exists())  # earlier evidence never deleted
+    for name in D._binding_names(self.expected["new_review"]): self.assertTrue((self.archive / name).exists())
+    self.assertEqual(self.abandoned.read_bytes(), self.leftover)
+    self.assertTrue((self.state / ("runtime-upgrade-approval-consumed-" + self.case.approval_id + ".json")).exists())
+    self.assertFalse(self.barrier.exists() or self.pending.exists())
+    self.check()
+
+  def test_a_failing_new_upgrade_after_adoption_is_a_clean_old_state_when_it_stops_before_its_barrier(self):
+    def refuse(): raise ValueError("no saved image proof")
+    self.adopt()
+    with self.assertRaisesRegex(ValueError, "no saved image proof"): self.upgrade_live(precheck=refuse)
+    self.assertFalse(self.barrier.exists() or self.pending.exists())
+    self.assertEqual(self.triple(), self.old_triple())
+    self.assertEqual(self.review_digest(), self.expected["old_review"])
+
+  def test_a_crash_at_every_adoption_step_is_resumed_or_refused_never_half_adopted(self):
+    steps = []
+    def counting():
+      steps.append(1)
+      self.check()
+    self.adopt(counting)
+    total = len(steps)
+    self.assertEqual(total, 3)
+    for number in range(1, total + 1):
+      with self.subTest(crash_at_guard=number):
+        case = Adoption("runTest")
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        seen = []
+        def crash(case=case, number=number, seen=seen):
+          seen.append(1)
+          case.check()
+          if len(seen) == number: raise OSError("simulated crash")
+        with self.assertRaisesRegex(OSError, "simulated crash"): case.adopt(crash)
+        self.assertTrue(case.barrier.exists() != case.abandoned.exists())  # exactly one of: still vetoed, or archived
+        case.check()
+        self.assertTrue(case.adopt())  # the same approval resumes
+        self.assertFalse(case.barrier.exists())
+        self.assertEqual((case.consumed.read_bytes(), case.abandoned.read_bytes()), (case.leftover, case.leftover))
+        self.assertTrue(case.adopt())
+        self.assertEqual(case.triple(), case.old_triple())
+
+  def test_a_crash_that_left_the_barrier_removed_but_the_archive_torn_is_refused(self):
+    self.adopt()
+    self.abandoned.write_bytes(b"other")
+    with self.assertRaisesRegex(ValueError, "neither in place nor archived"): self.adopt()
+    self.abandoned.write_bytes(self.leftover)
+    self.consumed.unlink()
+    with self.assertRaisesRegex(ValueError, "neither in place nor archived"): self.adopt()
+
+  # --- anything moved refuses, with zero writes -------------------------------------------------------
+  def test_a_moved_runtime_authority_config_or_review_refuses(self):
+    def first_runtime_file(c): return next(iter(sorted((c.state / "runtime").rglob("*.py"))))
+    cases = {
+      "runtime tree file": (lambda c: rewrite(first_runtime_file(c), first_runtime_file(c).read_bytes() + b"#"), "differs"),
+      "review": (lambda c: rewrite(c.state / D.REVIEW.name, (c.state / D.REVIEW.name).read_bytes() + b" "), "moved authority: runtime-deployment-review"),
+      "bootstrap": (lambda c: rewrite(c.state / D.BOOTSTRAP, b"other"), "moved authority: runtime-deployment-bootstrap"),
+      "config": (lambda c: rewrite(c.state / D.CONFIG, c.config + b" "), "moved authority: config"),
+      "receipt": (lambda c: rewrite(c.state / "runtime" / D.MANIFEST, b"{}"), "receipt"),
+    }
+    for label, (mutate, pattern) in cases.items():
+      with self.subTest(label):
+        case = Adoption("runTest")
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case.refuses_unchanged(pattern, lambda case=case, mutate=mutate: mutate(case))
+
+  def test_a_moved_marker_archive_or_baseline_refuses(self):
+    marker = lambda case: case.state / D.MAINTENANCE_PENDING
+    cases = {
+      "marker in the new form": (lambda c: (rewrite(marker(c), c.new_marker), rewrite(c.archive / "maintenance-intent.json", c.new_marker), rewrite(c.archive / D.BASELINE_NAME, c.new_baseline)), "not the pinned old marker"),
+      "marker only changed": (lambda c: rewrite(marker(c), c.new_marker), "not the pinned old marker"),
+      "archived intent differs": (lambda c: rewrite(c.archive / "maintenance-intent.json", c.new_marker), "archived intent"),
+      "baseline in the new form": (lambda c: rewrite(c.archive / D.BASELINE_NAME, c.new_baseline), "generation baseline"),
+      "baseline foreign": (lambda c: rewrite(c.archive / D.BASELINE_NAME, c.baseline + b" "), "generation baseline|Extra data"),
+      "marker missing": (lambda c: marker(c).unlink(), "No such file|FileNotFound"),
+      "retained old marker tampered": (lambda c: rewrite(c.archive / D._binding_names(c.old_new_review)[0], b"x"), "Retained old evidence differs"),
+      "retained old baseline tampered": (lambda c: rewrite(c.archive / D._binding_names(c.old_new_review)[1], b"x"), "Retained old evidence differs"),
+      "rebind record tampered": (lambda c: rewrite(c.archive / D._binding_names(c.old_new_review)[2], b"{}"), "not the old-form record"),
+      "rebind record without its copies": (lambda c: (c.archive / D._binding_names(c.old_new_review)[0]).unlink(), "not the old-form record"),
+      "rebind evidence for this approval's review": (lambda c: rewrite(c.archive / D._binding_names(c.expected["new_review"])[2], b"{}"), "already exists"),
+      "rebind temporary": (lambda c: rewrite(c.state / (D.MAINTENANCE_PENDING + ".runtime-rebind-tmp"), b"x"), "temporary exists"),
+      "archive temporary": (lambda c: rewrite(c.archive / (D.BASELINE_NAME + ".runtime-rebind-tmp"), b"x"), "temporary exists"),
+    }
+    for label, (mutate, pattern) in cases.items():
+      with self.subTest(label):
+        case = Adoption("runTest")
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case.refuses_unchanged(pattern, lambda case=case, mutate=mutate: mutate(case))
+
+  def test_publication_or_consumption_evidence_refuses(self):
+    cases = {
+      "this approval already consumed": (lambda c: rewrite(c.state / ("runtime-upgrade-approval-consumed-" + c.case.approval_id + ".json"), b"x"), "Publication evidence"),
+      "upgrade pending": (lambda c: rewrite(c.pending, c.leftover), "inconsistent|Active source-default"),
+      "runtime pending": (lambda c: (c.state / D.PENDING).mkdir(mode=0o700), "Publication evidence"),
+      "retained runtime": (lambda c: rewrite(c.state / ("runtime-review-retained-" + "a" * 12 + "-before-" + "b" * 12 + ".json"), b"x"), "Retained publication evidence"),
+      "retained config": (lambda c: rewrite(c.state / ("config-retained-" + "a" * 12 + "-before-" + "9" * 12 + ".json"), b"x"), "Retained publication evidence"),
+      "completion for the earlier review": (lambda c: rewrite(c.state / "runtime-upgrade-completed-999999999999.json", D._encoded({"review_sha256": c.old_new_review})), "Completion evidence"),
+      "completion for this review": (lambda c: rewrite(c.state / ("runtime-upgrade-completed-" + "b" * 12 + ".json"), b"{}"), "Publication evidence"),
+      "unreadable completion": (lambda c: rewrite(c.state / "runtime-upgrade-completed-888888888888.json", b"not json"), "Unreadable"),
+      "earlier consumed record differs": (lambda c: rewrite(c.consumed, b"other"), "inconsistent"),
+      "earlier archive already present": (lambda c: rewrite(c.abandoned, c.leftover), "inconsistent"),
+    }
+    for label, (mutate, pattern) in cases.items():
+      with self.subTest(label):
+        case = Adoption("runTest")
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        before_barrier = case.barrier.read_bytes()
+        mutate(case)
+        before = case.snapshot()
+        with self.assertRaisesRegex((ValueError, OSError), pattern): case.adopt()
+        self.assertEqual(case.snapshot(), before)
+        self.assertEqual(case.barrier.read_bytes(), before_barrier)
+
+  def test_a_foreign_or_tampered_leftover_is_never_adopted(self):
+    cases = {
+      "another approval": D._encoded({**json.loads(self.leftover), "approval_id": "306521e4-998e-4477-b603-31b93144d998"}),
+      "another marker": D._encoded({**json.loads(self.leftover), "marker_sha256": "0" * 64}),
+      "the same review as this approval": D._encoded({**json.loads(self.leftover), "new_review_sha256": self.expected["new_review"]}),
+      "another old review": D._encoded({**json.loads(self.leftover), "old_review_sha256": "0" * 64}),
+      "extra field": D._encoded({**json.loads(self.leftover), "x": 1}),
+      "not canonical": self.leftover + b"\n",
+      "bytes not matching the pin": D._encoded({**json.loads(self.leftover), "transaction_id": str(uuid.uuid4())}),
+    }
+    for label, raw in cases.items():
+      with self.subTest(label):
+        case = Adoption("runTest")
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        rewrite(case.barrier, raw)
+        before = case.snapshot()
+        with self.assertRaises(ValueError): case.adopt()
+        self.assertEqual(case.snapshot(), before)
+        with self.assertRaisesRegex(ValueError, "Active source-default state"): N._unchanged(case.approval)
+
+  def test_recovery_recognises_the_leftover_as_the_veto_and_preserves_everything(self):
+    with patch.object(N, "_private_bytes", side_effect=lambda path, mode=0o600: Path(path).read_bytes()):
+      N._restore_veto(D, self.approval)  # old authority proven, durable veto is the leftover itself
+      self.assertEqual(self.barrier.read_bytes(), self.leftover)
+      rewrite(self.state / D.CONFIG, self.config + b" ")
+      with self.assertRaisesRegex(ValueError, "Prepublication old authority changed"): N._restore_veto(D, self.approval)
+      self.assertEqual(self.barrier.read_bytes(), self.leftover)
+      rewrite(self.state / D.CONFIG, self.config)
+      rewrite(self.barrier, D._encoded({**json.loads(self.leftover), "marker_sha256": "0" * 64}))
+      with self.assertRaises(ValueError): N._restore_veto(D, self.approval)
+
+
 if __name__ == "__main__": unittest.main()
