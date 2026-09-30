@@ -440,6 +440,7 @@ WORK=/home/jjc/.local/state/codex-mba-autonomous/gen-7.2.7                # new 
 | H6c | Build the new pair (sudo builders) and audit it |
 | H6d | Stage it |
 | H6e | Attended ordinary boots, `test_resume`, S4 vector |
+| H6e-clean | Retire the successful vector's two stage slots |
 | H6f | Boot the new source entry; generation trial (`trial.py --generation`) |
 | H6g | Issue the qualification (bound to the trial's record), config and boot policy review |
 | H6h | `rebind` |
@@ -524,6 +525,20 @@ sudo /usr/bin/python3 -I -B "$P" disarm-restore                                #
 ```
 
 Each `--execute` is a one-time hardware vector: a failed or ambiguous attempt is terminal, is preserved as evidence and is never repeated. Ordinary boot success does not establish S4 safety. Use the runners' own `--help` for the exact evidence arguments.
+
+### H6e-clean: retire the two stage slots of the successful vector
+
+After a successful attended S4 (`state` `returned-and-cleaned`, original runner process returned, no cleanup errors), the V3 source stage and V2 restore stage EFI variables remain set, and `trial.verify_readiness` refuses while they exist. `cleanup-successful-pair-slots.py` retires exactly those two. It is bound to the vector named on the command line, which must equal the vector of the currently staged receipt, and it derives every expectation from that vector's own durable evidence (nothing is pinned to a kernel or image). Failed, ambiguous or unreconciled vectors are refused; they stay terminal evidence. The terminal-restore-witness cleanup is not needed for a successful run: it exists to remove a stale V3 recovery acceptance after a terminal failure, and trial readiness checks only the two slots.
+
+Preconditions (all checked, read-only by default): the guard names one attempt boot; `attempt.json` shows `returned-and-cleaned`, real S4, stages 4/7/2, attended cold-power recovery, no errors, source/restore/runtime hashes and entry ids equal to the receipt, kernel equal to the running `osrelease`; the fullrestore witness classifies `source-return-evidence-valid`; the recorded raw return markers, the acceptance and the live variables all equal the canonical values; images, Limine and backup unchanged; no override, no marker/cold/abort module. Either the same boot (restore entry selected) or a later ordinary source boot (source entry selected) is accepted.
+
+```bash
+V=<pair vector printed by the S4 runner>
+sudo /usr/bin/python3 -I -B "$EXP/cleanup-successful-pair-slots.py" --vector "$V"             # read-only validation
+sudo /usr/bin/python3 -I -B "$EXP/cleanup-successful-pair-slots.py" --vector "$V" --execute   # separate explicit approval
+```
+
+Execute archives the vector evidence and all four raw variables to `/var/lib/omarchy-t2-hibernation-pair-slot-cleanup/<vector>/` (root 0700), journals a delete intent, unlinks only the two slots, and writes absent and complete records. It is idempotent: an interrupted run is finished by rerunning the same command, and a completed run only re-verifies. The consumed guard, attempt, Entered/Armed witnesses, acceptance and receipt are never touched. Any mismatch refuses with zero deletions.
 
 ### H6f: boot the new source entry, then the generation trial
 
