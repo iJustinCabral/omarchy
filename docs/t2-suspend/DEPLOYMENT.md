@@ -445,6 +445,7 @@ WORK=<new private build tree, outside the ESP>
 | H6c | Build the new pair (sudo builders) and audit it |
 | H6d | Stage it |
 | H6e | Attended ordinary boots, `test_resume`, S4 vector |
+| H6e-clean | Retire the successful vector's two stage slots |
 | H6f | Boot the new source entry; generation trial (`trial.py --generation`) |
 | H6g | Issue the qualification (bound to the trial's record), config and boot policy review |
 | H6h | `rebind` |
@@ -458,7 +459,7 @@ Stage and run exactly as H1 and H2 do, with these differences. The approval prot
 sudo -n /usr/bin/python3 -I -B "$S/runtime-upgrade-native.py"
 ```
 
-Verify: `runtime-rebind-<new12>.json` and the two `*.before-runtime-<new12>.json` copies exist in `$S/boot-policy-transitions/<maintenance id>/`, `jq -r .runtime_review_sha256 "$S/package-maintenance.pending"` equals the new review digest, the guard exits 0 (`sudo /usr/bin/python3 -I -B $S/runtime/packages/t2-suspend/hibernate/update_guard.py`) and `sudo /usr/bin/python3 -I -B "$NATIVE" assess | jq '{class, changed_items, unknown_items}'` still reports `requalification-required`. After the volatile-state fix `control_inventory` differs only by real control files; `driver_modules` and `firmware` stay `unknown` until rebind (the qualified 7.2.6 module directory is gone). Failures: MAINTENANCE-RUNBOOK.md section 10, "After a runtime upgrade under maintenance that failed".
+Verify: `runtime-rebind-<new12>.json` and the two `*.before-runtime-<new12>.json` copies exist in `$S/boot-policy-transitions/<maintenance id>/`, `jq -r .runtime_review_sha256 "$S/package-maintenance.pending"` equals the new review digest, the guard exits 0 (`sudo /usr/bin/python3 -I -B $S/runtime/packages/t2-suspend/hibernate/update_guard.py`) and `sudo /usr/bin/python3 -I -B "$NATIVE" assess | jq '{class, changed_items, unknown_items}'` still reports `requalification-required`. After the volatile-state fix `control_inventory` differs only by real control files; `driver_modules` and `firmware` stay `unknown` until rebind (the qualified 7.2.6 module directory is gone). Failures: MAINTENANCE-RUNBOOK.md section 10, "After a runtime upgrade under maintenance that failed". A failure leaves the barrier `source-default-activation.pending` (plus `runtime-upgrade.pending` only if it stopped after the barrier's first guard) and vetoes updates; the failed approval is never re-run. The first live attempt (approval `c6051717`, commit `0807b7d7`) stopped at its first guard because the adapter's guard refused the core's own barrier; a new approval with the `leftover` field adopts that unconsumed barrier under strict no-movement proof (same section, "Adopting the barrier of an earlier, unconsumed approval"). Optional approval field for that case only: `"leftover": {"approval_id": <earlier UUID4>, "intent_sha256": <SHA-256 of the exact barrier bytes>}`.
 
 ### H6b: retire the old pair
 
@@ -529,6 +530,20 @@ sudo /usr/bin/python3 -I -B "$P" disarm-restore                                #
 ```
 
 Each `--execute` is a one-time hardware vector: a failed or ambiguous attempt is terminal, is preserved as evidence and is never repeated. Ordinary boot success does not establish S4 safety. Use the runners' own `--help` for the exact evidence arguments.
+
+### H6e-clean: retire the two stage slots of the successful vector
+
+After a successful attended S4 (`state` `returned-and-cleaned`, original runner process returned, no cleanup errors), the V3 source stage and V2 restore stage EFI variables remain set, and `trial.verify_readiness` refuses while they exist. `cleanup-successful-pair-slots.py` retires exactly those two. It is bound to the vector named on the command line, which must equal the vector of the currently staged receipt, and it derives every expectation from that vector's own durable evidence (nothing is pinned to a kernel or image). Failed, ambiguous or unreconciled vectors are refused; they stay terminal evidence. The terminal-restore-witness cleanup is not needed for a successful run: it exists to remove a stale V3 recovery acceptance after a terminal failure, and trial readiness checks only the two slots.
+
+Preconditions (all checked, read-only by default): the guard names one attempt boot; `attempt.json` shows `returned-and-cleaned`, real S4, stages 4/7/2, attended cold-power recovery, no errors, source/restore/runtime hashes and entry ids equal to the receipt, kernel equal to the running `osrelease`; the fullrestore witness classifies `source-return-evidence-valid`; the recorded raw return markers, the acceptance and the live variables all equal the canonical values; images, Limine and backup unchanged; no override, no marker/cold/abort module. Either the same boot (restore entry selected) or a later ordinary source boot (source entry selected) is accepted.
+
+```bash
+V=<pair vector printed by the S4 runner>
+sudo /usr/bin/python3 -I -B "$EXP/cleanup-successful-pair-slots.py" --vector "$V"             # read-only validation
+sudo /usr/bin/python3 -I -B "$EXP/cleanup-successful-pair-slots.py" --vector "$V" --execute   # separate explicit approval
+```
+
+Execute archives the vector evidence and all four raw variables to `/var/lib/omarchy-t2-hibernation-pair-slot-cleanup/<vector>/` (root 0700), journals a delete intent, unlinks only the two slots, and writes absent and complete records. It is idempotent: an interrupted run is finished by rerunning the same command, and a completed run only re-verifies. The consumed guard, attempt, Entered/Armed witnesses, acceptance and receipt are never touched. Any mismatch refuses with zero deletions.
 
 ### H6f: boot the new source entry, then the generation trial
 
@@ -604,7 +619,7 @@ General rules: fail closed. There is no automatic retry, no replay and no rollba
 | H3 | Marker written or not | MAINTENANCE-RUNBOOK.md sections 1 to 3 and 5 |
 | H4 | Update aborted by the guard before mutation | Read the guard message; runbook sections 2 and 3; never bypass the hook |
 | H5 | Refused with zero writes, or interrupted with an activation pending | Refusal: read the message above, nothing changed. Interrupted: do not reboot; re-run `reactivate` (MAINTENANCE-RUNBOOK.md section 6) |
-| H6a | Refused before the barrier, or barrier retained | As H2; the maintenance recovery also settles the marker binding (MAINTENANCE-RUNBOOK.md section 10) |
+| H6a | Refused before the barrier, or barrier retained | As H2; the maintenance recovery also settles the marker binding and always retains old-form copies beside it; a barrier left by an earlier unconsumed approval is adopted only by a new approval that pins it (`leftover`), never removed by hand (MAINTENANCE-RUNBOOK.md section 10) |
 | H6b | Refused, or interrupted retirement | MAINTENANCE-RUNBOOK.md section 9: re-run, or `retire-rollback` |
 | H6h | Refused with zero writes, or interrupted with a rebind pending | Refusal: read the message. Interrupted: do not reboot; re-run `rebind` (MAINTENANCE-RUNBOOK.md section 10) |
 

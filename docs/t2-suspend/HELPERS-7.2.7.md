@@ -57,6 +57,7 @@ Changed:
 Deliberately unchanged (evidence or fixtures):
 
 - `cleanup-successful-v16-slots.py` (`KERNEL = "7.2.6-..."`, image and receipt pins) and `cleanup-terminal-restore-witness.py` (7.2.6 osrelease check, per-vector pins) verify consumed 7.2.6 evidence; they must keep 7.2.6 values.
+- `cleanup-successful-pair-slots.py` is the generation-aware, evidence-derived successor for later successful vectors (DEPLOYMENT.md H6e-clean).
 - `audit-hibernation-swap-header.py` mentions the 7.2.6 `swsusp_header` layout in a docstring; the layout is unchanged in 7.2.7 for this use.
 - `tests/test-hibernate-product-*.py` use `4cbe981d...` and 7.2.6 vermagic strings as synthetic fixtures for `hibernate/*.py`; they do not depend on the real artifact.
 
