@@ -1,6 +1,20 @@
 # Resume here: permanent T2 hibernation
 
-Checkpoint date: September 29, 2026 (night). **Runtime `d64069bb` deployed; the machine is in inactive package maintenance on linux-t2 7.2.7 with radio package 1.6 (radio-only). Ordinary S3 passes on the stock entry. Hibernation stays OFF until a requalification on 7.2.7.** The first `omarchy update` (7.2.6 → 7.2.7) exposed and fixed a driver-package defect; see the incident record below. Older journal entries describe historical states, not instructions to replay them.
+**Current state (2026-09-30, source of truth for the top of this file; everything below the "History" marker is dated and superseded where it says so).** Map of all documents: [README.md](README.md). Hardware record: [EVIDENCE-7.2.7.md](EVIDENCE-7.2.7.md). Procedure for the next kernel update: [REQUALIFICATION.md](REQUALIFICATION.md).
+
+- Hibernation is **ACTIVE** on linux-t2 `7.2.7-arch1-Watanare-T2-2-t2`, generation `f4025add13d1` (source `b70b77cd`, restore `8ef56bab`), on the MacBookAir9,1. The source entry is the Limine default and the stock `Omarchy.linux-t2` entry is the fallback.
+- The 7.2.7 requalification is complete: source ordinary boot, test_resume, restore boot, S4 vector `ef9f9683`, slot cleanup, generation trial `3ab69461`, qualification `bdadff1b`, `rebind`, and routine S4 cycle `53ac1f92` (`qualified-product-cycle-reconciled`, 2026-09-30 12:28).
+- Installed runtime is `ecb35dac` (radio package 1.6). The `omarchy update` integration (`omarchy-update-t2-hibernation pre|post`) is merged in source at `8c2b0976` but is not a runtime file; its prompts have not yet run on the laptop.
+- While ACTIVE the update guard refuses bare pacman. `omarchy update` (or the `maintenance` action) pauses hibernation, and `assess` then `reactivate` (or requalification after a kernel change) turns it back on.
+- Open observation: lock-screen input did not respond at 2026-09-30 12:56, cause unexplained (see [EVIDENCE-7.2.7.md](EVIDENCE-7.2.7.md)). Not proven: other T2 models, battery-only cycle on 7.2.7, long soak.
+- Next: (1) take draft PRs #1 to #6 (andrew-boyd/omarchy, #6 is `intel-mac/p10/t2-hibernation`) out of draft with the 7.2.7 result; (2) upstream the t2bce hibernation patches (experiments 0005 to 0017 and `patches/bce`, on t2bce `6780d522`) to linux-t2 so stock kernels hibernate; (3) optionally turn the gen-7.2.7 operator scripts into in-repo tooling.
+- Last recorded boot when this block was written: `f46e17c1-a6f0-41e5-9f69-dfd934031c6c` (started 12:57 after the session that performed the routine cycle). Always reconcile with the live boot and the local handoff before acting.
+
+## History
+
+The sections from here on are dated checkpoints kept for the record. Where a statement says hibernation is off, unqualified or not deployed, it describes the date it was written, not now.
+
+Checkpoint date: September 29, 2026 (night) (historical, superseded above). **Runtime `d64069bb` deployed; the machine was in inactive package maintenance on linux-t2 7.2.7 with radio package 1.6 (radio-only). Ordinary S3 passed on the stock entry. Hibernation stayed OFF until a requalification on 7.2.7, which has since completed.** The first `omarchy update` (7.2.6 to 7.2.7) exposed and fixed a driver-package defect; see the incident record below. Older journal entries describe historical states, not instructions to replay them.
 
 ## Reconcile before doing anything
 
@@ -11,7 +25,7 @@ Checkpoint date: September 29, 2026 (night). **Runtime `d64069bb` deployed; the 
 
 Last observed boot: `a45522fe-3787-4d06-a53e-2e6b896ea210` (September 29, hibernation source image; the next reboot selects the stock entry). Installed runtime: `d64069bb` (review `c31e1a43…`). Source branch `fix-t2-vintage-mac-support` in `iJustinCabral/omarchy`.
 
-## What actually works, and what remains
+## What actually works, and what remains (state at 2026-09-27, historical)
 
 | Area | Verified state |
 | --- | --- |
@@ -36,7 +50,7 @@ The optional client/coordinator/broker experiments remain useful evidence, but a
 
 Plain existing `deactivation` is insufficient: removing opt-in selects stock `systemd-sleep`, and direct product admission can still accept the old qualified artifacts. The durable maintenance marker is needed to veto both routes and reactivation after updates.
 
-## Requalification on linux-t2 7.2.7 (status September 29, 2026, late)
+## Requalification on linux-t2 7.2.7 (completed September 30, 2026)
 
 **Hardware result, September 29, 2026, night.** The new 7.2.7 pair passed every attended gate so far. The source is `b70b77cd`, the restore is `8ef56bab`, and the manifest is `f4025add13d1`. Evidence lives under `~/.local/state/codex-mba-autonomous/gen-7.2.7/h6e/logs/` and `/var/lib/omarchy-t2-hibernation-pair/{test-resume-vectors,s4-vectors}/`.
 
@@ -60,7 +74,7 @@ Plain existing `deactivation` is insufficient: removing opt-in selects stock `sy
   - Upstream the t2bce hibernation patches to linux-t2.
 - Superseded list: remaining steps: H6e-clean (clear the V3/V2 stage slots with `cleanup-successful-pair-slots.py`, `6d569778`), H6f generation trial, H6g qualification, H6h `rebind`, and H6i one routine S4. The update guard refuses pacman until the slots are cleared.
 
-All source work for a new generation is done, each piece independently audited and integrated. Nothing has been executed on the machine yet: it is still on stock 7.2.7 in inactive package maintenance with runtime `d64069bb`, the old 7.2.6 pair still staged, and `assess` reporting `requalification-required`.
+(Historical, written before H6a.) All source work for a new generation was done, each piece independently audited and integrated. At that time nothing had been executed on the machine: it is still on stock 7.2.7 in inactive package maintenance with runtime `d64069bb`, the old 7.2.6 pair still staged, and `assess` reporting `requalification-required`.
 
 - **t2bce rebase** (`a2f5db3b`..`7ea330d7`): patches rebased onto t2linux t2bce `6780d522`, whose unpatched srcversions equal the installed stock modules; pins in `t2bce-source.json` (radio `manifest.json` untouched). See [T2BCE-7.2.7-REBASE.md](T2BCE-7.2.7-REBASE.md).
 - **Hardening** (`5469e1b2`, `b6babd8a`): patch 0016 (idempotent mailbox channel pause, refuse suspend after a skipped resume) and 0017 (bounded command-queue idle wait). The candidate is `candidate-7.2.7-h1`.
@@ -71,7 +85,7 @@ All source work for a new generation is done, each piece independently audited a
 - **Next:** H6a, then H6b retire, then H6c build and audit (no power actions), then H6d stage, then the attended H6e and H6f hardware steps, then H6g issue, H6h `rebind` and H6i a routine S4. Claude Code's permission classifier blocked the agent from running the root H6a stage, so the owner runs it or grants a rule.
 - **PR:** the curated hibernation product is draft andrew-boyd/omarchy#6 (`intel-mac/p10/t2-hibernation`), stacked on #5. Update it with the 7.2.7 hardware result.
 
-## Exact next implementation tasks
+## Exact next implementation tasks (historical, as of 2026-09-29 before the requalification)
 
 Status at `ddaca8da` (source only, each piece independently audited, then a whole-path integration audit that walked publish → update → kernel update → further updates → re-entry and found no step that blocks after a legitimate coherent update). **Deployment is NOT approved**, and installed `e489bab7` does not recognize any of it.
 
@@ -107,7 +121,7 @@ Fix (audited): radio package 1.6 (`c0bb551d`, `bb43fefe`, `45c7684e`) is radio-o
 
 Recovery, run from Snapper snapshot 4 through a chroot of `@`: installer rollback of 1.5 and transactional install of 1.6 for 7.2.7, rebuilt production UKI (`omarchy_linux-t2.efi`, Limine binds its BLAKE2b), hibernation images byte-identical, maintenance marker intact. After reboot: stock BCE family loaded with no errors, radio from 1.6 (Wi-Fi `1D85357E…`, Bluetooth `4DF58889…`), update guard exits 0, `assess` reports `requalification-required` (kernel, production UKI and control inventory changed; driver items unknown under the installed runtime's older inventory), and a real ACPI S3 lid-close cycle passed (16:44:55 → 16:45:07). Evidence: `~/.local/state/codex-mba-autonomous/recovery-7.2.7-*/`.
 
-Next tasks, in order:
+Next tasks, in order (historical; items 1 and 3 are done and item 2 is now documented in REQUALIFICATION.md, see the current state above):
 
 1. **Requalification on 7.2.7 (hardware campaign, owner-attended):** rebuild the private candidate stack (patch set through 0015, which also fixes S3 on the source image) and the source/restore UKI pair from the 7.2.7 production UKI, verify offline, then ordinary-boot, physical-input and real S4 qualification, issue a new qualification, deploy a runtime containing `1d1528fb` and a reviewed marker rebind (runtime upgrade is refused while the maintenance marker exists; design needed). Until then hibernation stays off and updates keep working.
 2. **Requalification after kernel updates (hardware campaign):** when `assess` reports `requalification-required`, rebuild the candidate stack (patch set through 0015) and the source/restore UKI pair from the new production UKI, verify offline, then attended ordinary-boot, physical-input and real S4 qualification, issue a new qualification, and rebind the maintenance marker to the new generation (not implemented; design first). Until then hibernation stays off after kernel updates while updates keep working.
@@ -147,6 +161,6 @@ ALPM VM: real pacman installed tiny v1; forged-marker v2 failed in its pre-hook 
 
 ## Reading map and pasteable resume prompt
 
-[Guide](HIBERNATION-GUIDE.md): human/agent overview. [Mechanism](HIBERNATION-MECHANISM.md): problem and solution diagrams. [Production plan](HIBERNATION-PRODUCTION-PLAN.md): requirements and implementation limits. [Investigation](HIBERNATION.md): detailed historical evidence. Research resource: <https://github.com/macintog/t2-platform-research>; use its actual contents when investigating new hardware paths, not assumptions from its title.
+[Overview](HIBERNATION-OVERVIEW.md): plain-language explanation. [Evidence](EVIDENCE-7.2.7.md): the 7.2.7 hardware record. [Requalification](REQUALIFICATION.md): procedure after a kernel update. [Guide](HIBERNATION-GUIDE.md): evidence register and agent contract. [Mechanism](HIBERNATION-MECHANISM.md): problem and solution diagrams. [Production plan](HIBERNATION-PRODUCTION-PLAN.md): requirements and implementation limits. [Investigation](HIBERNATION.md): detailed historical evidence. Research resource: <https://github.com/macintog/t2-platform-research>; use its actual contents when investigating new hardware paths, not assumptions from its title.
 
-> Resume the permanent T2 hibernation goal. Read docs/t2-suspend/RESUME.md first and reconcile current boot and repository state against the local handoff. Installed runtime remains e489bab7. The full update-survival cycle (runtime upgrade, maintenance with baseline, native guard, assess, reactivate) and the S3 fix are implemented, audited and VM-tested in source through cf907542; deployment follows docs/t2-suspend/DEPLOYMENT.md gates H0-H5, each needing my explicit OK. Claude Opus orchestrates bounded Claude Sonnet implementation and audit sub-agents. Do not run omarchy update before H3 and do not repeat consumed hardware tests.
+> Resume the permanent T2 hibernation goal. Read docs/t2-suspend/README.md, then RESUME.md (the top block is the current state) and reconcile the current boot and repository against the local handoff. Hibernation is ACTIVE on 7.2.7 generation f4025add13d1 and the omarchy update integration is merged (8c2b0976). Next: take PRs #1 to #6 out of draft, then upstream the t2bce hibernation patches to linux-t2. Claude Opus orchestrates bounded Claude Sonnet implementation and audit sub-agents; read agents/skills/t2-hibernation.md. Do not repeat consumed hardware vectors and do not run a boot, EFI or power step without the owner's explicit go.
