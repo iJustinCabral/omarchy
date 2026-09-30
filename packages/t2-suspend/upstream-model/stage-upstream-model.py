@@ -11,12 +11,15 @@ never enters a power transition.
 """
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 
 HERE = Path(__file__).resolve().parent
@@ -46,6 +49,10 @@ PRODUCT_ACTIVE = (
 PAIR_STATE = Path("var/lib/omarchy-t2-hibernation-pair")
 PAIR_EVIDENCE = (PAIR_STATE / "test-resume-vectors", PAIR_STATE / "s4-vectors",
                  Path("var/lib/omarchy-t2-hibernation-pair-retired"), Path("var/lib/omarchy-t2-hibernation-candidate"))
+PHYSICAL_LOCK = Path("var/lib/omarchy/t2-hibernate-trial/physical-cycle.lock")
+DB_LOCK = Path("var/lib/pacman/db.lck")
+PAIR_PENDING_STATES = ("preparing", "restore-arming", "rolling-back", "stage-failed-recovered")
+ESP_HEADROOM = 16 * 1024 * 1024
 STATE_FILES = ("receipt.json", "limine.conf.before")
 SCHEMA = "omarchy-t2-upstream-model-stage-v1"
 MAX_PROVENANCE = 4 * 1024 * 1024
@@ -146,6 +153,78 @@ def mark_terminal(root, image_sha256, reason):
   return True
 
 
+@contextmanager
+def locks(root):
+  """The exclusion the product transitions use: pacman db.lck (exclusive create) plus the physical cycle lock."""
+  lock = rooted(root, PHYSICAL_LOCK)
+  if lock.is_symlink() or not lock.is_file():
+    raise ValueError("Fixed physical cycle lock is missing")
+  db = rooted(root, DB_LOCK)
+  try:
+    db_fd = os.open(db, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+  except FileExistsError:
+    raise ValueError("pacman db.lck is held; retry after the package transaction ends") from None
+  physical, previous = None, {}
+
+  def terminate(signum, _frame):
+    raise SystemExit(128 + signum)
+
+  try:
+    # Terminating signals unwind through the finally so that only the db.lck created here is released.
+    for name in ("SIGTERM", "SIGHUP", "SIGINT"):
+      try:
+        previous[getattr(signal, name)] = signal.signal(getattr(signal, name), terminate)
+      except ValueError:
+        break
+    physical = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+      fcntl.flock(physical, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+      raise ValueError("A hibernation cycle holds the physical lock") from None
+    yield
+  finally:
+    for number, handler in previous.items():
+      signal.signal(number, handler)
+    if physical is not None:
+      os.close(physical)
+    held = os.fstat(db_fd)
+    os.close(db_fd)
+    current = db.lstat()
+    if (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino):
+      db.unlink()
+      fsync_directory(db.parent)
+
+
+def pair_receipt_sha256(root):
+  path = rooted(root, PAIR_STATE / "receipt.json")
+  return C.sha256(path.read_bytes()) if path.is_file() else None
+
+
+def require_pair_quiet(root):
+  """A pair transaction in a transient state means another transition is mid-flight; steady source-arming is normal."""
+  path = rooted(root, PAIR_STATE / "receipt.json")
+  if path.is_file():
+    try:
+      state = json.loads(path.read_text()).get("state")
+    except json.JSONDecodeError:
+      raise ValueError("Pair receipt is malformed; refusing") from None
+    if state in PAIR_PENDING_STATES:
+      raise ValueError("A pair transaction is pending (" + str(state) + "); finish it before using the upstream model")
+
+
+def require_esp_space(root, size):
+  free = os.statvfs(rooted(root, ESP_IMAGE).parent)
+  if free.f_bavail * free.f_frsize < size + ESP_HEADROOM:
+    raise ValueError("Not enough free space on the ESP for the image")
+
+
+def require_private_parents(directory, owner):
+  for parent in Path(directory).resolve().parents:
+    metadata = parent.stat()
+    if metadata.st_uid not in (0, owner) or (metadata.st_mode & 0o022 and not metadata.st_mode & 0o1000):
+      raise ValueError("Build input has an untrusted parent directory: " + str(parent))
+
+
 # ---- Build input -------------------------------------------------------------------
 
 def pe_sections(data):
@@ -194,6 +273,7 @@ def verify_production_sections(production, image_data, expected_production_hash)
 def load_build(root, directory):
   directory = Path(directory)
   owner = owner_of(root)
+  require_private_parents(directory, owner)
   for path in (directory, directory / C.BUILD_IMAGE, directory / C.BUILD_PROVENANCE):
     if path.is_symlink() or not path.exists():
       raise ValueError("Build input is missing or symlinked: " + str(path))
@@ -332,6 +412,8 @@ def verify_staged(root, receipt):
     raise ValueError("Upstream-model Limine hash is stale or ambiguous")
   if present(root, DEFAULT):
     raise ValueError("Persistent EFI default would weaken stock fallback")
+  if receipt.get("pair_receipt_sha256") != pair_receipt_sha256(root):
+    raise ValueError("The pair receipt changed since staging; roll back the upstream model before any pair retire, rollback or rebind")
 
 
 def verify_recovered(root, receipt):
@@ -360,7 +442,10 @@ def validate_state(state, extra=()):
 
 def remove_limine_block(root, receipt):
   limine = rooted(root, LIMINE)
-  remainder, found = judge_limine(receipt, read_limine(root), rooted(root, C.BACKUP).read_bytes())
+  current = read_limine(root)
+  if C.BEGIN.encode() not in current:
+    return  # nothing of ours to remove; foreign edits are not ours to judge here
+  remainder, found = judge_limine(receipt, current, rooted(root, C.BACKUP).read_bytes())
   if found:
     atomic_write(limine, remainder, 0o600)
 
@@ -393,12 +478,18 @@ def clean_unpublished_stage(root):
 
 
 def stage(root, build_directory):
+  with locks(root):
+    return _stage(root, build_directory)
+
+
+def _stage(root, build_directory):
   state = rooted(root, C.STATE)
   if state.exists():
     validate_state(state, STATE_FILES)
   if present(root, C.RECEIPT) or present(root, C.BACKUP) or present(root, ESP_IMAGE):
     raise ValueError("An upstream-model transaction already exists")
   require_maintenance(root)
+  require_pair_quiet(root)
   image_data, provenance, provenance_sha256 = load_build(root, build_directory)
   image_sha256 = hashlib.sha256(image_data).hexdigest()
   reject_image(root, image_sha256)
@@ -413,6 +504,7 @@ def stage(root, build_directory):
   if C.BEGIN in text or C.END in text or "/" + C.ENTRY_PREFIX in text or C.ESP_IMAGE in text:
     raise ValueError("An unowned upstream-model entry already exists")
   POLICY.limine_canonical(original)
+  require_esp_space(root, len(image_data))
 
   state.mkdir(parents=True, mode=0o700, exist_ok=True)
   state.chmod(0o700)
@@ -429,12 +521,11 @@ def stage(root, build_directory):
     "production_uki_sha256": provenance["production_uki_sha256"],
     "modules": {name: {"sha256": value["sha256"], "srcversion": value["srcversion"]} for name, value in provenance["modules"].items()},
     "original_limine_sha256": C.sha256(original),
+    "pair_receipt_sha256": pair_receipt_sha256(root),
     "armed_from_boot_id": None,
     "test_boot_id": None,
     "last_armed_cycle": 0,
   }
-  staged = original + entry_block(receipt)
-  receipt["staged_limine_sha256"] = C.sha256(staged)
   try:
     atomic_write(rooted(root, C.BACKUP), original, 0o600)
     save_receipt(root, receipt)
@@ -449,7 +540,14 @@ def stage(root, build_directory):
     raise
   try:
     atomic_write(rooted(root, ESP_IMAGE), image_data, 0o600)
+    # snapper may have rewritten its region since the first read: judge the fresh bytes against the
+    # backup canonically, then append the block to exactly those bytes.
+    fresh = read_limine(root)
+    if C.BEGIN.encode() in fresh or POLICY.limine_canonical(fresh) != POLICY.limine_canonical(original):
+      raise ValueError("Limine changed beyond the snapshot region while staging")
+    staged = fresh + entry_block(receipt)
     atomic_write(rooted(root, LIMINE), staged, 0o600)
+    receipt["staged_limine_sha256"] = C.sha256(staged)
     verify_staged(root, receipt)
     receipt["state"] = "staged"
     save_receipt(root, receipt)
@@ -492,10 +590,17 @@ def set_oneshot(root, receipt, target, runner, sync):
 
 
 def arm(root, runner=subprocess.run, sync=os.sync):
-  """First boot of the image: only from the healthy stock boot."""
+  """First boot of the image: only from the healthy stock boot, and never once an S4 cycle was armed."""
+  with locks(root):
+    return _arm(root, runner, sync)
+
+
+def _arm(root, runner, sync):
   receipt = load_receipt(root)
-  if receipt.get("state") not in ("staged", "armed", "booted", "s4-armed", "disarmed"):
+  if receipt.get("state") not in ("staged", "armed", "booted", "disarmed"):
     raise ValueError("Upstream-model transaction cannot be armed from state " + str(receipt.get("state")))
+  if receipt.get("last_armed_cycle", 0) > 0 and receipt["state"] != "disarmed":
+    raise ValueError("An S4 cycle was armed on this image; its state is not recoverable by re-arming")
   common_arm_checks(root, receipt)
   if selected_entry(root) != C.STOCK_ENTRY:
     raise ValueError("Boot arming requires the healthy stock boot")
@@ -512,6 +617,11 @@ def arm_s4(root, cycle, runner=subprocess.run, sync=os.sync):
   """Before an S4 cycle: only from the test boot, for the next (or the same, after disarm) cycle."""
   if type(cycle) is not int or not 1 <= cycle <= 3:
     raise ValueError("S4 cycle must be 1, 2 or 3")
+  with locks(root):
+    return _arm_s4(root, cycle, runner, sync)
+
+
+def _arm_s4(root, cycle, runner, sync):
   receipt = load_receipt(root)
   if receipt.get("state") not in ("booted", "disarmed"):
     raise ValueError("Upstream-model transaction cannot be armed for S4 from state " + str(receipt.get("state")))
@@ -522,7 +632,8 @@ def arm_s4(root, cycle, runner=subprocess.run, sync=os.sync):
   if receipt.get("test_boot_id") != boot_id:
     raise ValueError("S4 arming requires the boot that verified the image")
   last = receipt.get("last_armed_cycle", 0)
-  if cycle not in (last, last + 1) or cycle < 1:
+  allowed = (last, last + 1) if receipt["state"] == "disarmed" else (last + 1,)
+  if cycle not in allowed or cycle < 1:
     raise ValueError("S4 cycle out of order: last armed " + str(last))
   receipt.update(state="arming", arming={"purpose": "s4", "cycle": cycle, "boot_id": boot_id})
   save_receipt(root, receipt)
@@ -533,9 +644,15 @@ def arm_s4(root, cycle, runner=subprocess.run, sync=os.sync):
 
 
 def mark_booted(root):
-  """Record that the armed one-shot was consumed by this exact test boot (or the S4 return to it)."""
+  """Record that the armed one-shot was consumed by this exact test boot (or the S4 return to it).
+
+  An interrupted arm leaves state "arming"; the recorded purpose decides which arm it was.
+  """
   receipt = load_receipt(root)
-  if receipt.get("state") not in ARMED:
+  state = receipt.get("state")
+  if state == "arming":
+    state = "armed" if (receipt.get("arming") or {}).get("purpose") == "boot" else "s4-armed"
+  if state not in ARMED:
     raise ValueError("No armed upstream-model boot to confirm")
   verify_staged(root, receipt)
   if present(root, ONESHOT) or present(root, DEFAULT):
@@ -543,13 +660,14 @@ def mark_booted(root):
   if selected_entry(root) != receipt["entry_id"]:
     raise ValueError("Running boot is not the exact upstream-model entry")
   boot_id = current_boot_id(root)
-  if receipt["state"] == "armed":
+  if state == "armed":
     if boot_id == receipt.get("armed_from_boot_id"):
       raise ValueError("One-shot was not consumed by a new boot")
     receipt["test_boot_id"] = boot_id
   elif boot_id != receipt.get("test_boot_id"):
     raise ValueError("S4 return boot ID differs from the verified test boot")
   receipt["state"] = "booted"
+  receipt.pop("arming", None)
   save_receipt(root, receipt)
   return receipt
 
@@ -584,6 +702,11 @@ def disarm(root, runner=subprocess.run):
 # ---- Rollback and clear ------------------------------------------------------------
 
 def rollback(root):
+  with locks(root):
+    return _rollback(root)
+
+
+def _rollback(root):
   receipt = load_receipt(root)
   if present(root, ONESHOT):
     raise ValueError("Disarm LoaderEntryOneShot before rollback")

@@ -119,6 +119,10 @@ def fixture(base, *, maintenance=True, build=True):
     marker = root / stage.MAINTENANCE
     marker.parent.mkdir(parents=True)
     marker.write_text("pending\n")
+  lock = root / stage.PHYSICAL_LOCK
+  lock.parent.mkdir(parents=True)
+  lock.write_text("")
+  (root / stage.DB_LOCK).parent.mkdir(parents=True)
   pair = root / stage.PAIR_STATE
   pair.mkdir(parents=True)
   (pair / "receipt.json").write_text(json.dumps({"images": {"source": {"sha256": "5" * 64}}}))

@@ -392,4 +392,171 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-stage-crash-") as temporary
   rejects(lambda: stage.arm(root, runner=bootctl_for(root)), "production-kernel boot policy")
   assert not (root / stage.ONESHOT).exists()
 
-print("PASS: upstream-model stager refuses unsafe state and stages, arms, disarms, rolls back and clears idempotently")
+with tempfile.TemporaryDirectory(prefix="t2-upstream-stage-audit-") as temporary:
+  base = Path(temporary)
+
+  # Churn between the image write and the Limine write is preserved, not overwritten.
+  root, build, limine, original, production = fixture(base / "churn")
+  real_write = stage.atomic_write
+  churned_text = original.replace(region_text(1), region_text(4, "d"))
+  assert churned_text != original
+
+  def churning(path, data, mode):
+    real_write(path, data, mode)
+    if path.name == C.ESP_IMAGE:
+      limine.write_text(churned_text)
+
+  stage.atomic_write = churning
+  try:
+    receipt = stage.stage(root, build)
+  finally:
+    stage.atomic_write = real_write
+  assert limine.read_text() == churned_text + stage.entry_block(receipt).decode()
+  stage.verify_staged(root, receipt)
+  # Churn that is not a snapshot region aborts and recovers without losing the foreign edit.
+  root, build, limine, original, production = fixture(base / "foreign-churn")
+
+  def foreign(path, data, mode):
+    real_write(path, data, mode)
+    if path.name == C.ESP_IMAGE:
+      limine.write_text(original + "timeout: 0\n")
+
+  stage.atomic_write = foreign
+  try:
+    rejects(lambda: stage.stage(root, build), "while staging")
+  finally:
+    stage.atomic_write = real_write
+  assert limine.read_text() == original + "timeout: 0\n" and not (root / stage.ESP_IMAGE).exists()
+  assert stage.load_receipt(root)["state"] == "stage-failed-recovered"
+
+  # Locks: a held db.lck or physical lock refuses, and our own db.lck is always released.
+  root, build, limine, original, production = fixture(base / "locks")
+  (root / stage.DB_LOCK).write_text("held")
+  rejects(lambda: stage.stage(root, build), "db.lck is held")
+  assert (root / stage.DB_LOCK).read_text() == "held"
+  (root / stage.DB_LOCK).unlink()
+  import fcntl
+  descriptor = os.open(root / stage.PHYSICAL_LOCK, os.O_RDONLY)
+  fcntl.flock(descriptor, fcntl.LOCK_EX)
+  rejects(lambda: stage.stage(root, build), "physical lock")
+  assert not (root / stage.DB_LOCK).exists() and not (root / C.RECEIPT).exists()
+  fcntl.flock(descriptor, fcntl.LOCK_UN)
+  os.close(descriptor)
+  (root / stage.PHYSICAL_LOCK).unlink()
+  rejects(lambda: stage.stage(root, build), "physical cycle lock is missing")
+  (root / stage.PHYSICAL_LOCK).write_text("")
+  seen = []
+  real_judge = stage.judge_limine
+  stage.judge_limine = lambda *a: (seen.append((root / stage.DB_LOCK).exists()), real_judge(*a))[1]
+  try:
+    receipt = stage.stage(root, build)
+  finally:
+    stage.judge_limine = real_judge
+  assert seen and all(seen) and not (root / stage.DB_LOCK).exists()
+  # A signal inside the lock unwinds through the release.
+  import signal
+
+  def killed(*_a):
+    os.kill(os.getpid(), signal.SIGTERM)
+
+  advertise(root, receipt)
+  real_verify = stage.verify_staged
+  stage.verify_staged = lambda *a: (killed(), real_verify(*a))[1]
+  try:
+    try:
+      stage.arm(root, runner=bootctl_for(root))
+    except SystemExit as error:
+      assert error.code == 128 + signal.SIGTERM
+    else:
+      raise AssertionError("signal ignored")
+  finally:
+    stage.verify_staged = real_verify
+  assert not (root / stage.DB_LOCK).exists()
+  assert stage.load_receipt(root)["state"] == "staged"
+
+  # Pair interplay: steady source-arming is allowed, transient pair states refuse, a changed pair receipt blocks arming.
+  for state, allowed in (("source-arming", True), ("staged", True), ("rolled-back", True), ("restore-arming", False), ("preparing", False), ("rolling-back", False)):
+    root, build, limine, original, production = fixture(base / ("pair-" + state))
+    (root / stage.PAIR_STATE / "receipt.json").write_text(json.dumps({"state": state, "images": {"source": {"sha256": "5" * 64}}}))
+    if allowed:
+      assert stage.stage(root, build)["pair_receipt_sha256"] == sha((root / stage.PAIR_STATE / "receipt.json").read_bytes())
+    else:
+      rejects(lambda: stage.stage(root, build), "pair transaction is pending")
+      assert limine.read_text() == original
+  root, build, limine, original, production = fixture(base / "pair-changed")
+  receipt = stage.stage(root, build)
+  advertise(root, receipt)
+  assert "# BEGIN omarchy T2 hibernation pair" in limine.read_text()
+  (root / stage.PAIR_STATE / "receipt.json").write_text(json.dumps({"state": "rolled-back"}))
+  rejects(lambda: stage.arm(root, runner=bootctl_for(root)), "pair receipt changed")
+  assert not (root / stage.ONESHOT).exists()
+
+  # ESP space and build parents.
+  root, build, limine, original, production = fixture(base / "esp-full")
+  real_statvfs = os.statvfs
+  os.statvfs = lambda path: type("V", (), {"f_bavail": 1, "f_frsize": 4096})()
+  try:
+    rejects(lambda: stage.stage(root, build), "free space")
+  finally:
+    os.statvfs = real_statvfs
+  assert not (root / stage.ESP_IMAGE).exists() and not (root / C.RECEIPT).exists()
+  root, build, limine, original, production = fixture(base / "open-parent")
+  build.parent.chmod(0o777)
+  try:
+    rejects(lambda: stage.stage(root, build), "untrusted parent")
+  finally:
+    build.parent.chmod(0o755)
+
+  # F3: boot arming from stock is refused once an S4 cycle was armed, unless it was disarmed.
+  root, build, limine, original, production = fixture(base / "f3")
+  receipt = stage.stage(root, build)
+  advertise(root, receipt)
+  stage.arm(root, runner=bootctl_for(root))
+  (root / stage.ONESHOT).unlink()
+  set_boot(root, receipt["entry_id"], BOOT_B)
+  stage.mark_booted(root)
+  stage.arm_s4(root, 1, runner=bootctl_for(root))
+  (root / stage.ONESHOT).unlink()
+  set_boot(root, C.STOCK_ENTRY, BOOT_C)
+  rejects(lambda: stage.arm(root, runner=bootctl_for(root)), "cannot be armed from state s4-armed")
+  assert stage.load_receipt(root)["state"] == "s4-armed"
+  # F4: same-cycle re-arm only from disarmed, never from booted.
+  set_boot(root, receipt["entry_id"], BOOT_B)
+  stage.mark_booted(root)
+  rejects(lambda: stage.arm_s4(root, 1, runner=bootctl_for(root)), "out of order")
+  assert stage.arm_s4(root, 2, runner=bootctl_for(root))["last_armed_cycle"] == 2
+  stage.disarm(root, runner=bootctl_for(root))
+  assert stage.arm_s4(root, 2, runner=bootctl_for(root))["last_armed_cycle"] == 2
+
+  # F5: an interrupted arm (state arming) is confirmed by mark_booted when purpose, boot and entry match.
+  root, build, limine, original, production = fixture(base / "f5-boot")
+  receipt = stage.stage(root, build)
+  advertise(root, receipt)
+
+  def dying(arguments, check):
+    (root / stage.ONESHOT).write_bytes(efi_string(arguments[2]))
+    raise KeyboardInterrupt
+
+  try:
+    stage.arm(root, runner=dying)
+  except KeyboardInterrupt:
+    pass
+  assert stage.load_receipt(root)["state"] == "arming"
+  (root / stage.ONESHOT).unlink()
+  set_boot(root, receipt["entry_id"], BOOT_A)
+  rejects(lambda: stage.mark_booted(root), "new boot")
+  set_boot(root, receipt["entry_id"], BOOT_B)
+  booted = stage.mark_booted(root)
+  assert booted["state"] == "booted" and booted["test_boot_id"] == BOOT_B and "arming" not in booted
+  try:
+    stage.arm_s4(root, 1, runner=dying)
+  except KeyboardInterrupt:
+    pass
+  assert stage.load_receipt(root)["state"] == "arming"
+  (root / stage.ONESHOT).unlink()
+  set_boot(root, receipt["entry_id"], BOOT_C)
+  rejects(lambda: stage.mark_booted(root), "differs from the verified test boot")
+  set_boot(root, receipt["entry_id"], BOOT_B)
+  assert stage.mark_booted(root)["state"] == "booted"
+
+print("PASS: upstream-model stager locks, re-reads Limine before writing and enforces arm ordering")
