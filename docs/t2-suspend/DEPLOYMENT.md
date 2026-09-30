@@ -427,7 +427,7 @@ Common variables used below:
 ```bash
 S=/var/lib/omarchy/t2-hibernate-product
 NATIVE=$S/runtime/packages/t2-suspend/hibernate/boot_policy_native.py
-EXP=/home/jjc/Projects/MBA_9_1/packages/t2-suspend/experiments      # reviewed checkout only for builders that run as the operator; root actions run from installed snapshots where one exists
+EXP=$S/runtime/packages/t2-suspend/experiments        # root-owned, review-pinned copy installed by H6a; never run privileged Python from the workspace
 REL=7.2.7-arch1-Watanare-T2-2-t2
 CAND=/home/jjc/.local/state/codex-mba-autonomous/t2bce-7.2.7-hardening/candidate-7.2.7-h1
 WORK=/home/jjc/.local/state/codex-mba-autonomous/gen-7.2.7                # new private build tree, outside the ESP
@@ -480,23 +480,23 @@ The candidate `$CAND` (patches 0005 to 0017, `candidate-7.2.7-h1`, `provenance.j
 
 ```bash
 sudo /usr/bin/python3 -I -B "$EXP/build-hibernation-source-uki.py" --candidate-source "$CAND" \
-  --production-uki /boot/EFI/Linux/omarchy_linux-t2.efi --kernel-release "$REL" --output "$WORK/source" --experiment-id gen-7.2.7-source
+  --production-uki /boot/EFI/Linux/omarchy_linux-t2.efi --kernel-release "$REL" --output "$WORK/pair-source" --experiment-id gen-7.2.7-source
 sudo /usr/bin/python3 -I -B "$EXP/build-hibernation-candidate-uki.py" --candidate-source "$CAND" \
-  --production-uki /boot/EFI/Linux/omarchy_linux-t2.efi --kernel-release "$REL" --output "$WORK/restore" --experiment-id gen-7.2.7-restore \
+  --production-uki /boot/EFI/Linux/omarchy_linux-t2.efi --kernel-release "$REL" --output "$WORK/pair-restore" --experiment-id cold-pci-guard-fullrestore-v1 --minimal-restore-devices \
   --restore-marker-module "$WORK/mba_hibernate_efi_restore_marker.ko" --restore-marker-version v2 \
   --expected-restore-marker-sha256 <sha256> --expected-restore-marker-srcversion <srcversion> \
   --cold-pci-restore-guard-module "$WORK/mba_hibernate_cold_pci_guard.ko" \
   --expected-cold-pci-restore-guard-sha256 <GUARD_SHA256> --expected-cold-pci-restore-guard-srcversion <GUARD_SRCVERSION> \
   <the remaining pair-profile --cold-pci-* flags from the previous generation's provenance.json>
-sudo /usr/bin/python3 -I -B "$EXP/audit-hibernation-uki-pair.py" --source "$WORK/source" --restore "$WORK/restore"
+sudo /usr/bin/python3 -I -B "$EXP/audit-hibernation-uki-pair.py" --source "$WORK/pair-source" --restore "$WORK/pair-restore"
 ```
 
-Take the exact restore-side flag set from the qualified 7.2.6 pair's `provenance.json` (unchanged flags stay unchanged; only kernel-bound module paths and pins change). Independent audit of the pair before staging. This is a structural audit, not proof that the pair boots.
+The restore builder enforces `--experiment-id cold-pci-guard-fullrestore-v1` and requires `--minimal-restore-devices` with the cold-PCI flags. Pair outputs go to `$WORK/pair-source` and `$WORK/pair-restore` because `$WORK/source` holds the H6a runtime export. Take the exact restore-side flag set from the qualified 7.2.6 pair's `provenance.json` (unchanged flags stay unchanged; only kernel-bound module paths and pins change). Independent audit of the pair before staging. This is a structural audit, not proof that the pair boots.
 
 ### H6d: stage the new pair
 
 ```bash
-sudo /usr/bin/python3 -I -B "$P" stage --source "$WORK/source" --restore "$WORK/restore"
+sudo /usr/bin/python3 -I -B "$P" stage --source "$WORK/pair-source" --restore "$WORK/pair-restore"
 sudo /usr/bin/python3 -I -B "$P" verify
 ```
 
@@ -508,12 +508,12 @@ Owner attended, serialised, one at a time. The stock `Omarchy.linux-t2` entry st
 
 ```bash
 sudo /usr/bin/python3 -I -B "$P" arm-source                                    # then reboot into the source entry (attended)
-sudo /usr/bin/python3 -I -B "$EXP/verify-hibernation-uki-pair-source.py" --source "$WORK/source" --restore "$WORK/restore" --role source
-sudo /usr/bin/python3 -I -B "$EXP/run-hibernation-uki-pair-test-resume.py" --source "$WORK/source" --restore "$WORK/restore" \
+sudo /usr/bin/python3 -I -B "$EXP/verify-hibernation-uki-pair-source.py" --source "$WORK/pair-source" --restore "$WORK/pair-restore" --role source
+sudo /usr/bin/python3 -I -B "$EXP/run-hibernation-uki-pair-test-resume.py" --source "$WORK/pair-source" --restore "$WORK/pair-restore" \
   --physical-input-evidence <evidence> --validate-only --operator-attended
-sudo /usr/bin/python3 -I -B "$EXP/run-hibernation-uki-pair-test-resume.py" --source "$WORK/source" --restore "$WORK/restore" \
+sudo /usr/bin/python3 -I -B "$EXP/run-hibernation-uki-pair-test-resume.py" --source "$WORK/pair-source" --restore "$WORK/pair-restore" \
   --physical-input-evidence <evidence> --execute --operator-attended --expected-source-sha256 <source sha256>
-sudo /usr/bin/python3 -I -B "$EXP/run-hibernation-uki-pair-s4.py" --source "$WORK/source" --restore "$WORK/restore" \
+sudo /usr/bin/python3 -I -B "$EXP/run-hibernation-uki-pair-s4.py" --source "$WORK/pair-source" --restore "$WORK/pair-restore" \
   --test-resume-proof-source <proof> --disk-mode platform --marker-backend postwrite-efi --operator-attended --validate-only \
   --postwrite-efi-marker-module "$WORK/mba_hibernate_efi_postwrite_marker.ko" --postwrite-source-marker-version v3 \
   --expected-postwrite-efi-marker-sha256 <sha256> --expected-postwrite-efi-marker-srcversion <srcversion> \
@@ -531,7 +531,7 @@ The generation trial is a one-use, unqualified hardware run whose durable termin
 
 ```bash
 sudo /usr/bin/python3 -I -B "$P" arm-source && systemctl reboot    # attended; select nothing manually: the one-shot picks the source entry
-sudo /usr/bin/python3 -I -B "$EXP/verify-hibernation-uki-pair-source.py" --source "$WORK/source" --restore "$WORK/restore" --role source
+sudo /usr/bin/python3 -I -B "$EXP/verify-hibernation-uki-pair-source.py" --source "$WORK/pair-source" --restore "$WORK/pair-restore" --role source
 ```
 
 The trial's two inputs are written by the operator or orchestrator as root, never by this code, from audited evidence, root-owned 0600:
