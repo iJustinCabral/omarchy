@@ -180,6 +180,96 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-arrays-") as temporary:
     private_file.write_text(good + extra)
     rejects(lambda: build.audit_config(private_file, stock_file), expected)
 
+
+# verify_blacklist and module counts against the REAL production shape (derived from the production
+# initramfs file list): brcmfmac family, cfg80211 and brcmutil are present as .ko.zst, plus ~370 other modules.
+def real_tree(root, wifi=True, count=370, brcmfmac=True):
+  base = root / "usr/lib/modules" / release
+  names = ["kernel/drivers/net/wireless/broadcom/brcm80211/brcmutil/brcmutil.ko.zst", "kernel/net/wireless/cfg80211.ko.zst"]
+  if brcmfmac:
+    names += ["updates/dkms/" + name + ".ko.zst" for name in ("brcmfmac", "brcmfmac-bca", "brcmfmac-cyw", "brcmfmac-wcc")]
+  if not wifi:
+    names = []
+  names += ["kernel/fs/m%03d.ko.zst" % index for index in range(count)]
+  for name in names:
+    (base / name).parent.mkdir(parents=True, exist_ok=True)
+    (base / name).write_bytes(b"")
+  (root / "etc/modprobe.d").mkdir(parents=True, exist_ok=True)
+  (root / "etc/modprobe.d/brcmfmac.conf").write_text("options brcmfmac feature_disable=0x82000\n")
+  return root
+
+
+def kmod(honours_blacklist=True, resolves=True):
+  """Fake of modprobe alias resolution: kmod applies blacklist entries to alias lookups."""
+  def resolve(extracted, release_, config, use_blacklist=False):
+    blacklisted = (Path(config) / Path(C.BLACKLIST_DESTINATION).name).exists()
+    if not resolves or (blacklisted and honours_blacklist):
+      return ""
+    return "insmod /lib/modules/" + release_ + "/updates/dkms/brcmfmac.ko.zst\n"
+  return resolve
+
+
+with tempfile.TemporaryDirectory(prefix="t2-upstream-realshape-") as temporary:
+  base = Path(temporary)
+  real_resolve = build.resolve_alias
+
+  def trees(**candidate_options):
+    production = real_tree(base / ("p" + str(len(list(base.iterdir())))))
+    extracted = real_tree(base / ("c" + str(len(list(base.iterdir())))), **candidate_options)
+    (extracted / C.BLACKLIST_DESTINATION).write_text(C.blacklist_text())
+    return production, extracted
+
+  production, extracted = trees()
+  build.resolve_alias = kmod()
+  try:
+    report = build.verify_blacklist(extracted, release, production)
+    assert report["brcmfmac_in_initramfs"] is True and len(report["wifi_module_files"]) == 6
+    # The unblacklisted probe must not see our blacklist file (kmod applies it to aliases even without -b).
+    seen = []
+    build.resolve_alias = lambda extracted_, release_, config, use_blacklist=False: (seen.append((Path(config) / "zz-omarchy-t2-upstream-model.conf").exists()), kmod()(extracted_, release_, config, use_blacklist))[1]
+    build.verify_blacklist(extracted, release, production)
+    assert seen[0] is False and seen[1] is True
+    # Never vacuous.
+    build.resolve_alias = kmod(resolves=False)
+    rejects(lambda: build.verify_blacklist(extracted, release, production), "even without the blacklist")
+    build.resolve_alias = kmod(honours_blacklist=False)
+    rejects(lambda: build.verify_blacklist(extracted, release, production), "still load brcmfmac")
+    build.resolve_alias = kmod()
+    empty_production = real_tree(base / "empty-production", wifi=False)
+    rejects(lambda: build.verify_blacklist(extracted, release, empty_production), "extraction is incomplete")
+    _, stripped = trees(wifi=False)
+    (stripped / C.BLACKLIST_DESTINATION).write_text(C.blacklist_text())
+    rejects(lambda: build.verify_blacklist(stripped, release, production), "differ from production")
+    no_brcm_p, no_brcm_c = trees(brcmfmac=False)
+    rejects(lambda: build.verify_blacklist(no_brcm_c, release, no_brcm_p), "differ from production")
+    __import__("shutil").rmtree(no_brcm_p / "usr/lib/modules" / release / "updates")
+    rejects(lambda: build.verify_blacklist(no_brcm_c, release, no_brcm_p), "vacuous")
+    (extracted / C.BLACKLIST_DESTINATION).write_text("blacklist brcmfmac\n")
+    rejects(lambda: build.verify_blacklist(extracted, release, production), "missing or incomplete")
+  finally:
+    build.resolve_alias = real_resolve
+
+  # Module counts: complete extraction follows production through the declared delta.
+  production, extracted = trees()
+  tree = extracted / "usr/lib/modules" / release / "kernel/drivers/staging/t2bce"
+  for name in ("t2bce_dma", "t2bce_core", "t2bce_vhci"):
+    (production / "usr/lib/modules" / release / "kernel/drivers/staging/t2bce" / name).mkdir(parents=True)
+    (production / "usr/lib/modules" / release / "kernel/drivers/staging/t2bce" / name / (name + ".ko.zst")).write_bytes(b"")
+    (tree / name).mkdir(parents=True)
+    (tree / name / (name + ".ko")).write_bytes(b"")
+  (tree / "t2bce_audio").mkdir()
+  (tree / "t2bce_audio/t2bce_audio.ko").write_bytes(b"")
+  stem = "usr/lib/modules/" + release + "/kernel/drivers/staging/t2bce/"
+  removed = [stem + name + "/" + name + ".ko.zst" for name in ("t2bce_dma", "t2bce_core", "t2bce_vhci")]
+  added = [stem + name + "/" + name + ".ko" for name in ("t2bce_dma", "t2bce_core", "t2bce_vhci", "t2bce_audio")]
+  assert build.verify_module_counts(production, extracted, release, removed, added) == {"production": 379, "candidate": 380}
+  rejects(lambda: build.verify_module_counts(production, extracted, release, removed, added[:-1]), "count differs")
+  (tree / "t2bce_audio/t2bce_audio.ko").unlink()
+  rejects(lambda: build.verify_module_counts(production, extracted, release, removed, added), "count differs")
+  tiny = real_tree(base / "tiny", count=3)
+  rejects(lambda: build.verify_module_counts(tiny, tiny, release, [], []), "count differs")
+
+
 # Build configuration values parse the runtime `config` file only.
 assert build.config_values(cand_config)["MODULES"] == ["t2bce_vhci", "hid_apple", "t2bce_audio"]
 

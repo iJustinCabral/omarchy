@@ -271,21 +271,74 @@ def extract_initrd(initrd, destination):
   BASE.run(("lsinitcpio", "--cpio", "--extract", initrd), cwd=destination)
 
 
-def verify_blacklist(extracted, release):
-  """The blacklist file is present and keeps brcmfmac from loading by its PCI alias."""
+WIFI_FAMILY = ("brcmfmac*.ko*", "cfg80211*.ko*", "brcmutil*.ko*")
+
+
+def module_files(tree, release):
+  """Relative names of every kernel module file below usr/lib/modules/<release>."""
+  base = Path(tree) / "usr/lib/modules" / release
+  return sorted(str(item.relative_to(tree)) for item in base.rglob("*.ko*") if item.is_file() or item.is_symlink())
+
+
+def wifi_files(tree, release):
+  base = Path(tree) / "usr/lib/modules" / release
+  return sorted(str(item.relative_to(tree)) for pattern in WIFI_FAMILY for item in base.rglob(pattern))
+
+
+def resolve_alias(extracted, release, config_directory, use_blacklist=False):
+  """Modules modprobe would insmod for the BCM4377 Wi-Fi PCI alias with the given modprobe.d directory.
+
+  kmod applies blacklist entries to alias lookups even without --use-blacklist, so the "without the
+  blacklist" probe must use a configuration directory that does not contain our blacklist file.
+  """
+  command = ["modprobe", "--config", str(config_directory), "--dirname", str(extracted), "--set-version", release, "--show-depends"]
+  if use_blacklist:
+    command.append("--use-blacklist")
+  command.append(ALIAS_PROBE)
+  result = subprocess.run(command, text=True, capture_output=True, check=False)
+  return result.stdout
+
+
+def verify_blacklist(extracted, release, production_tree):
+  """The brcmfmac family is really in the image (as in production) and our blacklist stops its PCI alias.
+
+  Never vacuous: the extraction must hold the same Wi-Fi module files as production, and the alias must
+  resolve to brcmfmac without our blacklist file before it is required not to resolve with it.
+  """
   path = extracted / C.BLACKLIST_DESTINATION
   if not path.is_file() or C.blacklist_names(path.read_text()) != set(C.BLACKLISTED_MODULES):
     raise ValueError("Initramfs blacklist is missing or incomplete")
-  common = ("modprobe", "--config", extracted / "etc/modprobe.d", "--dirname", extracted,
-            "--set-version", release, "--show-depends", ALIAS_PROBE)
-  plain = BASE.run(common, capture=True).stdout
-  if not re.search(r"brcmfmac\.ko", plain):
-    raise ValueError("Wi-Fi alias does not resolve to brcmfmac in the initramfs; blacklist check would be vacuous")
-  result = subprocess.run([str(item) for item in common[:-1] + ("--use-blacklist", ALIAS_PROBE)],
-                          text=True, capture_output=True, check=False)
-  if re.search(r"brcmfmac[^\s]*\.ko", result.stdout):
+  before, after = wifi_files(production_tree, release), wifi_files(extracted, release)
+  if not before:
+    raise ValueError("Production initramfs extraction holds no Wi-Fi module files; the extraction is incomplete")
+  if before != after:
+    raise ValueError("Candidate Wi-Fi module files differ from production: " + repr(sorted(set(before) ^ set(after))[:6]))
+  if not any(Path(item).name.startswith("brcmfmac.ko") for item in after):
+    raise ValueError("brcmfmac.ko is absent from the image; the blacklist check would be vacuous")
+  config = Path(extracted) / "etc/modprobe.d"
+  with tempfile.TemporaryDirectory(prefix="t2-upstream-modprobe-") as directory:
+    without = Path(directory)
+    for item in config.iterdir():
+      if item.name != Path(C.BLACKLIST_DESTINATION).name:
+        shutil.copyfile(item, without / item.name)
+    plain = resolve_alias(extracted, release, without)
+    if not re.search(r"brcmfmac\.ko", plain):
+      raise ValueError("Wi-Fi alias does not resolve to brcmfmac even without the blacklist; the check would be vacuous")
+  if re.search(r"brcmfmac[^\s]*\.ko", resolve_alias(extracted, release, config, use_blacklist=True)):
     raise ValueError("Initramfs would still load brcmfmac from the Wi-Fi PCI alias")
-  return {"alias_probe": ALIAS_PROBE, "without_blacklist_loads_brcmfmac": True, "with_blacklist_loads_brcmfmac": False}
+  if re.search(r"brcmfmac[^\s]*\.ko", resolve_alias(extracted, release, config)):
+    raise ValueError("Initramfs blacklist is not honoured by modprobe alias resolution")
+  return {"brcmfmac_in_initramfs": True, "wifi_module_files": after, "alias_probe": ALIAS_PROBE,
+          "without_blacklist_loads_brcmfmac": True, "with_blacklist_loads_brcmfmac": False}
+
+
+def verify_module_counts(production_tree, extracted, release, removed, added):
+  """The extraction is complete: module file counts follow production exactly through the declared delta."""
+  before, after = len(module_files(production_tree, release)), len(module_files(extracted, release))
+  expected = before - sum(1 for item in removed if ".ko" in item) + sum(1 for item in added if ".ko" in item)
+  if before < 100 or after != expected:
+    raise ValueError("Module file count differs from production beyond the declared delta: production %d, candidate %d, expected %d" % (before, after, expected))
+  return {"production": before, "candidate": after}
 
 
 def audio_dependencies(extracted, release):
@@ -342,9 +395,9 @@ def build_initrd(work, module_root, release, expected, production_initrd):
     selected[name] = str(matches[0].relative_to(extracted))
   if list(tree.rglob("t2bce_ave.ko")):
     raise ValueError("Initramfs unexpectedly includes optional AVE")
-  blacklist_report = verify_blacklist(extracted, release)
   production_tree = work / "production-initrd-root"
   extract_initrd(production_initrd, production_tree)
+  blacklist_report = verify_blacklist(extracted, release, production_tree)
   production_manifest = manifest(production_tree)
   candidate_manifest = manifest(extracted)
   diff = manifest_diff(
@@ -354,6 +407,7 @@ def build_initrd(work, module_root, release, expected, production_initrd):
     candidate_config=(extracted / "config").read_text(),
   )
   blacklist_report["config_arrays"] = config_audit
+  blacklist_report["module_counts"] = verify_module_counts(production_tree, extracted, release, diff["removed"], diff["added"])
   return initrd, selected, blacklist_report, diff, production_manifest, candidate_manifest
 
 
