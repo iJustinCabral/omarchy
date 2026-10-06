@@ -156,10 +156,31 @@ class Host:
     if not uid or not user:
       raise ValueError("Cannot lock the desktop session: run the runner through sudo from the desktop user")
     runtime = "/run/user/" + uid
+    omarchy = self.omarchy_path(user, runtime)
+    # omarchy-shell (called by the helper) fails at once without OMARCHY_PATH and the helper hides its stderr,
+    # so the path and a PATH containing $OMARCHY_PATH/bin are passed explicitly, and the helper is invoked by
+    # its absolute path.
     result = self._subprocess(("runuser", "-u", user, "--", "env", "XDG_RUNTIME_DIR=" + runtime,
-                               "DBUS_SESSION_BUS_ADDRESS=unix:path=" + runtime + "/bus", "omarchy-system-sleep-lock"), timeout=30)
+                               "DBUS_SESSION_BUS_ADDRESS=unix:path=" + runtime + "/bus", "OMARCHY_PATH=" + omarchy,
+                               "PATH=" + omarchy + "/bin:/usr/local/bin:/usr/bin", omarchy + "/bin/omarchy-system-sleep-lock"), timeout=30)
     if result.returncode != 0:
       raise ValueError("Desktop lock was not secured: " + result.stderr.strip()[:200])
+
+  def omarchy_path(self, user, runtime):
+    """OMARCHY_PATH from the runner's environment, else the user's systemd manager; validated or refused."""
+    value = self.environ.get("OMARCHY_PATH")
+    if not value:
+      shown = self._subprocess(("runuser", "-u", user, "--", "env", "XDG_RUNTIME_DIR=" + runtime, "systemctl", "--user", "show-environment"), timeout=15)
+      for line in shown.stdout.splitlines() if shown.returncode == 0 else ():
+        if line.startswith("OMARCHY_PATH="):
+          value = line.split("=", 1)[1]
+    if not value:
+      raise ValueError("OMARCHY_PATH is not set in the runner environment or the user's systemd environment; pass --setenv=OMARCHY_PATH")
+    path = Path(value)
+    if (not path.is_absolute() or ".." in path.parts or not path.is_dir() or not (path / "bin/omarchy-system-sleep-lock").is_file()
+        or not (path / "shell/shell.qml").is_file()):
+      raise ValueError("OMARCHY_PATH is not an Omarchy checkout (needs bin/omarchy-system-sleep-lock and shell/shell.qml): " + value)
+    return str(path)
 
   def run(self, arguments, timeout=None):
     return self._run(tuple(arguments), timeout) if timeout else self._run(tuple(arguments))

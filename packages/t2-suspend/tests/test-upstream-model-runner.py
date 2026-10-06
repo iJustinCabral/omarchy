@@ -986,3 +986,69 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-classifier-") as tem
   assert verdict["verdict"] == "would-pass" and verdict["recorded_state"] == "failed" and verdict["state_changed"] is False
 
 print("PASS: upstream-model classifier flags real PM errors only, S3 may be repeated, and reassess is read-only")
+
+
+
+# The session lock: exact runuser argv, OMARCHY_PATH validation, and a refused cycle is retryable with the same number.
+with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-lock-") as temporary:
+  base = Path(temporary)
+  omarchy = base / "omarchy"
+  (omarchy / "bin").mkdir(parents=True)
+  (omarchy / "shell").mkdir()
+  (omarchy / "bin/omarchy-system-sleep-lock").write_text("#!/bin/bash\n")
+  (omarchy / "shell/shell.qml").write_text("")
+  calls = []
+
+  def fake(arguments, timeout=None):
+    calls.append((tuple(str(item) for item in arguments), timeout))
+    if tuple(arguments)[-3:] == ("systemctl", "--user", "show-environment"):
+      return subprocess.CompletedProcess(arguments, 0, "A=b\nOMARCHY_PATH=" + str(omarchy) + "\n", "")
+    return subprocess.CompletedProcess(arguments, 0, "", "")
+
+  def lock_host(environ):
+    host = run.Host(base, environ=environ)
+    host._subprocess = fake
+    return host
+
+  sudo = {"SUDO_UID": "1000", "SUDO_USER": "jjc"}
+  expected = ("runuser", "-u", "jjc", "--", "env", "XDG_RUNTIME_DIR=/run/user/1000", "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus",
+              "OMARCHY_PATH=" + str(omarchy), "PATH=" + str(omarchy) + "/bin:/usr/local/bin:/usr/bin", str(omarchy) + "/bin/omarchy-system-sleep-lock")
+  lock_host({**sudo, "OMARCHY_PATH": str(omarchy)}).lock()
+  assert calls == [(expected, 30)], calls
+  # Fallback: the user's systemd manager environment.
+  calls.clear()
+  lock_host(sudo).lock()
+  assert calls[0][0] == ("runuser", "-u", "jjc", "--", "env", "XDG_RUNTIME_DIR=/run/user/1000", "systemctl", "--user", "show-environment")
+  assert calls[1] == (expected, 30)
+  # Refusals.
+  empty = lock_host(sudo)
+  empty._subprocess = lambda arguments, timeout=None: subprocess.CompletedProcess(arguments, 0, "A=b\n", "")
+  rejects(empty.lock, "OMARCHY_PATH is not set")
+  for bad in ("relative/path", str(omarchy) + "/../omarchy", str(base / "nope"), str(base)):
+    rejects(lock_host({**sudo, "OMARCHY_PATH": bad}).lock, "not an Omarchy checkout")
+  (omarchy / "shell/shell.qml").unlink()
+  rejects(lock_host({**sudo, "OMARCHY_PATH": str(omarchy)}).lock, "not an Omarchy checkout")
+  (omarchy / "shell/shell.qml").write_text("")
+  (omarchy / "bin/omarchy-system-sleep-lock").unlink()
+  rejects(lock_host({**sudo, "OMARCHY_PATH": str(omarchy)}).lock, "not an Omarchy checkout")
+  (omarchy / "bin/omarchy-system-sleep-lock").write_text("#!/bin/bash\n")
+  rejects(lock_host({}).lock, "run the runner through sudo")
+  failing = lock_host({**sudo, "OMARCHY_PATH": str(omarchy)})
+  failing._subprocess = lambda arguments, timeout=None: subprocess.CompletedProcess(arguments, 1, "", "omarchy-system-sleep-lock: suspending without a secure lock")
+  rejects(failing.lock, "Desktop lock was not secured: omarchy-system-sleep-lock: suspending without a secure lock")
+
+  # A cycle refused at the lock (no guard, hibernate not attempted) is re-run with the same number; the old attempt is archived.
+  case = Env(base / "lock-retry")
+  case.to_s3_passed()
+  case.lock_hook = lambda: (_ for _ in ()).throw(ValueError("Desktop lock was not secured: the shell did not secure the session"))
+  rejects(lambda: run.s4_cycle(case.host, 1), "Desktop lock was not secured")
+  refused = case.attempt(1)
+  assert refused["state"] == "refused-before-guard" and refused["hibernate_attempted"] is False and not case.guard(1).exists() and not case.terminal()
+  cycle_dir = case.root / C.ATTEMPTS / case.receipt["image_sha256"] / "cycle-1"
+  case.lock_hook = None
+  assert run.s4_cycle(case.host, 1)["state"] == "returned-and-cleaned"
+  prior = list(cycle_dir.glob("prior-*/attempt.json"))
+  assert len(prior) == 1 and json.loads(prior[0].read_text())["state"] == "refused-before-guard"
+  assert (prior[0].parent / "pre.json").exists() and case.guard(1).exists()
+
+print("PASS: upstream-model session lock passes OMARCHY_PATH and PATH explicitly and a lock refusal is retryable")
