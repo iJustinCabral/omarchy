@@ -67,15 +67,22 @@ BAD_PM_PATTERNS = tuple(re.compile(pattern, re.I) for pattern in (
   r"Call Trace",
   r"\bBUG:",
   r"\bOops\b",
-  r"\bt2bce\w*:.*\b(?:error|failed|timed out)\b",
-  r"\bt2bce\w*:.*\b(?:error|err|status|ret|rc)\s*[=:]\s*-\d+",
-  r"\bt2bce\w*:.*-E(?:IO|TIMEDOUT|BUSY|NODEV|INVAL|NOMEM)\b",
+  # dev_err form: "t2bce_core 0000:74:00.1: command timed out"; module form: "t2bce_core: resume failed".
+  r"\bt2bce\w*(?:\s+[0-9a-f:.]+)?:.*\b(?:error|failed|timed out)\b",
+  r"\bt2bce\w*(?:\s+[0-9a-f:.]+)?:.*\b(?:error|err|status|ret|rc)\s*[=:]\s*-\d+",
+  r"\bt2bce\w*(?:\s+[0-9a-f:.]+)?:.*-E(?:IO|TIMEDOUT|BUSY|NODEV|INVAL|NOMEM)\b",
   r"\bPM: .*\bfailed\b",
   r"\bPM: .*\breturns -\d+",
+  r"Freezing of tasks failed",
+  r"\bPM: Error -\d+ creating image",
 ))
+# Taint notice for an unsigned out-of-tree module; not a PM fault.
+BENIGN_PM = re.compile(r"module verification failed", re.I)
 
 
 def is_bad_pm(line):
+  if BENIGN_PM.search(line):
+    return False
   return any(pattern.search(line) for pattern in BAD_PM_PATTERNS)
 
 EVIDENCE_COMMANDS = {
@@ -528,6 +535,35 @@ def archive_prior_s3(directory):
       item.rename(archive / item.name)
 
 
+def rerun_allowed(host, receipt, directory):
+  """Why a previous S3 record may be repeated, or ValueError. Passed and genuine failures are refused."""
+  record = json.loads((directory / "s3.json").read_text())
+  state = record.get("state")
+  if state == "passed":
+    raise ValueError("S3 already passed on this boot; its result is preserved")
+  if state in ("started", "accepted") and not (directory / "after.json").exists():
+    return "previous run interrupted in state " + state
+  after = directory / "after.json"
+  if state == "failed" and after.is_file():
+    saved = json.loads(after.read_text())
+    lines = saved.get("journal", [])
+    assessed = assess_s3_journal(saved)
+    # Classifier-only: today's classifier finds nothing, and every recorded problem was just a journal line.
+    if not assessed and all(item in lines for item in record.get("problems", [])):
+      return "classifier-only failure: re-assessed with the current classifier, zero problems"
+  raise ValueError("S3 genuinely failed on this image and is not repeatable: " + "; ".join(record.get("problems", [])[:3]))
+
+
+def assess_s3_journal(saved):
+  lines = saved.get("journal", [])
+  joined = "\n".join(lines)
+  problems = list(saved.get("problems", []))
+  if not re.search(r"suspend entry \(deep\)", joined) or not re.search(r"Waking up from system sleep state S3|PM: suspend exit", joined):
+    problems.append("Journal lacks the S3 entry/exit lines")
+  problems += [line for line in lines if is_bad_pm(line)][:5]
+  return problems
+
+
 def s3_reassess(host):
   """Read-only: re-evaluate the saved S3 journal with the current classifier; changes no state."""
   receipt = load(host)
@@ -538,11 +574,7 @@ def s3_reassess(host):
     raise ValueError("No saved S3 journal for this boot")
   saved = json.loads(path.read_text())
   lines = saved.get("journal", [])
-  joined = "\n".join(lines)
-  problems = list(saved.get("problems", []))
-  if not re.search(r"suspend entry \(deep\)", joined) or not re.search(r"Waking up from system sleep state S3|PM: suspend exit", joined):
-    problems.append("Journal lacks the S3 entry/exit lines")
-  problems += [line for line in lines if is_bad_pm(line)][:5]
+  problems = assess_s3_journal(saved)
   recorded = json.loads((directory / "s3.json").read_text()).get("state") if (directory / "s3.json").is_file() else None
   return {"verdict": "would-pass" if not problems else "would-fail", "problems": problems, "recorded_state": recorded,
           "journal_lines": len(lines), "state_changed": False}
@@ -556,18 +588,18 @@ def s3(host):
   facts = preconditions(host, receipt, efi_clear=True)
   directory = phase_dir(host, receipt, "s3-" + boot_id)
   record_path = directory / "s3.json"
+  rerun_reason = None
   if record_path.exists():
-    # S3 is not a one-use vector: a failed or interrupted run is archived (never deleted) and may be repeated;
-    # a passed run stands.
-    if json.loads(record_path.read_text()).get("state") == "passed":
-      raise ValueError("S3 already passed on this boot; its result is preserved")
+    # A passed run stands. A genuine S3 failure is not repeatable on this image (no-repeat rule); only an
+    # interrupted run or a classifier-only failure is, and the reason is recorded in the new attempt.
+    rerun_reason = rerun_allowed(host, receipt, directory)
     archive_prior_s3(directory)
   before = capture(host, receipt, directory, "before", facts["swap_target"])
   if before["problems"]:
     raise ValueError("Health before S3 failed: " + "; ".join(before["problems"]))
   host.ask("Press Enter to suspend (S3); wake the machine with a key press afterwards: ")
   mark = cursor(host)
-  save(host, directory / "s3.json", {"state": "started", "boot_id": boot_id, "time": host.now()})
+  save(host, directory / "s3.json", {"state": "started", "boot_id": boot_id, "time": host.now(), "rerun_reason": rerun_reason})
   result = host.run(("systemctl", "suspend"))
   after = capture(host, receipt, directory, "after", facts["swap_target"], after=mark, settle=SETTLE_SECONDS)
   lines = after["journal"]
@@ -581,10 +613,10 @@ def s3(host):
   if STAGE.current_boot_id(host.root) != boot_id:
     problems.append("Boot ID changed across S3")
   if problems:
-    save(host, directory / "s3.json", {"state": "failed", "boot_id": boot_id, "problems": problems})
+    save(host, directory / "s3.json", {"state": "failed", "boot_id": boot_id, "problems": problems, "rerun_reason": rerun_reason})
     raise ValueError("S3 failed: " + "; ".join(problems))
   phrase_hash = confirm(host, C.confirmation_phrase("s3", receipt["image_sha256"], boot_id))
-  save(host, directory / "s3.json", {"state": "passed", "boot_id": boot_id, "phrase_sha256": phrase_hash, "time": host.now()})
+  save(host, directory / "s3.json", {"state": "passed", "boot_id": boot_id, "phrase_sha256": phrase_hash, "time": host.now(), "rerun_reason": rerun_reason})
   return {"qualification": "upstream-model-s3-passed", "boot_id": boot_id}
 
 

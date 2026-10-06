@@ -319,7 +319,7 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-") as temporary:
   env.suspend_lines = "[  100.0] host kernel: PM: suspend entry (deep)\n"
   rejects(lambda: run.s3(env.host), "lacks the S3 entry/exit")
   assert json.loads((env.root / C.ATTEMPTS / env.receipt["image_sha256"] / ("s3-" + BOOT_B) / "s3.json").read_text())["state"] == "failed"
-  # S3 is not a one-use vector: after a failure it can be repeated; the failed record is archived, never deleted.
+  # A genuine S3 failure is not repeatable on this image (no-repeat rule); reassess is read-only.
   s3_directory = env.root / C.ATTEMPTS / env.receipt["image_sha256"] / ("s3-" + BOOT_B)
   failed_text = (s3_directory / "s3.json").read_text()
   verdict = run.s3_reassess(env.host)
@@ -327,22 +327,53 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-") as temporary:
   assert (s3_directory / "s3.json").read_text() == failed_text
   env.suspend_lines = "[  100.0] host kernel: PM: suspend entry (deep)\n[  110.0] host kernel: ACPI: PM: Waking up from system sleep state S3\n"
   env.journal = KERNEL + SWITCH_ROOT + LATE_WIFI
+  rejects(lambda: run.s3(env.host), "genuinely failed on this image and is not repeatable")
+  assert (s3_directory / "s3.json").read_text() == failed_text and not list(s3_directory.glob("s3-*.json"))
+  rejects(lambda: run.s4_cycle(env.host, 1), "S3 has not passed")
+
+  # Classifier-only failure (the live false positive): the saved journal holds only the bus-number line.
+  false_positive = "[19158.200892] kenobi kernel: apple 0003:05AC:0280.0009: hiddev97,hidraw2: USB HID v1.01 Device [Apple Inc. Apple Internal Keyboard / Trackpad] on usb-t2bce_vhci-5/input0"
+  env = Env(base / "g2-classifier-only")
+  env.boot_test_entry()
+  run.verify_boot(env.host)
+  s3_directory = env.root / C.ATTEMPTS / env.receipt["image_sha256"] / ("s3-" + BOOT_B)
+  s3_directory.mkdir(parents=True)
+  saved = ["[1.0] kernel: PM: suspend entry (deep)", false_positive, "[2.0] kernel: PM: suspend exit"]
+  (s3_directory / "s3.json").write_text(json.dumps({"state": "failed", "boot_id": BOOT_B, "problems": [false_positive]}))
+  (s3_directory / "after.json").write_text(json.dumps({"problems": [], "journal": saved}))
+  failed_text = (s3_directory / "s3.json").read_text()
+  assert run.s3_reassess(env.host)["verdict"] == "would-pass"
   assert run.s3(env.host)["qualification"] == "upstream-model-s3-passed"
   assert (s3_directory / "s3-1.json").read_text() == failed_text and (s3_directory / "prior-s3-1" / "after.json").exists()
-  assert json.loads((s3_directory / "s3.json").read_text())["state"] == "passed"
+  record = json.loads((s3_directory / "s3.json").read_text())
+  assert record["state"] == "passed" and "classifier-only" in record["rerun_reason"]
   rejects(lambda: run.s3(env.host), "already passed")
   assert run.s3_reassess(env.host)["verdict"] == "would-pass"
-  require_calls = run.require_s3(env.host, env.receipt, BOOT_B)
-  # A second failure archives as s3-2.json.
-  env2 = Env(base / "g2-twice")
-  env2.boot_test_entry()
-  run.verify_boot(env2.host)
-  env2.suspend_lines = "[  100.0] host kernel: PM: suspend entry (deep)\n"
-  rejects(lambda: run.s3(env2.host), "lacks the S3 entry/exit")
-  rejects(lambda: run.s3(env2.host), "lacks the S3 entry/exit")
-  names = sorted(item.name for item in (env2.root / C.ATTEMPTS / env2.receipt["image_sha256"] / ("s3-" + BOOT_B)).glob("s3*.json"))
-  assert names == ["s3-1.json", "s3.json"]
-  rejects(lambda: run.s4_cycle(env2.host, 1), "S3 has not passed")
+  run.require_s3(env.host, env.receipt, BOOT_B)
+
+  # A recorded non-journal problem (health, systemctl failure) keeps the failure genuine even if the journal is clean.
+  env = Env(base / "g2-mixed")
+  env.boot_test_entry()
+  run.verify_boot(env.host)
+  s3_directory = env.root / C.ATTEMPTS / env.receipt["image_sha256"] / ("s3-" + BOOT_B)
+  s3_directory.mkdir(parents=True)
+  (s3_directory / "s3.json").write_text(json.dumps({"state": "failed", "boot_id": BOOT_B, "problems": ["systemctl suspend failed: x"]}))
+  (s3_directory / "after.json").write_text(json.dumps({"problems": [], "journal": saved}))
+  rejects(lambda: run.s3(env.host), "not repeatable")
+  (s3_directory / "s3.json").write_text(json.dumps({"state": "failed", "boot_id": BOOT_B, "problems": [false_positive]}))
+  (s3_directory / "after.json").write_text(json.dumps({"problems": ["Wi-Fi interface is absent or not up"], "journal": saved}))
+  rejects(lambda: run.s3(env.host), "not repeatable")
+
+  # An interrupted run (started, no journal) may be repeated, with the reason recorded.
+  env = Env(base / "g2-interrupted")
+  env.boot_test_entry()
+  run.verify_boot(env.host)
+  s3_directory = env.root / C.ATTEMPTS / env.receipt["image_sha256"] / ("s3-" + BOOT_B)
+  s3_directory.mkdir(parents=True)
+  (s3_directory / "s3.json").write_text(json.dumps({"state": "started", "boot_id": BOOT_B}))
+  assert run.s3(env.host)["qualification"] == "upstream-model-s3-passed"
+  assert "interrupted in state started" in json.loads((s3_directory / "s3.json").read_text())["rerun_reason"]
+  assert json.loads((s3_directory / "s3-1.json").read_text())["state"] == "started"
   env = Env(base / "g2-ok")
   env.boot_test_entry()
   run.verify_boot(env.host)
@@ -898,6 +929,9 @@ REAL_OK = [
   "[19158.400000] kenobi bluetoothd[900]: Bluetooth: hci0: Injecting HCI hardware error event",
   "[19158.410000] kenobi kernel: Bluetooth: hci0: Injecting HCI hardware error event",
   "[19158.420000] kenobi kernel: t2bce_core: suspend: exit status=0",
+  "[19158.430000] kenobi kernel: t2bce_core: module verification failed: signature and/or required key missing - tainting kernel",
+  "[19158.440000] kenobi kernel: module verification failed: signature and/or required key missing - tainting kernel",
+  "[19158.450000] kenobi kernel: t2bce_core 0000:74:00.1: resume: exit status=0 path=stateful",
 ]
 REAL_BAD = [
   "[1.0] kenobi kernel: t2bce_core: suspend: exit status=-5",
@@ -912,6 +946,11 @@ REAL_BAD = [
   "[1.0] kenobi kernel: PM: dpm_run_callback(): pci_pm_suspend+0x0/0x1a0 returns -5",
   "[1.0] kenobi kernel: BUG: unable to handle page fault",
   "[1.0] kenobi kernel: Oops: 0000 [#1] SMP",
+  "[1.0] kenobi kernel: t2bce_core 0000:74:00.1: command timed out",
+  "[1.0] kenobi kernel: t2bce_vhci 0000:74:00.1: resume failed",
+  "[1.0] kenobi kernel: t2bce_core 0000:74:00.1: suspend: exit status=-5",
+  "[1.0] kenobi kernel: Freezing of tasks failed after 20.003 seconds (1 tasks refusing to freeze, wq_busy=0):",
+  "[1.0] kenobi kernel: PM: Error -12 creating image",
 ]
 for line in REAL_OK:
   assert not run.is_bad_pm(line), line
