@@ -44,6 +44,17 @@ RUNTIME_CONFIG_KEYS = ("HOOKS", "EARLYHOOKS", "LATEHOOKS", "CLEANUPHOOKS", "EMER
 ALIAS_PROBE = "pci:v000014E4d00004488sv0000106Bsd00000001bc02sc80i00"
 
 
+def run_stock(arguments, cwd=None, capture=False):
+  """BASE.run with umask 022 for the child: files mkinitcpio creates itself must get production's modes.
+
+  main() sets umask 077 for the builder's own work and publish directories; that must not leak into
+  the stock tools, or manifest() sees 0600 where production has 0644. The mode comparison stays strict.
+  """
+  command = [str(argument) for argument in arguments]
+  print("+ " + " ".join(command), flush=True)
+  return subprocess.run(command, cwd=cwd, check=True, text=True, capture_output=capture, preexec_fn=lambda: os.umask(0o022))
+
+
 def private_config():
   """Private mkinitcpio config text: stock sources plus the D1 module and the D2 hook."""
   return (
@@ -163,18 +174,18 @@ def prepare_module_root(work, candidate, release, expected):
   target = module_root / "usr/lib/modules" / release
   target.parent.mkdir(parents=True)
   (module_root / "lib").symlink_to("usr/lib")
-  BASE.run(("cp", "--archive", "--reflink=auto", installed, target))
+  run_stock(("cp", "--archive", "--reflink=auto", installed, target))
   for template in HOOK_SUPPORT:
     source = Path("/") / template.format(release=release)
     if source.exists():
       destination = module_root / source.relative_to("/")
       destination.parent.mkdir(parents=True, exist_ok=True)
-      BASE.run(("cp", "--archive", "--reflink=auto", source, destination))
+      run_stock(("cp", "--archive", "--reflink=auto", source, destination))
   firmware = sorted(Path("/").glob(FIRMWARE_GLOB))
   for source in firmware:
     destination = module_root / source.relative_to("/")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    BASE.run(("cp", "--archive", "--reflink=auto", source, destination))
+    run_stock(("cp", "--archive", "--reflink=auto", source, destination))
 
   for name in C.T2BCE_MODULES:
     current = BASE.selected_module_path(module_root, release, name)
@@ -187,7 +198,7 @@ def prepare_module_root(work, candidate, release, expected):
     destination = current.parent / (name + ".ko")
     shutil.copyfile(candidate / expected[name]["source"], destination)
     destination.chmod(0o644)
-  BASE.run(("depmod", "-b", module_root, release))
+  run_stock(("depmod", "-b", module_root, release))
   selected = {}
   for name in C.T2BCE_MODULES:
     path = BASE.selected_module_path(module_root, release, name)
@@ -267,8 +278,8 @@ def manifest_diff(production, candidate, release, *, dependencies=(), production
 
 def extract_initrd(initrd, destination):
   destination.mkdir()
-  BASE.run(("lsinitcpio", "--early", "--extract", initrd), cwd=destination)
-  BASE.run(("lsinitcpio", "--cpio", "--extract", initrd), cwd=destination)
+  run_stock(("lsinitcpio", "--early", "--extract", initrd), cwd=destination)
+  run_stock(("lsinitcpio", "--cpio", "--extract", initrd), cwd=destination)
 
 
 WIFI_FAMILY = ("brcmfmac*.ko*", "cfg80211*.ko*", "brcmutil*.ko*")
@@ -342,7 +353,7 @@ def verify_module_counts(production_tree, extracted, release, removed, added):
 
 
 def audio_dependencies(extracted, release):
-  output = BASE.run(("modprobe", "--config", extracted / "etc/modprobe.d", "--dirname", extracted,
+  output = run_stock(("modprobe", "--config", extracted / "etc/modprobe.d", "--dirname", extracted,
                      "--set-version", release, "--show-depends", "t2bce_audio"), capture=True).stdout
   paths = [line.split()[1] for line in output.splitlines() if line.startswith("insmod ")]
   return normalize_dependencies(paths, extracted)
@@ -375,7 +386,7 @@ def build_initrd(work, module_root, release, expected, production_initrd):
   stock.chmod(0o600)
   config_audit = audit_config(config, stock)
   initrd = work / "upstream-model.initrd"
-  BASE.run((
+  run_stock((
     "env",
     "MKINITCPIO_INSTALL=" + str(INSTALL_HOOKS) + ":/etc/initcpio/install:/usr/lib/initcpio/install",
     "OMARCHY_T2_UPSTREAM_MODEL_BLACKLIST=" + str(blacklist),

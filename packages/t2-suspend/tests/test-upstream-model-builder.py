@@ -270,6 +270,24 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-realshape-") as temporary:
   rejects(lambda: build.verify_module_counts(tiny, tiny, release, [], []), "count differs")
 
 
+# Inherited umask: main() runs with umask 077, but stock tools must create files with production's 0644.
+with tempfile.TemporaryDirectory(prefix="t2-upstream-umask-") as temporary:
+  work = Path(temporary)
+  old_umask = os.umask(0o077)
+  try:
+    build.BASE.run(("sh", "-c", "touch inherited"), cwd=work)
+    build.run_stock(("sh", "-c", "touch stock; mkdir stockdir"), cwd=work)
+    assert os.umask(0o077) == 0o077, "run_stock must not change the parent's umask"
+  finally:
+    os.umask(old_umask)
+  assert (work / "inherited").stat().st_mode & 0o777 == 0o600
+  assert (work / "stock").stat().st_mode & 0o777 == 0o644 and (work / "stockdir").stat().st_mode & 0o777 == 0o755
+  # The mode comparison stays strict: a 0600 file is still a difference from production's 0644.
+  rejects(lambda: build.manifest_diff({"VERSION": "file:aa:644", **production_with_buildconfig}, {"VERSION": "file:aa:600", **candidate_with_buildconfig}, release,
+                                      dependencies=["/" + audio, "/" + snd], production_config=prod_config, candidate_config=cand_config), "changed: VERSION")
+  source = (package / "upstream-model/build-upstream-model-uki.py").read_text()
+  assert "BASE.run(" not in source.replace("BASE.run with", "")
+
 # Build configuration values parse the runtime `config` file only.
 assert build.config_values(cand_config)["MODULES"] == ["t2bce_vhci", "hid_apple", "t2bce_audio"]
 
