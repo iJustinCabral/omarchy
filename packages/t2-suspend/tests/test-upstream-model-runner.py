@@ -824,3 +824,40 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-pci-") as temporary:
   assert run.health(case.host, case.receipt)[1] == []
 
 print("PASS: upstream-model health accepts the unbound Secure Enclave and requires every other function's driver")
+
+
+# The real terminal path: a pty slave, not a stub. A single "r+" open of a tty raised UnsupportedOperation.
+import pty
+import threading
+
+with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-tty-") as temporary:
+  base = Path(temporary)
+  phrase = C.confirmation_phrase("boot", "a" * 64, BOOT_B)
+  master, slave = pty.openpty()
+  try:
+    host = run.Host(base, tty_path=os.ttyname(slave), euid=lambda: 0)
+    # Old behaviour, for the record: text-mode r+ cannot open a tty.
+    try:
+      open(os.ttyname(slave), "r+")
+    except OSError as error:
+      assert "seekable" in str(error)
+    else:
+      raise AssertionError("r+ unexpectedly worked")
+    os.write(master, (phrase + "\n").encode())
+    assert host.ask("prompt> ") == phrase
+    assert b"prompt> " in os.read(master, 4096)
+    # A wrong or empty answer is returned as typed (the caller compares).
+    os.write(master, b"\n")
+    assert host.ask("again> ") == ""
+    # The same path works for the real confirm() flow end to end.
+    os.write(master, (phrase + "\n").encode())
+    assert run.confirm(host, phrase) == C.sha256(phrase.encode())
+  finally:
+    os.close(master)
+    os.close(slave)
+  # A genuinely missing terminal keeps the original refusal.
+  absent = run.Host(base, tty_path=str(base / "no-such-dir" / "tty"), euid=lambda: 0)
+  rejects(lambda: absent.ask("x> "), "controlling terminal (/dev/tty) is required")
+  assert run.Host(base).tty_path == "/dev/tty"
+
+print("PASS: upstream-model typed confirmation works on a real pty and refuses without a terminal")

@@ -94,8 +94,9 @@ class Host:
   """Everything the runner touches outside its own state: commands, the terminal, clocks and the root."""
 
   def __init__(self, root=Path("/"), run=None, ask=None, now=time.time, sleep=time.sleep, euid=os.geteuid,
-               sync=os.sync, stager_runner=subprocess.run, owner=None, lock=None, environ=None):
+               sync=os.sync, stager_runner=subprocess.run, owner=None, lock=None, environ=None, tty_path="/dev/tty"):
     self.root = Path(root)
+    self.tty_path = str(tty_path)
     self.now, self.sleep, self.euid, self.sync = now, sleep, euid, sync
     self.stager_runner = stager_runner
     self.environ = os.environ if environ is None else environ
@@ -111,13 +112,14 @@ class Host:
     except (OSError, subprocess.TimeoutExpired) as error:
       return subprocess.CompletedProcess(arguments, 127, "", str(error))
 
-  @staticmethod
-  def _tty(prompt):
+  def _tty(self, prompt):
+    # Separate write and read handles: a single text-mode "r+" open of a tty raises UnsupportedOperation
+    # (BufferedRandom needs a seekable file), which used to look like a missing terminal.
     try:
-      with open("/dev/tty", "r+") as terminal:
-        terminal.write(prompt)
-        terminal.flush()
-        return terminal.readline().rstrip("\n")
+      with open(self.tty_path, "w") as output, open(self.tty_path) as source:
+        output.write(prompt)
+        output.flush()
+        return source.readline().rstrip("\n")
     except OSError as error:
       raise ValueError("A controlling terminal (/dev/tty) is required for typed confirmation") from error
 
