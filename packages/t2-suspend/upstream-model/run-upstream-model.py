@@ -337,14 +337,21 @@ def health(host, receipt):
     facts["srcversion_" + name] = actual
     if actual != receipt["modules"][name]["srcversion"]:
       problems.append(name + " srcversion differs from the candidate pin")
-  for function in C.T2_FUNCTIONS + (C.WIFI_FUNCTION,):
-    link = host.root / "sys/bus/pci/devices" / function / "driver"
+  required = {**C.T2_DRIVERS, C.WIFI_FUNCTION: "brcmfmac", C.BLUETOOTH_FUNCTION: "hci_bcm4377"}
+  for function in C.T2_FUNCTIONS + (C.WIFI_FUNCTION, C.BLUETOOTH_FUNCTION):
+    device = host.root / "sys/bus/pci/devices" / function
+    link = device / "driver"
     driver = os.path.basename(os.readlink(link)) if link.is_symlink() else None
     facts["driver_" + function] = driver
-    if driver is None:
-      problems.append(function + " has no bound driver")
-  if facts.get("driver_" + C.WIFI_FUNCTION) not in (None, "brcmfmac"):
-    problems.append("Wi-Fi function is bound to the wrong driver")
+    if function == C.T2_ENCLAVE:
+      # Secure Enclave: present is required, unbound is expected and recorded.
+      facts["enclave_present"] = device.is_dir()
+      if not device.is_dir():
+        problems.append(function + " (T2 Secure Enclave) is not present")
+    elif driver is None:
+      problems.append(function + " has no bound driver (expected " + required[function] + ")")
+    elif driver != required[function]:
+      problems.append(function + " is bound to " + driver + ", expected " + required[function])
   nets = sorted((host.root / "sys/bus/pci/devices" / C.WIFI_FUNCTION / "net").glob("*")) if (host.root / "sys/bus/pci/devices" / C.WIFI_FUNCTION / "net").is_dir() else []
   facts["wifi_netdev"] = [net.name for net in nets]
   states = [(net / "operstate").read_text().strip() for net in nets]

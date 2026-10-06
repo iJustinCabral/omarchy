@@ -78,10 +78,13 @@ class Env:
     self.write("proc/uptime", "100.00 20.00\n")
     for name in C.T2BCE_MODULES:
       self.write("sys/module/" + name + "/srcversion", self.receipt["modules"][name]["srcversion"] + "\n")
-    for function in C.T2_FUNCTIONS + (C.WIFI_FUNCTION,):
+    # Real shape: the Secure Enclave (74:00.2) has no driver; the others are bound to their real drivers.
+    drivers = {**C.T2_DRIVERS, C.WIFI_FUNCTION: "brcmfmac", C.BLUETOOTH_FUNCTION: "hci_bcm4377"}
+    for function in C.T2_FUNCTIONS + (C.WIFI_FUNCTION, C.BLUETOOTH_FUNCTION):
       directory = self.root / "sys/bus/pci/devices" / function
       directory.mkdir(parents=True)
-      (directory / "driver").symlink_to("../../../bus/pci/drivers/" + ("brcmfmac" if function == C.WIFI_FUNCTION else "t2bce"))
+      if function in drivers:
+        (directory / "driver").symlink_to("../../../bus/pci/drivers/" + drivers[function])
     self.write("sys/bus/pci/devices/" + C.WIFI_FUNCTION + "/net/wlan0/operstate", "up\n")
     self.write("proc/bus/input/devices", 'N: Name="Apple Internal Keyboard / Trackpad"\nN: Name="Apple Inc. Apple Internal Keyboard"\nN: Name="bcm5974 Trackpad"\n')
     self.power("1", "Charging", 80)
@@ -794,3 +797,30 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-evidence-") as tempo
   assert (case.root / C.STATE / "runner.lock").exists()
 
 print("PASS: upstream-model runner ignores signals in flight, weighs all refusal evidence and serialises runners")
+
+
+with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-pci-") as temporary:
+  base = Path(temporary)
+  case = Env(base / "pci")
+  case.boot_test_entry()
+  devices = case.root / "sys/bus/pci/devices"
+  facts, problems = run.health(case.host, case.receipt)
+  assert problems == [] and facts["driver_" + C.T2_ENCLAVE] is None and facts["enclave_present"] is True
+  assert facts["driver_0000:74:00.0"] == "nvme" and facts["driver_0000:74:00.1"] == "t2bce_core" and facts["driver_0000:74:00.3"] == "t2bce_audio"
+  # The enclave being unbound is expected; absent is a failure.
+  __import__("shutil").rmtree(devices / C.T2_ENCLAVE)
+  assert any("Secure Enclave" in item and "not present" in item for item in run.health(case.host, case.receipt)[1])
+  (devices / C.T2_ENCLAVE).mkdir()
+  # Every other function must be bound to its own driver.
+  for function, driver in {**C.T2_DRIVERS, C.WIFI_FUNCTION: "brcmfmac", C.BLUETOOTH_FUNCTION: "hci_bcm4377"}.items():
+    link = devices / function / "driver"
+    target = os.readlink(link)
+    link.unlink()
+    assert any(function + " has no bound driver" in item for item in run.health(case.host, case.receipt)[1]), function
+    link.symlink_to("../../../bus/pci/drivers/wrong")
+    assert any(function + " is bound to wrong" in item for item in run.health(case.host, case.receipt)[1]), function
+    link.unlink()
+    link.symlink_to(target)
+  assert run.health(case.host, case.receipt)[1] == []
+
+print("PASS: upstream-model health accepts the unbound Secure Enclave and requires every other function's driver")

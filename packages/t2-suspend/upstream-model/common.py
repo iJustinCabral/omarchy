@@ -61,6 +61,11 @@ HOOK = "omarchy-t2-upstream-model-blacklist"
 BLACKLIST_DESTINATION = "etc/modprobe.d/zz-omarchy-t2-upstream-model.conf"
 WIFI_FUNCTION = "0000:73:00.0"
 T2_FUNCTIONS = ("0000:74:00.0", "0000:74:00.1", "0000:74:00.2", "0000:74:00.3")
+# Required drivers per T2 function. 74:00.2 (106b:1802) is the Secure Enclave: no Linux driver binds it, so
+# only its presence is required and its (unbound) state is recorded.
+T2_DRIVERS = {"0000:74:00.0": "nvme", "0000:74:00.1": "t2bce_core", "0000:74:00.3": "t2bce_audio"}
+T2_ENCLAVE = "0000:74:00.2"
+BLUETOOTH_FUNCTION = "0000:73:00.1"
 
 SHA256 = re.compile(r"[0-9a-f]{64}")
 UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
