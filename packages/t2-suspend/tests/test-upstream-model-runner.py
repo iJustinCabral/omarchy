@@ -319,7 +319,30 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-") as temporary:
   env.suspend_lines = "[  100.0] host kernel: PM: suspend entry (deep)\n"
   rejects(lambda: run.s3(env.host), "lacks the S3 entry/exit")
   assert json.loads((env.root / C.ATTEMPTS / env.receipt["image_sha256"] / ("s3-" + BOOT_B) / "s3.json").read_text())["state"] == "failed"
-  rejects(lambda: run.s3(env.host), "already run")
+  # S3 is not a one-use vector: after a failure it can be repeated; the failed record is archived, never deleted.
+  s3_directory = env.root / C.ATTEMPTS / env.receipt["image_sha256"] / ("s3-" + BOOT_B)
+  failed_text = (s3_directory / "s3.json").read_text()
+  verdict = run.s3_reassess(env.host)
+  assert verdict["verdict"] == "would-fail" and verdict["state_changed"] is False and verdict["recorded_state"] == "failed"
+  assert (s3_directory / "s3.json").read_text() == failed_text
+  env.suspend_lines = "[  100.0] host kernel: PM: suspend entry (deep)\n[  110.0] host kernel: ACPI: PM: Waking up from system sleep state S3\n"
+  env.journal = KERNEL + SWITCH_ROOT + LATE_WIFI
+  assert run.s3(env.host)["qualification"] == "upstream-model-s3-passed"
+  assert (s3_directory / "s3-1.json").read_text() == failed_text and (s3_directory / "prior-s3-1" / "after.json").exists()
+  assert json.loads((s3_directory / "s3.json").read_text())["state"] == "passed"
+  rejects(lambda: run.s3(env.host), "already passed")
+  assert run.s3_reassess(env.host)["verdict"] == "would-pass"
+  require_calls = run.require_s3(env.host, env.receipt, BOOT_B)
+  # A second failure archives as s3-2.json.
+  env2 = Env(base / "g2-twice")
+  env2.boot_test_entry()
+  run.verify_boot(env2.host)
+  env2.suspend_lines = "[  100.0] host kernel: PM: suspend entry (deep)\n"
+  rejects(lambda: run.s3(env2.host), "lacks the S3 entry/exit")
+  rejects(lambda: run.s3(env2.host), "lacks the S3 entry/exit")
+  names = sorted(item.name for item in (env2.root / C.ATTEMPTS / env2.receipt["image_sha256"] / ("s3-" + BOOT_B)).glob("s3*.json"))
+  assert names == ["s3-1.json", "s3.json"]
+  rejects(lambda: run.s4_cycle(env2.host, 1), "S3 has not passed")
   env = Env(base / "g2-ok")
   env.boot_test_entry()
   run.verify_boot(env.host)
@@ -861,3 +884,66 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-tty-") as temporary:
   assert run.Host(base).tty_path == "/dev/tty"
 
 print("PASS: upstream-model typed confirmation works on a real pty and refuses without a terminal")
+
+
+# The classifier flags real error reports and never device or bus names (real lines from the live S3).
+REAL_OK = [
+  "[19158.200892] kenobi kernel: apple 0003:05AC:0280.0009: hiddev97,hidraw2: USB HID v1.01 Device [Apple Inc. Apple Internal Keyboard / Trackpad] on usb-t2bce_vhci-5/input0",
+  "[19158.195013] kenobi kernel: input: Apple Inc. Apple Internal Keyboard / Trackpad as /devices/pci0000:00/0000:00:1c.4/0000:74:00.1/t2bce_core/t2bce_core/t2bce_vhci/usb5/5-5/5-5:1.0/0003:05AC:0280.0009/input/input79",
+  "[19158.100000] kenobi kernel: t2bce_core: resume: exit status=0 path=stateful elapsed=312ms",
+  "[19158.150000] kenobi kernel: usb 5-1: reset high-speed USB device number 2 using t2bce_core",
+  "[19157.900000] kenobi kernel: PM: suspend entry (deep)",
+  "[19158.300000] kenobi kernel: PM: suspend exit",
+  "[19158.310000] kenobi kernel: ACPI: PM: Waking up from system sleep state S3",
+  "[19158.400000] kenobi bluetoothd[900]: Bluetooth: hci0: Injecting HCI hardware error event",
+  "[19158.410000] kenobi kernel: Bluetooth: hci0: Injecting HCI hardware error event",
+  "[19158.420000] kenobi kernel: t2bce_core: suspend: exit status=0",
+]
+REAL_BAD = [
+  "[1.0] kenobi kernel: t2bce_core: suspend: exit status=-5",
+  "[1.0] kenobi kernel: t2bce_vhci: command timed out",
+  "[1.0] kenobi kernel: xhci_hcd 0000:00:14.0: xHCI host controller not responding, HC died",
+  "[1.0] kenobi kernel: Call Trace:",
+  "[1.0] kenobi kernel: t2bce_core: resume failed",
+  "[1.0] kenobi kernel: t2bce_dma: error -5 while mapping",
+  "[1.0] kenobi kernel: t2bce_core: resume: ret=-110",
+  "[1.0] kenobi kernel: t2bce_vhci: urb dequeue returned -EIO",
+  "[1.0] kenobi kernel: PM: Device 0000:74:00.1 failed to suspend: error -5",
+  "[1.0] kenobi kernel: PM: dpm_run_callback(): pci_pm_suspend+0x0/0x1a0 returns -5",
+  "[1.0] kenobi kernel: BUG: unable to handle page fault",
+  "[1.0] kenobi kernel: Oops: 0000 [#1] SMP",
+]
+for line in REAL_OK:
+  assert not run.is_bad_pm(line), line
+for line in REAL_BAD:
+  assert run.is_bad_pm(line), line
+
+# End to end: the live false positive no longer fails S3, and the S4 post-return classifier shares the rule.
+with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-classifier-") as temporary:
+  base = Path(temporary)
+  case = Env(base / "false-positive")
+  case.boot_test_entry()
+  run.verify_boot(case.host)
+  case.suspend_lines += "".join(line.split("kenobi ", 1)[1].join(["[200.0] host ", ""]) + "\n" for line in REAL_OK[:4])
+  assert run.s3(case.host)["qualification"] == "upstream-model-s3-passed"
+  bad = Env(base / "true-positive")
+  bad.boot_test_entry()
+  run.verify_boot(bad.host)
+  bad.suspend_lines += "[ 200.0] host kernel: t2bce_core: suspend: exit status=-5\n"
+  rejects(lambda: run.s3(bad.host), "status=-5")
+  # Reassess uses the current classifier on the saved journal and changes nothing.
+  before = (bad.root / C.ATTEMPTS / bad.receipt["image_sha256"] / ("s3-" + BOOT_B) / "s3.json").read_text()
+  assert run.s3_reassess(bad.host)["verdict"] == "would-fail"
+  assert (bad.root / C.ATTEMPTS / bad.receipt["image_sha256"] / ("s3-" + BOOT_B) / "s3.json").read_text() == before
+  # An old failed record that only tripped on the bus-number false positive reassesses as would-pass.
+  old = Env(base / "old-false-positive")
+  old.boot_test_entry()
+  run.verify_boot(old.host)
+  old_dir = old.root / C.ATTEMPTS / old.receipt["image_sha256"] / ("s3-" + BOOT_B)
+  old_dir.mkdir(parents=True)
+  (old_dir / "s3.json").write_text(json.dumps({"state": "failed", "problems": ["old"]}))
+  (old_dir / "after.json").write_text(json.dumps({"problems": [], "journal": ["[1.0] kernel: PM: suspend entry (deep)", REAL_OK[0], "[2.0] kernel: PM: suspend exit"]}))
+  verdict = run.s3_reassess(old.host)
+  assert verdict["verdict"] == "would-pass" and verdict["recorded_state"] == "failed" and verdict["state_changed"] is False
+
+print("PASS: upstream-model classifier flags real PM errors only, S3 may be repeated, and reassess is read-only")

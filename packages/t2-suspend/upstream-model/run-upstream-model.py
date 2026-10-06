@@ -9,6 +9,7 @@ Phases, all run as root from the stager's receipt:
   s4           G3/G4 one S4 cycle (1, 2 or 3): attendance phrase, O_EXCL guard before the power
                write, one-shot armed, /run drop-in routing `systemctl hibernate` to stock
                systemd-sleep, evidence, post-return cleanup and confirmation.
+  s3-reassess  Read-only: re-evaluate the saved S3 journal with the current classifier.
   recover      On the test boot after a dead runner: remove the drop-in, disarm, settle attempts, continue.
   pre-reactivate-check  Refuse while any drop-in, /run helper, one-shot, receipt or unsettled attempt remains.
   cleanup      Remove the /run drop-in and helpers and disarm an owned one-shot.
@@ -57,7 +58,26 @@ JOURNAL_FILTER = re.compile(
   r"PM:|Waking up from|t2bce|\bbce\b|vhci|HC died|timeout|brcmfmac|hci_bcm4377|thunderbolt|i915|nvme|btrfs|Call Trace",
   re.I,
 )
-BAD_PM = re.compile(r"HC died|Call Trace|t2bce\S*.*(?:error|failed|timed out|-5\b)|BUG:|Oops", re.I)
+# Real error reports only. Device and bus names (usb-t2bce_vhci-5, ...using t2bce_core) are never matched: driver
+# messages are recognised by their "t2bce*:" prefix, errnos by a "status=/error/ret/rc" label or a -E* name.
+# The Bluetooth "Injecting HCI hardware error event" after S3 is the radio package's transport rebuild
+# (patches/bluetooth/0003) and carries neither prefix, so it is deliberately not flagged.
+BAD_PM_PATTERNS = tuple(re.compile(pattern, re.I) for pattern in (
+  r"HC died",
+  r"Call Trace",
+  r"\bBUG:",
+  r"\bOops\b",
+  r"\bt2bce\w*:.*\b(?:error|failed|timed out)\b",
+  r"\bt2bce\w*:.*\b(?:error|err|status|ret|rc)\s*[=:]\s*-\d+",
+  r"\bt2bce\w*:.*-E(?:IO|TIMEDOUT|BUSY|NODEV|INVAL|NOMEM)\b",
+  r"\bPM: .*\bfailed\b",
+  r"\bPM: .*\breturns -\d+",
+))
+
+
+def is_bad_pm(line):
+  return any(pattern.search(line) for pattern in BAD_PM_PATTERNS)
+
 EVIDENCE_COMMANDS = {
   "lspci-k": ("lspci", "-k"),
   "lsmod": ("lsmod",),
@@ -495,6 +515,39 @@ def require_g1(host, receipt):
   return boot_id
 
 
+def archive_prior_s3(directory):
+  """s3.json becomes s3-<n>.json and the capture files of that run move to prior-s3-<n>/."""
+  n = 1
+  while (directory / ("s3-" + str(n) + ".json")).exists() or (directory / ("prior-s3-" + str(n))).exists():
+    n += 1
+  archive = directory / ("prior-s3-" + str(n))
+  archive.mkdir(mode=0o700)
+  (directory / "s3.json").rename(directory / ("s3-" + str(n) + ".json"))
+  for item in sorted(directory.iterdir()):
+    if item.is_file() and not re.fullmatch(r"s3-[0-9]+\.json", item.name):
+      item.rename(archive / item.name)
+
+
+def s3_reassess(host):
+  """Read-only: re-evaluate the saved S3 journal with the current classifier; changes no state."""
+  receipt = load(host)
+  boot_id = STAGE.current_boot_id(host.root)
+  directory = STAGE.rooted(host.root, C.ATTEMPTS / receipt["image_sha256"] / ("s3-" + boot_id))
+  path = directory / "after.json"
+  if not path.is_file():
+    raise ValueError("No saved S3 journal for this boot")
+  saved = json.loads(path.read_text())
+  lines = saved.get("journal", [])
+  joined = "\n".join(lines)
+  problems = list(saved.get("problems", []))
+  if not re.search(r"suspend entry \(deep\)", joined) or not re.search(r"Waking up from system sleep state S3|PM: suspend exit", joined):
+    problems.append("Journal lacks the S3 entry/exit lines")
+  problems += [line for line in lines if is_bad_pm(line)][:5]
+  recorded = json.loads((directory / "s3.json").read_text()).get("state") if (directory / "s3.json").is_file() else None
+  return {"verdict": "would-pass" if not problems else "would-fail", "problems": problems, "recorded_state": recorded,
+          "journal_lines": len(lines), "state_changed": False}
+
+
 @locked
 def s3(host):
   """G2: plain S3 suspend on the image."""
@@ -502,8 +555,13 @@ def s3(host):
   boot_id = require_g1(host, receipt)
   facts = preconditions(host, receipt, efi_clear=True)
   directory = phase_dir(host, receipt, "s3-" + boot_id)
-  if (directory / "s3.json").exists():
-    raise ValueError("S3 was already run on this boot; its result is preserved")
+  record_path = directory / "s3.json"
+  if record_path.exists():
+    # S3 is not a one-use vector: a failed or interrupted run is archived (never deleted) and may be repeated;
+    # a passed run stands.
+    if json.loads(record_path.read_text()).get("state") == "passed":
+      raise ValueError("S3 already passed on this boot; its result is preserved")
+    archive_prior_s3(directory)
   before = capture(host, receipt, directory, "before", facts["swap_target"])
   if before["problems"]:
     raise ValueError("Health before S3 failed: " + "; ".join(before["problems"]))
@@ -519,7 +577,7 @@ def s3(host):
   joined = "\n".join(lines)
   if not re.search(r"suspend entry \(deep\)", joined) or not re.search(r"Waking up from system sleep state S3|PM: suspend exit", joined):
     problems.append("Journal lacks the S3 entry/exit lines")
-  problems += [line for line in lines if BAD_PM.search(line)][:5]
+  problems += [line for line in lines if is_bad_pm(line)][:5]
   if STAGE.current_boot_id(host.root) != boot_id:
     problems.append("Boot ID changed across S3")
   if problems:
@@ -897,7 +955,7 @@ def post_return(host, receipt, cycle, attempt, directory, mark, boot_id):
     problems.append("Swap target or header after the resume: " + str(error))
   record = capture(host, receipt, directory, "post", target, after=mark, extra={"swap_header_after": header}, settle=SETTLE_SECONDS)
   problems += record["problems"]
-  problems += [line for line in record["journal"] if BAD_PM.search(line)][:5]
+  problems += [line for line in record["journal"] if is_bad_pm(line)][:5]
   joined = "\n".join(record["journal"])
   if "hibernation entry" not in joined:
     problems.append("Journal lacks the hibernation entry line")
@@ -1003,7 +1061,7 @@ def pre_reactivate_check(host):
 
 def main():
   parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-  parser.add_argument("phase", choices=("preflight", "verify-boot", "s3", "s4", "cleanup", "recover", "pre-reactivate-check", "recovery"))
+  parser.add_argument("phase", choices=("preflight", "verify-boot", "s3", "s3-reassess", "s4", "cleanup", "recover", "pre-reactivate-check", "recovery"))
   parser.add_argument("--cycle", type=int)
   args = parser.parse_args()
   if args.phase == "recovery":
@@ -1021,6 +1079,8 @@ def main():
         result = verify_boot(host)
       elif args.phase == "s3":
         result = s3(host)
+      elif args.phase == "s3-reassess":
+        result = s3_reassess(host)
       elif args.phase == "s4":
         if args.cycle is None:
           parser.error("s4 requires --cycle")
