@@ -48,6 +48,8 @@ class Env:
     self.hibernate_rc = 0
     self.consume_transition = True
     self.hibernate_active = None
+    self.hibernate_invoked = False
+    self.pre_guard_state = None
     self.cat_override = None
     self.hibernate_hook = None
     self.suspend_hook = None
@@ -60,7 +62,8 @@ class Env:
     self.bootctl_log = []
     self._sysfs()
     self.host = run.Host(self.root, run=self.command, ask=self.ask, now=lambda: self.clock, sleep=self.sleep, euid=lambda: 0,
-                         sync=lambda: self.calls.append("sync"), stager_runner=bootctl_for(self.root, self.bootctl_log), lock=self.lock)
+                         sync=lambda: self.calls.append("sync"), stager_runner=bootctl_for(self.root, self.bootctl_log), lock=self.lock,
+                         monotonic_clock=lambda: self.clock)
 
   # -- fake sysfs ---------------------------------------------------------------
   def write(self, relative, text):
@@ -142,11 +145,18 @@ class Env:
     )
 
   def unit_state(self):
-    state = self.hibernate_active() if callable(self.hibernate_active) else self.hibernate_active
+    # The pre-guard idle check must not consume the post-hibernate script. A missing ActiveState
+    # is what the runner treats as the test double.
+    if not self.hibernate_invoked:
+      state = self.pre_guard_state
+    else:
+      state = self.hibernate_active() if callable(self.hibernate_active) else self.hibernate_active
     if not state:
       return ""
     job = "123" if state in ("activating", "active", "deactivating") else ""
     sub = "start" if state == "activating" else "dead"
+    if state == "failed":
+      sub = "failed"
     return "ActiveState=" + state + "\nSubState=" + sub + "\nJob=" + job + "\n"
 
   def show(self):
@@ -194,6 +204,7 @@ class Env:
       self.journal += self.suspend_lines
       return done()
     if arguments == ("systemctl", "hibernate"):
+      self.hibernate_invoked = True
       if self.hibernate_hook:
         self.hibernate_hook()
       if self.hibernate_rc:
@@ -1093,32 +1104,36 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-lock-") as temporary
 print("PASS: upstream-model session lock passes OMARCHY_PATH and PATH explicitly and a lock refusal is retryable")
 
 
-# Settle, cat, and the early-return race. A zero return with the one-shot still armed is not a hardware vector.
-assert run.hibernate_settled("ExecStart={ path=/usr/lib/systemd/systemd-sleep ; argv[]=/usr/lib/systemd/systemd-sleep hibernate ; }\n") is True
-assert run.hibernate_settled("ActiveState=activating\nSubState=start\nJob=12\n") is False
-assert run.hibernate_settled("ActiveState=active\nSubState=running\nJob=\n") is False
-assert run.hibernate_settled("ActiveState=failed\nSubState=failed\nJob=\n") is True
-assert run.hibernate_settled("ActiveState=inactive\nSubState=dead\nJob=0\n") is True
+# Settle, cat, and the inhibit-delay race. Pre-start idle is not "settled".
+assert run.hibernate_transaction("ExecStart={ path=/usr/lib/systemd/systemd-sleep ; argv[]=/usr/lib/systemd/systemd-sleep hibernate ; }\n") == "missing"
+assert run.hibernate_transaction("ActiveState=activating\nSubState=start\nJob=12\n") == "busy"
+assert run.hibernate_transaction("ActiveState=active\nSubState=running\nJob=\n") == "busy"
+assert run.hibernate_transaction("ActiveState=failed\nSubState=failed\nJob=\n") == "failed"
+assert run.hibernate_transaction("ActiveState=inactive\nSubState=dead\nJob=0\n") == "idle"
+assert run.hibernate_transaction("ActiveState=inactive\nSubState=dead\nJob=\n") == "idle"
 assert run.last_execstart("ExecStart=\nExecStart=/usr/bin/python3 -B /x/sleep_entry.py\nExecStart=\nExecStart=/usr/lib/systemd/systemd-sleep hibernate\n") == "/usr/lib/systemd/systemd-sleep hibernate"
 assert run.last_execstart("ExecStart=/usr/bin/python3 -B /x/sleep_entry.py\n").endswith("sleep_entry.py")
 
 with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-race-") as temporary:
   base = Path(temporary)
 
-  # rc 0, unit settles to failed, one-shot never consumed, no PM lines: retryable userspace refusal.
+  # rc 0: inactive (inhibit delay), then activating, then failed. Drop-in stays through the idle polls.
   case = Env(base / "early-return")
   case.to_s3_passed()
   case.consume_transition = False
-  polls = {"n": 0}
+  polls = {"n": 0, "idle": 0}
 
   def active(polls=polls, case=case):
     polls["n"] += 1
-    assert case.dropin_present(), "drop-in removed while systemd-hibernate.service was still activating"
-    return "activating" if polls["n"] < 3 else "failed"
+    assert case.dropin_present(), "drop-in removed before systemd-hibernate.service left the transaction"
+    if polls["n"] <= 2:
+      polls["idle"] += 1
+      return "inactive"
+    return "activating" if polls["n"] < 5 else "failed"
 
   case.hibernate_active = active
   rejects(lambda: run.s4_cycle(case.host, 1), "returned 0 with LoaderEntryOneShot still armed")
-  assert polls["n"] >= 3
+  assert polls["idle"] >= 2 and polls["n"] >= 5
   record = case.attempt(1)
   assert record["state"] == "refused-before-transition" and record["hibernate_returncode"] == 0 and record["real_s4_attempted"] is False
   assert not case.terminal() and not case.guard(1).exists() and not case.dropin_present() and not (case.root / stage.ONESHOT).exists()
@@ -1127,6 +1142,7 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-race-") as temporary
   # The same cycle can proceed once the unit settles and the transition is consumed.
   case.consume_transition = True
   case.hibernate_active = None
+  case.hibernate_invoked = False
   assert run.s4_cycle(case.host, 1)["state"] == "returned-and-cleaned"
   assert case.guard(1).exists() and not case.terminal()
 
@@ -1146,6 +1162,60 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-race-") as temporary
   rejects(lambda: run.s4_cycle(case.host, 1), "did not settle")
   assert case.terminal() and case.dropin_present() and (case.root / stage.ONESHOT).exists() and case.guard(1).exists()
   assert case.attempt(1)["unwound"] is False and case.attempt(1)["state"] == "failed-terminal"
+
+  # rc 0 and the unit never leaves inactive: the inhibit deadline fires, and nothing is unwound.
+  case = Env(base / "never-started")
+  case.to_s3_passed()
+  case.consume_transition = False
+  case.hibernate_active = "inactive"
+  rejects(lambda: run.s4_cycle(case.host, 1), "did not settle")
+  assert case.terminal() and case.dropin_present() and (case.root / stage.ONESHOT).exists() and case.guard(1).exists()
+  assert case.attempt(1)["unwound"] is False and case.attempt(1)["state"] == "failed-terminal"
+  assert "45s" in case.attempt(1)["error"]
+
+  # The activating window was missed, but the one-shot is gone and the entry line is present.
+  case = Env(base / "missed-poll")
+  case.to_s3_passed()
+  case.consume_transition = False
+  polls = {"n": 0}
+
+  def missed(polls=polls, case=case):
+    polls["n"] += 1
+    assert case.dropin_present(), "drop-in removed while the unit was still idle"
+    if polls["n"] < 3:
+      return "inactive"
+    (case.root / stage.ONESHOT).unlink()
+    case.header(b"SWAPSPACE2", 5)
+    case.journal += case.hibernate_lines
+    return "inactive"
+
+  case.hibernate_active = missed
+  assert run.s4_cycle(case.host, 1)["state"] == "returned-and-cleaned"
+  assert polls["n"] >= 3 and case.guard(1).exists() and not case.terminal() and not case.dropin_present()
+
+  # A nonzero return with the unit still idle is logind refusing, not the inhibit-delay race.
+  case = Env(base / "rc-idle")
+  case.to_s3_passed()
+  case.hibernate_rc = 1
+  polls = {"n": 0}
+
+  def stay_idle(polls=polls):
+    polls["n"] += 1
+    return "inactive"
+
+  case.hibernate_active = stay_idle
+  rejects(lambda: run.s4_cycle(case.host, 1), "returned 1")
+  assert polls["n"] == 1
+  assert case.attempt(1)["state"] == "refused-before-transition" and not case.terminal()
+  assert not case.dropin_present() and not (case.root / stage.ONESHOT).exists()
+
+  # A stale failed unit is refused before the guard, so it cannot be read as this attempt.
+  case = Env(base / "stale-failed")
+  case.to_s3_passed()
+  case.pre_guard_state = "failed"
+  rejects(lambda: run.s4_cycle(case.host, 1), "not idle before the guard")
+  assert case.attempt(1)["state"] == "refused-before-guard" and not case.guard(1).exists() and not case.terminal()
+  assert not case.dropin_present() and not (case.root / stage.ONESHOT).exists() and not case.called("systemctl", "hibernate")
 
   # cat's last ExecStart is the product hook: refuse before the guard and remove the drop-in.
   case = Env(base / "cat-product")

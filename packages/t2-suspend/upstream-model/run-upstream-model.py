@@ -18,11 +18,13 @@ Phases, all run as root from the stager's receipt:
   recovery     Print the recovery checklist.
 Any failure after a guard is consumed makes the image hash terminal, except a userspace refusal
 with the one-shot still armed and no PM-entry evidence: that guard is renamed and the cycle can
-be repeated. `systemctl hibernate` can return before systemd-hibernate.service reaches ExecStart;
-the /run drop-in stays until that unit has settled, because a daemon-reload in that window puts
-the product sleep_entry hook back. Typed phrases come from /dev/tty unless --autonomous (or
-OMARCHY_T2_AUTONOMOUS=1) records the owner's waiver instead of a phrase hash. The runner never
-writes boot entries itself; it arms only through the stager.
+be repeated. `systemctl hibernate` can return before systemd-hibernate.service reaches ExecStart.
+While a delay inhibitor is held, logind accepts the request and leaves the unit inactive with no
+job for up to InhibitDelayMaxSec. That pre-start idle state is not settled: the /run drop-in stays
+until the transaction has been seen to finish, or until positive S4 evidence shows the poll missed
+it. A daemon-reload before then puts the product sleep_entry hook back. Typed phrases come from
+/dev/tty unless --autonomous (or OMARCHY_T2_AUTONOMOUS=1) records the owner's waiver instead of a
+phrase hash. The runner never writes boot entries itself; it arms only through the stager.
 """
 
 import argparse
@@ -60,7 +62,11 @@ WAIVER_TOKEN = b"autonomous-owner-authorized"
 ATTENDED_KIND = "upstream-model-attended-s4-v1"
 AUTONOMOUS_KIND = "upstream-model-autonomous-s4-v1"
 SETTLE_SECONDS = 90
+# After the unit is busy. CLOCK_MONOTONIC, so a resume does not expire it across the powered-off gap.
 HIBERNATE_SETTLE_SECONDS = 30
+# Pre-start idle wait. Longer than InhibitDelayMaxSec (15s on this machine): logind can return
+# success and only then arm StartUnit. A longer delay still ends terminal with the drop-in left.
+HIBERNATE_INHIBIT_SECONDS = 45
 RECLASSIFY_LOOKBACK_SECONDS = 30
 MAINTENANCE_REFUSAL = "Incomplete source-default transition or package maintenance blocks hibernation"
 BATTERY_MINIMUM = 70
@@ -135,11 +141,13 @@ class Host:
 
   def __init__(self, root=Path("/"), run=None, ask=None, now=time.time, sleep=time.sleep, euid=os.geteuid,
                sync=os.sync, stager_runner=subprocess.run, owner=None, lock=None, environ=None, tty_path="/dev/tty",
-               autonomous=False):
+               autonomous=False, monotonic_clock=None):
     self.root = Path(root)
     self.tty_path = str(tty_path)
     self.autonomous = bool(autonomous)
     self.now, self.sleep, self.euid, self.sync = now, sleep, euid, sync
+    # CLOCK_MONOTONIC. Not host.now(): wall time jumps by the powered-off interval across S4.
+    self.monotonic_clock = time.monotonic if monotonic_clock is None else monotonic_clock
     self.stager_runner = stager_runner
     self.environ = os.environ if environ is None else environ
     self._run = run or self._subprocess
@@ -806,12 +814,8 @@ def assert_stock_exec(host):
     raise ValueError("systemctl cat last ExecStart is not stock systemd-sleep hibernate")
 
 
-def hibernate_settled(text):
-  """True when systemd-hibernate.service is not mid-transaction.
-
-  A show that does not report ActiveState counts as settled. The test double's ExecStart listing
-  has no such key; a live `systemctl show -p ActiveState` always includes it.
-  """
+def unit_fields(text):
+  """First assignment of each key in `systemctl show` output."""
   fields = {}
   for line in text.splitlines():
     if "=" not in line:
@@ -819,29 +823,113 @@ def hibernate_settled(text):
     key, _, value = line.partition("=")
     if key not in fields:
       fields[key] = value.strip()
-  if "ActiveState" not in fields:
-    return True
-  if fields.get("Job", "") not in ("", "0"):
-    return False
-  return fields["ActiveState"] not in ("activating", "deactivating", "active")
+  return fields
 
 
-def wait_until_hibernate_settled(host):
-  """Block until systemd-hibernate.service has left the start transaction.
+def hibernate_transaction(text):
+  """'missing', 'busy', 'failed', or 'idle'.
 
-  logind can return from `systemctl hibernate` (especially under systemd-run) before the unit
-  reaches ExecStart. A daemon-reload in that window drops the /run override and the product
-  sleep_entry hook runs instead of systemd-sleep. The drop-in stays installed for this wait.
-  On timeout the caller must leave the drop-in and the one-shot in place.
+  'idle' is inactive with no job. That is both the pre-start inhibit-delay state and a finished
+  success, so it is not proof that this attempt's transaction has started or finished. A show
+  with no ActiveState is 'missing': the test double's ExecStart listing has no such key, and a
+  live `systemctl show -p ActiveState` always includes it.
   """
-  deadline = host.now() + HIBERNATE_SETTLE_SECONDS
+  fields = unit_fields(text)
+  if "ActiveState" not in fields:
+    return "missing"
+  if fields.get("Job", "") not in ("", "0"):
+    return "busy"
+  if fields["ActiveState"] in ("activating", "deactivating", "active"):
+    return "busy"
+  if fields["ActiveState"] == "failed":
+    return "failed"
+  return "idle"
+
+
+def positive_transition_evidence(host, mark, dmesg_before):
+  """True only when a source positively shows that S4 began.
+
+  A missing LoaderEntryOneShot counts: firmware consumes it by booting the resume entry.
+  A TRANSITION_KERNEL hit in the kernel log or dmesg since the pre-write baseline counts, as
+  does a systemd-sleep sleep line. Unreadable journal or dmesg is not evidence. This is the
+  opposite of no_transition_evidence, which treats an unreadable source as a transition.
+  """
+  if not host.exists(STAGE.ONESHOT):
+    return True
+  kernel, dmesg, full = "", "", ""
+  try:
+    kernel = host.output(("journalctl", "-k", "-b", "-o", "short-monotonic", "--no-pager", "--after-cursor=" + mark))
+  except (ValueError, OSError):
+    kernel = ""
+  try:
+    dmesg = host.output(("dmesg",))
+  except (ValueError, OSError):
+    dmesg = ""
+  try:
+    _filtered, full = journal_slice(host, mark)
+  except (ValueError, OSError):
+    full = ""
+  new_dmesg = dmesg[len(dmesg_before):] if dmesg.startswith(dmesg_before) else dmesg
+  if TRANSITION_KERNEL.search(kernel) or TRANSITION_KERNEL.search(new_dmesg):
+    return True
+  return any("systemd-sleep" in line and TRANSITION_SLEEP.search(line) for line in full.splitlines())
+
+
+def settle_timeout(seconds):
+  raise RuntimeError("systemd-hibernate.service did not settle within " + str(seconds) + "s; drop-in left in place")
+
+
+def wait_until_hibernate_settled(host, mark, dmesg_before, returncode):
+  """Hold the drop-in until this attempt's hibernate transaction has finished.
+
+  logind's HibernateWithFlags returns success as soon as the request is accepted. While a delay
+  inhibitor is held, systemd arms a timer and does not call StartUnit, so the unit sits inactive
+  with no job for up to InhibitDelayMaxSec. Treating that idle state as settled removes the /run
+  drop-in, and a daemon-reload then lets the product sleep_entry hook run.
+
+  Return code 0 with the unit still idle keeps the drop-in until the job appears, the unit
+  fails, positive S4 evidence shows the poll missed the transition, or the monotonic inhibit
+  deadline passes. A nonzero status with the unit idle is not that race: logind did not accept
+  the request, and the caller classifies it. The in-transaction deadline starts only once the
+  unit is busy, on CLOCK_MONOTONIC, so the powered-off wall-clock gap cannot expire it.
+
+  On timeout this raises while the caller still has the attempt in flight. The caller must leave
+  the drop-in and the one-shot in place and must not mark the cycle retryable.
+  """
+  idle_deadline = host.monotonic_clock() + HIBERNATE_INHIBIT_SECONDS
+  busy_deadline = None
+  show = ("systemctl", "show", "systemd-hibernate.service", "-p", "ActiveState", "-p", "SubState", "-p", "Job")
   while True:
-    text = host.output(("systemctl", "show", "systemd-hibernate.service", "-p", "ActiveState", "-p", "SubState", "-p", "Job"))
-    if hibernate_settled(text):
+    kind = hibernate_transaction(host.output(show))
+    if kind == "missing":
       return
-    if host.now() >= deadline:
-      raise RuntimeError("systemd-hibernate.service did not settle within " + str(HIBERNATE_SETTLE_SECONDS) + "s; drop-in left in place")
+    if kind == "busy":
+      if busy_deadline is None:
+        busy_deadline = host.monotonic_clock() + HIBERNATE_SETTLE_SECONDS
+      elif host.monotonic_clock() >= busy_deadline:
+        settle_timeout(HIBERNATE_SETTLE_SECONDS)
+    elif busy_deadline is not None or kind == "failed":
+      # The transaction was seen and has left activating/active, or it already failed between polls.
+      return
+    elif positive_transition_evidence(host, mark, dmesg_before):
+      return
+    elif returncode != 0:
+      return
+    elif host.monotonic_clock() >= idle_deadline:
+      settle_timeout(HIBERNATE_INHIBIT_SECONDS)
     host.sleep(1)
+
+
+def assert_hibernate_idle(host):
+  """The unit is idle before the guard. A stale failed unit must not be read as this attempt.
+
+  A show with no ActiveState is the test double and counts as idle. Failure here is before the
+  guard: the caller removes the drop-in and disarms, and the image is not terminal.
+  """
+  text = host.output(("systemctl", "show", "systemd-hibernate.service", "-p", "ActiveState", "-p", "SubState", "-p", "Job"))
+  kind = hibernate_transaction(text)
+  if kind not in ("missing", "idle"):
+    raise ValueError("systemd-hibernate.service is not idle before the guard: " + kind)
 
 
 def install_dropin(host):
@@ -1037,8 +1125,10 @@ def s4_cycle(host, cycle):
     if host.exists(HIBERNATE_LOCATION):
       raise ValueError("HibernateLocation EFI variable is already set")
     # Re-check immediately before the point of no return. A reload since install_dropin must not
-    # have put sleep_entry.py back in front of the guard.
+    # have put sleep_entry.py back in front of the guard. A stale failed unit must not be read as
+    # this attempt once the guard exists.
     assert_stock_exec(host)
+    assert_hibernate_idle(host)
     mark = cursor(host)
     dmesg_before = host.output(("dmesg",))
     # From here a signal must not abort the cycle: once the guard exists the hibernate job can continue in
@@ -1055,9 +1145,11 @@ def s4_cycle(host, cycle):
     print("omarchy-t2-upstream-model: starting " + mode + " S4 cycle " + str(cycle) + " boot=" + boot_id + " image=" + receipt["image_sha256"][:12], flush=True)
     in_flight = True
     result = host.run(("systemctl", "hibernate"))
-    # Stay in flight until the unit leaves activating/active. The drop-in is still installed, so a
-    # late ExecStart still runs systemd-sleep rather than the product hook.
-    wait_until_hibernate_settled(host)
+    # Stay in flight through the inhibit delay. logind can return 0 while the unit is still
+    # inactive with no job; removing the drop-in there lets sleep_entry.py run. A real transition
+    # that this poll misses is recognised only from positive evidence (one-shot consumed or a
+    # kernel/sleep line), never from an unreadable journal.
+    wait_until_hibernate_settled(host, mark, dmesg_before, result.returncode)
     in_flight = False
     attempt["hibernate_returncode"] = result.returncode
     # A return with the one-shot still armed and no PM evidence never reached the firmware. Return
