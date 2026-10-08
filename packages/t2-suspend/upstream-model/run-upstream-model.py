@@ -9,13 +9,20 @@ Phases, all run as root from the stager's receipt:
   s4           G3/G4 one S4 cycle (1, 2 or 3): attendance phrase, O_EXCL guard before the power
                write, one-shot armed, /run drop-in routing `systemctl hibernate` to stock
                systemd-sleep, evidence, post-return cleanup and confirmation.
+  reclassify   Archive a failed-terminal marker when the attempt was a userspace refusal before
+               any PM entry, so the same image can be retried. Renames evidence; deletes nothing.
   s3-reassess  Read-only: re-evaluate the saved S3 journal with the current classifier.
   recover      On the test boot after a dead runner: remove the drop-in, disarm, settle attempts, continue.
   pre-reactivate-check  Refuse while any drop-in, /run helper, one-shot, receipt or unsettled attempt remains.
   cleanup      Remove the /run drop-in and helpers and disarm an owned one-shot.
   recovery     Print the recovery checklist.
-Any failure after a guard is consumed makes the image hash terminal. Typed phrases come from
-/dev/tty. The runner never writes boot entries itself; it arms only through the stager.
+Any failure after a guard is consumed makes the image hash terminal, except a userspace refusal
+with the one-shot still armed and no PM-entry evidence: that guard is renamed and the cycle can
+be repeated. `systemctl hibernate` can return before systemd-hibernate.service reaches ExecStart;
+the /run drop-in stays until that unit has settled, because a daemon-reload in that window puts
+the product sleep_entry hook back. Typed phrases come from /dev/tty unless --autonomous (or
+OMARCHY_T2_AUTONOMOUS=1) records the owner's waiver instead of a phrase hash. The runner never
+writes boot entries itself; it arms only through the stager.
 """
 
 import argparse
@@ -49,7 +56,13 @@ GUARD_SCRIPT = PRODUCT_RUNTIME + "/update_guard.py"
 NATIVE_SCRIPT = PRODUCT_RUNTIME + "/boot_policy_native.py"
 MODEL = "MacBookAir9,1"
 ACCEPTANCE_SECONDS = 30 * 60
+WAIVER_TOKEN = b"autonomous-owner-authorized"
+ATTENDED_KIND = "upstream-model-attended-s4-v1"
+AUTONOMOUS_KIND = "upstream-model-autonomous-s4-v1"
 SETTLE_SECONDS = 90
+HIBERNATE_SETTLE_SECONDS = 30
+RECLASSIFY_LOOKBACK_SECONDS = 30
+MAINTENANCE_REFUSAL = "Incomplete source-default transition or package maintenance blocks hibernation"
 BATTERY_MINIMUM = 70
 CYCLE_POWER = {1: "AC", 2: "AC", 3: "battery"}
 HIBERNATE_LOCATION = "sys/firmware/efi/efivars/HibernateLocation-8cf2644b-4b0b-428f-9387-6d876050dc67"
@@ -121,9 +134,11 @@ class Host:
   """Everything the runner touches outside its own state: commands, the terminal, clocks and the root."""
 
   def __init__(self, root=Path("/"), run=None, ask=None, now=time.time, sleep=time.sleep, euid=os.geteuid,
-               sync=os.sync, stager_runner=subprocess.run, owner=None, lock=None, environ=None, tty_path="/dev/tty"):
+               sync=os.sync, stager_runner=subprocess.run, owner=None, lock=None, environ=None, tty_path="/dev/tty",
+               autonomous=False):
     self.root = Path(root)
     self.tty_path = str(tty_path)
+    self.autonomous = bool(autonomous)
     self.now, self.sleep, self.euid, self.sync = now, sleep, euid, sync
     self.stager_runner = stager_runner
     self.environ = os.environ if environ is None else environ
@@ -490,6 +505,12 @@ def image_reject_check(host, receipt):
 
 
 def confirm(host, phrase):
+  """Hash of a phrase read from /dev/tty, or of the waiver token when the owner waived phrases.
+
+  Autonomous mode never reads the tty and never stores a hash of a phrase the owner did not type.
+  """
+  if host.autonomous:
+    return C.sha256(WAIVER_TOKEN)
   answer = host.ask("Type exactly (Enter alone aborts):\n  " + phrase + "\n> ")
   if answer.strip() != phrase:
     raise ValueError("Typed phrase does not match; nothing was changed")
@@ -525,11 +546,11 @@ def verify_boot(host):
   record = capture(host, receipt, directory, "boot", facts["swap_target"], extra={"initramfs": initramfs})
   if record["problems"]:
     raise ValueError("Ordinary-boot health failed: " + "; ".join(record["problems"]))
-  phrase_hash = confirm(host, C.confirmation_phrase("boot", receipt["image_sha256"], boot_id))
+  confirmed = confirmation_record(host, "boot", receipt["image_sha256"], boot_id)
   if receipt["state"] == "armed":
     STAGE.mark_booted(host.root)
   save(host, directory / "g1.json", {"state": "passed", "boot_id": boot_id, "image_sha256": receipt["image_sha256"],
-                                      "phrase_sha256": phrase_hash, "time": host.now()})
+                                      "time": host.now(), **confirmed})
   return {"qualification": "upstream-model-ordinary-boot-verified", "boot_id": boot_id, "hibernate_attempted": False}
 
 
@@ -618,7 +639,8 @@ def s3(host):
   before = capture(host, receipt, directory, "before", facts["swap_target"])
   if before["problems"]:
     raise ValueError("Health before S3 failed: " + "; ".join(before["problems"]))
-  host.ask("Press Enter to suspend (S3); wake the machine with a key press afterwards: ")
+  if not host.autonomous:
+    host.ask("Press Enter to suspend (S3); wake the machine with a key press afterwards: ")
   mark = cursor(host)
   save(host, directory / "s3.json", {"state": "started", "boot_id": boot_id, "time": host.now(), "rerun_reason": rerun_reason})
   result = host.run(("systemctl", "suspend"))
@@ -636,8 +658,8 @@ def s3(host):
   if problems:
     save(host, directory / "s3.json", {"state": "failed", "boot_id": boot_id, "problems": problems, "rerun_reason": rerun_reason})
     raise ValueError("S3 failed: " + "; ".join(problems))
-  phrase_hash = confirm(host, C.confirmation_phrase("s3", receipt["image_sha256"], boot_id))
-  save(host, directory / "s3.json", {"state": "passed", "boot_id": boot_id, "phrase_sha256": phrase_hash, "time": host.now(), "rerun_reason": rerun_reason})
+  confirmed = confirmation_record(host, "s3", receipt["image_sha256"], boot_id)
+  save(host, directory / "s3.json", {"state": "passed", "boot_id": boot_id, "time": host.now(), "rerun_reason": rerun_reason, **confirmed})
   return {"qualification": "upstream-model-s3-passed", "boot_id": boot_id}
 
 
@@ -687,13 +709,22 @@ def create_guard(host, receipt, cycle, record):
   return path
 
 
+def confirmation_record(host, kind, image_sha256, boot_id):
+  """Attended runs store the typed phrase hash. Autonomous runs store the waiver, not a forged phrase."""
+  if host.autonomous:
+    return {"physical_confirmation": "waived-by-owner", "waiver_sha256": C.sha256(WAIVER_TOKEN)}
+  return {"phrase_sha256": confirm(host, C.confirmation_phrase(kind, image_sha256, boot_id))}
+
+
 def issue_acceptance(host, receipt, cycle, boot_id, power, directory):
-  phrase = C.attendance_phrase(receipt["image_sha256"], boot_id, cycle, power)
-  phrase_hash = confirm(host, phrase)
   issued = host.now()
-  record = {"kind": "upstream-model-attended-s4-v1", "image_sha256": receipt["image_sha256"], "boot_id": boot_id,
-            "cycle": cycle, "power": power, "phrase_sha256": phrase_hash, "issued": issued,
-            "expires": issued + ACCEPTANCE_SECONDS, "accepted": True}
+  record = {"image_sha256": receipt["image_sha256"], "boot_id": boot_id, "cycle": cycle, "power": power,
+            "issued": issued, "expires": issued + ACCEPTANCE_SECONDS, "accepted": True}
+  if host.autonomous:
+    record.update(kind=AUTONOMOUS_KIND, attendance="owner-authorized-without-typed-phrase", waiver_sha256=C.sha256(WAIVER_TOKEN))
+  else:
+    record.update(kind=ATTENDED_KIND, attendance="typed",
+                  phrase_sha256=confirm(host, C.attendance_phrase(receipt["image_sha256"], boot_id, cycle, power)))
   save(host, directory / "acceptance.json", record)
   return record
 
@@ -706,9 +737,12 @@ def require_acceptance(host, receipt, cycle, boot_id, power, directory):
   if metadata.st_uid != host.owner or stat.S_IMODE(metadata.st_mode) != 0o600:
     raise ValueError("Attendance acceptance has an unsafe owner or mode")
   record = json.loads(path.read_text())
-  phrase_hash = C.sha256(C.attendance_phrase(receipt["image_sha256"], boot_id, cycle, power).encode())
-  expected = {"kind": "upstream-model-attended-s4-v1", "image_sha256": receipt["image_sha256"], "boot_id": boot_id,
-              "cycle": cycle, "power": power, "phrase_sha256": phrase_hash, "accepted": True}
+  if host.autonomous:
+    identity = {"kind": AUTONOMOUS_KIND, "waiver_sha256": C.sha256(WAIVER_TOKEN)}
+  else:
+    identity = {"kind": ATTENDED_KIND, "phrase_sha256": C.sha256(C.attendance_phrase(receipt["image_sha256"], boot_id, cycle, power).encode())}
+  expected = {"image_sha256": receipt["image_sha256"], "boot_id": boot_id, "cycle": cycle, "power": power,
+              "accepted": True, **identity}
   if any(record.get(key) != value for key, value in expected.items()):
     raise ValueError("Attendance acceptance differs from this image, boot, cycle and power source")
   if not isinstance(record.get("expires"), (int, float)) or host.now() > record["expires"]:
@@ -745,6 +779,71 @@ def show_units(host):
   return {name: parse_exec(text, name) for name in ("ExecStart", "ExecStartPre", "ExecStopPost")}
 
 
+def last_execstart(text):
+  """The last ExecStart= assignment in `systemctl cat` output. An empty assignment clears it."""
+  value = None
+  for line in text.splitlines():
+    stripped = line.strip()
+    if stripped.startswith("ExecStart="):
+      value = stripped.split("=", 1)[1].strip()
+  return value
+
+
+def assert_stock_exec(host):
+  """Effective ExecStart is stock systemd-sleep, and the last cat assignment agrees.
+
+  The product drop-in may appear earlier in `systemctl cat`. The last ExecStart= is the one
+  systemd will run. sleep_entry.py there means the product hook won.
+  """
+  units = show_units(host)
+  if units != expected_units(host):
+    raise ValueError("systemd-hibernate.service does not show the expected stock ExecStart and prepare steps")
+  shown = " ".join(" ".join(argv) for argvs in units.values() for argv in argvs)
+  if "sleep_entry.py" in shown:
+    raise ValueError("systemd-hibernate.service ExecStart still names sleep_entry.py")
+  last = last_execstart(host.output(("systemctl", "cat", "systemd-hibernate.service")))
+  if last != "/usr/lib/systemd/systemd-sleep hibernate":
+    raise ValueError("systemctl cat last ExecStart is not stock systemd-sleep hibernate")
+
+
+def hibernate_settled(text):
+  """True when systemd-hibernate.service is not mid-transaction.
+
+  A show that does not report ActiveState counts as settled. The test double's ExecStart listing
+  has no such key; a live `systemctl show -p ActiveState` always includes it.
+  """
+  fields = {}
+  for line in text.splitlines():
+    if "=" not in line:
+      continue
+    key, _, value = line.partition("=")
+    if key not in fields:
+      fields[key] = value.strip()
+  if "ActiveState" not in fields:
+    return True
+  if fields.get("Job", "") not in ("", "0"):
+    return False
+  return fields["ActiveState"] not in ("activating", "deactivating", "active")
+
+
+def wait_until_hibernate_settled(host):
+  """Block until systemd-hibernate.service has left the start transaction.
+
+  logind can return from `systemctl hibernate` (especially under systemd-run) before the unit
+  reaches ExecStart. A daemon-reload in that window drops the /run override and the product
+  sleep_entry hook runs instead of systemd-sleep. The drop-in stays installed for this wait.
+  On timeout the caller must leave the drop-in and the one-shot in place.
+  """
+  deadline = host.now() + HIBERNATE_SETTLE_SECONDS
+  while True:
+    text = host.output(("systemctl", "show", "systemd-hibernate.service", "-p", "ActiveState", "-p", "SubState", "-p", "Job"))
+    if hibernate_settled(text):
+      return
+    if host.now() >= deadline:
+      raise RuntimeError("systemd-hibernate.service did not settle within " + str(HIBERNATE_SETTLE_SECONDS) + "s; drop-in left in place")
+    host.sleep(1)
+
+
 def install_dropin(host):
   directory, dropin = runtime_paths(host)
   if directory.exists() or dropin.exists() or dropin.is_symlink():
@@ -764,8 +863,7 @@ def install_dropin(host):
     dropin.parent.mkdir(parents=True, exist_ok=True)
     STAGE.atomic_write(dropin, C.dropin_text(C.RUNTIME_DIR, pins["prepare_sha256"]).encode(), 0o644)
     host.output(("systemctl", "daemon-reload"))
-    if show_units(host) != expected_units(host):
-      raise ValueError("systemd-hibernate.service does not show the expected stock ExecStart and prepare steps")
+    assert_stock_exec(host)
   except BaseException:
     ignore_signals()
     remove_dropin(host)
@@ -855,6 +953,26 @@ def no_transition_evidence(host, target, mark, dmesg_before=""):
   return not any("systemd-sleep" in line and TRANSITION_SLEEP.search(line) for line in full.splitlines())
 
 
+def archive_guard(host, receipt, cycle):
+  """Rename cycle-N to cycle-N.refused-<time>. The file is evidence; it is not deleted."""
+  guard = host.root / C.GUARDS / receipt["image_sha256"] / ("cycle-" + str(cycle))
+  if guard.is_symlink() or not guard.is_file():
+    raise ValueError("Cycle guard is missing or is a symlink")
+  stamp = str(int(host.now()))
+  archived = guard.with_name(guard.name + ".refused-" + stamp)
+  n = 0
+  while archived.exists():
+    n += 1
+    archived = guard.with_name(guard.name + ".refused-" + stamp + "-" + str(n))
+  guard.rename(archived)
+  try:
+    STAGE.fsync_directory(guard.parent)
+  except Exception:
+    archived.rename(guard)
+    raise
+  return archived
+
+
 def archive_prior_attempt(host, directory):
   """Move the files of a refused attempt into prior-<time>/ (evidence is kept, never deleted)."""
   archive = directory / ("prior-" + str(int(host.now())))
@@ -888,6 +1006,9 @@ def s4_cycle(host, cycle):
   save(host, attempt_path, attempt)
   consumed, armed, installed, in_flight, saved = False, False, False, False, {}
   try:
+    reset = host.run(("systemctl", "reset-failed", "systemd-hibernate.service"))
+    if reset.returncode != 0:
+      raise ValueError("Could not clear systemd-hibernate.service: " + reset.stderr.strip()[:200])
     capture(host, receipt, directory, "pre", facts["swap_target"])
     issue_acceptance(host, receipt, cycle, boot_id, power["label"], directory)
     attempt["state"] = "accepted"
@@ -915,6 +1036,9 @@ def s4_cycle(host, cycle):
       raise ValueError("LoaderEntryOneShot is not exactly the upstream-model entry")
     if host.exists(HIBERNATE_LOCATION):
       raise ValueError("HibernateLocation EFI variable is already set")
+    # Re-check immediately before the point of no return. A reload since install_dropin must not
+    # have put sleep_entry.py back in front of the guard.
+    assert_stock_exec(host)
     mark = cursor(host)
     dmesg_before = host.output(("dmesg",))
     # From here a signal must not abort the cycle: once the guard exists the hibernate job can continue in
@@ -927,16 +1051,26 @@ def s4_cycle(host, cycle):
     attempt.update(state="transition-started", hibernate_attempted=True, real_s4_attempted=True, pre_write_monotonic=host.read("proc/uptime").split()[0])
     save(host, attempt_path, attempt)
     host.sync()
-    print("omarchy-t2-upstream-model: starting attended S4 cycle " + str(cycle) + " boot=" + boot_id + " image=" + receipt["image_sha256"][:12], flush=True)
+    mode = "autonomous" if host.autonomous else "attended"
+    print("omarchy-t2-upstream-model: starting " + mode + " S4 cycle " + str(cycle) + " boot=" + boot_id + " image=" + receipt["image_sha256"][:12], flush=True)
     in_flight = True
     result = host.run(("systemctl", "hibernate"))
+    # Stay in flight until the unit leaves activating/active. The drop-in is still installed, so a
+    # late ExecStart still runs systemd-sleep rather than the product hook.
+    wait_until_hibernate_settled(host)
     in_flight = False
     attempt["hibernate_returncode"] = result.returncode
+    # A return with the one-shot still armed and no PM evidence never reached the firmware. Return
+    # code 0 is the early-return race: logind answered before ExecStart. One-shot consumed means the
+    # resume path ran; that stays on post_return even when the journal lacks the entry line.
+    if host.exists(STAGE.ONESHOT) and no_transition_evidence(host, facts["swap_target"], mark, dmesg_before):
+      if result.returncode != 0:
+        message = "systemctl hibernate returned " + str(result.returncode) + ": " + result.stderr.strip()[:200]
+      else:
+        message = "systemctl hibernate returned 0 with LoaderEntryOneShot still armed and no hibernation entry"
+      raise RefusedBeforeTransition(message)
     if result.returncode != 0:
-      message = "systemctl hibernate returned " + str(result.returncode) + ": " + result.stderr.strip()[:200]
-      if no_transition_evidence(host, facts["swap_target"], mark, dmesg_before):
-        raise RefusedBeforeTransition(message)
-      raise RuntimeError(message)
+      raise RuntimeError("systemctl hibernate returned " + str(result.returncode) + ": " + result.stderr.strip()[:200])
     attempt["state"] = "returned"
     save(host, attempt_path, attempt)
     post_return(host, receipt, cycle, attempt, directory, mark, boot_id)
@@ -960,17 +1094,14 @@ def s4_cycle(host, cycle):
         STAGE.disarm(host.root, runner=host.stager_runner)
       except Exception as disarm_error:
         cleanup_errors.append("disarm: " + str(disarm_error))
+    reset = host.run(("systemctl", "reset-failed", "systemd-hibernate.service"))
+    if reset.returncode != 0:
+      cleanup_errors.append("reset-failed: " + reset.stderr.strip()[:200])
     if cleanup_errors:
       attempt["cleanup_errors"] = cleanup_errors
     if consumed and isinstance(error, RefusedBeforeTransition):
       # No evidence of a transition: keep the guard as evidence under a per-attempt name and allow a retry.
-      guard = host.root / C.GUARDS / receipt["image_sha256"] / ("cycle-" + str(cycle))
-      archived = guard.with_name(guard.name + ".refused-" + str(int(host.now())))
-      n = 0
-      while archived.exists():
-        n += 1
-        archived = guard.with_name(guard.name + ".refused-" + str(int(host.now())) + "-" + str(n))
-      guard.rename(archived)
+      archived = archive_guard(host, receipt, cycle)
       attempt["guard_archived_as"] = archived.name
       attempt.update(state="refused-before-transition", real_s4_attempted=False)
     elif consumed:
@@ -1016,8 +1147,11 @@ def post_return(host, receipt, cycle, attempt, directory, mark, boot_id):
   if problems:
     raise RuntimeError("Post-return checks failed: " + "; ".join(problems))
   STAGE.mark_booted(host.root)
-  phrase_hash = confirm(host, C.confirmation_phrase("s4", receipt["image_sha256"], boot_id))
-  attempt.update(state="returned-and-cleaned", physical_confirmation_sha256=phrase_hash, hardware_qualified=False)
+  confirmed = confirmation_record(host, "s4", receipt["image_sha256"], boot_id)
+  if host.autonomous:
+    attempt.update(state="returned-and-cleaned", hardware_qualified=False, **confirmed)
+  else:
+    attempt.update(state="returned-and-cleaned", hardware_qualified=False, physical_confirmation_sha256=confirmed["phrase_sha256"])
   save(host, directory / "attempt.json", attempt)
 
 
@@ -1112,17 +1246,127 @@ def pre_reactivate_check(host):
   return {"state": "clear-to-reactivate-check-assess-first"}
 
 
+RECLASSIFY_TRANSITION = re.compile(r"hibernation entry|Freezing|swsusp|PM: Preparing|Syncing filesystems|\bImage\b")
+
+
+def journal_between(text, start, end):
+  chosen = []
+  for line in text.splitlines():
+    stamp = monotonic(line)
+    if stamp is not None and start <= stamp <= end:
+      chosen.append(line)
+  return chosen
+
+
+def archive_terminal(host, image_sha256):
+  """Rename <sha>.json to <sha>.reclassified-<time>.json. Stripping one .json suffix is not the image hash."""
+  marker = host.root / C.TERMINAL / (image_sha256 + ".json")
+  if marker.is_symlink() or not marker.is_file():
+    raise ValueError("Terminal marker is missing or is a symlink")
+  stamp = str(int(host.now()))
+  archived = marker.with_name(image_sha256 + ".reclassified-" + stamp + ".json")
+  n = 0
+  while archived.exists():
+    n += 1
+    archived = marker.with_name(image_sha256 + ".reclassified-" + stamp + "-" + str(n) + ".json")
+  marker.rename(archived)
+  try:
+    STAGE.fsync_directory(marker.parent)
+  except Exception:
+    archived.rename(marker)
+    raise
+  return archived
+
+
+@locked
+def reclassify_userspace_refusal(host, cycle):
+  """Archive a failed-terminal marker when the attempt never reached PM.
+
+  The captured post journal bounds the window. /proc/uptime is CLOCK_BOOTTIME and the journal's
+  short-monotonic clock is CLOCK_MONOTONIC; they diverge by time spent suspended, so the stored
+  pre_write_monotonic is required as evidence the runner reached the write but is not a journal cursor.
+  Nothing is unlinked. A failure after the first rename puts that file back before raising.
+  """
+  receipt = load(host)
+  if STAGE.selected_entry(host.root) != receipt["entry_id"]:
+    raise ValueError("reclassify runs on the upstream-model test boot")
+  image = receipt["image_sha256"]
+  attempt = cycle_state(host, receipt, cycle)
+  if attempt is None or attempt.get("state") != "failed-terminal":
+    raise ValueError("Cycle " + str(cycle) + " is not failed-terminal")
+  if attempt.get("boot_id") != STAGE.current_boot_id(host.root):
+    raise ValueError("Attempt boot does not match this boot")
+  if attempt.get("hibernate_returncode") != 0 or attempt.get("hibernate_attempted") is not True:
+    raise ValueError("Only a zero-return hibernate attempt can be reclassified")
+  try:
+    float(attempt["pre_write_monotonic"])
+  except (KeyError, TypeError, ValueError):
+    raise ValueError("Attempt has no pre-write monotonic") from None
+  directory = STAGE.rooted(host.root, C.ATTEMPTS / image / ("cycle-" + str(cycle)))
+  post_path = directory / "post.json"
+  if post_path.is_symlink() or not post_path.is_file():
+    raise ValueError("Post capture is missing")
+  post = json.loads(post_path.read_text())
+  header = post.get("swap_header_after") or {}
+  if header.get("marker") != "normal-swap-signature" or header.get("signature_hex") != b"SWAPSPACE2".hex():
+    raise ValueError("Post-return swap header was not a normal SWAPSPACE2 signature")
+  captured = "\n".join(post.get("journal") or [])
+  if RECLASSIFY_TRANSITION.search(captured):
+    raise ValueError("Captured journal shows a hibernation transition")
+  names = post.get("efi_variables") or []
+  if not any(isinstance(name, str) and name.startswith("LoaderEntryOneShot-") for name in names):
+    raise ValueError("Post capture did not record LoaderEntryOneShot; the firmware may have consumed it")
+  if any(isinstance(name, str) and name.startswith("HibernateLocation-") for name in names) or host.exists(HIBERNATE_LOCATION):
+    raise ValueError("HibernateLocation was set")
+  stamps = [stamp for stamp in (monotonic(line) for line in (post.get("journal") or [])) if stamp is not None]
+  if not stamps:
+    raise ValueError("Post capture has no timestamped journal lines to bound the reclassify window")
+  start, end = min(stamps) - RECLASSIFY_LOOKBACK_SECONDS, max(stamps)
+  live = host.output(("journalctl", "-b", "-o", "short-monotonic", "--no-pager"))
+  window = journal_between(live, start, end)
+  joined = "\n".join(window)
+  if MAINTENANCE_REFUSAL not in joined:
+    raise ValueError("Journal window lacks the package-maintenance refusal")
+  if RECLASSIFY_TRANSITION.search(joined) or any("systemd-sleep" in line and TRANSITION_SLEEP.search(line) for line in window):
+    raise ValueError("Journal window shows a hibernation transition")
+  problems = attempt.get("post_problems") or []
+  if not any("lacks the hibernation entry line" in item for item in problems):
+    raise ValueError("Attempt was not the missing-entry misclassification")
+  require_clean_header(host, swap_target(host))
+  guard = host.root / C.GUARDS / image / ("cycle-" + str(cycle))
+  marker = host.root / C.TERMINAL / (image + ".json")
+  if guard.is_symlink() or not guard.is_file() or marker.is_symlink() or not marker.is_file():
+    raise ValueError("Cycle guard or terminal marker is missing or is a symlink")
+  archived_marker, archived_guard = None, None
+  try:
+    archived_marker = archive_terminal(host, image)
+    archived_guard = archive_guard(host, receipt, cycle)
+    attempt.update(state="refused-before-transition", reclassified_from="failed-terminal", reclassified_at=host.now(),
+                   real_s4_attempted=False, guard_archived_as=archived_guard.name, terminal_archived_as=archived_marker.name)
+    save(host, directory / "attempt.json", attempt)
+  except Exception:
+    if archived_guard is not None and archived_guard.exists() and not guard.exists():
+      archived_guard.rename(guard)
+    if archived_marker is not None and archived_marker.exists() and not marker.exists():
+      archived_marker.rename(marker)
+    raise
+  return {"state": "refused-before-transition", "cycle": cycle, "image_sha256": image,
+          "guard_archived_as": archived_guard.name, "terminal_archived_as": archived_marker.name,
+          "window": [start, end]}
+
+
 def main():
   parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-  parser.add_argument("phase", choices=("preflight", "verify-boot", "s3", "s3-reassess", "s4", "cleanup", "recover", "pre-reactivate-check", "recovery"))
+  parser.add_argument("phase", choices=("preflight", "verify-boot", "s3", "s3-reassess", "s4", "reclassify", "cleanup", "recover", "pre-reactivate-check", "recovery"))
   parser.add_argument("--cycle", type=int)
+  parser.add_argument("--autonomous", action="store_true", help="Owner waived typed phrases for this run. Never forges a phrase hash.")
   args = parser.parse_args()
   if args.phase == "recovery":
     print(CHECKLIST)
     return
   if os.geteuid() != 0:
     raise SystemExit("Root required")
-  host = Host()
+  host = Host(autonomous=args.autonomous or os.environ.get("OMARCHY_T2_AUTONOMOUS") == "1")
   try:
     with terminating_signals():
       if args.phase == "preflight":
@@ -1138,6 +1382,10 @@ def main():
         if args.cycle is None:
           parser.error("s4 requires --cycle")
         result = s4_cycle(host, args.cycle)
+      elif args.phase == "reclassify":
+        if args.cycle is None:
+          parser.error("reclassify requires --cycle")
+        result = reclassify_userspace_refusal(host, args.cycle)
       elif args.phase == "pre-reactivate-check":
         result = pre_reactivate_check(host)
       elif args.phase == "recover":

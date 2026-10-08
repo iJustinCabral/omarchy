@@ -137,7 +137,11 @@ def is_terminal(root, image_sha256):
 
 
 def mark_terminal(root, image_sha256, reason):
-  """Durably mark an image hash terminal (exclusive create; never removed by this tool)."""
+  """Durably mark an image hash terminal (exclusive create; never removed by this tool).
+
+  The runner's reclassify archives a userspace misclassification by renaming the marker to
+  <sha>.reclassified-<time>.json. This function still never unlinks it.
+  """
   path = rooted(root, C.TERMINAL / (image_sha256 + ".json"))
   path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
   data = (json.dumps({"image_sha256": image_sha256, "reason": reason}, indent=2, sort_keys=True) + "\n").encode()

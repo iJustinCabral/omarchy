@@ -46,6 +46,9 @@ class Env:
     self.suspend_lines = "[  100.0] host kernel: PM: suspend entry (deep)\n[  110.0] host kernel: ACPI: PM: Waking up from system sleep state S3\n"
     self.hibernate_lines = "[  200.0] host kernel: PM: hibernation: hibernation entry\n"
     self.hibernate_rc = 0
+    self.consume_transition = True
+    self.hibernate_active = None
+    self.cat_override = None
     self.hibernate_hook = None
     self.suspend_hook = None
     self.guard_rc = 0
@@ -117,6 +120,35 @@ class Env:
   def dropin_present(self):
     return (self.root / C.DROPIN).is_file()
 
+  def cat(self):
+    if self.cat_override is not None:
+      return self.cat_override
+    product = (
+      "# /etc/systemd/system/systemd-hibernate.service.d/omarchy-t2.conf\n"
+      "[Service]\n"
+      "ExecStart=\n"
+      "ExecStart=/usr/bin/python3 -B /var/lib/omarchy/t2-hibernate-product/runtime/packages/t2-suspend/hibernate/sleep_entry.py\n"
+    )
+    if not self.dropin_present():
+      return product
+    script = "/" + str(C.RUNTIME_DIR) + "/prepare.py"
+    return product + (
+      "\n# /run/systemd/system/systemd-hibernate.service.d/zz-upstream-model.conf\n"
+      "[Service]\n"
+      "ExecStart=\n"
+      "ExecStart=/usr/lib/systemd/systemd-sleep hibernate\n"
+      "ExecStartPre=/usr/bin/python3 -I -B " + script + " pre\n"
+      "ExecStopPost=/usr/bin/python3 -I -B " + script + " post\n"
+    )
+
+  def unit_state(self):
+    state = self.hibernate_active() if callable(self.hibernate_active) else self.hibernate_active
+    if not state:
+      return ""
+    job = "123" if state in ("activating", "active", "deactivating") else ""
+    sub = "start" if state == "activating" else "dead"
+    return "ActiveState=" + state + "\nSubState=" + sub + "\nJob=" + job + "\n"
+
   def show(self):
     if not self.dropin_present():
       return self.product_unit
@@ -150,6 +182,10 @@ class Env:
       return done(self.failed_units)
     if arguments[:2] == ("systemctl", "daemon-reload"):
       return done()
+    if arguments[:2] == ("systemctl", "cat"):
+      return done(self.cat())
+    if arguments[:2] == ("systemctl", "show") and "ActiveState" in arguments:
+      return done(self.unit_state())
     if arguments[:2] == ("systemctl", "show"):
       return done(self.show())
     if arguments == ("systemctl", "suspend"):
@@ -162,6 +198,9 @@ class Env:
         self.hibernate_hook()
       if self.hibernate_rc:
         return done("", self.hibernate_rc, "Failed to hibernate")
+      if not self.consume_transition:
+        # logind answered before ExecStart. The one-shot, header and journal stay as they were.
+        return done()
       # What the real S4 does to observable state: the one-shot is consumed, the header is reset, the journal grows.
       assert self.dropin_present(), "hibernate ran without the drop-in"
       assert (self.root / stage.ONESHOT).is_file(), "hibernate ran without the one-shot armed"
@@ -1052,3 +1091,203 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-lock-") as temporary
   assert (prior[0].parent / "pre.json").exists() and case.guard(1).exists()
 
 print("PASS: upstream-model session lock passes OMARCHY_PATH and PATH explicitly and a lock refusal is retryable")
+
+
+# Settle, cat, and the early-return race. A zero return with the one-shot still armed is not a hardware vector.
+assert run.hibernate_settled("ExecStart={ path=/usr/lib/systemd/systemd-sleep ; argv[]=/usr/lib/systemd/systemd-sleep hibernate ; }\n") is True
+assert run.hibernate_settled("ActiveState=activating\nSubState=start\nJob=12\n") is False
+assert run.hibernate_settled("ActiveState=active\nSubState=running\nJob=\n") is False
+assert run.hibernate_settled("ActiveState=failed\nSubState=failed\nJob=\n") is True
+assert run.hibernate_settled("ActiveState=inactive\nSubState=dead\nJob=0\n") is True
+assert run.last_execstart("ExecStart=\nExecStart=/usr/bin/python3 -B /x/sleep_entry.py\nExecStart=\nExecStart=/usr/lib/systemd/systemd-sleep hibernate\n") == "/usr/lib/systemd/systemd-sleep hibernate"
+assert run.last_execstart("ExecStart=/usr/bin/python3 -B /x/sleep_entry.py\n").endswith("sleep_entry.py")
+
+with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-race-") as temporary:
+  base = Path(temporary)
+
+  # rc 0, unit settles to failed, one-shot never consumed, no PM lines: retryable userspace refusal.
+  case = Env(base / "early-return")
+  case.to_s3_passed()
+  case.consume_transition = False
+  polls = {"n": 0}
+
+  def active(polls=polls, case=case):
+    polls["n"] += 1
+    assert case.dropin_present(), "drop-in removed while systemd-hibernate.service was still activating"
+    return "activating" if polls["n"] < 3 else "failed"
+
+  case.hibernate_active = active
+  rejects(lambda: run.s4_cycle(case.host, 1), "returned 0 with LoaderEntryOneShot still armed")
+  assert polls["n"] >= 3
+  record = case.attempt(1)
+  assert record["state"] == "refused-before-transition" and record["hibernate_returncode"] == 0 and record["real_s4_attempted"] is False
+  assert not case.terminal() and not case.guard(1).exists() and not case.dropin_present() and not (case.root / stage.ONESHOT).exists()
+  assert len(sorted((case.root / C.GUARDS / case.receipt["image_sha256"]).glob("cycle-1.refused-*"))) == 1
+  assert ("systemctl", "reset-failed", "systemd-hibernate.service") in case.calls
+  # The same cycle can proceed once the unit settles and the transition is consumed.
+  case.consume_transition = True
+  case.hibernate_active = None
+  assert run.s4_cycle(case.host, 1)["state"] == "returned-and-cleaned"
+  assert case.guard(1).exists() and not case.terminal()
+
+  # Evidence of a freeze with the one-shot still armed stays terminal.
+  case = Env(base / "early-but-freezing")
+  case.to_s3_passed()
+  case.consume_transition = False
+  case.hibernate_hook = lambda: setattr(case, "dmesg", case.dmesg + "[   60.0] PM: Freezing user space processes\n")
+  rejects(lambda: run.s4_cycle(case.host, 1), "one-shot")
+  assert case.terminal() and case.guard(1).exists() and case.attempt(1)["state"] == "failed-terminal"
+
+  # A unit that stays activating is left untouched and the image is terminal.
+  case = Env(base / "settle-timeout")
+  case.to_s3_passed()
+  case.consume_transition = False
+  case.hibernate_active = "activating"
+  rejects(lambda: run.s4_cycle(case.host, 1), "did not settle")
+  assert case.terminal() and case.dropin_present() and (case.root / stage.ONESHOT).exists() and case.guard(1).exists()
+  assert case.attempt(1)["unwound"] is False and case.attempt(1)["state"] == "failed-terminal"
+
+  # cat's last ExecStart is the product hook: refuse before the guard and remove the drop-in.
+  case = Env(base / "cat-product")
+  case.to_s3_passed()
+  case.cat_override = "ExecStart=/usr/bin/python3 -B /var/lib/omarchy/t2-hibernate-product/runtime/packages/t2-suspend/hibernate/sleep_entry.py\n"
+  rejects(lambda: run.s4_cycle(case.host, 1), "last ExecStart is not stock")
+  assert not case.guard(1).exists() and not case.dropin_present() and not case.terminal() and not case.called("systemctl", "hibernate")
+
+  # The unit is right at install time and wrong again just before the guard.
+  case = Env(base / "cat-recheck")
+  case.to_s3_passed()
+  real_arm = run.STAGE.arm_s4
+
+  def flip(root, cycle, runner=None, sync=None, case=case):
+    real_arm(root, cycle, runner=runner, sync=sync)
+    case.cat_override = "ExecStart=/usr/bin/python3 -B /x/sleep_entry.py\n"
+
+  run.STAGE.arm_s4 = flip
+  try:
+    rejects(lambda: run.s4_cycle(case.host, 1), "last ExecStart is not stock")
+  finally:
+    run.STAGE.arm_s4 = real_arm
+  assert not case.guard(1).exists() and not case.terminal() and not (case.root / stage.ONESHOT).exists() and not case.dropin_present()
+
+print("PASS: upstream-model runner waits for hibernate to settle and treats an armed one-shot as no transition")
+
+
+def plant_terminal(case, *, journal_extra="", post_journal=None, efi=None, problems=None):
+  """A failed-terminal cycle shaped like the 2026-10-06 userspace misclassification."""
+  sha = case.receipt["image_sha256"]
+  directory = case.root / C.ATTEMPTS / sha / "cycle-1"
+  directory.mkdir(parents=True)
+  if problems is None:
+    problems = ["Journal lacks the hibernation entry line"]
+  attempt = {
+    "state": "failed-terminal", "hibernate_attempted": True, "hibernate_returncode": 0, "real_s4_attempted": True,
+    "pre_write_monotonic": "22722.96", "boot_id": BOOT_B, "cycle": 1, "image_sha256": sha, "post_problems": problems,
+    "error": "Post-return checks failed: Journal lacks the hibernation entry line",
+  }
+  (directory / "attempt.json").write_text(json.dumps(attempt) + "\n")
+  if post_journal is None:
+    # The span has to cover the refusal. The live post capture runs from the cursor through the
+    # settle, so the maintenance line sits inside it even though the filter did not keep that line.
+    post_journal = ["[22712.359805] host NetworkManager[1]: dhcp4 activation beginning",
+                    "[22804.014243] host NetworkManager[1]: dhcp4 activation beginning"]
+  if efi is None:
+    efi = ["LoaderEntryOneShot-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"]
+  post = {"journal": post_journal, "efi_variables": efi,
+          "swap_header_after": {"marker": "normal-swap-signature", "signature_hex": b"SWAPSPACE2".hex(), "flags": 5}}
+  (directory / "post.json").write_text(json.dumps(post) + "\n")
+  run.create_guard(case.host, case.receipt, 1, {"cycle": 1, "boot_id": BOOT_B})
+  run.STAGE.mark_terminal(case.root, sha, "test misclassification")
+  case.journal += "[22713.245020] host python3[9]: ValueError: " + run.MAINTENANCE_REFUSAL + "\n" + journal_extra
+
+
+with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-reclassify-") as temporary:
+  base = Path(temporary)
+
+  case = Env(base / "reclassify-ok")
+  case.to_s3_passed()
+  # A later S3-style freeze is outside the post-capture window and must not block.
+  plant_terminal(case, journal_extra="[90000.000000] host kernel: Freezing user space processes\n")
+  result = run.reclassify_userspace_refusal(case.host, 1)
+  sha = case.receipt["image_sha256"]
+  assert result["state"] == "refused-before-transition" and not case.terminal()
+  assert case.attempt(1)["reclassified_from"] == "failed-terminal" and case.attempt(1)["real_s4_attempted"] is False
+  names = sorted(path.name for path in (case.root / C.TERMINAL).iterdir())
+  assert len(names) == 1 and names[0].startswith(sha + ".reclassified-") and names[0].endswith(".json")
+  assert names[0].removesuffix(".json") != sha
+  assert not case.guard(1).exists()
+  archived = sorted((case.root / C.GUARDS / sha).glob("cycle-1.refused-*"))
+  assert len(archived) == 1 and archived[0].is_file()
+  # The archived marker still holds the original reason.
+  assert "misclassification" in (case.root / C.TERMINAL / names[0]).read_text()
+  assert run.s4_cycle(case.host, 1)["state"] == "returned-and-cleaned"
+  assert case.guard(1).exists() and not case.terminal()
+  prior = list((case.root / C.ATTEMPTS / sha / "cycle-1").glob("prior-*/attempt.json"))
+  assert len(prior) == 1 and json.loads(prior[0].read_text())["state"] == "refused-before-transition"
+  rejects(lambda: run.reclassify_userspace_refusal(case.host, 1), "not failed-terminal")
+
+  case = Env(base / "window-freeze")
+  case.to_s3_passed()
+  plant_terminal(case, journal_extra="[22713.500000] host kernel: PM: Freezing user space processes\n")
+  rejects(lambda: run.reclassify_userspace_refusal(case.host, 1), "Journal window shows a hibernation transition")
+  assert case.terminal() and case.guard(1).exists() and case.attempt(1)["state"] == "failed-terminal"
+
+  case = Env(base / "no-refusal-text")
+  case.to_s3_passed()
+  plant_terminal(case)
+  case.journal = case.journal.replace(run.MAINTENANCE_REFUSAL, "some other error")
+  rejects(lambda: run.reclassify_userspace_refusal(case.host, 1), "lacks the package-maintenance refusal")
+  assert case.terminal() and case.guard(1).exists()
+
+  case = Env(base / "dirty-header")
+  case.to_s3_passed()
+  plant_terminal(case)
+  case.header(b"S1SUSPEND")
+  rejects(lambda: run.reclassify_userspace_refusal(case.host, 1), "SWAPSPACE2")
+  assert case.terminal() and case.guard(1).exists()
+
+  case = Env(base / "no-oneshot")
+  case.to_s3_passed()
+  plant_terminal(case, efi=["LoaderEntryDefault-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"])
+  rejects(lambda: run.reclassify_userspace_refusal(case.host, 1), "did not record LoaderEntryOneShot")
+  assert case.terminal() and case.guard(1).exists()
+
+  case = Env(base / "captured-entry")
+  case.to_s3_passed()
+  plant_terminal(case, post_journal=["[22712.359805] host kernel: PM: hibernation: hibernation entry"])
+  rejects(lambda: run.reclassify_userspace_refusal(case.host, 1), "Captured journal shows a hibernation transition")
+  assert case.terminal() and case.guard(1).exists()
+
+  case = Env(base / "hibernate-location")
+  case.to_s3_passed()
+  plant_terminal(case, efi=["LoaderEntryOneShot-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f", "HibernateLocation-8cf2644b-4b0b-428f-9387-6d876050dc67"])
+  rejects(lambda: run.reclassify_userspace_refusal(case.host, 1), "HibernateLocation was set")
+  assert case.terminal() and case.guard(1).exists()
+
+print("PASS: upstream-model reclassify archives a userspace refusal and leaves a real transition terminal")
+
+
+# Autonomous mode records a waiver. It does not read the tty and it does not hash a phrase nobody typed.
+silent = run.Host(Path("/"), autonomous=True, ask=lambda prompt: (_ for _ in ()).throw(AssertionError("tty read: " + prompt)))
+assert run.confirm(silent, "not typed") == C.sha256(run.WAIVER_TOKEN)
+assert C.sha256(run.WAIVER_TOKEN) != C.sha256(C.attendance_phrase("a" * 64, BOOT_B, 1, "AC").encode())
+
+with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-autonomous-") as temporary:
+  base = Path(temporary)
+  case = Env(base / "auto-s4")
+  case.to_s3_passed()
+  asked = len([call for call in case.calls if isinstance(call, tuple) and call[0] == "ask"])
+  case.host.autonomous = True
+  attempt = run.s4_cycle(case.host, 1)
+  assert len([call for call in case.calls if isinstance(call, tuple) and call[0] == "ask"]) == asked
+  assert attempt["state"] == "returned-and-cleaned" and attempt["physical_confirmation"] == "waived-by-owner"
+  assert attempt["waiver_sha256"] == C.sha256(run.WAIVER_TOKEN) and "physical_confirmation_sha256" not in attempt
+  acceptance = json.loads((case.root / C.ATTEMPTS / case.receipt["image_sha256"] / "cycle-1" / "acceptance.json").read_text())
+  assert acceptance["kind"] == run.AUTONOMOUS_KIND and acceptance["attendance"] == "owner-authorized-without-typed-phrase"
+  assert acceptance["waiver_sha256"] == C.sha256(run.WAIVER_TOKEN) and "phrase_sha256" not in acceptance
+  assert acceptance["waiver_sha256"] != C.sha256(C.attendance_phrase(case.receipt["image_sha256"], BOOT_B, 1, "AC").encode())
+  # An attended host must not accept the waiver file.
+  case.host.autonomous = False
+  rejects(lambda: run.require_acceptance(case.host, case.receipt, 1, BOOT_B, "AC", case.root / C.ATTEMPTS / case.receipt["image_sha256"] / "cycle-1"), "differs")
+
+print("PASS: upstream-model autonomous mode waives typed phrases without forging one")
