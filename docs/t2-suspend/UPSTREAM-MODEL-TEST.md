@@ -179,3 +179,15 @@ BUILD=$TOOLS_ROOT/build-$(date +%Y%m%d)
 - The exact `systemctl show` rendering of several `ExecStartPre`/`ExecStopPost` entries (the parser reads every `argv[]=` in each line).
 - Whether the installed DKMS radio modules equal the hardened `radio-h1` candidate (not compared; this test substitutes only `t2bce_*`).
 - Whether the current ordinary-boot `dmesg` records PID 1 messages early enough for the initramfs Wi-Fi log-order check; if not, G1 refuses rather than guessing.
+
+## 7. Observed cycle 1 (2026-10-08)
+
+Image `58e41e2972eec3013adc5c48e05d8b318d1652df9fcb969c0190333c5fd86100`, test boot `c6ed6685-6ddc-4828-bf30-5d850ac8f58f`, AC. Observed. The gates after G2 were not completed. The attempt did not reach `returned-and-cleaned` and carries no qualification. The product stays in package maintenance.
+
+The test boot journal has `PM: hibernation: hibernation entry` (monotonic 156267.510075) and `PM: hibernation: hibernation exit` (156273.895061). `attempt.json` is `returned` with `hibernate_attempted` true, `hibernate_returncode` 0, and `real_s4_attempted` true. `post.json` was not written. Guard `cycle-1` exists. `require_sequence` refuses another cycle 1 while that guard or that attempt state remains, and it refuses cycles 2 and 3 until cycle 1 is `returned-and-cleaned` on that same boot. Do not repeat the cycle.
+
+Resume radio captures on that test boot: `post-wifi-link.txt` is rc 0 with an empty `iw` body. `post-bluetooth.txt` has `Powered: no` and `PowerState: on`. `prepare.post` calls `set_bluetooth(True)` when `bluetooth_was_powered` is set, and `set_bluetooth` raises `Bluetooth did not power on` after `bluetoothctl power on` does not leave `Powered: yes`. The test boot logged that sentence at monotonic 156277.733887. Stock boot `8f22e906-1679-47b2-89c9-8e9b4f5e3a04` (Limine `Omarchy.linux-t2`) is a later fresh boot. It logged `PM: Image not found (code -22)`. Its Wi-Fi and Bluetooth came up, so the miss is the test-image resume path.
+
+The 2026-10-06 userspace refusal is a different event, archived as `prior-1791480678` with `reclassified_from` `failed-terminal` and `real_s4_attempted` false. Its error text says the journal lacks the hibernation entry line.
+
+Hypothesis only: the runner stopped during `post_return` after saving `returned` and before `post.json`, and S4 may need the `hci_bcm4377` half of `experiments/0005`. Those are not verified causes and this section does not change the runner or the radio drivers.
