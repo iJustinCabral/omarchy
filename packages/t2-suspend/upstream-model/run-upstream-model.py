@@ -920,6 +920,22 @@ def wait_until_hibernate_settled(host, mark, dmesg_before, returncode):
     host.sleep(1)
 
 
+def clear_failed_hibernate(host):
+  """Clear a leftover failed hibernate unit. An unloaded unit has no failed state.
+
+  systemd 261 reset-failed uses GetUnit. systemctl show can report LoadState=loaded from the
+  unit file while GetUnit says the unit is not loaded. That answer is an empty failure list,
+  not a unit that is still failed.
+  """
+  result = host.run(("systemctl", "reset-failed", "systemd-hibernate.service"))
+  if result.returncode == 0:
+    return
+  detail = (result.stderr or result.stdout or "").strip()
+  if "not loaded" in detail:
+    return
+  raise ValueError("Could not clear systemd-hibernate.service: " + detail[:200])
+
+
 def assert_hibernate_idle(host):
   """The unit is idle before the guard. A stale failed unit must not be read as this attempt.
 
@@ -1094,9 +1110,7 @@ def s4_cycle(host, cycle):
   save(host, attempt_path, attempt)
   consumed, armed, installed, in_flight, saved = False, False, False, False, {}
   try:
-    reset = host.run(("systemctl", "reset-failed", "systemd-hibernate.service"))
-    if reset.returncode != 0:
-      raise ValueError("Could not clear systemd-hibernate.service: " + reset.stderr.strip()[:200])
+    clear_failed_hibernate(host)
     capture(host, receipt, directory, "pre", facts["swap_target"])
     issue_acceptance(host, receipt, cycle, boot_id, power["label"], directory)
     attempt["state"] = "accepted"
@@ -1186,9 +1200,10 @@ def s4_cycle(host, cycle):
         STAGE.disarm(host.root, runner=host.stager_runner)
       except Exception as disarm_error:
         cleanup_errors.append("disarm: " + str(disarm_error))
-    reset = host.run(("systemctl", "reset-failed", "systemd-hibernate.service"))
-    if reset.returncode != 0:
-      cleanup_errors.append("reset-failed: " + reset.stderr.strip()[:200])
+    try:
+      clear_failed_hibernate(host)
+    except ValueError as reset_error:
+      cleanup_errors.append("reset-failed: " + str(reset_error)[:200])
     if cleanup_errors:
       attempt["cleanup_errors"] = cleanup_errors
     if consumed and isinstance(error, RefusedBeforeTransition):

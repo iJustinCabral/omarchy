@@ -50,6 +50,7 @@ class Env:
     self.hibernate_active = None
     self.hibernate_invoked = False
     self.pre_guard_state = None
+    self.reset_failed_error = None
     self.cat_override = None
     self.hibernate_hook = None
     self.suspend_hook = None
@@ -191,6 +192,10 @@ class Env:
     if arguments[:2] == ("systemctl", "--failed"):
       return done(self.failed_units)
     if arguments[:2] == ("systemctl", "daemon-reload"):
+      return done()
+    if arguments[:2] == ("systemctl", "reset-failed"):
+      if self.reset_failed_error:
+        return done("", 1, self.reset_failed_error)
       return done()
     if arguments[:2] == ("systemctl", "cat"):
       return done(self.cat())
@@ -1216,6 +1221,21 @@ with tempfile.TemporaryDirectory(prefix="t2-upstream-runner-race-") as temporary
   rejects(lambda: run.s4_cycle(case.host, 1), "not idle before the guard")
   assert case.attempt(1)["state"] == "refused-before-guard" and not case.guard(1).exists() and not case.terminal()
   assert not case.dropin_present() and not (case.root / stage.ONESHOT).exists() and not case.called("systemctl", "hibernate")
+
+  # systemd 261: reset-failed says the unit is not loaded when it was never started. That is not a failed unit.
+  case = Env(base / "reset-not-loaded")
+  case.to_s3_passed()
+  case.reset_failed_error = "Failed to reset failed state of unit systemd-hibernate.service: Unit systemd-hibernate.service not loaded."
+  assert run.s4_cycle(case.host, 1)["state"] == "returned-and-cleaned"
+  assert case.guard(1).exists() and not case.terminal() and case.called("systemctl", "hibernate")
+
+  # Any other reset-failed failure is still before the guard.
+  case = Env(base / "reset-denied")
+  case.to_s3_passed()
+  case.reset_failed_error = "Failed to reset failed state of unit systemd-hibernate.service: Access denied"
+  rejects(lambda: run.s4_cycle(case.host, 1), "Could not clear systemd-hibernate.service")
+  assert case.attempt(1)["state"] == "refused-before-guard" and not case.guard(1).exists() and not case.terminal()
+  assert not case.called("systemctl", "hibernate")
 
   # cat's last ExecStart is the product hook: refuse before the guard and remove the drop-in.
   case = Env(base / "cat-product")
